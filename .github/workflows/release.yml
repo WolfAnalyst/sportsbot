@@ -46,8 +46,17 @@ jobs:
             echo "Release $V already exists - nothing to do."
             exit 0
           fi
-          echo "Creating release $V at ${{ github.sha }} ..."
-          gh release create "$V" \
-            --title "$V" \
-            --generate-notes \
-            --target "${{ github.sha }}"
+          # Prefer the matching CHANGELOG.md section as release notes; fall back to
+          # auto-generated notes if there's no CHANGELOG (this fork) or no section.
+          NOTES=""
+          if [ -f CHANGELOG.md ]; then
+            NOTES=$(awk -v ver="$V" 'index($0,"## ")==1 && index($0,ver)>0 {f=1;next} f && (index($0,"## ")==1 || $0=="---") {exit} f {print}' CHANGELOG.md)
+          fi
+          if [ -n "$(printf '%s' "$NOTES" | tr -d '[:space:]')" ]; then
+            echo "Creating release $V from its CHANGELOG.md section."
+            printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.md"
+            gh release create "$V" --title "$V" --notes-file "$RUNNER_TEMP/notes.md" --target "${{ github.sha }}"
+          else
+            echo "Creating release $V with auto-generated notes (no CHANGELOG section)."
+            gh release create "$V" --title "$V" --generate-notes --target "${{ github.sha }}"
+          fi
