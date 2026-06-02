@@ -1,0 +1,53 @@
+name: release
+
+# Auto-cut a GitHub Release + tag whenever the version in config.py bumps.
+# This fork runs tipbot's config.py, so the version (TIPBOT_VERSION = "vX.Y ...")
+# matches the tipbot build it was synced from. On every push to main this reads
+# that vX.Y; if a release/tag for it doesn't exist yet, it creates the tag (at the
+# pushed commit) + a Release with auto-generated notes. Pushes that don't change
+# the version are a no-op.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from config.py
+        id: ver
+        run: |
+          VERSION=$(grep -m1 '^TIPBOT_VERSION' config.py | grep -oP 'v[0-9]+\.[0-9]+' | head -1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::No vX.Y found on the TIPBOT_VERSION line in config.py"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      - name: Create release if the tag is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          if gh release view "$V" >/dev/null 2>&1; then
+            echo "Release $V already exists - nothing to do."
+            exit 0
+          fi
+          echo "Creating release $V at ${{ github.sha }} ..."
+          gh release create "$V" \
+            --title "$V" \
+            --generate-notes \
+            --target "${{ github.sha }}"
