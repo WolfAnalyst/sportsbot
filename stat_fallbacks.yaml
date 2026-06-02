@@ -1,0 +1,45 @@
+# Stat fallback chains for tipsters that don't supply explicit alt props.
+#
+# When a primary placement fails with "Selection ... not found" or
+# "Market ... not found" or all alt-line ±1 retries are exhausted, TipBot
+# falls through to the stats listed in the chain (in order). For each
+# fallback stat it does a fresh price-check and places where the closest
+# line is within 10% of the tipped odds.
+#
+# Why this exists: Sportsbet's Cain PRA market wasn't offered on
+# 2026-04-30; only Points was. Kev's "Cain o13.5pra" failed hard with no
+# alt provided. With this chain, TipBot would try Cain points_rebounds,
+# then points_assists, then points, and place on whichever had a line
+# close to 13.5 at acceptable odds.
+#
+# Tipster filter: only tipsters in `enabled_tipsters` get this fallback
+# applied. Shook is intentionally excluded because Shook tips already
+# carry an explicit `alt_line` from the parser, and double-falling-back
+# would conflict with that.
+#
+# Chain order: list canonical underscore stat names (matches NBA_OU_MARKETS
+# keys in main.py). First-match wins.
+
+nba:
+  enabled_tipsters: [kev_nba, ausbets_nba, tipbot_test]
+  chains:
+    points_rebounds_assists:
+      - points_rebounds
+      - points_assists
+      - points
+    points_rebounds:
+      - points_rebounds_assists
+      - points
+    points_assists:
+      - points_rebounds_assists
+      - points
+    points:
+      - points_rebounds_assists
+      - points_rebounds
+      - points_assists
+
+# AFL chains can be added later if needed. Saiyan's tips usually carry
+# an explicit line so the existing alt-line system covers most cases.
+afl:
+  enabled_tipsters: []
+  chains: {}

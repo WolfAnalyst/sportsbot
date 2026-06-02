@@ -1,0 +1,19 @@
+# ── Your PRIVATE settings — never uploaded, never touched by updates ──
+# You create these by copying the .example files. Updates (git pull) only
+# change code + the .example templates, so your real settings are safe.
+.env
+sessions.yaml
+
+# ── Telegram login (created on first run) ──
+*.session
+*.session-journal
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ── Logs + local scratch ──
+logs/
+_old.*.bak

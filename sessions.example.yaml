@@ -1,0 +1,90 @@
+# ====================================================================
+#  sportsbot - your bookmaker accounts (HyperBot sessions).
+#
+#  >>> COPY this file to a new file named exactly  sessions.yaml  and edit
+#      THAT. <<<  (Your sessions.yaml is private and never uploaded.)
+#
+#  ONE block per bookie account you've logged into HyperBot.
+#  Sports only: AFL + NBA + MLB. (No racing in this build.)
+# ====================================================================
+#
+# HOW TO USE:
+#   1. In HyperBot, each logged-in bookie account has a numeric SESSION ID.
+#   2. Copy the example block below ONCE PER ACCOUNT.
+#   3. Change the id (the "12345" line), name, and bookmaker for each.
+#   4. Put the SAME ids into your .env priority lists (AFL_SESSION_PRIORITY etc.).
+#   5. Adjust the liability caps to YOUR account's limits if you know them
+#      (the example numbers are a safe starting point).
+#   6. Restart the bot after any change (no live reload).
+#
+# WHAT THE NUMBERS MEAN:
+#   liability = the most you could WIN on that bet (profit if it wins), NOT
+#   the stake. The bot works out the stake from the live odds:
+#       stake = liability_cap / (odds - 1)
+#       e.g. cap 500 at odds 1.9  ->  stake ~555  (liability ~500)
+#   A list like [300, 250, 224] = try 300 first, then step down if rejected.
+#
+# IMPORTANT:
+#   - An account NOT listed here is skipped (the bot can't size its bet).
+#   - An account listed here but NOT in any *_SESSION_PRIORITY in .env is
+#     ignored. Both this file AND .env must include the id.
+#   - Stat caps cover BOTH over/under and "X+" (threshold) markets.
+
+# ────────────────────────────────────────────────────────────────────
+# EXAMPLE ACCOUNT - copy this whole block per account. Replace 12345 with
+# your real HyperBot session id, and the name / bookmaker to match.
+# ────────────────────────────────────────────────────────────────────
+"12345":
+  name: "My Sportsbet"
+  bookmaker: sportsbet          # sportsbet | bet365 | tab | ladbrokes | pointsbet | neds | tabtouch
+  boost_eligible: false
+  liability:
+    nba:
+      h2h: 1000                 # head-to-head (moneyline)
+      line: 1000                # handicap / point spread
+      total_points: 1000        # over/under total
+      sgm: 1000                 # same-game multi
+      player_points: 800
+      player_rebounds: 800
+      player_assists: 800
+      player_pra: 800           # points+rebounds+assists
+      player_pts_rebs: 800
+      player_pts_asts: 800
+      player_asts_rebs: 800
+      player_threes: 800
+      player_blocks: 800
+      player_steals: 800
+      player_threshold: 1000    # shared cap for all NBA "X+" markets
+    mlb:
+      money_line: 1000          # moneyline (note: MLB key is money_line)
+      line: 1000                # run line (handicap)
+      total_points: 1000        # over/under total runs
+      team_total: 1000
+      sgm: 1000                 # same-game multi (Shook's 2+ HRRBI lands here)
+      player_stats: 800         # all MLB player props (hits, RBIs, HR, H+R+RBI, ...)
+    afl:
+      h2h: 1000
+      line: 1000
+      total_points: 1000
+      sgm: 1000
+      # A list lets the bot step the stake DOWN if the bookie rejects the
+      # first (largest) try - handy for disposals where caps move around.
+      player_disposals: [300, 250, 224]
+      player_marks: 400
+      player_tackles: 400
+      player_kicks: 400
+      player_handballs: 400
+      player_clearances: 400
+      player_hitouts: 400
+      player_fantasy: 400
+      player_goals: 1000
+
+# ── Add more accounts below (copy the block above) ───────────────────
+# "67890":
+#   name: "My Bet365"
+#   bookmaker: bet365
+#   boost_eligible: false
+#   liability:
+#     nba: { h2h: 1000, line: 1000, total_points: 1000, sgm: 1000, player_threshold: 1000 }
+#     mlb: { money_line: 1000, line: 1000, total_points: 1000, team_total: 1000, sgm: 1000, player_stats: 800 }
+#     afl: { h2h: 1000, line: 1000, total_points: 1000, sgm: 1000, player_disposals: 400, player_goals: 1000 }

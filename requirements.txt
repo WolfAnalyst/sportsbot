@@ -1,0 +1,4 @@
+telethon
+requests
+PyYAML
+python-dotenv
