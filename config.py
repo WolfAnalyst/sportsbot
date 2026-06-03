@@ -14,7 +14,7 @@ load_dotenv()
 # always clear which build is running. The code fingerprint computed in
 # main.py (_code_fingerprint) complements this — it catches partial/stale
 # deploys even when this string wasn't bumped.
-TIPBOT_VERSION = "v5.1 (2026-06-03: IMAGE-TIP CHANNELS (vision). Three Telegram channels post tips as images: Eddie's Bets AFL -> sports pipeline (place_tip, HARD-locked to Sportsbet via TIPSTERS_FORCE_BOOKIE, team inferred from roster_afl), Zak Trussell SA Racing + The Trial Sniper -> racing pipeline (tiptitans_processor.process_image_racing_tip -> place_racing_tip). Channels carry NO bot_id (only the tipster posts; sender filter skipped). Handler downloads media -> groq_parser.parse_tip_image (Llama-4 Scout vision, per-tipster racing/AFL prompts) -> route by sport. TEST GATE IMAGE_TIPS_TEST_MODE (default ON): $1/unit (IMAGE_TIPS_TEST_UNIT_SIZE) enforced in placing process via _apply_image_test_stake (sports) + the racing orchestrator. Anything not placed/found -> manual. On top of v5.0 MLB phase-3.)"
+TIPBOT_VERSION = "v5.2 (2026-06-03: LOG-AUDIT FIXES on top of v5.1 image-tip channels. (#3) MLB team-abbreviation resolution: MLB_TEAM_ALIASES in nba_resolver maps bare codes (OAK->Athletics, LAD, NYY, all 30 teams) so Shook MLB tips that carry only an abbreviation resolve instead of going to manual; ambiguous bare tokens omitted, substring fallback + NBA path unchanged. (#6) Confirmed-not-placed racing bets no longer hide the shortfall: reconcile.decide_ambiguous returns a distinct 'not_placed' verdict (vs 'conservative'=uncertain); racing_placer routes that stake to a confirmed_not_placed bucket counted in unfilled_stake (-> unfilled/manual alert + critical) while still debiting remaining so it is NOT auto-spilled (no double-bet; tip 62051 TRACER BULLET). Sports paths unchanged. (#2) Image-channel chatter filter: _image_text_is_actionable surfaces only bet/instruction-like text posts (race code/odds/$/units/scratch/etc.), drops chatter (logged). Builds on v5.1.)"
 
 # ── Telegram ─────────────────────────────────────────────────────────
 _raw_api_id = os.getenv("TELEGRAM_API_ID", "0")
@@ -81,6 +81,20 @@ HYPERBOT_BASE_URL = os.getenv(
 
 # ── Groq ─────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
+# ── Tip parser provider (LLM backend that parses tipster messages) ───
+# Which LLM backend `tip_parser` uses: "groq" (default, LIVE) or "claude"
+# (Anthropic Sonnet — SCAFFOLDED but INERT). The Claude path activates ONLY
+# when ALL of these hold: TIP_PARSER_PROVIDER=claude, ANTHROPIC_API_KEY set,
+# `anthropic` installed, and main.py's parser import pointed at tip_parser
+# (one line). Until then this is a pure no-op — Groq stays the parser. If
+# "claude" is selected but unusable (no key / SDK), tip_parser FAILS SAFE back
+# to Groq rather than dropping tips. Full plan: REBUILD-note CLAUDE_PARSER.md.
+TIP_PARSER_PROVIDER = os.getenv("TIP_PARSER_PROVIDER", "groq").strip().lower()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# Sonnet 4.6 (Wilson's chosen model for the Claude parser path). Exact ID, no
+# date suffix. Override via .env only if migrating models.
+CLAUDE_PARSER_MODEL = os.getenv("CLAUDE_PARSER_MODEL", "claude-sonnet-4-6")
 
 # ── Line Tolerance ───────────────────────────────────────────────────
 LINE_TOLERANCE = _env_float("LINE_TOLERANCE", "1.0")

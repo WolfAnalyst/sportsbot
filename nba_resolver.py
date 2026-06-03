@@ -72,6 +72,57 @@ NBA_TEAM_ALIASES = {
     "spurs": "San Antonio Spurs", "san antonio": "San Antonio Spurs", "sa": "San Antonio Spurs", "sas": "San Antonio Spurs",
 }
 
+# MLB team aliases — values MUST match ESPN's scoreboard displayName exactly
+# (the alias path matches on ==, not substring). Covers all 30 teams via
+# mascot, the standard 2-3 letter abbreviations tipsters use (Shook posts bare
+# codes like "OAK", "LAD", "NYY"), and common nicknames. WHY this exists:
+# substring matching alone can't bridge an abbreviation to a name with no text
+# overlap — "OAK" is not a substring of "Athletics" (the A's dropped the city),
+# so a 2026-06-03 Shook tip "OAK / Nick Kurtz 2+ HRRBI" resolved to nothing and
+# went to manual. Ambiguous bare tokens are deliberately OMITTED to avoid
+# wrong-game bets: "chi" (Cubs vs White Sox), "ny" (Mets vs Yankees), "la"
+# (Dodgers vs Angels), "sox" (Red vs White) — those must arrive as the distinct
+# code (CHC/CWS, NYM/NYY, LAD/LAA) or full name, else they fall through to the
+# substring path / manual.
+MLB_TEAM_ALIASES = {
+    # AL East
+    "orioles": "Baltimore Orioles", "baltimore": "Baltimore Orioles", "bal": "Baltimore Orioles",
+    "red sox": "Boston Red Sox", "redsox": "Boston Red Sox", "bosox": "Boston Red Sox", "boston": "Boston Red Sox", "bos": "Boston Red Sox",
+    "yankees": "New York Yankees", "yanks": "New York Yankees", "nyy": "New York Yankees", "bombers": "New York Yankees",
+    "rays": "Tampa Bay Rays", "tampa bay": "Tampa Bay Rays", "tampa": "Tampa Bay Rays", "tb": "Tampa Bay Rays", "tbr": "Tampa Bay Rays",
+    "blue jays": "Toronto Blue Jays", "bluejays": "Toronto Blue Jays", "jays": "Toronto Blue Jays", "toronto": "Toronto Blue Jays", "tor": "Toronto Blue Jays",
+    # AL Central
+    "white sox": "Chicago White Sox", "whitesox": "Chicago White Sox", "chisox": "Chicago White Sox", "cws": "Chicago White Sox", "chw": "Chicago White Sox",
+    "guardians": "Cleveland Guardians", "guards": "Cleveland Guardians", "cleveland": "Cleveland Guardians", "cle": "Cleveland Guardians",
+    "tigers": "Detroit Tigers", "detroit": "Detroit Tigers", "det": "Detroit Tigers",
+    "royals": "Kansas City Royals", "kansas city": "Kansas City Royals", "kc": "Kansas City Royals", "kcr": "Kansas City Royals",
+    "twins": "Minnesota Twins", "minnesota": "Minnesota Twins", "min": "Minnesota Twins",
+    # AL West
+    "astros": "Houston Astros", "stros": "Houston Astros", "houston": "Houston Astros", "hou": "Houston Astros",
+    "angels": "Los Angeles Angels", "halos": "Los Angeles Angels", "laa": "Los Angeles Angels", "anaheim": "Los Angeles Angels",
+    "athletics": "Athletics", "oakland": "Athletics", "oakland athletics": "Athletics", "oak": "Athletics", "ath": "Athletics", "a's": "Athletics", "as": "Athletics",
+    "mariners": "Seattle Mariners", "seattle": "Seattle Mariners", "sea": "Seattle Mariners",
+    "rangers": "Texas Rangers", "texas": "Texas Rangers", "tex": "Texas Rangers",
+    # NL East
+    "braves": "Atlanta Braves", "atlanta": "Atlanta Braves", "atl": "Atlanta Braves",
+    "marlins": "Miami Marlins", "miami": "Miami Marlins", "mia": "Miami Marlins",
+    "mets": "New York Mets", "nym": "New York Mets",
+    "phillies": "Philadelphia Phillies", "phils": "Philadelphia Phillies", "philadelphia": "Philadelphia Phillies", "philly": "Philadelphia Phillies", "phi": "Philadelphia Phillies",
+    "nationals": "Washington Nationals", "nats": "Washington Nationals", "washington": "Washington Nationals", "wsh": "Washington Nationals", "wsn": "Washington Nationals", "was": "Washington Nationals",
+    # NL Central
+    "cubs": "Chicago Cubs", "cubbies": "Chicago Cubs", "chc": "Chicago Cubs",
+    "reds": "Cincinnati Reds", "cincinnati": "Cincinnati Reds", "cin": "Cincinnati Reds",
+    "brewers": "Milwaukee Brewers", "crew": "Milwaukee Brewers", "milwaukee": "Milwaukee Brewers", "mil": "Milwaukee Brewers",
+    "pirates": "Pittsburgh Pirates", "bucs": "Pittsburgh Pirates", "buccos": "Pittsburgh Pirates", "pittsburgh": "Pittsburgh Pirates", "pit": "Pittsburgh Pirates",
+    "cardinals": "St. Louis Cardinals", "cards": "St. Louis Cardinals", "redbirds": "St. Louis Cardinals", "st louis": "St. Louis Cardinals", "st. louis": "St. Louis Cardinals", "stl": "St. Louis Cardinals",
+    # NL West
+    "diamondbacks": "Arizona Diamondbacks", "dbacks": "Arizona Diamondbacks", "d-backs": "Arizona Diamondbacks", "snakes": "Arizona Diamondbacks", "arizona": "Arizona Diamondbacks", "ari": "Arizona Diamondbacks", "az": "Arizona Diamondbacks",
+    "rockies": "Colorado Rockies", "rox": "Colorado Rockies", "colorado": "Colorado Rockies", "col": "Colorado Rockies",
+    "dodgers": "Los Angeles Dodgers", "lad": "Los Angeles Dodgers",
+    "padres": "San Diego Padres", "pads": "San Diego Padres", "friars": "San Diego Padres", "san diego": "San Diego Padres", "sd": "San Diego Padres", "sdp": "San Diego Padres",
+    "giants": "San Francisco Giants", "san francisco": "San Francisco Giants", "sf": "San Francisco Giants", "sfg": "San Francisco Giants",
+}
+
 
 def _fetch_schedule(sport: str, date: str) -> list[dict]:
     """Fetch games for a date. Returns list of {"home": name, "away": name}."""
@@ -135,12 +186,14 @@ def _fetch_schedule(sport: str, date: str) -> list[dict]:
         return []
 
 
-def _match_team(query: str, games: list[dict]) -> Optional[dict]:
-    """Find a game involving the queried team."""
+def _match_team(query: str, games: list[dict], aliases: dict = NBA_TEAM_ALIASES) -> Optional[dict]:
+    """Find a game involving the queried team. `aliases` is the sport-specific
+    abbreviation/nickname table (NBA by default; MLB callers pass
+    MLB_TEAM_ALIASES so codes like 'OAK' resolve to 'Athletics')."""
     query_lower = query.strip().lower()
 
     # Try alias lookup first
-    full_name = NBA_TEAM_ALIASES.get(query_lower, "")
+    full_name = aliases.get(query_lower, "")
 
     for game in games:
         home_lower = game["home"].lower()
@@ -224,9 +277,10 @@ def resolve_mlb_event(team: str = "") -> Optional[str]:
     """Resolve an MLB team name to a 'Home v Away' event string via ESPN's MLB
     scoreboard (baseball/mlb). TEAM-based only for now — there's no MLB roster
     for player->team lookup, so an MLB player-prop tip must carry the team/game.
-    Checks yesterday/today/tomorrow in AEST->US priority, same as NBA. The
-    _match_team substring fallback handles MLB names (no MLB alias table yet:
-    'Yankees' matches 'New York Yankees'). 2026-06-01."""
+    Checks yesterday/today/tomorrow in AEST->US priority, same as NBA. Resolves
+    via MLB_TEAM_ALIASES (abbreviation/nickname table — 'OAK' -> 'Athletics')
+    then falls back to substring ('Yankees' matches 'New York Yankees').
+    2026-06-01; MLB alias table added 2026-06-03."""
     if not (team or "").strip():
         log.warning("Cannot resolve MLB event: no team given")
         return None
@@ -241,7 +295,7 @@ def resolve_mlb_event(team: str = "") -> Optional[str]:
     for check_date in check_order:
         games = _fetch_schedule("mlb", check_date)
         for try_team in teams_to_try:
-            game = _match_team(try_team, games)
+            game = _match_team(try_team, games, MLB_TEAM_ALIASES)
             if game:
                 event = f"{game['home']} v {game['away']}"
                 log.info(f"Resolved MLB '{team}' -> '{event}' on {check_date}")

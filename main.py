@@ -7540,6 +7540,57 @@ def _img_coerce_int(v):
             return None
 
 
+# Word-boundary keywords that mark a text-only post in an IMAGE channel as
+# actionable (a bet or an instruction worth a manual ping) rather than chatter.
+# Kept deliberately generous on INSTRUCTION words (scratch/late-mail/etc.) since
+# the cost of dropping one is the operator leaving a bet they should've pulled;
+# the cost of keeping chatter is just a ping. Bet TYPES + race/odds/stake
+# patterns are handled separately below.
+_IMAGE_ACTIONABLE_KEYWORDS = (
+    # instructions / changes
+    "scratch", "scratched", "scratching", "non runner", "non-runner",
+    "late mail", "mail", "update", "remove", "removed", "cancel", "cancelled",
+    "off the", "adding", "added", "add",
+    # bet types / racing terms
+    "each way", "e/w", "multi", "double", "treble", "quaddie", "quadrella",
+    "trifecta", "quinella", "exacta", "exotic", "first 4", "first four",
+    "sgm", "srm", "same race", "back", "lay", "selection", "selections",
+    "runner", "runners", "to win", "the win", "the place", "odds", "tip", "tips",
+)
+# Matched as whole words (\b...\b) so "multi" doesn't fire on "multiple",
+# "tip" doesn't fire on inflections we didn't mean, etc.
+_IMAGE_ACTIONABLE_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(kw) for kw in _IMAGE_ACTIONABLE_KEYWORDS) + r")\b"
+)
+
+
+def _image_text_is_actionable(text: str) -> bool:
+    """True if a text-only post in an image-tip channel looks like a bet or an
+    instruction (keep -> manual ping); False for plain chatter (drop, log only).
+
+    These channels post the actual TIP as an image (always processed); text
+    posts are supplementary, so we only surface the ones that carry betting
+    intent. 2026-06-03: previously EVERY text post pinged manual, flooding it
+    with 'thanks lads' / 'good luck' / emoji chatter from Zak & Trial."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if _IMAGE_ACTIONABLE_RE.search(t):
+        return True
+    # Racing/odds/stake patterns that imply a concrete selection.
+    if re.search(r"\br\d{1,2}\b", t):            # race code R1..R12
+        return True
+    if re.search(r"\$\s*\d", t):                 # $50
+        return True
+    if re.search(r"\b\d+(?:\.\d+)?\s*u\b", t):   # 0.5u / 2u units
+        return True
+    if re.search(r"\b\d+\.\d{1,2}\b", t):        # decimal odds e.g. 2.50
+        return True
+    if re.search(r"\brace\s*\d", t):             # "race 5"
+        return True
+    return False
+
+
 def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: int) -> dict:
     """Build a racing parsed_tip dict (place_racing_tip shape) from one raw
     vision-extracted racing dict. Adds synthetic id/titan/event_title/title
@@ -7558,9 +7609,16 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
     titan = {"zak_racing": "ZAK", "trial_sniper": "TRIAL"}.get(
         tipster, (tipster or "IMG").upper()[:5]
     )
+    # Zak & Trial Sniper tip THOROUGHBREDS (a distinct discipline from the
+    # harness tracks in sessions.yaml — same-named tracks like Bunbury have
+    # both). Tag the discipline so racing_placer caps these against the flat
+    # per-account `racing.thoroughbreds` cap (win 1000 / place 500) and BYPASSES
+    # the per-track harness caps. Day-before tips have no MBL.
+    discipline = "thoroughbred" if tipster in ("zak_racing", "trial_sniper") else ""
     return {
         "id": f"img-{tipster}-{race_num}-{saddle}-{idx}",
         "titan": titan,
+        "discipline": discipline,
         "track": track,
         "race_num": race_num,
         # Vision rarely prints a race-type code; "" lets racing_placer fall
@@ -8200,8 +8258,14 @@ async def main():
                     )
                 )
             elif text:
-                log.info(f"[{channel_name}] text-only post on image channel -> manual alert")
-                notifier.notify_image_alert(channel_name, text)
+                # Only surface text posts that look like a bet/instruction;
+                # drop plain chatter (logged, never lost) to stop flooding
+                # manual with 'thanks'/'good luck'/emoji noise (2026-06-03).
+                if _image_text_is_actionable(text):
+                    log.info(f"[{channel_name}] text-only post on image channel (actionable) -> manual alert")
+                    notifier.notify_image_alert(channel_name, text)
+                else:
+                    log.info(f"[{channel_name}] text-only chatter on image channel -> dropped (not bet-like): {text[:80]}")
             return
 
         # Detect image/media - alert only.

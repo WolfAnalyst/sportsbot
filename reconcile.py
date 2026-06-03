@@ -173,11 +173,17 @@ def decide_ambiguous(hb, account_id, *, event, stake, sport, selection,
       {'action': 'spill'}
           -> confirmed NOT placed AND spill_enabled: recover the stake
              (ladder/spill to another session). Tier 2.
+      {'action': 'not_placed', 'reason': str}
+          -> pending_bets POSITIVELY confirmed NOT placed, spill off (Tier 1).
+             Caller must NOT debit-as-placed (we KNOW nothing landed): leave the
+             stake unfilled so it surfaces for manual re-placement. Racing
+             honours this; sports paths that only check 'placed'/'spill' treat
+             it as their existing default (debit-as-placed) — unchanged.
       {'action': 'conservative', 'reason': str}
           -> fall back to the caller's existing behaviour (debit-as-placed +
-             blocklist + critical alert). Fires when reconciliation disabled, no
-             account_id, pending_bets failed (never spill on uncertainty), or
-             confirmed not-found while spill is off (Tier 1).
+             blocklist + critical alert). Fires on UNCERTAINTY only:
+             reconciliation disabled, no account_id, or pending_bets API failed
+             (never spill/abandon on uncertainty).
 
     Only for the SLOW-REJECTION class — NOT text-pattern ambiguous (Pointsbet
     'intercepted'), which always stays conservative (decision 2)."""
@@ -207,8 +213,19 @@ def decide_ambiguous(hb, account_id, *, event, stake, sport, selection,
     # landed is False — confirmed not placed.
     if spill_enabled:
         return {'action': 'spill'}
-    return {'action': 'conservative',
-            'reason': 'confirmed not-placed but spill off (Tier 1)'}
+    # Spill off, but pending_bets POSITIVELY confirmed the bet is NOT on the
+    # account. This is distinct from 'conservative' (which means "we don't
+    # know"): here we KNOW nothing landed, so the caller must NOT debit-as-
+    # placed. Racing (racing_placer) treats this as a clean failure -> the
+    # stake stays unfilled and surfaces for manual re-placement. Sports paths
+    # (main.py) only branch on 'placed'/'spill', so 'not_placed' falls through
+    # to their existing debit-as-placed default — behaviour unchanged there.
+    # WHY this matters: tip 62051 (TRACER BULLET, 2026-06-03) — bet365 returned
+    # "Bet placement failed", reconcile confirmed not-placed, but the old
+    # 'conservative' path counted the $200 as tentatively placed, so
+    # unfilled=$0 and the shortfall never reached manual.
+    return {'action': 'not_placed',
+            'reason': 'confirmed not-placed, spill off (Tier 1)'}
 
 
 # ── Self-test against the live 2026-05-30 sample ────────────────────────────

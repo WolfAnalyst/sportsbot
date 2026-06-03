@@ -243,19 +243,64 @@ _VALID_DAY_KEYS = {
 
 
 def _validate_racing_block(sid: str, racing_body: dict) -> None:
-    """Validate a racing liability block. Warn-only."""
-    for track_key, track_body in racing_body.items():
+    """Validate a racing liability block. Warn-only.
+
+    Layout: `racing -> {thoroughbreds: {win,place}, harness: {<track>: caps,
+    default: mbl}}`. The legacy flat layout (tracks directly under `racing`) is
+    still accepted for back-compat.
+    """
+    # Discipline cap: flat {win, place} (thoroughbreds — Zak/Trial day-before).
+    tb = racing_body.get("thoroughbreds")
+    if tb is not None:
+        if not isinstance(tb, dict):
+            log.warning(
+                f"sessions.yaml: session {sid} racing.thoroughbreds should be a "
+                f"mapping of bet_type -> cap"
+            )
+        else:
+            for bt, cap in tb.items():
+                if bt not in KNOWN_RACING_BET_TYPES:
+                    log.warning(
+                        f"sessions.yaml: session {sid} racing.thoroughbreds.{bt} "
+                        f"is not a known racing bet type (expected: win/place)"
+                    )
+                if not _is_valid_cap(cap):
+                    log.warning(
+                        f"sessions.yaml: session {sid} racing.thoroughbreds.{bt} = "
+                        f"{cap!r} is not a valid cap"
+                    )
+
+    # Per-track HARNESS caps live under racing.harness; fall back to the legacy
+    # flat layout (tracks directly under racing, minus the thoroughbreds key).
+    harness = racing_body.get("harness")
+    if isinstance(harness, dict):
+        _validate_track_caps(sid, "racing.harness", harness)
+    elif harness is not None:
+        log.warning(
+            f"sessions.yaml: session {sid} racing.harness should be a mapping of "
+            f"<track> -> caps"
+        )
+    else:
+        legacy = {k: v for k, v in racing_body.items() if k != "thoroughbreds"}
+        _validate_track_caps(sid, "racing", legacy)
+
+
+def _validate_track_caps(sid: str, prefix: str, tracks_body: dict) -> None:
+    """Validate a mapping of <track> -> {win/place (+ day overrides)} plus an
+    optional `default`. Warn-only. Shared by the harness section + the legacy
+    flat layout."""
+    for track_key, track_body in tracks_body.items():
         if track_key == "default":
             # Default may be a number, "unlimited", or "mbl"
             if not _is_valid_cap(track_body):
                 log.warning(
-                    f"sessions.yaml: session {sid} racing.default has invalid value "
+                    f"sessions.yaml: session {sid} {prefix}.default has invalid value "
                     f"{track_body!r} (expected number, 'unlimited', or 'mbl')"
                 )
             continue
         if not isinstance(track_body, dict):
             log.warning(
-                f"sessions.yaml: session {sid} racing.{track_key} should be a "
+                f"sessions.yaml: session {sid} {prefix}.{track_key} should be a "
                 f"mapping of bet_type -> cap"
             )
             continue
@@ -265,32 +310,32 @@ def _validate_racing_block(sid: str, racing_body: dict) -> None:
             if bt in _VALID_DAY_KEYS:
                 if not isinstance(cap, dict):
                     log.warning(
-                        f"sessions.yaml: session {sid} racing.{track_key}.{bt} "
+                        f"sessions.yaml: session {sid} {prefix}.{track_key}.{bt} "
                         f"day override should be a mapping of bet_type -> cap"
                     )
                     continue
                 for inner_bt, inner_cap in cap.items():
                     if inner_bt not in KNOWN_RACING_BET_TYPES:
                         log.warning(
-                            f"sessions.yaml: session {sid} racing.{track_key}.{bt}."
+                            f"sessions.yaml: session {sid} {prefix}.{track_key}.{bt}."
                             f"{inner_bt} is not a known racing bet type "
                             f"(expected: win/place)"
                         )
                     if not _is_valid_cap(inner_cap):
                         log.warning(
-                            f"sessions.yaml: session {sid} racing.{track_key}.{bt}."
+                            f"sessions.yaml: session {sid} {prefix}.{track_key}.{bt}."
                             f"{inner_bt} = {inner_cap!r} is not a valid cap"
                         )
                 continue
             # Plain bet_type cap at track level
             if bt not in KNOWN_RACING_BET_TYPES:
                 log.warning(
-                    f"sessions.yaml: session {sid} racing.{track_key}.{bt} "
+                    f"sessions.yaml: session {sid} {prefix}.{track_key}.{bt} "
                     f"is not a known racing bet type (expected: win/place)"
                 )
             if not _is_valid_cap(cap):
                 log.warning(
-                    f"sessions.yaml: session {sid} racing.{track_key}.{bt} = "
+                    f"sessions.yaml: session {sid} {prefix}.{track_key}.{bt} = "
                     f"{cap!r} is not a valid cap"
                 )
 
@@ -509,14 +554,23 @@ def lookup_racing_liability(
     if not isinstance(racing_block, dict):
         return None
 
+    # Per-track HARNESS caps live under racing.harness (Tip Titans etc.). Fall
+    # back to the legacy flat layout (tracks directly under racing) for
+    # robustness if a session predates the harness wrapper. The thoroughbreds
+    # discipline cap is resolved separately (lookup_thoroughbreds_liability).
+    tracks_block = racing_block.get("harness")
+    if not isinstance(tracks_block, dict):
+        tracks_block = racing_block
+
     # Direct track match first
-    track_block = racing_block.get(track)
+    track_block = tracks_block.get(track)
 
     # Case-insensitive track lookup if no direct hit
     if track_block is None and track:
         t_lower = track.lower().strip()
-        for k, v in racing_block.items():
-            if k == "default":
+        for k, v in tracks_block.items():
+            # reserved keys, NOT track names — never match a track lookup.
+            if k in ("default", "thoroughbreds", "harness"):
                 continue
             if isinstance(k, str) and k.lower().strip() == t_lower:
                 track_block = v
@@ -540,10 +594,40 @@ def lookup_racing_liability(
             return _normalise_cap(cap)
 
     # Fall back to default
-    default = racing_block.get("default")
+    default = tracks_block.get("default")
     if default is not None:
         return _normalise_cap(default)
     return None
+
+
+def lookup_thoroughbreds_liability(
+    session_id: str, bet_type: str,
+) -> Optional[float | str]:
+    """Resolve the THOROUGHBRED discipline liability cap for a session.
+
+    Thoroughbred bets (Zak / Trial Sniper image-racing tips) are day-before
+    tips with no MBL, so they use a flat per-account cap kept under
+    `liability.racing.thoroughbreds.{win,place}` — INDEPENDENT of the per-track
+    HARNESS caps. This is a separate lookup on purpose so a thoroughbred bet can
+    NEVER pick up a same-named harness track's cap (e.g. Bunbury has both a
+    thoroughbred and a harness track).
+
+    Returns float, 'unlimited', 0.0 (do-not-bet), or None when not configured
+    (caller decides the fallback).
+    """
+    meta = _session_meta.get(str(session_id))
+    if not meta:
+        return None
+    racing_block = meta.liability.get("racing")
+    if not isinstance(racing_block, dict):
+        return None
+    tb_block = racing_block.get("thoroughbreds")
+    if not isinstance(tb_block, dict):
+        return None
+    cap = tb_block.get(bet_type)
+    if cap is None:
+        return None
+    return _normalise_cap(cap)
 
 
 def _resolve_day_name(date: Optional[str]) -> Optional[str]:
