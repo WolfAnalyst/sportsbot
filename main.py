@@ -4470,6 +4470,70 @@ def _match_handicap_in_catalog(team_selection: str, tipped_line, markets: dict):
     return None
 
 
+def _match_total_in_catalog(side: str, tipped_line, markets: dict):
+    """Resolve a match-TOTAL leg (Over/Under) against the live catalog.
+
+    1. Standard `total_points` market: Over/Under at the tipped line within
+       ±1.0 (totals aren't handicaps, so the wider tolerance is kept).
+    2. Fallback to `pick_own_total`: the every-0.5 alt lines (selection
+       'Over (+172.5)' / 'Under (+172.5)', WITH a `line` field) — this is where
+       an off-main total lives; the `total_points` market only carries the main
+       line (~166.5). pick_own_total's line is baked into the selection, so the
+       proposition_id is returned for placement disambiguation.
+
+    Returns {market, selection, line, proposition_id, odds} (closest within
+    tolerance) or None when not carried -> caller routes to manual. Mirrors
+    _match_handicap_in_catalog (line/pick_own_line). 2026-06-03: added so Eddie
+    AFL totals at an off-main line (e.g. 172.5 vs a 166.5 main) place at the
+    exact alt line instead of failing/snapping to the wrong line."""
+    s_side = (side or "").lower().strip()
+    if s_side not in ("over", "under") or tipped_line is None:
+        return None
+    try:
+        tip = float(tipped_line)
+    except (TypeError, ValueError):
+        return None
+
+    # 1. total_points main market (selection 'Over'/'Under', has `line`). ±1.0.
+    best = None
+    for s in _catalog_selections(markets, "total_points"):
+        if (s.get("selection") or "").lower().strip() != s_side:
+            continue
+        try:
+            ln = float(s.get("line"))
+        except (TypeError, ValueError):
+            continue
+        gap = abs(ln - tip)
+        if gap <= 1.0 and (best is None or gap < best[0]):
+            best = (gap, {
+                "market": "total_points", "selection": s.get("selection"),
+                "line": ln, "proposition_id": s.get("proposition_id"),
+                "odds": s.get("odds"),
+            })
+    if best:
+        return best[1]
+
+    # 2. pick_own_total alt lines ('Over (+172.5)' with a `line` field). ±0.5.
+    best = None
+    for s in _catalog_selections(markets, "pick_own_total"):
+        if not (s.get("selection") or "").lower().strip().startswith(s_side):
+            continue
+        try:
+            ln = float(s.get("line"))
+        except (TypeError, ValueError):
+            continue
+        gap = abs(ln - tip)
+        if gap <= _HC_LINE_TOLERANCE and (best is None or gap < best[0]):
+            best = (gap, {
+                "market": "pick_own_total", "selection": s.get("selection"),
+                "line": None, "proposition_id": s.get("proposition_id"),
+                "odds": s.get("odds"),
+            })
+    if best:
+        return best[1]
+    return None
+
+
 def _catalog_selections(markets: dict, market_name: str) -> list:
     """Return the selection list for a catalog market, tolerating both the
     wrapped {market: {selections: [...]}} shape (post-adapter) and the raw
@@ -6961,47 +7025,40 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
             log.debug(f"Handicap catalog match skipped: {e}")
 
     elif market == "total_points" and line is not None:
-        # Game-total within-1.0 auto-adjust (totals are not handicaps, so they
-        # keep the ±1.0 tolerance). Match by selection ("Over"/"Under") and
-        # pick the closest line.
+        # Match TOTAL against the catalog: total_points main line (±1.0), then
+        # pick_own_total alt lines (±0.5; line baked into the selection ->
+        # proposition_id). Mirrors the line/pick_own_line handicap path so an
+        # off-main total (e.g. Eddie's 172.5 vs a 166.5 main line) places at the
+        # EXACT alt line instead of snapping to the wrong line / dying. A catalog
+        # miss leaves the leg as-is -> placement fails -> manual. 2026-06-03.
         try:
             price_resp = hb.price_check_sports(
                 session_id=sid, sport=tip.sport, event=tip.event,
             )
             if price_resp.get("success"):
-                markets_data = price_resp.get("markets", {})
-                market_data = markets_data.get(market) or {}
-                selections = market_data.get("selections", [])
-                sel_lower = (selection or "").lower()
-                matching_sel = [
-                    s for s in selections
-                    if (s.get("selection", "") or "").lower() == sel_lower
-                ]
-                exact = [
-                    s for s in matching_sel
-                    if abs(float(s.get("line", 0)) - float(line)) < 0.01
-                ]
-                if exact:
-                    _resolved_live_odds = exact[0].get("odds")  # ceiling-checked below
-                if not exact and matching_sel:
-                    closest = min(
-                        matching_sel,
-                        key=lambda s: abs(float(s.get("line", 0)) - float(line)),
-                    )
-                    avail_line = float(closest.get("line", 0))
-                    gap = abs(avail_line - float(line))
-                    log.info(
-                        f"Price check ({market}): line {line} not found for "
-                        f"'{selection}', closest is {avail_line} (gap={gap:.1f})"
-                    )
-                    if gap <= 1.0:
+                _tm = _match_total_in_catalog(
+                    selection, line, price_resp.get("markets") or {},
+                )
+                if _tm:
+                    if _tm["market"] != market or _tm["line"] != line:
                         log.info(
-                            f"Auto-adjusting team {market} line {line} -> {avail_line}"
+                            f"Total catalog-matched: '{selection}' line={line} "
+                            f"-> market={_tm['market']} sel='{_tm['selection']}' "
+                            f"line={_tm['line']} odds={_tm['odds']}"
                         )
-                        line = avail_line
-                        _resolved_live_odds = closest.get("odds")  # ceiling-checked below
+                    market = _tm["market"]
+                    selection = _tm["selection"]
+                    line = _tm["line"]  # None for pick_own_total (in-selection)
+                    _resolved_prop_id = _tm.get("proposition_id")
+                    _resolved_live_odds = _tm.get("odds")  # ceiling-checked below
+                else:
+                    log.info(
+                        f"Total '{selection}' line={line} not carried "
+                        f"(total_points ±1.0 / pick_own_total ±0.5) on "
+                        f"{bookie}:{sid} — routing to manual"
+                    )
         except Exception as e:
-            log.debug(f"Team-total price check skipped: {e}")
+            log.debug(f"Total catalog match skipped: {e}")
 
     # ── Max-odds CEILING sanity check (all sports tipsters) ─────────
     # If the live (catalog/price-check) odds for the resolved selection are far
