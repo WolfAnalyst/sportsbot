@@ -182,6 +182,26 @@ def _exceeds_odds_ceiling(tipster: str, tipped_odds, matched_odds) -> bool:
     return m > t * mult
 
 
+# Min-odds FLOOR (price-moved / wrong-selection guard), symmetric to the
+# ceiling. Live odds >10% BELOW the tip (matched < tipped × 0.9) -> manual.
+_ODDS_FLOOR_PCT = 0.9
+
+
+def _below_odds_floor(tipped_odds, matched_odds) -> bool:
+    """True if `matched_odds` is more than 10% BELOW the tipped price
+    (matched < tipped × _ODDS_FLOOR_PCT) — the price-moved / wrong-selection
+    guard, all sports. Requires valid tipped + matched odds; returns False (no
+    block) otherwise, so a missing price never blocks a bet."""
+    try:
+        t = float(tipped_odds or 0)
+        m = float(matched_odds or 0)
+    except (TypeError, ValueError):
+        return False
+    if t <= 1.0 or m <= 0:
+        return False
+    return m < t * _ODDS_FLOOR_PCT
+
+
 def _is_handicap_sgm(tip) -> bool:
     """True if `tip` is an SGM containing at least one handicap (line /
     first_half_line) leg. Used to route handicap SGMs to manual."""
@@ -7080,6 +7100,34 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
             success=False, tip=tip, session_id=sid, bookie=bookie,
             error=(f"odds ceiling: live {_resolved_live_odds} > tipped "
                    f"{tip.suggested_odds} ×{_mult} (possible wrong selection)"),
+            timestamp=datetime.now(),
+            placed_market=market, placed_player=player, placed_stat=stat,
+            placed_line=line, placed_selection=selection,
+            placed_leg_summary=_format_tip_placement_summary(tip),
+        )
+
+    # ── Min-odds FLOOR sanity check (all sports tipsters) ───────────
+    # Symmetric to the ceiling: if the live odds are >10% BELOW the tipped price
+    # (live < tipped × 0.9), the market has moved against us / it's likely the
+    # wrong selection — route to manual with a PRICE reason rather than place at
+    # a much shorter price. target_odds enforces this bookie-side too, but this
+    # routes cleanly to manual with a clear reason instead of a bookie reject.
+    # Only fires when we captured live odds (catalog match); a missing price
+    # never blocks. Wilson 2026-06-03.
+    if _resolved_live_odds and _below_odds_floor(
+        tip.suggested_odds, _resolved_live_odds
+    ):
+        log.warning(
+            f"ODDS-FLOOR: {tip.tipster} {leg.player or leg.team_full} "
+            f"{selection} {line} {stat} — live odds {_resolved_live_odds} < tipped "
+            f"{tip.suggested_odds} ×{_ODDS_FLOOR_PCT} on {bookie}:{sid}. Price "
+            f"moved / possible wrong selection; NOT placing, routing to manual."
+        )
+        return BetResult(
+            success=False, tip=tip, session_id=sid, bookie=bookie,
+            error=(f"price floor: live {_resolved_live_odds} < tipped "
+                   f"{tip.suggested_odds} ×{_ODDS_FLOOR_PCT} "
+                   f"(price moved / possible wrong selection)"),
             timestamp=datetime.now(),
             placed_market=market, placed_player=player, placed_stat=stat,
             placed_line=line, placed_selection=selection,
