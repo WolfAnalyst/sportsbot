@@ -14,7 +14,7 @@ load_dotenv()
 # always clear which build is running. The code fingerprint computed in
 # main.py (_code_fingerprint) complements this — it catches partial/stale
 # deploys even when this string wasn't bumped.
-TIPBOT_VERSION = "v5.6 (2026-06-03: racing robustness from the Warwick Farm/Morphettville post-mortems (payload/name were CORRECT; misses were HyperBot-side). (a) Retry-on-no-prices: place_racing_tip re-shops ONCE after RACING_NO_PRICE_RETRY_SEC (default 5s) when the first pass returns 0 prices for a TODAY/undated race -> rides out transient HB misses (bet365 WS odds landing ~1.8s after the response; a corporate's transient meeting_not_in_catalogue). Gated to today/undated (ante-post not-yet-loaded won't appear in seconds); read-only, no double-bet. (b) RACING_TRACK_ALIASES: 'Morphettville Parks'/'Morphettville Park' -> 'Morphettville' in _build_racing_tip_dict (runner-match is the safety net). (c) Race# forward-fill: _route_image_racing_tips inherits the last-seen race# for a 2nd+ selection grouped under one race heading (Jofra in Morphettville R7 was dropped to manual) + racing vision prompt carries race# across a group. Builds on v5.5.)"
+TIPBOT_VERSION = "v5.7 (2026-06-03: dedicated 3u cap on Zak/Trial racing-image plays. IMAGE_RACING_MAX_UNITS (default 3) applied in _route_image_racing_tips as min(units, MAX_UNITS, IMAGE_RACING_MAX_UNITS) — independent of the global MAX_UNITS so raising that for other tipsters never un-caps these. $1/u test = $3 max; planned $400/u = $1,200 intended (then liability-capped to $1000 win/$500 place thoroughbred cap per account). Builds on v5.6 (racing retry-on-no-prices, track aliases, race# forward-fill).)"
 
 # ── Telegram ─────────────────────────────────────────────────────────
 _raw_api_id = os.getenv("TELEGRAM_API_ID", "0")
@@ -158,6 +158,13 @@ IMAGE_TIPS_TEST_UNIT_SIZE = _env_float("IMAGE_TIPS_TEST_UNIT_SIZE", "1")
 EDDIE_UNIT_SIZE = _env_float("EDDIE_UNIT_SIZE", "10")
 ZAK_UNIT_SIZE = _env_float("ZAK_UNIT_SIZE", "10")
 TRIAL_SNIPER_UNIT_SIZE = _env_float("TRIAL_SNIPER_UNIT_SIZE", "10")
+
+# Hard max units per racing-image play (Zak / Trial). DEDICATED cap, independent
+# of the global MAX_UNITS — so raising MAX_UNITS for other tipsters never
+# un-caps these. Their unit size will be $400 in production, so 3u = $1,200
+# intended (then liability-capped to the $1000 win / $500 place thoroughbred
+# cap per account); $1/u in test = $3. 2026-06-03.
+IMAGE_RACING_MAX_UNITS = _env_float("IMAGE_RACING_MAX_UNITS", "3.0")
 
 # Parser keys whose channels deliver tips as IMAGES (vision path). Maps the
 # parser key -> sport so the handler routes racing tips to the racing

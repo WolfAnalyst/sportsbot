@@ -32,6 +32,7 @@ from config import (
     X_TIPSTER, X_FORCE_BOOKIE, X_MAX_ODDS_MULT, MAX_ODDS_MULT,
     AUTO_MANUAL_HANDICAP_SGM, MLB_STAT_MAP, MLB_FLAT_STAKE,
     IMAGE_TIPS_TEST_MODE, IMAGE_TIPS_TEST_UNIT_SIZE, IMAGE_TIP_PARSERS,
+    IMAGE_RACING_MAX_UNITS,
 )
 from groq_parser import parse_tip_image
 from models import ParsedTip, ParsedLeg, BetResult
@@ -7887,8 +7888,10 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
                 continue
 
             # Compute $1/unit test stake (or per-channel prod size). Capped at
-            # MAX_UNITS. Enforced here in the placing process by design.
-            units_capped = min(parsed["units"], MAX_UNITS)
+            # the DEDICATED racing-image cap (Zak/Trial max 3u — survives a
+            # global MAX_UNITS bump) and the global MAX_UNITS. Enforced here in
+            # the placing process by design.
+            units_capped = min(parsed["units"], MAX_UNITS, IMAGE_RACING_MAX_UNITS)
             if IMAGE_TIPS_TEST_MODE:
                 intended_stake = round(units_capped * IMAGE_TIPS_TEST_UNIT_SIZE, 2)
             else:
