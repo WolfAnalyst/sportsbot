@@ -19,7 +19,7 @@ import re
 import sys
 import time
 import unicodedata
-from datetime import datetime
+from datetime import datetime, date as _date, timedelta as _timedelta
 from pathlib import Path
 
 from telethon import TelegramClient, events
@@ -7564,6 +7564,79 @@ _IMAGE_ACTIONABLE_RE = re.compile(
 )
 
 
+_IMG_WEEKDAYS = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2, "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4, "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
+}
+_IMG_MONTHS = {}
+for _mi, _mn in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july", "august",
+     "september", "october", "november", "december"], 1):
+    _IMG_MONTHS[_mn] = _mi
+    _IMG_MONTHS[_mn[:3]] = _mi
+
+
+def _img_parse_racing_date(raw_date, msg_time) -> "str|None":
+    """Convert a vision-extracted race date/day to ISO YYYY-MM-DD, anchored on
+    the post time. Returns None when absent/unparseable — the caller's
+    price-check then defaults to today (pre-existing behaviour).
+
+    WHY: ante-post image tips (Zak posts Saturday's SA card mid-week) were
+    price-checked against TODAY because the date wasn't carried — wrong day ->
+    'race not in catalog' -> manual, and worse, a same-numbered race on the
+    wrong day could match and place on the WRONG race. Handles ISO, D/M[/Y]
+    (AU order), 'June 6'/'6 June', weekday names ('Saturday'/'Sat' -> the next
+    such day on/after the post), and today/tomorrow. 2026-06-03."""
+    s = (raw_date or "").strip().lower()
+    if not s:
+        return None
+    # Anchor on the post's AEST calendar date (event.date is UTC; +10h, June=no
+    # DST). A naive msg_time (datetime.now fallback) is already local.
+    try:
+        anchor = msg_time
+        if getattr(anchor, "tzinfo", None) is not None:
+            anchor = anchor + _timedelta(hours=10)
+        base = anchor.date() if hasattr(anchor, "date") else _date.today()
+    except Exception:
+        base = _date.today()
+    m = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", s)
+    if m:
+        try:
+            return _date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except ValueError:
+            return None
+    if "today" in s:
+        return base.isoformat()
+    if "tomorrow" in s:
+        return (base + _timedelta(days=1)).isoformat()
+    for name, wd in _IMG_WEEKDAYS.items():
+        if re.search(rf"\b{name}\b", s):
+            return (base + _timedelta(days=(wd - base.weekday()) % 7)).isoformat()
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", s)
+    if m:
+        d, mo = int(m.group(1)), int(m.group(2))
+        yr = int(m.group(3)) if m.group(3) else base.year
+        if yr < 100:
+            yr += 2000
+        try:
+            return _date(yr, mo, d).isoformat()
+        except ValueError:
+            return None
+    m = (re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?([a-z]{3,9})\b", s)
+         or re.search(r"\b([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?\b", s))
+    if m:
+        g1, g2 = m.group(1), m.group(2)
+        d, mon_name = (int(g1), g2) if g1.isdigit() else (int(g2), g1)
+        mo = _IMG_MONTHS.get(mon_name) or _IMG_MONTHS.get(mon_name[:3])
+        if mo:
+            try:
+                return _date(base.year, mo, d).isoformat()
+            except ValueError:
+                return None
+    return None
+
+
 def _image_text_is_actionable(text: str) -> bool:
     """True if a text-only post in an image-tip channel looks like a bet or an
     instruction (keep -> manual ping); False for plain chatter (drop, log only).
@@ -7591,7 +7664,8 @@ def _image_text_is_actionable(text: str) -> bool:
     return False
 
 
-def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: int) -> dict:
+def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: int,
+                           msg_time=None) -> dict:
     """Build a racing parsed_tip dict (place_racing_tip shape) from one raw
     vision-extracted racing dict. Adds synthetic id/titan/event_title/title
     for logging + Tip-Titans-style notifications."""
@@ -7629,7 +7703,9 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
         "market": market,
         "units": units,
         "tipster_odds": odds,
-        "date": (raw.get("date") or None),
+        # Carry the meeting date from the image (ante-post tips are for a future
+        # day; null defaults to today downstream). 2026-06-03.
+        "date": _img_parse_racing_date(raw.get("date"), msg_time),
         # Synthetic fields the racing notifier reads off the raw tip:
         "event_title": f"{track or '?'} R{race_num if race_num is not None else '?'}",
         "title": f"{saddle if saddle is not None else '?'}. {runner or '?'}",
@@ -7655,7 +7731,7 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
                 log.info(f"[{channel_name}] skipping non-tip row {idx} (no saddle/runner/odds)")
                 continue
 
-            parsed = _build_racing_tip_dict(raw, tipster, default_units, idx)
+            parsed = _build_racing_tip_dict(raw, tipster, default_units, idx, msg_time)
 
             # Guard 2: no race number -> can't price-check the right race
             # safely. Route to manual rather than risk the wrong race.
@@ -7719,12 +7795,31 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
 
     alert_only = False
     alert_reason = ""
-    if market_type and market_type != "player_prop":
-        # Margin / team line / total / other: Scout is unreliable on these and
-        # they don't map to the player-prop catalog -> always manual.
+    leg_team = team or player
+    if market_type == "total":
+        # Match TOTAL (combined points O/U) -> total_points. team_full (either
+        # competing team) resolves the AFL fixture; selection over/under + line
+        # drive the catalog match (_execute_bet total_points branch, ±1.0).
+        # $1-gated like all image tips; a catalog miss routes to manual.
+        leg = ParsedLeg(market="total_points", team_full=leg_team, player="",
+                        stat="", line=line, selection=side)
+        if not leg_team or side not in ("over", "under") or not line:
+            alert_only = True
+            alert_reason = "total market missing team/side/line — place manually"
+    elif market_type == "team_line":
+        # Team HANDICAP -> line. The resolver backfills selection from team_full;
+        # the SIGNED line is matched in the catalog ±0.5 by
+        # _match_handicap_in_catalog, which never places the wrong side — a miss
+        # (or a wrong/absent sign) routes to manual.
+        leg = ParsedLeg(market="line", team_full=leg_team, player="",
+                        stat="", line=line, selection=leg_team)
+        if not leg_team or not line:
+            alert_only = True
+            alert_reason = "team line missing team/line — place manually"
+    elif market_type and market_type != "player_prop":
+        # Margin / other: no clean catalog mapping -> always manual.
         alert_only = True
         alert_reason = f"{market_type} market (image tip) — place manually"
-        leg_team = team or player
         leg = ParsedLeg(market="other", team_full=leg_team, player=player,
                         stat=stat, line=line, selection=side)
     else:
@@ -7755,13 +7850,54 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
     return tip
 
 
+def _image_afl_conflicting_indices(raw_tips: list) -> set:
+    """Indices of AFL image tips that are opposite sides (over AND under) of the
+    SAME market+team+line — the signature of the vision model over-reading a
+    background odds grid (one image -> 'West Coast over 172.5' AND 'under
+    172.5'). Both can't be the tip and we can't disambiguate, so these route to
+    manual rather than auto-place BOTH sides (which v5.2 now could, since totals
+    /lines place). 2026-06-03 Eddie image. The prompt is the primary fix; this
+    is the safety net."""
+    groups: dict = {}
+    for i, raw in enumerate(raw_tips):
+        mkt = (raw.get("market_type") or "").strip().lower()
+        key_team = (raw.get("team") or raw.get("player") or "").strip().lower()
+        ln = _img_coerce_float(raw.get("line"))
+        side = (raw.get("side") or "").strip().lower()
+        if ln is None or side not in ("over", "under"):
+            continue
+        groups.setdefault((mkt, key_team, round(abs(ln), 1)), []).append((i, side))
+    conflicted: set = set()
+    for items in groups.values():
+        if {s for _, s in items} >= {"over", "under"}:
+            conflicted.update(i for i, _ in items)
+    return conflicted
+
+
 def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                           default_units: float, msg_time, channel_name: str) -> None:
     """Route vision-extracted AFL tips through the sports pipeline (place_tip,
     Sportsbet-locked via TIPSTERS_FORCE_BOOKIE). Mirrors the per-tip steps of
     _process_tip (cap units, flat/test-stake clamp, dupe-check, place_tip)."""
+    conflicted = _image_afl_conflicting_indices(raw_tips)
     for idx, raw in enumerate(raw_tips):
         try:
+            # Over+under of the same line parsed from one image = background-grid
+            # over-parse. Can't tell which is the tip -> manual, never auto-place
+            # both sides.
+            if idx in conflicted:
+                desc = (f"{raw.get('team') or raw.get('player') or '?'} "
+                        f"{raw.get('side') or ''} {raw.get('line') or ''} "
+                        f"[{raw.get('market_type') or '?'}]").strip()
+                log.info(f"[{channel_name}] AFL image tip {idx} ambiguous "
+                         f"(over+under of same line parsed) -> manual: {desc}")
+                notifier.notify_image_alert(
+                    channel_name,
+                    f"(manual: ambiguous — both sides of the same line parsed "
+                    f"from the image) {desc}",
+                )
+                continue
+
             tip = _build_afl_tip_from_image(
                 raw, tipster, unit_size, default_units, msg_time
             )

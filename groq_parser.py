@@ -835,30 +835,46 @@ IMAGE_PROMPT_RACING = (
     "Convert stake to a number (1.2u -> 1.2). `market` is \"win\" unless the "
     "tip explicitly says place or each-way. `rated` is the tipster's rated/"
     "assessed price if shown, else null. Use null for ANY field not printed "
-    "on the image — do NOT guess a track, date, race or price. SKIP rows that "
-    "are not bets (venue/date headers, commentary, 'GOOD LUCK', totals). "
-    "Preserve exact numbers. JSON only."
+    "on the image — do NOT guess a track, race or price. "
+    "DATE IS IMPORTANT: many tips are for a FUTURE day (e.g. Saturday's card "
+    "posted mid-week). If the image shows a meeting date or day ANYWHERE (a "
+    "header/caption like 'Saturday', 'Sat 7 June', 'SAT', '07/06', '7/6/26'), "
+    "copy it EXACTLY-as-printed into `date` on EVERY tip row (same value on all "
+    "rows). A weekday word ('Saturday') is fine — return it verbatim, do not "
+    "convert it. Only use null for `date` if NO date/day appears on the image. "
+    "SKIP rows that are not bets (venue/date headers as their own rows, "
+    "commentary, 'GOOD LUCK', totals). Preserve exact numbers. JSON only."
 )
 
 IMAGE_PROMPT_AFL = (
-    "You are an OCR + extraction tool for AFL betting-tip images. Read the "
-    "image and extract EVERY individual bet EXACTLY as printed. Respond with "
+    "You are an OCR + extraction tool for AFL betting-tip images. Respond with "
     "ONLY valid JSON, no markdown fences, in this shape: "
     '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
     '"side": "over"|"under"|null, "line": number|null, "odds": number|null, '
     '"bookie": str|null, "units": number|null, "market_type": "player_prop"|'
-    '"team_line"|"margin"|"total"|"other"} ]}. Rules: for a player statistic '
-    "bet set market_type=\"player_prop\", `player`=full printed name, and "
-    "`stat` to ONE lowercase word from: disposals, goals, marks, tackles, "
-    "kicks, handballs, clearances, hitouts, fantasy_points. `side` is \"over\" "
-    "for 'over'/'N+'/'2+' style lines and \"under\" for 'under'. `line` is the "
-    "number (23.5, or for 'N+' use N-0.5 e.g. '24+' -> 23.5). Convert prices "
-    "to decimal numbers ($1.87 -> 1.87). Convert stake to a number (2.5u -> "
-    "2.5). For a team handicap/line bet use market_type=\"team_line\" and put "
-    "the team in `player`; for a winning-margin bet use \"margin\"; for a "
-    "match/quarter total use \"total\"; anything else \"other\" (these "
-    "non-player-prop types will be placed manually). Use null for ANY field "
-    "not printed. SKIP non-bet rows (headers, commentary). JSON only."
+    '"team_line"|"margin"|"total"|"other"} ]}. '
+    "EXTRACT ONLY THE TIPSTER'S ACTUAL SELECTION(S) — the bet(s) they are "
+    "backing. This is the HIGHLIGHTED / boxed / bold / centred / largest "
+    "selection, or the one added to a betslip/bet-card (the one shown with the "
+    "stake or 'BET' button). DO NOT extract the surrounding odds board, market "
+    "grid, or other available options shown in the background — those are NOT "
+    "the tip. Most images contain exactly ONE bet; only return multiple if the "
+    "tipster clearly lists several distinct selections. NEVER output both the "
+    "OVER and the UNDER of the same line (only one side can be the tip). "
+    "Rules: for a player statistic bet set market_type=\"player_prop\", "
+    "`player`=full printed name, and `stat` to ONE lowercase word from: "
+    "disposals, goals, marks, tackles, kicks, handballs, clearances, hitouts, "
+    "fantasy_points. `side` is \"over\" for 'over'/'N+'/'2+' lines and "
+    "\"under\" for 'under'. `line` is the number (23.5, or for 'N+' use N-0.5 "
+    "e.g. '24+' -> 23.5). Convert prices to decimal numbers ($1.87 -> 1.87). "
+    "Convert stake to a number (2.5u -> 2.5). For a team handicap/line bet use "
+    "market_type=\"team_line\", put the team in `team`, and set `line` to the "
+    "handicap WITH ITS SIGN — negative if the team is favourite / giving start "
+    "(e.g. 'Geelong -8.5' -> -8.5), positive if receiving (e.g. '+8.5' -> 8.5). "
+    "For a match/quarter total (combined points, e.g. 'Under 172.5') use "
+    "market_type=\"total\", `side`=over/under, `line`=the number, and put one "
+    "competing team in `team`. For a winning-margin bet use \"margin\"; "
+    "anything else \"other\". Use null for ANY field not printed. JSON only."
 )
 
 
