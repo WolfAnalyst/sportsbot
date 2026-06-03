@@ -7624,6 +7624,27 @@ def _normalise_afl_image_stat(stat) -> str:
     return _AFL_IMAGE_STAT_ALIASES.get(s, s)
 
 
+# Track-name aliases: the name a tipster/image uses -> the name bookies carry.
+# Some SA venues are written differently by tipsters vs bookies — Zak writes
+# "Morphettville Parks" / "Morphettville Park" for the venue bookies list as
+# "Morphettville". Keyed lowercased. Runner-matching is the safety net if a
+# venue genuinely splits courses on the same day (wrong course -> the tipped
+# runner isn't in that race -> no bet -> manual). 2026-06-03.
+RACING_TRACK_ALIASES = {
+    "morphettville parks": "Morphettville",
+    "morphettville park": "Morphettville",
+}
+
+
+def _normalise_racing_track(track):
+    """Map a tipster/image track name to the bookie-carried name via
+    RACING_TRACK_ALIASES (e.g. 'Morphettville Parks' -> 'Morphettville').
+    Unknown tracks pass through unchanged."""
+    if not track:
+        return track
+    return RACING_TRACK_ALIASES.get(track.strip().lower(), track)
+
+
 def _img_coerce_float(v):
     try:
         if v is None or v == "":
@@ -7774,7 +7795,7 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
     """Build a racing parsed_tip dict (place_racing_tip shape) from one raw
     vision-extracted racing dict. Adds synthetic id/titan/event_title/title
     for logging + Tip-Titans-style notifications."""
-    track = (raw.get("track") or None)
+    track = _normalise_racing_track(raw.get("track")) or None
     race_num = _img_coerce_int(raw.get("race"))
     saddle = _img_coerce_int(raw.get("saddle"))
     runner = (raw.get("runner") or "").strip()
@@ -7824,6 +7845,7 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
     from tiptitans_processor import process_image_racing_tip
 
     placed_any = False
+    last_race_num = None  # forward-fill across selections grouped under a race
     for idx, raw in enumerate(raw_tips):
         try:
             saddle = _img_coerce_int(raw.get("saddle"))
@@ -7831,15 +7853,30 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
             odds = _img_coerce_float(raw.get("odds"))
             race_num = _img_coerce_int(raw.get("race"))
 
-            # Guard 1: phantom header row (no selection at all) -> skip.
+            # Guard 1: phantom header row (no selection at all) -> skip (don't
+            # let it touch the forward-fill state).
             if saddle is None and not runner and not odds:
                 log.info(f"[{channel_name}] skipping non-tip row {idx} (no saddle/runner/odds)")
                 continue
 
+            # Forward-fill the race number: Zak/Trial list 2+ selections under
+            # ONE race heading and the 2nd+ row often has a null race# (Jofra in
+            # Morphettville R7, 2026-06-03 — was dropped to manual). Inherit the
+            # last-seen race# so the extra selection still places. Safe: if the
+            # inherit is wrong the tipped runner won't be in that race -> no
+            # price -> manual (runner-match guard).
+            if race_num is None and last_race_num is not None:
+                race_num = last_race_num
+                raw = {**raw, "race": race_num}
+                log.info(f"[{channel_name}] racing tip {idx} missing race# -> "
+                         f"inherited R{race_num} from the preceding selection")
+            if race_num is not None:
+                last_race_num = race_num
+
             parsed = _build_racing_tip_dict(raw, tipster, default_units, idx, msg_time)
 
-            # Guard 2: no race number -> can't price-check the right race
-            # safely. Route to manual rather than risk the wrong race.
+            # Guard 2: no race number (and none to inherit) -> can't price-check
+            # the right race safely. Route to manual rather than risk the wrong race.
             if race_num is None:
                 log.info(f"[{channel_name}] racing tip {idx} missing race# -> manual")
                 notifier.notify_image_alert(

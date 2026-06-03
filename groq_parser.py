@@ -842,6 +842,10 @@ IMAGE_PROMPT_RACING = (
     "copy it EXACTLY-as-printed into `date` on EVERY tip row (same value on all "
     "rows). A weekday word ('Saturday') is fine — return it verbatim, do not "
     "convert it. Only use null for `date` if NO date/day appears on the image. "
+    "RACE NUMBER: if several selections sit under ONE race (e.g. a 'Race 7' / "
+    "'R7' heading followed by two horses), set `race` to that race number on "
+    "EVERY selection in that group — NEVER leave the 2nd/3rd selection's `race` "
+    "null just because the heading isn't repeated on its row. "
     "SKIP rows that are not bets (venue/date headers as their own rows, "
     "commentary, 'GOOD LUCK', totals). Preserve exact numbers. JSON only."
 )
