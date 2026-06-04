@@ -28,6 +28,7 @@ from config import (
     TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE,
     TIPSTER_CHANNELS, MAX_UNITS, SESSIONS_YAML_PATH,
     USE_LEGACY_PLACEMENT, BOOKIE_AFL_ALIASES, TIPBOT_VERSION,
+    AFL_CONCURRENT_FANOUT, AFL_FANOUT_MIN_STAKE,
     RECONCILE_AMBIGUOUS, RECONCILE_SPILL,
     X_TIPSTER, X_FORCE_BOOKIE, X_MAX_ODDS_MULT, MAX_ODDS_MULT,
     AUTO_MANUAL_HANDICAP_SGM, MLB_STAT_MAP, MLB_FLAT_STAKE,
@@ -1656,6 +1657,11 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
     # comparison). Set USE_LEGACY_PLACEMENT=true in .env to fall back to
     # v3.10 behaviour (raw SESSION_PRIORITY + stake ladder, no liability caps).
     if not USE_LEGACY_PLACEMENT:
+        # AFL (Saiyan + Eddie): concurrent fan-out across all eligible
+        # Sportsbet accounts (v5.11) instead of the sequential spillover.
+        # Gated by AFL_CONCURRENT_FANOUT; NBA/MLB keep _place_singles_v4.
+        if AFL_CONCURRENT_FANOUT and (tip.sport or "").lower() == "afl":
+            return _place_afl_fanout(tip)
         return _place_singles_v4(tip)
 
     # ── Legacy v3.10 path (USE_LEGACY_PLACEMENT=true) ───────────────
@@ -3032,6 +3038,395 @@ def _v4_get_active_sessions_unfiltered(tip: ParsedTip) -> list[dict]:
             sessions = filtered
 
     return sessions
+
+
+def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
+    """
+    v5.11 AFL concurrent fan-out placement (Saiyan + Eddie).
+
+    Replaces the sequential one-account-at-a-time spillover of
+    _place_singles_v4 for AFL singles (gated by AFL_CONCURRENT_FANOUT):
+
+      1. Pull eligible Sportsbet sessions (sport filter + force-bookie +
+         per-sport priority list — identical gating to _place_singles_v4).
+      2. Resolve the leg's exact catalog {market, line, selection, prop_id}
+         ONCE per bookie via _resolve_single_for_placement(apply_odds_guards=
+         False). A catalog miss on every bookie -> whole tip to manual (the
+         line resolver is KEPT; only the price check / odds guards are dropped,
+         so we never blind-POST an unresolved line — the Jaxon Prior $0 bug).
+      3. Split the intended unit stake EVENLY across the eligible accounts,
+         each clamped to its TOP liability bracket (sessions.yaml), sized off
+         the catalog odds captured during the resolve-once step (falling back
+         to tipped odds) so the liability cap holds against a near-live price —
+         no extra price check. session_ids are de-duped, each account floored
+         at AFL_FANOUT_MIN_STAKE, and a running total caps the fan-out at the
+         intended unit size (so the floor can't overstake and a surplus of
+         accounts stops once intended is met).
+      4. Fire ALL accounts CONCURRENTLY (ThreadPoolExecutor) with the SAME
+         resolved payload — single POST per account, no stake ladder,
+         initial_post_max_attempts=1 preserved (no double-staking).
+      5. Roll up into the same consolidated placed / unfilled / ambiguous
+         notifications and audit log as _place_singles_v4 (a maybe-landed
+         outcome is NOT re-prompted for manual placement).
+
+    "Unfilled" here = accounts sized to place whose POST FAILED, plus any silent
+    bookie auto-cap shortfall — NOT (unit size − placed). With 4 SB accounts at
+    ~$99-$117 each the even split exceeds each cap, so every account maxes out;
+    the unit size above the summed caps is expected headroom for future
+    accounts, not an underfill.
+
+    RESIDUAL RISK (accepted, Wilson "no price check"): with the odds guards off,
+    a fill at LONGER odds than the catalog/tipped price can push realised
+    liability above the configured bracket. Sizing off the captured catalog odds
+    minimises (not eliminates) this; the bookie MBL + AUTO-CAP detection backstop.
+    """
+    import time as _time_mod
+    import concurrent.futures
+    _t_start = _time_mod.time()
+
+    sport = (tip.sport or "afl").lower()
+    intended_stake = tip.stake_dollars
+    first_leg = tip.legs[0] if tip.legs else None
+    if not first_leg:
+        log.warning("AFL fan-out: tip has no legs")
+        return [BetResult(success=False, tip=tip, error="no legs",
+                          timestamp=datetime.now())]
+    market = first_leg.market or ""
+    tipped_odds = tip.suggested_odds
+
+    # Resolve the HyperBot market name once for liability-cap lookup (same as
+    # _place_singles_v4: the parser leaves player props as generic
+    # "player_prop", but sessions.yaml is keyed by the resolved name).
+    liability_market = market
+    try:
+        _rlm = _resolve_leg_for_hyperbot(
+            first_leg, sport,
+            is_threshold=getattr(tip, "_is_threshold", False),
+            tipster=tip.tipster,
+        )
+        liability_market = _rlm.get("market") or market
+    except Exception as e:
+        log.warning(
+            f"AFL fan-out: leg resolve for liability failed: {e}; using '{market}'"
+        )
+
+    # ── Eligible sessions (identical gating to _place_singles_v4) ──────
+    raw_sessions = _v4_get_active_sessions_unfiltered(tip)
+    if not raw_sessions:
+        log.warning("AFL fan-out: no active sessions after sport filter")
+        notifier.notify_bet_failed(BetResult(
+            success=False, tip=tip, error="No active HyperBot sessions",
+            timestamp=datetime.now()))
+        return [BetResult(success=False, tip=tip, error="No active sessions",
+                          timestamp=datetime.now())]
+
+    configured_priority = session_priority.get_priority_for(sport, is_sgm=False)
+    if not configured_priority:
+        log.info(f"AFL fan-out: no priority list for {sport} — routing to manual")
+        notifier.notify_bet_failed(BetResult(
+            success=False, tip=tip,
+            error=f"No auto-placement configured for {sport} singles (manual only)",
+            timestamp=datetime.now()))
+        return [BetResult(success=False, tip=tip,
+                          error=f"{sport} singles route to manual",
+                          timestamp=datetime.now())]
+
+    sessions = session_priority.filter_and_order_sessions(
+        raw_sessions, sport, is_sgm=False,
+    )
+    if not sessions:
+        log.warning(
+            f"AFL fan-out: no priority sessions for {sport} — routing to manual"
+        )
+        notifier.notify_bet_failed(BetResult(
+            success=False, tip=tip,
+            error=f"No priority sessions configured for {sport} singles",
+            timestamp=datetime.now()))
+        return [BetResult(success=False, tip=tip,
+                          error="No priority sessions configured",
+                          timestamp=datetime.now())]
+
+    n_accounts = len(sessions)
+    per_account_target = round(intended_stake / n_accounts, 2)
+    log.info(
+        f"AFL fan-out: {n_accounts} session(s), intended ${intended_stake:.2f} "
+        f"-> ${per_account_target:.2f}/account (even split), tipped_odds={tipped_odds}"
+    )
+
+    # ── Resolve the catalog line ONCE per bookie ───────────────────────
+    # All fan-out sessions are the same bookie (Sportsbet) in practice, so this
+    # is a single catalog lookup; per-bookie caching keeps it correct if the
+    # priority list ever spans bookies (each bookie carries its own lines).
+    resolved_by_bookie: dict[str, dict | None] = {}
+    manual_by_bookie: dict[str, BetResult] = {}
+    for sess in sessions:
+        bk = (sess.get("bookie", "") or "").lower()
+        if bk in resolved_by_bookie:
+            continue
+        _resolved, _manual = _resolve_single_for_placement(
+            tip, sess, apply_odds_guards=False,
+        )
+        resolved_by_bookie[bk] = _resolved  # None when routed to manual
+        if _manual is not None:
+            manual_by_bookie[bk] = _manual
+
+    if not any(resolved_by_bookie.values()):
+        log.info(
+            "AFL fan-out: line not carried on any eligible bookie — routing to manual"
+        )
+        _example = next(iter(manual_by_bookie.values()), None)
+        notifier.notify_bet_failed(_example or BetResult(
+            success=False, tip=tip,
+            error="AFL fan-out: line not carried in catalog — routing to manual",
+            timestamp=datetime.now()))
+        return [_example or BetResult(
+            success=False, tip=tip,
+            error="line not carried — manual", timestamp=datetime.now())]
+
+    # ── Size each account: top liability bracket, capped by the split ──
+    # - Dedup by session_id: a duplicated AFL_SESSION_PRIORITY entry must NOT
+    #   produce two concurrent POSTs to the same account (double-stake). This
+    #   mirrors the used_session_ids guard _place_singles_v4 has.
+    # - Size off the catalog odds captured during the resolve-once step when
+    #   available (resolved["live_odds"]), falling back to tipped odds, so the
+    #   liability cap is honoured against a near-live price — no extra call.
+    # - A running `allocated` total caps the fan-out at the intended unit size,
+    #   so the per-account floor (Eddie $1/u test mode) can never overstake and
+    #   a future surplus of accounts stops filling once intended is met.
+    jobs: list[tuple[dict, float, dict]] = []  # (session, stake, resolved)
+    seen_sids: set[str] = set()
+    allocated = 0.0
+    for sess in sessions:
+        sid = str(sess.get("session_id", ""))
+        if sid in seen_sids:
+            log.warning(
+                f"AFL fan-out: duplicate session {sid} in priority list — "
+                f"skipping the duplicate (no double-stake)"
+            )
+            continue
+        seen_sids.add(sid)
+        bk = (sess.get("bookie", "") or "").lower()
+        resolved = resolved_by_bookie.get(bk)
+        if resolved is None:
+            log.info(f"AFL fan-out: {bk} session {sid} skipped (line not carried)")
+            continue
+        remaining_budget = round(intended_stake - allocated, 2)
+        if remaining_budget <= 0:
+            log.info(
+                f"AFL fan-out: intended ${intended_stake:.2f} fully allocated — "
+                f"{bk} session {sid} not needed (skip)"
+            )
+            continue
+        sizing_odds = resolved.get("live_odds") or tipped_odds
+        steps, cap_reason, is_list_mode = session_priority.resolve_stake_steps(
+            sid, sport, liability_market,
+            sizing_odds if (sizing_odds and sizing_odds > 1.0) else 0,
+            per_account_target,
+            _v4_ladder_steps,
+        )
+        stake = steps[0] if steps else 0.0
+        if stake <= 0:
+            log.info(
+                f"AFL fan-out: {bk} session {sid} no usable stake "
+                f"({cap_reason}) — skipping"
+            )
+            continue
+        # Floor tiny splits (Eddie $1/u test mode) so the bet still reaches the
+        # bookie; liability caps already bound it from above. No effect on live
+        # Saiyan ($600/u) where each split is ~$99-$117.
+        if 0 < stake < AFL_FANOUT_MIN_STAKE:
+            stake = AFL_FANOUT_MIN_STAKE
+        # Never let the floor (or a bracket-capped stake) push total spend above
+        # the intended unit size — caps the Eddie test-mode 4x overstake and the
+        # surplus-accounts case.
+        if stake > remaining_budget:
+            stake = remaining_budget
+        stake = round(stake, 2)
+        if stake <= 0:
+            continue
+        allocated = round(allocated + stake, 2)
+        log.info(
+            f"AFL fan-out: {bk} session {sid} -> ${stake:.2f} "
+            f"(top bracket, {cap_reason}, list_mode={is_list_mode}, "
+            f"sizing_odds={sizing_odds})"
+        )
+        jobs.append((sess, stake, resolved))
+
+    if not jobs:
+        log.warning(
+            "AFL fan-out: no placeable accounts after sizing — routing to manual"
+        )
+        notifier.notify_bet_failed(BetResult(
+            success=False, tip=tip,
+            error="AFL fan-out: no placeable accounts (caps/odds) — manual",
+            timestamp=datetime.now()))
+        return [BetResult(success=False, tip=tip,
+                          error="no placeable accounts — manual",
+                          timestamp=datetime.now())]
+
+    # ── Fire all accounts CONCURRENTLY ─────────────────────────────────
+    # HTTP client is thread-safe (fresh requests.post per call, immutable
+    # headers); each thread builds its own payload from the shared read-only
+    # resolved dict and a distinct session/stake. No shared mutable state, so
+    # no lock is needed. Single POST per account (no ladder); _execute_bet
+    # keeps initial_post_max_attempts=1 so a transient failure is never
+    # re-fired (no double-staking).
+    results: list[BetResult] = []
+    log.info(f"AFL fan-out: firing {len(jobs)} concurrent placement(s)")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        futures = {
+            ex.submit(_execute_bet, tip, sess, stake, resolved): (sess, stake)
+            for (sess, stake, resolved) in jobs
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            sess, stake = futures[fut]
+            sid = str(sess.get("session_id", ""))
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                log.error(f"AFL fan-out: placement on {sid} raised: {e}")
+                results.append(BetResult(
+                    success=False, tip=tip, session_id=sid,
+                    bookie=sess.get("bookie", "unknown"),
+                    error=f"fan-out placement exception: {e}",
+                    timestamp=datetime.now()))
+
+    # ── Roll up: notify + audit (mirrors _place_singles_v4 tail) ───────
+    # Classify each result once into placed / ambiguous / failed.
+    # AMBIGUOUS (maybe-landed) = a fast timeout / 5xx / dropped connection
+    # (is_ambiguous, set by _execute_bet from the client) OR a slow rejection
+    # (elapsed >= threshold) that is not clearly pre-placement. The bet MAY
+    # already be on the account, so it is EXCLUDED from both placed and failed:
+    # counting it as unfilled would prompt Wilson to re-place a bet that landed
+    # (the Erasmus/Dawson double-stake). Single pass (not membership tests) —
+    # BetResult is a value-equality dataclass, so `in` would be unreliable.
+    def _is_ambiguous(r: BetResult) -> bool:
+        if getattr(r, "is_ambiguous", False):  # fast API-level ambiguous
+            return True
+        _el = getattr(r, "elapsed_sec", None) or 0.0
+        return (
+            _el >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
+            and not _is_definitely_pre_placement(r.error or "")
+        )
+
+    placed_results: list[BetResult] = []
+    ambiguous_results: list[BetResult] = []
+    failed_results: list[BetResult] = []
+    for r in results:
+        if r.success:
+            placed_results.append(r)
+        elif _is_ambiguous(r):
+            ambiguous_results.append(r)
+        else:
+            failed_results.append(r)
+    attempted_stake = round(sum(stake for (_s, stake, _r) in jobs), 2)
+    total_placed = round(sum(r.stake or 0 for r in placed_results), 2)
+    # Ambiguous stake is treated as COMMITTED (may have landed) so the manual
+    # top-up alert never asks to re-place it.
+    ambiguous_total = round(sum(r.stake or 0 for r in ambiguous_results), 2)
+    # "Unfilled" = stake on accounts we sized but failed to place OR a silent
+    # bookie auto-cap shortfall (success with a reduced stake). NOT the unit
+    # size above the summed caps, which is expected headroom for more accounts.
+    unfilled = round(attempted_stake - total_placed - ambiguous_total, 2)
+
+    ambiguous_outcomes = [
+        {
+            "bookie": r.bookie,
+            "session_id": r.session_id,
+            "stake": round(r.stake or 0, 2),
+            "odds": r.odds or 0,
+            "elapsed_sec": round(getattr(r, "elapsed_sec", None) or 0.0, 2),
+            "error": (r.error or "")[:200],
+            "reason": ("fast_ambiguous" if getattr(r, "is_ambiguous", False)
+                       else "slow_rejection"),
+            "correlation_id": getattr(r, "correlation_id", None),
+        }
+        for r in ambiguous_results
+    ]
+
+    session_timing = [
+        {
+            "session_id": r.session_id,
+            "bookie": r.bookie,
+            "elapsed_sec": getattr(r, "elapsed_sec", None) or 0.0,
+            "attempts": 1,
+            "fails": 0 if r.success else 1,
+            "succeeded": r.success,
+        }
+        for r in results
+    ]
+
+    _log_jsonl(AUDIT_LOG, {
+        "type": "tip_outcome",
+        "tipster": tip.tipster,
+        "event": tip.event,
+        "intended_stake": round(intended_stake, 2),
+        "attempted_stake": attempted_stake,
+        "placed_stake": total_placed,
+        "ambiguous_stake": ambiguous_total,
+        "unfilled_stake": unfilled,
+        "fanout": True,
+        "accounts": len(jobs),
+        "placements": [
+            {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
+             "fill_odds": r.odds, "bet_id": r.bet_id}
+            for r in placed_results
+        ],
+        "ambiguous": [
+            {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
+             "error": r.error, "correlation_id": getattr(r, "correlation_id", None)}
+            for r in ambiguous_results
+        ],
+        "failures": [
+            {"session_id": r.session_id, "bookie": r.bookie, "error": r.error}
+            for r in failed_results
+        ],
+    })
+
+    if placed_results:
+        notifier.notify_tip_placed_summary(
+            tip, placed_results, attempted_stake, unfilled,
+            total_elapsed_sec=round(_time_mod.time() - _t_start, 2),
+            session_timing=session_timing,
+        )
+        log.info(
+            f"AFL fan-out: placed ${total_placed:.2f} across "
+            f"{len(placed_results)}/{len(jobs)} account(s) "
+            f"({len(failed_results)} failed, {len(ambiguous_results)} ambiguous)"
+        )
+
+    # Manual top-up alert on a hard failure OR a genuine underfill (a silent
+    # bookie auto-cap leaves a success with a reduced stake -> unfilled>0 but no
+    # failed_result). Gate matches _place_singles_v4 ('if unfilled > 0').
+    if failed_results or unfilled > 0.01:
+        log.warning(
+            f"AFL fan-out: ${unfilled:.2f} unfilled "
+            f"({len(failed_results)} account(s) failed)"
+        )
+        notifier.notify_tip_unfilled_with_placements(
+            tip, attempted_stake, total_placed, unfilled,
+            placed_results, failed_results,
+            session_timing=session_timing,
+        )
+        _log_jsonl(ERROR_LOG, {
+            "type": "tip_unfilled",
+            "tipster": tip.tipster,
+            "event": tip.event,
+            "intended_stake": intended_stake,
+            "attempted_stake": attempted_stake,
+            "placed_stake": total_placed,
+            "unfilled_stake": unfilled,
+            "last_error": failed_results[-1].error if failed_results else None,
+            "message": tip.raw_message,
+            "fanout": True,
+        })
+
+    # AMBIGUOUS critical alert (maybe-landed) — fires regardless of fill state
+    # so Wilson verifies at the bookie. Mirrors the _place_singles_v4 tail.
+    if ambiguous_outcomes:
+        _emit_sports_ambiguous_alert(tip, ambiguous_outcomes)
+
+    return results
 
 
 def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
@@ -6828,16 +7223,27 @@ def _format_tip_placement_summary(tip) -> str:
     return " / ".join(_format_leg_human(l) for l in tip.legs)
 
 
-def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
-    """Execute a single bet on a specific session."""
+def _resolve_single_for_placement(
+    tip: ParsedTip, session: dict, *, apply_odds_guards: bool = True,
+) -> "tuple[dict | None, BetResult | None]":
+    """Resolve a single leg to the exact catalog {market, line, selection,
+    proposition_id, target_odds} the bookie carries, for one session.
+
+    Returns (resolved, None) when placeable, or (None, BetResult) when the leg
+    must route to manual — a catalog miss, an empty selection+player, or (when
+    apply_odds_guards) an odds ceiling/floor breach.
+
+    Extracted from _execute_bet (v5.11) so the AFL concurrent fan-out can
+    resolve the line ONCE per bookie and reuse it across all accounts.
+    apply_odds_guards=False skips the ceiling/floor PRICE guards (the fan-out
+    drops them per Wilson's "no price check"); the catalog line resolver and
+    the empty-selection guard are ALWAYS applied — they are correctness gates,
+    not price gates, and a blind POST of an unresolved line places $0 (the
+    Jaxon Prior failure, 2026-05-31).
+    """
     leg = tip.legs[0]
     sid = str(session["session_id"])
     bookie = session.get("bookie", "unknown")
-
-    log.info(
-        f"Placing on {bookie} (session {sid}): "
-        f"{leg.player or leg.team_full} {leg.selection} {leg.line} {leg.stat} ${stake}"
-    )
 
     is_threshold = getattr(tip, '_is_threshold', False)
     resolved = _resolve_leg_for_hyperbot(
@@ -6948,7 +7354,7 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
                 f"line={line} not carried in catalog on {bookie}:{sid} "
                 f"(market={market}) — routing to manual (no blind POST)"
             )
-            return BetResult(
+            return (None, BetResult(
                 success=False, tip=tip, session_id=sid, bookie=bookie,
                 error=(f"afl player-prop not carried in catalog: "
                        f"{player or leg.player} {stat or leg.stat} line={line} "
@@ -6957,7 +7363,7 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
                 placed_market=market, placed_player=player, placed_stat=stat,
                 placed_line=line, placed_selection=selection,
                 placed_leg_summary=_format_tip_placement_summary(tip),
-            )
+            ))
 
     # ── Price check + within-1.0 line auto-adjust ───────────────────
     # Player props use the per-player markets_filter and look up by
@@ -7120,7 +7526,7 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
     # selection/line — do NOT place; route to manual. Only fires when we actually
     # captured live odds above; a missing price never blocks. Pairs with the 0.9×
     # target_odds floor. Racing has its own ceiling in racing_placer.
-    if _resolved_live_odds and _exceeds_odds_ceiling(
+    if apply_odds_guards and _resolved_live_odds and _exceeds_odds_ceiling(
         tip.tipster, tip.suggested_odds, _resolved_live_odds
     ):
         _mult = TIPSTERS_MAX_ODDS_MULT.get(tip.tipster, MAX_ODDS_MULT)
@@ -7130,7 +7536,7 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
             f"{tip.suggested_odds} ×{_mult} on {bookie}:{sid}. Possible WRONG "
             f"selection; NOT placing, routing to manual."
         )
-        return BetResult(
+        return (None, BetResult(
             success=False, tip=tip, session_id=sid, bookie=bookie,
             error=(f"odds ceiling: live {_resolved_live_odds} > tipped "
                    f"{tip.suggested_odds} ×{_mult} (possible wrong selection)"),
@@ -7138,7 +7544,7 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
             placed_market=market, placed_player=player, placed_stat=stat,
             placed_line=line, placed_selection=selection,
             placed_leg_summary=_format_tip_placement_summary(tip),
-        )
+        ))
 
     # ── Min-odds FLOOR sanity check (all sports tipsters) ───────────
     # Symmetric to the ceiling: if the live odds are >10% BELOW the tipped price
@@ -7148,7 +7554,7 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
     # routes cleanly to manual with a clear reason instead of a bookie reject.
     # Only fires when we captured live odds (catalog match); a missing price
     # never blocks. Wilson 2026-06-03.
-    if _resolved_live_odds and _below_odds_floor(
+    if apply_odds_guards and _resolved_live_odds and _below_odds_floor(
         tip.suggested_odds, _resolved_live_odds
     ):
         log.warning(
@@ -7157,7 +7563,7 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
             f"{tip.suggested_odds} ×{_ODDS_FLOOR_PCT} on {bookie}:{sid}. Price "
             f"moved / possible wrong selection; NOT placing, routing to manual."
         )
-        return BetResult(
+        return (None, BetResult(
             success=False, tip=tip, session_id=sid, bookie=bookie,
             error=(f"price floor: live {_resolved_live_odds} < tipped "
                    f"{tip.suggested_odds} ×{_ODDS_FLOOR_PCT} "
@@ -7166,7 +7572,7 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
             placed_market=market, placed_player=player, placed_stat=stat,
             placed_line=line, placed_selection=selection,
             placed_leg_summary=_format_tip_placement_summary(tip),
-        )
+        ))
 
     # ── Empty selection AND player guard (fix F, 2026-06-01) ────────
     # place_single_sports_bet OMITS empty selection/player from the payload, so
@@ -7183,7 +7589,7 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
             f"empty selection AND player for {tip.event} {market} line={line} "
             f"on {bookie}:{sid} — nothing to bet; routing to manual (no POST)"
         )
-        return BetResult(
+        return (None, BetResult(
             success=False, tip=tip, session_id=sid, bookie=bookie,
             error=(f"empty selection and player ({market} line={line}) "
                    f"— routing to manual"),
@@ -7191,7 +7597,62 @@ def _execute_bet(tip: ParsedTip, session: dict, stake: float) -> BetResult:
             placed_market=market, placed_player=player, placed_stat=stat,
             placed_line=line, placed_selection=selection,
             placed_leg_summary=_format_tip_placement_summary(tip),
+        ))
+
+    # ── Resolution complete — hand back the catalog-matched fields ──
+    # `live_odds` is the catalog price captured during resolution (None for
+    # markets with no catalog odds, e.g. team h2h). The AFL fan-out sizes
+    # liability off it when present so the cap is honoured against a near-live
+    # price — at no extra API cost, since resolution already fetched it.
+    return (
+        {
+            "market": market, "selection": selection, "player": player,
+            "stat": stat, "line": line, "target_odds": target_odds,
+            "proposition_id": _resolved_prop_id,
+            "live_odds": _resolved_live_odds,
+        },
+        None,
+    )
+
+
+def _execute_bet(
+    tip: ParsedTip, session: dict, stake: float, presolved: dict | None = None,
+) -> BetResult:
+    """Execute a single bet on a specific session.
+
+    When `presolved` is provided (catalog-resolved fields from
+    _resolve_single_for_placement), the per-account price check and odds
+    guards are skipped and the resolved payload is POSTed directly — the AFL
+    concurrent fan-out path (v5.11), where the line was resolved ONCE per
+    bookie up front. When None (the default), the leg is resolved against the
+    live catalog first, exactly as before — every existing caller
+    (_try_place_with_name_variants, SGM/MLB/racing paths) is unchanged.
+    """
+    leg = tip.legs[0]
+    sid = str(session["session_id"])
+    bookie = session.get("bookie", "unknown")
+
+    log.info(
+        f"Placing on {bookie} (session {sid}): "
+        f"{leg.player or leg.team_full} {leg.selection} {leg.line} {leg.stat} ${stake}"
+    )
+
+    if presolved is None:
+        resolved, _manual = _resolve_single_for_placement(
+            tip, session, apply_odds_guards=True,
         )
+        if _manual is not None:
+            return _manual
+    else:
+        resolved = presolved
+
+    market = resolved["market"]
+    selection = resolved["selection"]
+    player = resolved["player"]
+    stat = resolved["stat"]
+    line = resolved["line"]
+    target_odds = resolved["target_odds"]
+    _resolved_prop_id = resolved["proposition_id"]
 
     # ── Build and log payload ───────────────────────────────────────
     # Translate Squiggle-format event to bookmaker-specific format

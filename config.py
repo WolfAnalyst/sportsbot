@@ -14,7 +14,7 @@ load_dotenv()
 # always clear which build is running. The code fingerprint computed in
 # main.py (_code_fingerprint) complements this — it catches partial/stale
 # deploys even when this string wasn't bumped.
-TIPBOT_VERSION = "v5.10 (2026-06-05: (a) BET PLACED summary now shows the ACTUAL placed line per account ALWAYS (notify_tip_placed_summary) — previously only when it differed from the tipped line, so an exact match (Soligo 18.5) showed nothing while an adjusted one (Cook 17.5->16.5) did; now 'line=18.5' / 'line=16.5 (tipped 17.5)' on every placement so per-account lines are verifiable. (b) AGS/anytime-goalscorer recognised by the eddie_afl vision prompt: 'AGS'/'anytime goal'/'1+ goal' -> goals over 0.5, and keep BOTH the AGS and 2+ rows (Dempsey image dropped the AGS row, extracted only 2+). A single 1+ goal then places via goalscorer_threshold_afl. Builds on v5.9.)"
+TIPBOT_VERSION = "v5.11 (2026-06-05: AFL CONCURRENT FAN-OUT (Saiyan + Eddie). AFL singles now place on ALL eligible Sportsbet accounts AT ONCE (ThreadPoolExecutor), replacing the sequential one-account-at-a-time spillover of _place_singles_v4. The intended unit stake is split EVENLY across accounts, each clamped to its top liability bracket (sizing off the catalog odds captured during a single resolve-once-per-bookie step — no per-account price check, no odds ceiling/floor guards). Single POST per account (no ladder), initial_post_max_attempts=1 preserved. session_id dedup (no double-stake) + running-budget cap (per-account floor can't overstake the unit size) + ambiguous/maybe-landed handling restored (excluded from re-prompt, critical alert fires). _execute_bet refactored: resolution extracted into _resolve_single_for_placement, new presolved fast-path; all other sports/SGM/racing paths byte-identical. Gated AFL_CONCURRENT_FANOUT (default ON). Builds on v5.10.)"
 
 # ── Telegram ─────────────────────────────────────────────────────────
 _raw_api_id = os.getenv("TELEGRAM_API_ID", "0")
@@ -379,6 +379,31 @@ RACING_SESSION_PRIORITY = os.getenv("RACING_SESSION_PRIORITY", "")
 # priority module init) are also skipped — the flag is a true full rollback.
 # Default false: ship v4.0 logic active.
 USE_LEGACY_PLACEMENT = os.getenv("USE_LEGACY_PLACEMENT", "false").strip().lower() in ("1", "true", "yes")
+
+# ── AFL concurrent fan-out placement (v5.11, 2026-06-05) ────────────
+# Saiyan + Eddie AFL singles place on ALL eligible Sportsbet sessions
+# CONCURRENTLY (one POST per account, fired in parallel via a thread pool)
+# instead of the sequential one-account-at-a-time spillover of
+# _place_singles_v4. The intended unit stake is split EVENLY across the
+# eligible accounts, each clamped to its top liability bracket from
+# sessions.yaml. The exact catalog line is resolved ONCE per bookie (the
+# line resolver is kept — a catalog miss still routes to manual) and the
+# SAME resolved payload is fanned out; there is NO per-account price check,
+# NO odds ceiling/floor guard, and NO stake ladder (single shot per account,
+# initial_post_max_attempts=1 preserved). Default ON (Wilson 2026-06-05:
+# "build it live now"). Set AFL_CONCURRENT_FANOUT=false to revert AFL to the
+# sequential _place_singles_v4 path. Only affects sport == "afl" singles;
+# NBA/MLB/racing/SGM paths are untouched. Restart tipbot to apply.
+AFL_CONCURRENT_FANOUT = os.getenv("AFL_CONCURRENT_FANOUT", "true").strip().lower() in ("1", "true", "yes")
+
+# Minimum per-account stake floor for the fan-out. When the even split
+# (intended / num_accounts) rounds below this, the account places this floor
+# instead so the bet still reaches the bookie. Primarily matters for Eddie in
+# IMAGE_TIPS_TEST_MODE ($1/unit), where a $1 tip split across 4 accounts would
+# otherwise be ~$0.25/account (below the bookie minimum). For live Saiyan
+# ($600/unit) the floor never binds. Set to 0 to disable (sub-min splits then
+# just fail at the bookie). Liability caps still bound the stake from above.
+AFL_FANOUT_MIN_STAKE = float(os.getenv("AFL_FANOUT_MIN_STAKE", "1.0"))
 
 # ── Ambiguous-outcome reconciliation (v4.5, 2026-05-31) ─────────────
 # When a placement gets a slow rejection (Erasmus class), query
