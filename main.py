@@ -514,11 +514,13 @@ def _emit_sports_ambiguous_alert(tip, ambiguous_outcomes: list[dict]) -> None:
     for a in ambiguous_outcomes:
         latency = a.get("elapsed_sec")
         latency_tag = f" (rejection took {latency:.1f}s)" if latency else ""
+        _cid = a.get("correlation_id")
+        cid_tag = f"\n    cid: {_esc(str(_cid))}" if _cid else ""
         lines.append(
             f"  {_esc(str(a.get('bookie', '')))}:{_esc(str(a.get('session_id', '')))} "
             f"${a.get('stake', 0):.2f} @ {a.get('odds')} - "
             f"{_esc(str(a.get('reason', 'ambiguous')))}{latency_tag}"
-            f"\n    err: {_esc(str(a.get('error', ''))[:200])}"
+            f"\n    err: {_esc(str(a.get('error', ''))[:200])}{cid_tag}"
         )
     detail_str = "\n".join(lines)
     event = _esc(str(getattr(tip, "event", "?") or "?"))
@@ -3040,12 +3042,17 @@ def _v4_get_active_sessions_unfiltered(tip: ParsedTip) -> list[dict]:
     return sessions
 
 
-def _is_ambiguous_outcome(r: BetResult) -> bool:
+def _is_ambiguous_result(r: BetResult) -> bool:
     """A maybe-landed outcome: a fast API-level ambiguous flag (timeout / 5xx /
     dropped connection, set by _execute_bet from the client) OR a slow rejection
     (elapsed >= threshold) that is not clearly pre-placement. The bet MAY be on
     the account, so callers must NOT ladder down or re-prompt a manual re-place
-    (the Erasmus/Dawson double-stake). Shared by the fan-out ladder + rollup."""
+    (the Erasmus/Dawson double-stake). Shared by the fan-out ladder + rollup.
+
+    NOTE: named distinctly from the STRING-based _is_ambiguous_outcome(error: str)
+    near the top of this file — they must NOT collide. v5.12 originally reused that
+    name and shadowed the string version, breaking the legacy-SGM ambiguous guard
+    (AttributeError on str). Fixed v5.13."""
     if r.success:
         return False
     if getattr(r, "is_ambiguous", False):
@@ -3082,7 +3089,7 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
                     f"after {i} stake-reject(s)"
                 )
             return r
-        if _is_ambiguous_outcome(r):
+        if _is_ambiguous_result(r):
             log.warning(
                 f"AFL fan-out: {bk}:{sid} AMBIGUOUS on ${step:.2f} — stopping ladder "
                 f"(bet may have landed; not retrying a lower rung)"
@@ -3209,6 +3216,21 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                           error="No priority sessions configured",
                           timestamp=datetime.now())]
 
+    # De-dup by session_id BEFORE computing the split: a duplicated
+    # AFL_SESSION_PRIORITY entry (operator .env typo) would otherwise inflate
+    # n_accounts and silently under-stake the unit (the seen_sids guard below
+    # only stops the second POST, after the split was already wrong). v5.13.
+    _seen_pre: set[str] = set()
+    _deduped: list[dict] = []
+    for s in sessions:
+        _sid = str(s.get("session_id", ""))
+        if _sid and _sid in _seen_pre:
+            log.warning(f"AFL fan-out: duplicate session {_sid} in priority — de-duped")
+            continue
+        _seen_pre.add(_sid)
+        _deduped.append(s)
+    sessions = _deduped
+
     n_accounts = len(sessions)
     per_account_target = round(intended_stake / n_accounts, 2)
     log.info(
@@ -3280,7 +3302,15 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                 f"{bk} session {sid} not needed (skip)"
             )
             continue
-        sizing_odds = resolved.get("live_odds") or tipped_odds
+        # Coerce catalog odds defensively (HyperBot could serialise odds as a
+        # JSON string on provider drift; a raw "2.5" > 1.0 compare would TypeError
+        # and drop the whole tip to a misleading parse-error). v5.13.
+        _lo = resolved.get("live_odds")
+        try:
+            _lo = float(_lo) if _lo is not None else None
+        except (TypeError, ValueError):
+            _lo = None
+        sizing_odds = _lo or tipped_odds
         # resolve_stake_steps returns the FULL descending ladder: a list cap
         # (player_disposals [100,74,50]) -> a stake per liability bracket; a
         # scalar cap -> the percentage ladder. Each account walks this ladder
@@ -3373,17 +3403,31 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     for r in results:
         if r.success:
             placed_results.append(r)
-        elif _is_ambiguous_outcome(r):
+        elif _is_ambiguous_result(r):
             ambiguous_results.append(r)
         else:
             failed_results.append(r)
 
     top_by_sid = {str(s.get("session_id", "")): ladder[0]
                   for (s, ladder, _r) in jobs}
+    odds_by_sid = {str(s.get("session_id", "")): (resolved or {}).get("live_odds")
+                   for (s, _l, resolved) in jobs}
+
+    def _at_risk_stake(r: BetResult) -> float:
+        # A failed/ambiguous BetResult carries stake=None (the failure branch of
+        # _execute_bet never sets it). The rung we actually FIRED is stashed as
+        # _requested_stake; fall back to the account's top rung. Without this the
+        # ambiguous alert/audit show $0 and the operator can't size reconciliation.
+        return round(
+            (getattr(r, "_requested_stake", None) or r.stake
+             or top_by_sid.get(str(r.session_id), 0.0) or 0.0), 2)
+
     attempted_stake = round(sum(top_by_sid.values()), 2)  # sum of top rungs
     total_placed = round(sum(r.stake or 0 for r in placed_results), 2)
-    # Ambiguous stake is treated as COMMITTED (may have landed).
-    ambiguous_total = round(sum(r.stake or 0 for r in ambiguous_results), 2)
+    # Ambiguous stake is treated as COMMITTED (may have landed). Use the AT-RISK
+    # stake (rung fired), NOT r.stake (None on a failure) — v5.13 fix so the
+    # maybe-landed exposure isn't reported as $0.
+    ambiguous_total = round(sum(_at_risk_stake(r) for r in ambiguous_results), 2)
     # "Unfilled" = stake we WANTED but did not land on the bookie. A success at a
     # LOWER liability rung (graceful bracket degradation, e.g. $117 rejected ->
     # placed $87) is NOT unfilled — that is the intended ladder behaviour. Only
@@ -3395,7 +3439,12 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         unfilled += top_by_sid.get(str(r.session_id), 0.0)
     for r in placed_results:
         _req = getattr(r, "_requested_stake", None) or (r.stake or 0)
-        unfilled += max(0.0, round(_req - (r.stake or 0), 2))  # auto-cap shortfall
+        _short = max(0.0, round(_req - (r.stake or 0), 2))  # auto-cap shortfall
+        # Ignore sub-$1 cent jitter (matches _execute_bet's $1 auto-cap deadband)
+        # so a bookie echoing $86.96 for a $87 request doesn't fire a phantom
+        # unfilled alert on an otherwise fully-filled tip. v5.13.
+        if _short > 1.0:
+            unfilled += _short
     unfilled = round(unfilled, 2)
     # Displayed "intended" = placed + couldn't-place + maybe-landed, so the
     # summary's "placed of intended" stays consistent (bracket degradation just
@@ -3406,8 +3455,8 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         {
             "bookie": r.bookie,
             "session_id": r.session_id,
-            "stake": round(r.stake or 0, 2),
-            "odds": r.odds or 0,
+            "stake": _at_risk_stake(r),
+            "odds": (r.odds or odds_by_sid.get(str(r.session_id)) or 0),
             "elapsed_sec": round(getattr(r, "elapsed_sec", None) or 0.0, 2),
             "error": (r.error or "")[:200],
             "reason": ("fast_ambiguous" if getattr(r, "is_ambiguous", False)
@@ -3446,7 +3495,8 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             for r in placed_results
         ],
         "ambiguous": [
-            {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
+            {"session_id": r.session_id, "bookie": r.bookie,
+             "stake": _at_risk_stake(r),
              "error": r.error, "correlation_id": getattr(r, "correlation_id", None)}
             for r in ambiguous_results
         ],
@@ -7372,7 +7422,7 @@ def _resolve_single_for_placement(
     # SGM enricher. Uses leg.player/leg.stat because the AFL threshold
     # routing empties the resolved player/stat fields. NBA falls through to
     # the within-1.0 block below (its O/U markets carry the right lines).
-    if tip.sport == "afl" and (player or leg.player) and (
+    if (tip.sport or "").lower() == "afl" and (player or leg.player) and (
         _is_afl_player_prop_market(market) or leg.stat
     ):
         # Catalog-resolve against the live single price_check_sports (/v3/price)
@@ -7447,7 +7497,7 @@ def _resolve_single_for_placement(
     # meant team handicap never got auto-adjusted and the bookie was
     # blocklisted. AFL player props are handled by the catalog block above,
     # so this within-1.0 path is NBA/NBL (and team markets) only.
-    if market.startswith("player_") and player and tip.sport != "afl":
+    if market.startswith("player_") and player and (tip.sport or "").lower() != "afl":
         try:
             price_resp = hb.price_check_sports(
                 session_id=sid, sport=tip.sport, event=tip.event,
@@ -8142,9 +8192,12 @@ async def _process_tip(text: str, tipster: str, sport: str,
             resolve_time = time.time() - resolve_start
 
             any_success = any(r.success for r in results)
-            # Register fingerprint only after a successful placement so a
-            # failed tip doesn't permanently lock out re-tips for 10 min.
-            if any_success:
+            # Register the fingerprint after a successful OR AMBIGUOUS (maybe-
+            # landed) placement: a re-post of the same tip must NOT fan out a
+            # second time onto an account where the first attempt may have
+            # already landed (double-stake). A clean total failure stays
+            # unregistered so genuine re-tips aren't locked out for 10 min. v5.13.
+            if any_success or any(_is_ambiguous_result(r) for r in results):
                 _register_tip_fingerprint(tip)
 
             for r in results:
@@ -8648,7 +8701,10 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
 
             _audit_tip(tip, msg_time)
             results = place_tip(tip)
-            if any(r.success for r in results):
+            # v5.13: also lock the fingerprint on an ambiguous (maybe-landed)
+            # outcome so a re-post can't double-stake an account that may have
+            # already placed.
+            if any(r.success for r in results) or any(_is_ambiguous_result(r) for r in results):
                 _register_tip_fingerprint(tip)
                 for r in results:
                     if r.success:
