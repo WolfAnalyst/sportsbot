@@ -500,22 +500,31 @@ def notify_tip_placed_summary(
             f"  {_session_label(r.session_id, r.bookie)}: "
             f"${r.stake:.2f} @ {r.odds} [{r.bet_id}]"
         )
-        diff_parts = []
+        # ALWAYS show the actual placed line/market/stat per account so the
+        # operator can verify each bet — lines legitimately differ per account
+        # after a ±1.0 catalog snap (e.g. Soligo 18.5 on some, 17.5 on others;
+        # Cook 17.5 tipped -> 16.5 placed). Previously this only appeared when
+        # the placed value DIFFERED from the tipped one, so an exact-match line
+        # (Soligo 18.5) showed nothing. Flag the tipped value when it was
+        # adjusted. 2026-06-05.
+        detail_parts = []
         placed_line = getattr(r, "placed_line", None)
         placed_stat = getattr(r, "placed_stat", None)
         placed_market = getattr(r, "placed_market", None)
-        if placed_line is not None and ref_line is not None:
+        if placed_line is not None:
             try:
-                if abs(float(placed_line) - float(ref_line)) > 0.01:
-                    diff_parts.append(f"line={placed_line}")
+                if ref_line is not None and abs(float(placed_line) - float(ref_line)) > 0.01:
+                    detail_parts.append(f"line={placed_line} (tipped {ref_line})")
+                else:
+                    detail_parts.append(f"line={placed_line}")
             except (TypeError, ValueError):
-                pass
-        if placed_stat and ref_stat and placed_stat != ref_stat:
-            diff_parts.append(f"stat={placed_stat}")
+                detail_parts.append(f"line={placed_line}")
         if placed_market and ref_market and placed_market != ref_market:
-            diff_parts.append(f"market={placed_market}")
-        if diff_parts:
-            base += f"  (placed {', '.join(diff_parts)})"
+            detail_parts.append(f"market={placed_market}")
+        if placed_stat and ref_stat and placed_stat != ref_stat:
+            detail_parts.append(f"stat={placed_stat}")
+        if detail_parts:
+            base += f"  (placed {', '.join(detail_parts)})"
         base += _timing_suffix(sid_str, getattr(r, "elapsed_sec", None))
         placement_lines.append(base)
 

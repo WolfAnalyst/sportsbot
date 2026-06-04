@@ -14,7 +14,7 @@ load_dotenv()
 # always clear which build is running. The code fingerprint computed in
 # main.py (_code_fingerprint) complements this — it catches partial/stale
 # deploys even when this string wasn't bumped.
-TIPBOT_VERSION = "v5.9 (2026-06-04: NBA fixes. (a) No-unit gate: ParsedTip.units_explicit (default True) set False by groq when the tipster gave no unit; _process_tip routes UNITS_REQUIRED_TIPSTERS {ausbets_nba,kev_nba} tips with no unit to manual instead of placing at a defaulted stake (AusBets 'Knicks 5.5' -> $400 attempt). Other tipsters unaffected. (b) Same-surname disambiguation fallback: resolve_event now, when the top candidate(s) have no game today but EXACTLY ONE candidate does, uses it (Mitchell Robinson/Knicks vs Duncan Robinson/Pistons-no-game, which the score floor had blocked -> manual). Safe: 2+ playable same-surname -> no guess (manual). Builds on v5.8.)"
+TIPBOT_VERSION = "v5.10 (2026-06-05: (a) BET PLACED summary now shows the ACTUAL placed line per account ALWAYS (notify_tip_placed_summary) — previously only when it differed from the tipped line, so an exact match (Soligo 18.5) showed nothing while an adjusted one (Cook 17.5->16.5) did; now 'line=18.5' / 'line=16.5 (tipped 17.5)' on every placement so per-account lines are verifiable. (b) AGS/anytime-goalscorer recognised by the eddie_afl vision prompt: 'AGS'/'anytime goal'/'1+ goal' -> goals over 0.5, and keep BOTH the AGS and 2+ rows (Dempsey image dropped the AGS row, extracted only 2+). A single 1+ goal then places via goalscorer_threshold_afl. Builds on v5.9.)"
 
 # ── Telegram ─────────────────────────────────────────────────────────
 _raw_api_id = os.getenv("TELEGRAM_API_ID", "0")
