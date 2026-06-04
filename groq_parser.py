@@ -1131,6 +1131,11 @@ def parse_with_groq(
             # by 3 then round to the nearest 0.25 unit to match our risk level.
             # 0.3u -> 0.9 -> 1.0u, 0.4u -> 1.2 -> 1.25u, 0.5u -> 1.5 -> 1.5u
             raw_units = _safe_float(td.get("units"), default_units)
+            # Did the tipster give an EXPLICIT unit, or did we default it? Some
+            # tipsters (aus/kev) must carry a unit to count as a bet — gated in
+            # main._process_tip via UNITS_REQUIRED_TIPSTERS. 2026-06-04.
+            _parsed_units = _safe_float(td.get("units"), None)
+            units_explicit = _parsed_units is not None and _parsed_units > 0
             if tipster == "shook":
                 scaled = raw_units * 3
                 final_units = round(scaled * 4) / 4  # nearest 0.25
@@ -1167,6 +1172,7 @@ def parse_with_groq(
                 suggested_odds=_safe_float(td.get("odds"), 0.0),
                 is_pyo_sgm=is_pyo_sgm,
                 alt_line=_normalise_alt_dict(td.get("alt_line")),
+                units_explicit=units_explicit,
             )
 
             # For AFL, if Groq didn't extract a team but we have a player,

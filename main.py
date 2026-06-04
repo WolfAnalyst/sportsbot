@@ -137,6 +137,12 @@ STAKE_FLOOR = 0.0  # Don't bother with bets below this (currently no minimum)
 # sportsbet sessions in NBA_SESSION_PRIORITY.
 TIPSTERS_IGNORE_SUGGESTED_BOOKIE: set[str] = {"kev_nba", "ausbets_nba"}
 
+# Tipsters whose tips MUST carry an explicit unit/stake to be placed. A tip with
+# no unit (we'd otherwise default it) is NOT a confirmed bet for these cappers —
+# route it to manual instead of placing at the default stake (Wilson 2026-06-04:
+# AusBets "Knicks 5.5" had no unit yet attempted a $400 line bet).
+UNITS_REQUIRED_TIPSTERS: set[str] = {"kev_nba", "ausbets_nba"}
+
 # ── Tipsters HARD-LOCKED to a single bookie ─────────────────────────
 # Opposite of the ignore-list: these tips are placed ONLY on the named bookie.
 # If that bookie has no active session, the tip routes to manual — it is NEVER
@@ -1522,6 +1528,33 @@ def resolve_event(tip: ParsedTip) -> str:
                     # Update the leg's player name to the disambiguated one
                     tip.legs[0].player = c["name"]
                     return result
+
+            # Fallback (2026-06-04): the top candidate(s) had no game and the
+            # score floor blocked the lower ones. If EXACTLY ONE candidate (any
+            # score) actually has a game today, it's UNAMBIGUOUS -> use it.
+            # ('Robinson' matched Duncan Robinson/Pistons (1.0, no game) over
+            # Mitchell Robinson/Knicks (0.829, playing) -> the floor blocked
+            # Mitchell and it went to manual.) Stays safe: if two same-surname
+            # players BOTH have games today we do NOT guess (keep manual).
+            playable = []
+            for c in candidates:
+                r = resolve_nba_event(team=c["team"], player=c["name"], sport=tip.sport)
+                if r:
+                    playable.append((c, r))
+            if len(playable) == 1:
+                c, r = playable[0]
+                log.info(
+                    f"Disambiguation fallback: only '{c['name']}' ({c['team']}, "
+                    f"score={c['score']}) has a game today -> using it (unambiguous)"
+                )
+                tip.legs[0].player = c["name"]
+                return r
+            if len(playable) > 1:
+                log.warning(
+                    f"Disambiguation: {len(playable)} same-surname candidates have "
+                    f"games today ({[p[0]['name'] for p in playable]}) — ambiguous, "
+                    f"routing to manual"
+                )
 
             log.warning(f"None of {len(candidates)} candidates for '{player}' have a game scheduled")
             return ""
@@ -7554,6 +7587,17 @@ async def _process_tip(text: str, tipster: str, sport: str,
         if _is_duplicate(tip):
             log.info(f"DUPE detected, skipping: {tip.tipster} {_tip_fingerprint(tip)}")
             continue
+
+        # No-unit gate: aus/kev tips MUST carry an explicit unit to be a bet.
+        # Without one we'd default the stake and place a bet the capper never
+        # actually sized — route to manual instead (Wilson 2026-06-04).
+        if tip.tipster in UNITS_REQUIRED_TIPSTERS and not getattr(tip, "units_explicit", True):
+            log.info(
+                f"No-unit gate: {tip.tipster} tip has no explicit unit/stake "
+                f"-> manual (not placing). Raw: {tip.raw_message[:120]}"
+            )
+            tip.alert_only = True
+            tip.alert_reason = "no unit/stake specified by the tipster — place manually"
 
         # Time the resolve + place step
         resolve_start = time.time()

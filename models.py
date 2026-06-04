@@ -38,6 +38,11 @@ class ParsedTip:
     alt_line: Optional[dict] = None  # Fallback alt line if primary fails (legacy single-alt)
     alt_lines: Optional[list] = None  # Ordered list of alt props for spillover fill
                                        # Each dict: {stat, line, selection, market, is_threshold}
+    units_explicit: bool = True  # False when the tipster gave NO unit/stake and
+                                  # we defaulted it. Some tipsters (aus/kev) must
+                                  # carry an explicit unit to count as a bet —
+                                  # see UNITS_REQUIRED_TIPSTERS gate. Default True
+                                  # so every other parser/path is unaffected.
 
     @property
     def stake_dollars(self) -> float:
