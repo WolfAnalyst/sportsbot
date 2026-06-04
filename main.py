@@ -3040,6 +3040,67 @@ def _v4_get_active_sessions_unfiltered(tip: ParsedTip) -> list[dict]:
     return sessions
 
 
+def _is_ambiguous_outcome(r: BetResult) -> bool:
+    """A maybe-landed outcome: a fast API-level ambiguous flag (timeout / 5xx /
+    dropped connection, set by _execute_bet from the client) OR a slow rejection
+    (elapsed >= threshold) that is not clearly pre-placement. The bet MAY be on
+    the account, so callers must NOT ladder down or re-prompt a manual re-place
+    (the Erasmus/Dawson double-stake). Shared by the fan-out ladder + rollup."""
+    if r.success:
+        return False
+    if getattr(r, "is_ambiguous", False):
+        return True
+    _el = getattr(r, "elapsed_sec", None) or 0.0
+    return (
+        _el >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
+        and not _is_definitely_pre_placement(r.error or "")
+    )
+
+
+def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetResult:
+    """Place ONE account in the AFL fan-out, walking its liability ladder: try the
+    top bracket first; on a stake-too-high / MBL rejection, drop to the next
+    bracket (e.g. $100→$74→$50 liability) and retry — same graceful degradation
+    _place_singles_v4 does per session, but here every account ladders in its OWN
+    thread so all accounts still START together. Stops on the first success, on a
+    non-stake error, or on an AMBIGUOUS (maybe-landed) outcome — never ladder past
+    an ambiguous, that could double-stake. Returns the terminal BetResult; the rung
+    requested is stashed as `_requested_stake` for auto-cap detection."""
+    sid = str(sess.get("session_id", ""))
+    bk = sess.get("bookie", "unknown")
+    last: BetResult | None = None
+    for i, step in enumerate(ladder):
+        r = _execute_bet(tip, sess, step, presolved=resolved)
+        try:
+            r._requested_stake = step
+        except Exception:
+            pass
+        if r.success:
+            if i > 0:
+                log.info(
+                    f"AFL fan-out: {bk}:{sid} laddered to rung {i + 1} (${step:.2f}) "
+                    f"after {i} stake-reject(s)"
+                )
+            return r
+        if _is_ambiguous_outcome(r):
+            log.warning(
+                f"AFL fan-out: {bk}:{sid} AMBIGUOUS on ${step:.2f} — stopping ladder "
+                f"(bet may have landed; not retrying a lower rung)"
+            )
+            return r
+        last = r
+        if not _is_stake_error(r.error or ""):
+            log.info(
+                f"AFL fan-out: {bk}:{sid} non-stake error on ${step:.2f} — abandoning "
+                f"ladder: {(r.error or '')[:80]}"
+            )
+            return r
+        log.info(f"AFL fan-out: {bk}:{sid} stake-reject ${step:.2f}, laddering down")
+    return last if last is not None else BetResult(
+        success=False, tip=tip, session_id=sid, bookie=bk,
+        error="fan-out: empty ladder", timestamp=datetime.now())
+
+
 def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     """
     v5.11 AFL concurrent fan-out placement (Saiyan + Eddie).
@@ -3054,17 +3115,19 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
          False). A catalog miss on every bookie -> whole tip to manual (the
          line resolver is KEPT; only the price check / odds guards are dropped,
          so we never blind-POST an unresolved line — the Jaxon Prior $0 bug).
-      3. Split the intended unit stake EVENLY across the eligible accounts,
-         each clamped to its TOP liability bracket (sessions.yaml), sized off
-         the catalog odds captured during the resolve-once step (falling back
-         to tipped odds) so the liability cap holds against a near-live price —
-         no extra price check. session_ids are de-duped, each account floored
-         at AFL_FANOUT_MIN_STAKE, and a running total caps the fan-out at the
-         intended unit size (so the floor can't overstake and a surplus of
+      3. Split the intended unit stake EVENLY across the eligible accounts and
+         build each account's LIABILITY LADDER (sessions.yaml top bracket first,
+         then the lower brackets), sized off the catalog odds captured during the
+         resolve-once step (falling back to tipped odds) so the cap holds against
+         a near-live price — no extra price check. session_ids are de-duped, each
+         rung floored at AFL_FANOUT_MIN_STAKE, and a running total caps the fan-out
+         at the intended unit size (so the floor can't overstake and a surplus of
          accounts stops once intended is met).
-      4. Fire ALL accounts CONCURRENTLY (ThreadPoolExecutor) with the SAME
-         resolved payload — single POST per account, no stake ladder,
-         initial_post_max_attempts=1 preserved (no double-staking).
+      4. Fire ALL accounts CONCURRENTLY (ThreadPoolExecutor): each account walks
+         its OWN ladder in its thread (top bracket; drop a bracket on a stake-too-
+         high / MBL reject) so all accounts START together. initial_post_max_attempts
+         =1 per rung + the ladder STOPS on an ambiguous/maybe-landed rung (never
+         retries a lower one) = no double-staking.
       5. Roll up into the same consolidated placed / unfilled / ambiguous
          notifications and audit log as _place_singles_v4 (a maybe-landed
          outcome is NOT re-prompted for manual placement).
@@ -3193,7 +3256,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # - A running `allocated` total caps the fan-out at the intended unit size,
     #   so the per-account floor (Eddie $1/u test mode) can never overstake and
     #   a future surplus of accounts stops filling once intended is met.
-    jobs: list[tuple[dict, float, dict]] = []  # (session, stake, resolved)
+    jobs: list[tuple[dict, list, dict]] = []  # (session, ladder, resolved)
     seen_sids: set[str] = set()
     allocated = 0.0
     for sess in sessions:
@@ -3218,39 +3281,44 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             )
             continue
         sizing_odds = resolved.get("live_odds") or tipped_odds
+        # resolve_stake_steps returns the FULL descending ladder: a list cap
+        # (player_disposals [100,74,50]) -> a stake per liability bracket; a
+        # scalar cap -> the percentage ladder. Each account walks this ladder
+        # (top first, drop a bracket on a stake-too-high reject) in its thread.
         steps, cap_reason, is_list_mode = session_priority.resolve_stake_steps(
             sid, sport, liability_market,
             sizing_odds if (sizing_odds and sizing_odds > 1.0) else 0,
             per_account_target,
             _v4_ladder_steps,
         )
-        stake = steps[0] if steps else 0.0
-        if stake <= 0:
+        # Budget-cap every rung at the remaining unit size (so a surplus of
+        # accounts or a small intended can't be exceeded), drop non-positive.
+        steps = [round(min(s, remaining_budget), 2) for s in steps if s and s > 0]
+        # Drop sub-floor rungs (a sub-min POST just rejects). If that empties the
+        # ladder but there WAS a positive step, keep ONE floored rung so a tiny
+        # split (Eddie $1/u test mode) still reaches the bookie.
+        ladder = [s for s in steps if s >= AFL_FANOUT_MIN_STAKE]
+        if not ladder and steps:
+            ladder = [round(min(AFL_FANOUT_MIN_STAKE, remaining_budget), 2)]
+        # Dedup consecutive equal rungs (the per-account split can flatten two
+        # brackets to the same stake).
+        _dedup: list = []
+        for s in ladder:
+            if s > 0 and (not _dedup or _dedup[-1] != s):
+                _dedup.append(s)
+        ladder = _dedup
+        if not ladder:
             log.info(
                 f"AFL fan-out: {bk} session {sid} no usable stake "
                 f"({cap_reason}) — skipping"
             )
             continue
-        # Floor tiny splits (Eddie $1/u test mode) so the bet still reaches the
-        # bookie; liability caps already bound it from above. No effect on live
-        # Saiyan ($600/u) where each split is ~$99-$117.
-        if 0 < stake < AFL_FANOUT_MIN_STAKE:
-            stake = AFL_FANOUT_MIN_STAKE
-        # Never let the floor (or a bracket-capped stake) push total spend above
-        # the intended unit size — caps the Eddie test-mode 4x overstake and the
-        # surplus-accounts case.
-        if stake > remaining_budget:
-            stake = remaining_budget
-        stake = round(stake, 2)
-        if stake <= 0:
-            continue
-        allocated = round(allocated + stake, 2)
+        allocated = round(allocated + ladder[0], 2)  # budget tracks the top rung
         log.info(
-            f"AFL fan-out: {bk} session {sid} -> ${stake:.2f} "
-            f"(top bracket, {cap_reason}, list_mode={is_list_mode}, "
-            f"sizing_odds={sizing_odds})"
+            f"AFL fan-out: {bk} session {sid} -> ladder {ladder} "
+            f"({cap_reason}, list_mode={is_list_mode}, sizing_odds={sizing_odds})"
         )
-        jobs.append((sess, stake, resolved))
+        jobs.append((sess, ladder, resolved))
 
     if not jobs:
         log.warning(
@@ -3267,19 +3335,21 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # ── Fire all accounts CONCURRENTLY ─────────────────────────────────
     # HTTP client is thread-safe (fresh requests.post per call, immutable
     # headers); each thread builds its own payload from the shared read-only
-    # resolved dict and a distinct session/stake. No shared mutable state, so
-    # no lock is needed. Single POST per account (no ladder); _execute_bet
-    # keeps initial_post_max_attempts=1 so a transient failure is never
-    # re-fired (no double-staking).
+    # resolved dict and a distinct session/ladder. No shared mutable state, so
+    # no lock is needed. Each account walks its OWN liability ladder in its
+    # thread (_fanout_place_account) — all accounts START together; within an
+    # account, rungs are sequential. _execute_bet keeps initial_post_max_attempts
+    # =1 so a single rung's transient failure is never re-fired (no double-stake),
+    # and the ladder STOPS on an ambiguous/maybe-landed rung (never retries lower).
     results: list[BetResult] = []
-    log.info(f"AFL fan-out: firing {len(jobs)} concurrent placement(s)")
+    log.info(f"AFL fan-out: firing {len(jobs)} concurrent placement(s) (each ladders)")
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
         futures = {
-            ex.submit(_execute_bet, tip, sess, stake, resolved): (sess, stake)
-            for (sess, stake, resolved) in jobs
+            ex.submit(_fanout_place_account, tip, sess, ladder, resolved): sess
+            for (sess, ladder, resolved) in jobs
         }
         for fut in concurrent.futures.as_completed(futures):
-            sess, stake = futures[fut]
+            sess = futures[fut]
             sid = str(sess.get("session_id", ""))
             try:
                 results.append(fut.result())
@@ -3292,42 +3362,45 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                     timestamp=datetime.now()))
 
     # ── Roll up: notify + audit (mirrors _place_singles_v4 tail) ───────
-    # Classify each result once into placed / ambiguous / failed.
-    # AMBIGUOUS (maybe-landed) = a fast timeout / 5xx / dropped connection
-    # (is_ambiguous, set by _execute_bet from the client) OR a slow rejection
-    # (elapsed >= threshold) that is not clearly pre-placement. The bet MAY
-    # already be on the account, so it is EXCLUDED from both placed and failed:
-    # counting it as unfilled would prompt Wilson to re-place a bet that landed
-    # (the Erasmus/Dawson double-stake). Single pass (not membership tests) —
-    # BetResult is a value-equality dataclass, so `in` would be unreliable.
-    def _is_ambiguous(r: BetResult) -> bool:
-        if getattr(r, "is_ambiguous", False):  # fast API-level ambiguous
-            return True
-        _el = getattr(r, "elapsed_sec", None) or 0.0
-        return (
-            _el >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
-            and not _is_definitely_pre_placement(r.error or "")
-        )
-
+    # Classify each result once into placed / ambiguous / failed. AMBIGUOUS
+    # (maybe-landed) is EXCLUDED from both placed and the manual re-prompt (see
+    # _is_ambiguous_outcome) — counting it as unfilled would prompt a re-place of
+    # a bet that may have landed (Erasmus/Dawson double-stake). Single pass —
+    # BetResult is a value-equality dataclass, so `in` membership is unreliable.
     placed_results: list[BetResult] = []
     ambiguous_results: list[BetResult] = []
     failed_results: list[BetResult] = []
     for r in results:
         if r.success:
             placed_results.append(r)
-        elif _is_ambiguous(r):
+        elif _is_ambiguous_outcome(r):
             ambiguous_results.append(r)
         else:
             failed_results.append(r)
-    attempted_stake = round(sum(stake for (_s, stake, _r) in jobs), 2)
+
+    top_by_sid = {str(s.get("session_id", "")): ladder[0]
+                  for (s, ladder, _r) in jobs}
+    attempted_stake = round(sum(top_by_sid.values()), 2)  # sum of top rungs
     total_placed = round(sum(r.stake or 0 for r in placed_results), 2)
-    # Ambiguous stake is treated as COMMITTED (may have landed) so the manual
-    # top-up alert never asks to re-place it.
+    # Ambiguous stake is treated as COMMITTED (may have landed).
     ambiguous_total = round(sum(r.stake or 0 for r in ambiguous_results), 2)
-    # "Unfilled" = stake on accounts we sized but failed to place OR a silent
-    # bookie auto-cap shortfall (success with a reduced stake). NOT the unit
-    # size above the summed caps, which is expected headroom for more accounts.
-    unfilled = round(attempted_stake - total_placed - ambiguous_total, 2)
+    # "Unfilled" = stake we WANTED but did not land on the bookie. A success at a
+    # LOWER liability rung (graceful bracket degradation, e.g. $117 rejected ->
+    # placed $87) is NOT unfilled — that is the intended ladder behaviour. Only
+    # (a) accounts that placed NOTHING (their top rung) and (b) a silent bookie
+    # auto-cap on a winning rung (requested rung - actual stake) count. Mirrors
+    # the list-mode "lower brackets are expected" rule in _place_singles_v4.
+    unfilled = 0.0
+    for r in failed_results:
+        unfilled += top_by_sid.get(str(r.session_id), 0.0)
+    for r in placed_results:
+        _req = getattr(r, "_requested_stake", None) or (r.stake or 0)
+        unfilled += max(0.0, round(_req - (r.stake or 0), 2))  # auto-cap shortfall
+    unfilled = round(unfilled, 2)
+    # Displayed "intended" = placed + couldn't-place + maybe-landed, so the
+    # summary's "placed of intended" stays consistent (bracket degradation just
+    # lowers the displayed intended honestly, rather than showing phantom unfill).
+    display_intended = round(total_placed + unfilled + ambiguous_total, 2)
 
     ambiguous_outcomes = [
         {
@@ -3385,7 +3458,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
 
     if placed_results:
         notifier.notify_tip_placed_summary(
-            tip, placed_results, attempted_stake, unfilled,
+            tip, placed_results, display_intended, unfilled,
             total_elapsed_sec=round(_time_mod.time() - _t_start, 2),
             session_timing=session_timing,
         )
@@ -3404,7 +3477,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             f"({len(failed_results)} account(s) failed)"
         )
         notifier.notify_tip_unfilled_with_placements(
-            tip, attempted_stake, total_placed, unfilled,
+            tip, display_intended, total_placed, unfilled,
             placed_results, failed_results,
             session_timing=session_timing,
         )

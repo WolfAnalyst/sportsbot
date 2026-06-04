@@ -14,7 +14,7 @@ load_dotenv()
 # always clear which build is running. The code fingerprint computed in
 # main.py (_code_fingerprint) complements this — it catches partial/stale
 # deploys even when this string wasn't bumped.
-TIPBOT_VERSION = "v5.11 (2026-06-05: AFL CONCURRENT FAN-OUT (Saiyan + Eddie). AFL singles now place on ALL eligible Sportsbet accounts AT ONCE (ThreadPoolExecutor), replacing the sequential one-account-at-a-time spillover of _place_singles_v4. The intended unit stake is split EVENLY across accounts, each clamped to its top liability bracket (sizing off the catalog odds captured during a single resolve-once-per-bookie step — no per-account price check, no odds ceiling/floor guards). Single POST per account (no ladder), initial_post_max_attempts=1 preserved. session_id dedup (no double-stake) + running-budget cap (per-account floor can't overstake the unit size) + ambiguous/maybe-landed handling restored (excluded from re-prompt, critical alert fires). _execute_bet refactored: resolution extracted into _resolve_single_for_placement, new presolved fast-path; all other sports/SGM/racing paths byte-identical. Gated AFL_CONCURRENT_FANOUT (default ON). Builds on v5.10.)"
+TIPBOT_VERSION = "v5.12 (2026-06-05: AFL fan-out now LADDERS per account. Builds on v5.11's concurrent fan-out (Saiyan + Eddie AFL singles place on all eligible Sportsbet accounts at once via ThreadPoolExecutor, unit split + capped at top liability bracket, line resolved once per bookie, no per-account price check / odds guards). v5.12: instead of one shot per account, each account now walks its OWN liability ladder in its thread — top bracket first, dropping to the next bracket ([100->74->50] liability) on a stake-too-high/MBL reject — all accounts still START together. Ladder STOPS on an ambiguous/maybe-landed rung (never retries lower = no double-stake) + initial_post_max_attempts=1 per rung. Graceful bracket degradation (success at a lower rung) is NOT counted as unfilled; only fully-failed accounts + auto-cap shortfalls alert. Sizes off the catalog odds captured during resolution. Gated AFL_CONCURRENT_FANOUT (default ON).)"
 
 # ── Telegram ─────────────────────────────────────────────────────────
 _raw_api_id = os.getenv("TELEGRAM_API_ID", "0")
@@ -380,20 +380,21 @@ RACING_SESSION_PRIORITY = os.getenv("RACING_SESSION_PRIORITY", "")
 # Default false: ship v4.0 logic active.
 USE_LEGACY_PLACEMENT = os.getenv("USE_LEGACY_PLACEMENT", "false").strip().lower() in ("1", "true", "yes")
 
-# ── AFL concurrent fan-out placement (v5.11, 2026-06-05) ────────────
+# ── AFL concurrent fan-out placement (v5.11/v5.12, 2026-06-05) ──────
 # Saiyan + Eddie AFL singles place on ALL eligible Sportsbet sessions
-# CONCURRENTLY (one POST per account, fired in parallel via a thread pool)
-# instead of the sequential one-account-at-a-time spillover of
-# _place_singles_v4. The intended unit stake is split EVENLY across the
-# eligible accounts, each clamped to its top liability bracket from
-# sessions.yaml. The exact catalog line is resolved ONCE per bookie (the
-# line resolver is kept — a catalog miss still routes to manual) and the
-# SAME resolved payload is fanned out; there is NO per-account price check,
-# NO odds ceiling/floor guard, and NO stake ladder (single shot per account,
-# initial_post_max_attempts=1 preserved). Default ON (Wilson 2026-06-05:
-# "build it live now"). Set AFL_CONCURRENT_FANOUT=false to revert AFL to the
-# sequential _place_singles_v4 path. Only affects sport == "afl" singles;
-# NBA/MLB/racing/SGM paths are untouched. Restart tipbot to apply.
+# CONCURRENTLY (fired in parallel via a thread pool) instead of the sequential
+# one-account-at-a-time spillover of _place_singles_v4. The intended unit stake
+# is split EVENLY across the eligible accounts; each account then walks its OWN
+# liability ladder (top bracket from sessions.yaml first, dropping a bracket on
+# a stake-too-high / MBL reject — v5.12). The exact catalog line is resolved
+# ONCE per bookie (the line resolver is kept — a catalog miss still routes to
+# manual) and that resolved payload is fanned out; there is NO per-account price
+# check and NO odds ceiling/floor guard. Per rung initial_post_max_attempts=1,
+# and the ladder STOPS on an ambiguous/maybe-landed rung (no double-stake).
+# Default ON (Wilson 2026-06-05: "build it live now"). Set
+# AFL_CONCURRENT_FANOUT=false to revert AFL to the sequential _place_singles_v4
+# path. Only affects sport == "afl" singles; NBA/MLB/racing/SGM untouched.
+# Restart tipbot to apply.
 AFL_CONCURRENT_FANOUT = os.getenv("AFL_CONCURRENT_FANOUT", "true").strip().lower() in ("1", "true", "yes")
 
 # Minimum per-account stake floor for the fan-out. When the even split
