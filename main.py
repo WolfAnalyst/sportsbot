@@ -3118,10 +3118,13 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
       1. Pull eligible Sportsbet sessions (sport filter + force-bookie +
          per-sport priority list — identical gating to _place_singles_v4).
       2. Resolve the leg's exact catalog {market, line, selection, prop_id}
-         ONCE per bookie via _resolve_single_for_placement(apply_odds_guards=
-         False). A catalog miss on every bookie -> whole tip to manual (the
-         line resolver is KEPT; only the price check / odds guards are dropped,
-         so we never blind-POST an unresolved line — the Jaxon Prior $0 bug).
+         ONCE per bookie via _resolve_single_for_placement(apply_ceiling=True,
+         apply_floor=False). A catalog miss on every bookie -> whole tip to
+         manual (line resolver KEPT). v5.13: the WRONG-SELECTION ceiling (live >
+         1.25x tipped -> manual) is KEPT — it runs off the resolve-time catalog
+         odds already in hand, no extra call; the price-FLOOR is dropped so a
+         shorter-than-tipped live price still places (Wilson's choice). No
+         per-account price check; we never blind-POST an unresolved line.
       3. Split the intended unit stake EVENLY across the eligible accounts and
          build each account's LIABILITY LADDER (sessions.yaml top bracket first,
          then the lower brackets), sized off the catalog odds captured during the
@@ -3145,10 +3148,12 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     the unit size above the summed caps is expected headroom for future
     accounts, not an underfill.
 
-    RESIDUAL RISK (accepted, Wilson "no price check"): with the odds guards off,
-    a fill at LONGER odds than the catalog/tipped price can push realised
-    liability above the configured bracket. Sizing off the captured catalog odds
-    minimises (not eliminates) this; the bookie MBL + AUTO-CAP detection backstop.
+    RESIDUAL RISK (accepted): the wrong-selection ceiling is back (v5.13), but the
+    price-FLOOR is off, so a fill at LONGER odds than the sized catalog/tipped
+    price can still push realised liability above the configured bracket. Sizing
+    off the captured catalog odds minimises (not eliminates) this; bookie MBL +
+    AUTO-CAP detection backstop. (h2h with no tipped/catalog odds also sizes with
+    no liability conversion — bookie MBL is the only cap there.)
     """
     import time as _time_mod
     import concurrent.futures
@@ -3249,7 +3254,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         if bk in resolved_by_bookie:
             continue
         _resolved, _manual = _resolve_single_for_placement(
-            tip, sess, apply_odds_guards=False,
+            tip, sess, apply_ceiling=True, apply_floor=False,
         )
         resolved_by_bookie[bk] = _resolved  # None when routed to manual
         if _manual is not None:
@@ -7347,22 +7352,27 @@ def _format_tip_placement_summary(tip) -> str:
 
 
 def _resolve_single_for_placement(
-    tip: ParsedTip, session: dict, *, apply_odds_guards: bool = True,
+    tip: ParsedTip, session: dict, *,
+    apply_ceiling: bool = True, apply_floor: bool = True,
 ) -> "tuple[dict | None, BetResult | None]":
     """Resolve a single leg to the exact catalog {market, line, selection,
     proposition_id, target_odds} the bookie carries, for one session.
 
     Returns (resolved, None) when placeable, or (None, BetResult) when the leg
-    must route to manual — a catalog miss, an empty selection+player, or (when
-    apply_odds_guards) an odds ceiling/floor breach.
+    must route to manual — a catalog miss, an empty selection+player, an odds
+    CEILING breach (when apply_ceiling), or a price-FLOOR breach (when apply_floor).
 
-    Extracted from _execute_bet (v5.11) so the AFL concurrent fan-out can
-    resolve the line ONCE per bookie and reuse it across all accounts.
-    apply_odds_guards=False skips the ceiling/floor PRICE guards (the fan-out
-    drops them per Wilson's "no price check"); the catalog line resolver and
-    the empty-selection guard are ALWAYS applied — they are correctness gates,
-    not price gates, and a blind POST of an unresolved line places $0 (the
-    Jaxon Prior failure, 2026-05-31).
+    Extracted from _execute_bet (v5.11). The AFL fan-out resolves ONCE per bookie
+    and reuses it across accounts. Both guards run off the resolve-time catalog
+    odds that are already captured here — NO extra price-check call.
+      - apply_ceiling: the WRONG-SELECTION guard (live > 1.25x tipped -> manual;
+        catches same-surname / ±1.0 line / wrong-O/U snaps placing a wrong pick).
+      - apply_floor: the price-moved guard (live < 0.9x tipped -> manual).
+    The fan-out keeps the ceiling but DROPS the floor (Wilson v5.13: a shorter-
+    than-tipped live price should still place). Every other caller (NBA/MLB/
+    handicap/total/SGM/racing via presolved=None) keeps BOTH (the defaults).
+    The catalog line resolver + empty-selection guard are ALWAYS applied — a
+    blind POST of an unresolved line places $0 (the Jaxon Prior failure).
     """
     leg = tip.legs[0]
     sid = str(session["session_id"])
@@ -7649,7 +7659,7 @@ def _resolve_single_for_placement(
     # selection/line — do NOT place; route to manual. Only fires when we actually
     # captured live odds above; a missing price never blocks. Pairs with the 0.9×
     # target_odds floor. Racing has its own ceiling in racing_placer.
-    if apply_odds_guards and _resolved_live_odds and _exceeds_odds_ceiling(
+    if apply_ceiling and _resolved_live_odds and _exceeds_odds_ceiling(
         tip.tipster, tip.suggested_odds, _resolved_live_odds
     ):
         _mult = TIPSTERS_MAX_ODDS_MULT.get(tip.tipster, MAX_ODDS_MULT)
@@ -7677,7 +7687,7 @@ def _resolve_single_for_placement(
     # routes cleanly to manual with a clear reason instead of a bookie reject.
     # Only fires when we captured live odds (catalog match); a missing price
     # never blocks. Wilson 2026-06-03.
-    if apply_odds_guards and _resolved_live_odds and _below_odds_floor(
+    if apply_floor and _resolved_live_odds and _below_odds_floor(
         tip.suggested_odds, _resolved_live_odds
     ):
         log.warning(
@@ -7762,7 +7772,7 @@ def _execute_bet(
 
     if presolved is None:
         resolved, _manual = _resolve_single_for_placement(
-            tip, session, apply_odds_guards=True,
+            tip, session,
         )
         if _manual is not None:
             return _manual

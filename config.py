@@ -14,7 +14,7 @@ load_dotenv()
 # always clear which build is running. The code fingerprint computed in
 # main.py (_code_fingerprint) complements this — it catches partial/stale
 # deploys even when this string wasn't bumped.
-TIPBOT_VERSION = "v5.13 (2026-06-05: AFL fan-out hardening from a 10-agent scrutiny pass (18 confirmed findings). FIXES: (1) renamed the v5.12 _is_ambiguous_result(BetResult) so it no longer SHADOWS the pre-existing _is_ambiguous_outcome(error:str) — that collision broke the legacy-SGM ambiguous guard (AttributeError on str). (2) ambiguous/maybe-landed alerts + audit now show the REAL at-risk stake (_requested_stake) + live odds + correlation_id instead of $0.00 @ 0 — operator can size manual reconciliation. (3) de-dup sessions BEFORE the even split so a duplicated AFL_SESSION_PRIORITY entry can't silently under-stake. (4) register the dedup fingerprint on an ambiguous outcome (not just success) so a re-post can't double-stake an account where the first attempt may have landed. (5) $1 deadband on auto-cap shortfall (no phantom unfilled alert on cent jitter). (6) float-coerce catalog odds; (7) case-insensitive AFL check in the resolver. NOT changed (your explicit 'no odds guards' choice): the wrong-selection ceiling + longer-fill liability overshoot remain OFF on the fan-out — flagged for decision. Builds on v5.12.)"
+TIPBOT_VERSION = "v5.14 (2026-06-05: AFL fan-out re-enables the WRONG-SELECTION ceiling. After the v5.13 scrutiny flagged that the odds ceiling was also a wrong-selection guard (a catalog-valid-but-wrong pick — same-surname / ±1.0 line / wrong-O/U snap — was placing across ALL accounts), Wilson chose 'ceiling only'. _resolve_single_for_placement's apply_odds_guards flag is split into apply_ceiling + apply_floor; the fan-out now resolves with apply_ceiling=True, apply_floor=False — so a live price > 1.25x tipped routes the whole tip to manual (off the resolve-time catalog odds, no extra call), while a shorter-than-tipped live price still places. All other paths (NBA/MLB/handicap/total/SGM/racing via presolved=None) keep BOTH guards (defaults). Residual (accepted): longer-fill liability overshoot + h2h-no-odds uncapped sizing still rely on bookie MBL. Builds on v5.13.)"
 
 # ── Telegram ─────────────────────────────────────────────────────────
 _raw_api_id = os.getenv("TELEGRAM_API_ID", "0")
@@ -389,7 +389,10 @@ USE_LEGACY_PLACEMENT = os.getenv("USE_LEGACY_PLACEMENT", "false").strip().lower(
 # a stake-too-high / MBL reject — v5.12). The exact catalog line is resolved
 # ONCE per bookie (the line resolver is kept — a catalog miss still routes to
 # manual) and that resolved payload is fanned out; there is NO per-account price
-# check and NO odds ceiling/floor guard. Per rung initial_post_max_attempts=1,
+# check. v5.14: the WRONG-SELECTION ceiling (live > 1.25x tipped -> manual) is
+# KEPT (it runs off the resolve-time catalog odds already in hand — no extra
+# call); the price-FLOOR is dropped (a shorter-than-tipped live price still
+# places). Per rung initial_post_max_attempts=1,
 # and the ladder STOPS on an ambiguous/maybe-landed rung (no double-stake).
 # Default ON (Wilson 2026-06-05: "build it live now"). Set
 # AFL_CONCURRENT_FANOUT=false to revert AFL to the sequential _place_singles_v4
