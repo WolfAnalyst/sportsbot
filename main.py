@@ -7816,15 +7816,22 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
     # per-account `racing.thoroughbreds` cap (win 1000 / place 500) and BYPASSES
     # the per-track harness caps. Day-before tips have no MBL.
     discipline = "thoroughbred" if tipster in ("zak_racing", "trial_sniper") else ""
+    # Race-type code (R=thoroughbred, H=harness, G=greyhound). Vision rarely
+    # prints it. For Zak/Trial THOROUGHBRED tipsters, default an empty type to
+    # "(R)" so bookies can disambiguate MULTI-DISCIPLINE venues: Geelong has BOTH
+    # a thoroughbred and a greyhound track, and an empty type made 5/6 bookies
+    # miss Geelong R1 (sportsbet 'race_type_mismatch', others 'not in catalog');
+    # only tabtouch matched (2026-06-04). 2026-06-04.
+    race_type = (raw.get("race_type") or "").strip()
+    if not race_type and discipline == "thoroughbred":
+        race_type = "(R)"
     return {
         "id": f"img-{tipster}-{race_num}-{saddle}-{idx}",
         "titan": titan,
         "discipline": discipline,
         "track": track,
         "race_num": race_num,
-        # Vision rarely prints a race-type code; "" lets racing_placer fall
-        # back to its conservative 'country' class (does not block pricing).
-        "race_type": (raw.get("race_type") or ""),
+        "race_type": race_type,
         "runner": runner,
         "saddle": saddle,
         "market": market,

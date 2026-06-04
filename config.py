@@ -14,7 +14,7 @@ load_dotenv()
 # always clear which build is running. The code fingerprint computed in
 # main.py (_code_fingerprint) complements this — it catches partial/stale
 # deploys even when this string wasn't bumped.
-TIPBOT_VERSION = "v5.7 (2026-06-03: dedicated 3u cap on Zak/Trial racing-image plays. IMAGE_RACING_MAX_UNITS (default 3) applied in _route_image_racing_tips as min(units, MAX_UNITS, IMAGE_RACING_MAX_UNITS) — independent of the global MAX_UNITS so raising that for other tipsters never un-caps these. $1/u test = $3 max; planned $400/u = $1,200 intended (then liability-capped to $1000 win/$500 place thoroughbred cap per account). Builds on v5.6 (racing retry-on-no-prices, track aliases, race# forward-fill).)"
+TIPBOT_VERSION = "v5.8 (2026-06-04: (a) thoroughbred race-type: _build_racing_tip_dict defaults an empty race_type to '(R)' for Zak/Trial so bookies disambiguate multi-discipline venues (Geelong = thoroughbred + greyhound track; empty type made 5/6 bookies miss Geelong R1, only tabtouch matched). (b) silent-placement-fail alert: both racing notify paths now alert when placed_stake==0 with failures, even below the $10 unfilled threshold, so a failed bet (e.g. tabtouch 409 on Exploit) isn't lost. Investigated (bookie/HB-side, no code): Brunson market_not_carried = NBA Finals single-game markets closed by tip-off (only series 'per game in the finals' props left); Hart $76/acct = Sportsbet's own max bet (laddered 190->76); bet365 'Bet placement failed' = slow/overloaded session 73361 (HB-side, already caught -> manual). Builds on v5.7.)"
 
 # ── Telegram ─────────────────────────────────────────────────────────
 _raw_api_id = os.getenv("TELEGRAM_API_ID", "0")
