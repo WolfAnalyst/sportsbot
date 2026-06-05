@@ -6969,7 +6969,18 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
         # model suppressed this entirely (Happ's $52 went only to the tag).
         # Fires whenever a real remainder is left after every account took its
         # rung (i.e. an account couldn't fill / fewer accounts than the stake).
-        if remaining > 1.0:
+        # v5.18 (Wilson 2026-06-05): only fire the leftover->manual alert for a
+        # GENUINE partial fill. A stale/replayed tip (e.g. an overnight Shook
+        # message re-delivered on a flaky telethon reconnect, OUTSIDE the dedup
+        # window) reaches here with no resolved event AND no raw message, so the
+        # alert renders "Event: UNRESOLVED", empty Raw, "@ 0" odds. The sportsbot
+        # fork emitted 4x duplicate Freddie Freeman "BET UNFILLED" alerts exactly
+        # this way. A live Shook tip ALWAYS carries the raw Telegram text (and a
+        # resolved event), so require at least one as proof-of-liveness.
+        _tip_is_live = bool((tip.event or "").strip()) or bool(
+            (getattr(tip, "raw_message", "") or "").strip()
+        )
+        if remaining > 1.0 and _tip_is_live:
             try:
                 notifier.notify_tip_unfilled_with_placements(
                     tip, intended, round(placed, 2), round(remaining, 2),
@@ -6980,6 +6991,14 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
                 )
             except Exception as e:
                 log.error(f"MLB HRRBI leftover manual notify failed: {e}")
+        elif remaining > 1.0:
+            log.warning(
+                f"MLB HRRBI: ${remaining:.2f} leftover but tip looks degraded "
+                f"(event='{tip.event}', raw_empty="
+                f"{not bool((getattr(tip, 'raw_message', '') or '').strip())}) "
+                f"-- suppressing leftover->manual alert (likely a stale/replayed "
+                f"re-delivery, not a live partial fill)"
+            )
     return all_results
 
 
