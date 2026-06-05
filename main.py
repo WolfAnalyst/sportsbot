@@ -33,7 +33,7 @@ from config import (
     X_TIPSTER, X_FORCE_BOOKIE, X_MAX_ODDS_MULT, MAX_ODDS_MULT,
     AUTO_MANUAL_HANDICAP_SGM, MLB_STAT_MAP, MLB_FLAT_STAKE,
     IMAGE_TIPS_TEST_MODE, IMAGE_TIPS_TEST_UNIT_SIZE, IMAGE_TIP_PARSERS,
-    IMAGE_RACING_MAX_UNITS,
+    IMAGE_RACING_MAX_UNITS, IMAGE_RACING_TEST_MODE,
 )
 from groq_parser import parse_tip_image
 from models import ParsedTip, ParsedLeg, BetResult
@@ -6133,6 +6133,14 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
         list_ladder = None
         if isinstance(sgm_cap, tuple) and sgm_cap:
             list_ladder = [float(v) for v in sgm_cap]
+            # MLB HRRBI: try a $100 STAKE rung FIRST, then the configured ladder
+            # (e.g. [87,85,80]). There is no pre-place SGM combined price to
+            # convert a liability, so 100 is applied as a stake step like the
+            # others (Wilson 2026-06-05, v5.15). MLB-scoped so AFL/NBA list-cap
+            # SGMs (none today) are unaffected. max_stake rises to 100 so the
+            # effective_stake clamp below doesn't truncate the first attempt.
+            if (sport or "").lower() == "mlb":
+                list_ladder = [100.0] + list_ladder
             max_stake = max(list_ladder)
             cap_reason = f"list stake ladder {list_ladder}"
             sizing_odds = 0
@@ -8488,9 +8496,15 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
 
 
 async def _route_image_racing_tips(raw_tips: list, tipster: str,
-                                   channel_name: str, default_units: float,
-                                   msg_time) -> None:
-    """Route vision-extracted RACING tips to the racing pipeline at $1/u."""
+                                   channel_name: str, unit_size: float,
+                                   default_units: float, msg_time) -> None:
+    """Route vision-extracted RACING tips (Zak/Trial) to the racing pipeline.
+
+    Stake = units (capped at IMAGE_RACING_MAX_UNITS=3u) × unit_size, unless
+    IMAGE_RACING_TEST_MODE is on (then $1/u). v5.15: previously the production
+    branch multiplied by default_units (the channel's 1.0 field) instead of
+    unit_size, so it never actually staked at the configured size — fixed.
+    """
     from tiptitans_processor import process_image_racing_tip
 
     placed_any = False
@@ -8535,19 +8549,22 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
                 )
                 continue
 
-            # Compute $1/unit test stake (or per-channel prod size). Capped at
-            # the DEDICATED racing-image cap (Zak/Trial max 3u — survives a
-            # global MAX_UNITS bump) and the global MAX_UNITS. Enforced here in
-            # the placing process by design.
+            # Stake = units × unit_size, capped at the DEDICATED racing-image
+            # cap (Zak/Trial max 3u — survives a global MAX_UNITS bump) AND the
+            # global MAX_UNITS — the per-runner typo/wrong-parse guard. While
+            # IMAGE_RACING_TEST_MODE is on, fall back to the $1/u test stake
+            # (Zak/Trial-specific gate; does NOT affect Eddie AFL). Enforced
+            # here in the placing process by design (the $600 lesson). v5.15:
+            # use unit_size, not default_units (the old bug capped prod to ~$1).
             units_capped = min(parsed["units"], MAX_UNITS, IMAGE_RACING_MAX_UNITS)
-            if IMAGE_TIPS_TEST_MODE:
+            if IMAGE_RACING_TEST_MODE:
                 intended_stake = round(units_capped * IMAGE_TIPS_TEST_UNIT_SIZE, 2)
             else:
-                intended_stake = round(units_capped * float(default_units), 2)
+                intended_stake = round(units_capped * float(unit_size), 2)
 
             await process_image_racing_tip(
                 parsed, intended_stake, hb, notifier,
-                source=channel_name, test_mode=IMAGE_TIPS_TEST_MODE,
+                source=channel_name, test_mode=IMAGE_RACING_TEST_MODE,
             )
             placed_any = True
         except Exception as e:
@@ -8761,7 +8778,7 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
 
     if sport_l == "racing":
         await _route_image_racing_tips(
-            raw_tips, tipster, channel_name, default_units, msg_time
+            raw_tips, tipster, channel_name, unit_size, default_units, msg_time
         )
     else:
         _route_image_afl_tips(

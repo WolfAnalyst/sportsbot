@@ -14,7 +14,7 @@ load_dotenv()
 # always clear which build is running. The code fingerprint computed in
 # main.py (_code_fingerprint) complements this — it catches partial/stale
 # deploys even when this string wasn't bumped.
-TIPBOT_VERSION = "v5.14 (2026-06-05: AFL fan-out re-enables the WRONG-SELECTION ceiling. After the v5.13 scrutiny flagged that the odds ceiling was also a wrong-selection guard (a catalog-valid-but-wrong pick — same-surname / ±1.0 line / wrong-O/U snap — was placing across ALL accounts), Wilson chose 'ceiling only'. _resolve_single_for_placement's apply_odds_guards flag is split into apply_ceiling + apply_floor; the fan-out now resolves with apply_ceiling=True, apply_floor=False — so a live price > 1.25x tipped routes the whole tip to manual (off the resolve-time catalog odds, no extra call), while a shorter-than-tipped live price still places. All other paths (NBA/MLB/handicap/total/SGM/racing via presolved=None) keep BOTH guards (defaults). Residual (accepted): longer-fill liability overshoot + h2h-no-odds uncapped sizing still rely on bookie MBL. Builds on v5.13.)"
+TIPBOT_VERSION = "v5.15 (2026-06-05: (1) MLB HRRBI SGM tries a $100 STAKE rung FIRST, then the existing [87,85,80] ladder (MLB-scoped prepend in _place_sgm_v4; no pre-place SGM odds so 100 is a stake step, not a converted liability). (2) Zak/Trial racing-image plays flipped to FULL unit sizing ($400/u): fixed a bug where the production stake used the channel's default_units (1.0) instead of unit_size (so it never actually staked at the configured size); added a SEPARATE IMAGE_RACING_TEST_MODE gate (default false=live) so Zak/Trial go full-size WITHOUT un-testing Eddie AFL (still $1/u via IMAGE_TIPS_TEST_MODE). The 10% odds floor, runner-match, 1.5x wrong-horse ceiling, route-remainder/whole-to-manual, and 3u per-runner cap already existed (shared with Tip Titans). Builds on v5.14.) === ORIGINAL v5.14: AFL fan-out re-enables the WRONG-SELECTION ceiling. After the v5.13 scrutiny flagged that the odds ceiling was also a wrong-selection guard (a catalog-valid-but-wrong pick — same-surname / ±1.0 line / wrong-O/U snap — was placing across ALL accounts), Wilson chose 'ceiling only'. _resolve_single_for_placement's apply_odds_guards flag is split into apply_ceiling + apply_floor; the fan-out now resolves with apply_ceiling=True, apply_floor=False — so a live price > 1.25x tipped routes the whole tip to manual (off the resolve-time catalog odds, no extra call), while a shorter-than-tipped live price still places. All other paths (NBA/MLB/handicap/total/SGM/racing via presolved=None) keep BOTH guards (defaults). Residual (accepted): longer-fill liability overshoot + h2h-no-odds uncapped sizing still rely on bookie MBL. Builds on v5.13.)"
 
 # ── Telegram ─────────────────────────────────────────────────────────
 _raw_api_id = os.getenv("TELEGRAM_API_ID", "0")
@@ -153,11 +153,21 @@ TEST_UNIT_SIZE = _env_float("TEST_UNIT_SIZE", "1")
 IMAGE_TIPS_TEST_MODE = _env_bool("IMAGE_TIPS_TEST_MODE", True)
 IMAGE_TIPS_TEST_UNIT_SIZE = _env_float("IMAGE_TIPS_TEST_UNIT_SIZE", "1")
 
-# Production per-channel unit sizes (used ONLY when IMAGE_TIPS_TEST_MODE is
-# false). Kept small until each tipster is validated.
+# Racing image tips (Zak / Trial) have their OWN test gate, SEPARATE from the
+# global IMAGE_TIPS_TEST_MODE (which still governs Eddie AFL at $1/u). Default
+# False = Zak/Trial place at their FULL unit size (ZAK/TRIAL_UNIT_SIZE) with the
+# shared racing guards (10% odds floor, runner-match, 1.5x wrong-horse ceiling,
+# route-remainder/whole-to-manual, 3u cap). Set IMAGE_RACING_TEST_MODE=true to
+# drop Zak/Trial back to the $1/u test stake WITHOUT affecting Eddie. The racing
+# image path is Zak/Trial-only (Eddie AFL uses a different route). v5.15
+# (Wilson 2026-06-05: "flip Zak/Trial to full unit sizing at 400 now").
+IMAGE_RACING_TEST_MODE = _env_bool("IMAGE_RACING_TEST_MODE", False)
+
+# Production per-channel unit sizes (Eddie used ONLY when IMAGE_TIPS_TEST_MODE is
+# false; Zak/Trial used when IMAGE_RACING_TEST_MODE is false — now the default).
 EDDIE_UNIT_SIZE = _env_float("EDDIE_UNIT_SIZE", "10")
-ZAK_UNIT_SIZE = _env_float("ZAK_UNIT_SIZE", "10")
-TRIAL_SNIPER_UNIT_SIZE = _env_float("TRIAL_SNIPER_UNIT_SIZE", "10")
+ZAK_UNIT_SIZE = _env_float("ZAK_UNIT_SIZE", "400")
+TRIAL_SNIPER_UNIT_SIZE = _env_float("TRIAL_SNIPER_UNIT_SIZE", "400")
 
 # Hard max units per racing-image play (Zak / Trial). DEDICATED cap, independent
 # of the global MAX_UNITS — so raising MAX_UNITS for other tipsters never
