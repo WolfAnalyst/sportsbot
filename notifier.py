@@ -228,6 +228,12 @@ def notify_bet_placed(result) -> bool:
         f"<b>Bet ID:</b> <code>{result.bet_id}</code>"
         f"{elapsed_str}"
     )
+    try:  # v5.21 bets_placed.csv ledger (guarded; never breaks placement)
+        from bet_ledger import log_sports_bet
+        log_sports_bet(tip, result,
+                       _session_label(getattr(result, "session_id", ""), result.bookie))
+    except Exception:
+        pass
     return _send_success(text)
 
 
@@ -596,6 +602,15 @@ def notify_tip_placed_summary(
         f"<b>Placements:</b>\n<pre>{_escape_html(placements_str)}</pre>"
         f"{tried_block}"
     )
+    try:  # v5.21 bets_placed.csv ledger — one row per landed leg (guarded)
+        from bet_ledger import log_sports_bet
+        for _r in (placed_results or []):
+            if getattr(_r, "success", False) and getattr(_r, "bet_id", None):
+                log_sports_bet(tip, _r,
+                               _session_label(getattr(_r, "session_id", ""),
+                                              getattr(_r, "bookie", "")))
+    except Exception:
+        pass
     return _send_success(text)
 
 
@@ -822,6 +837,14 @@ def notify_tiptitans_placed(
         f"{elapsed_tag}\n"
         f"<b>Placements:</b>\n<pre>{_escape_html(placements_str)}</pre>"
     )
+    try:  # v5.21 bets_placed.csv ledger — one row per landed racing leg (guarded)
+        from bet_ledger import log_racing_bet
+        for _p in (placed or []):
+            if _p.get("bet_id"):
+                log_racing_bet(parsed, _p,
+                               _session_label(_p.get("session_id", ""), _p.get("bookie", "")))
+    except Exception:
+        pass
     return _send_success(text)
 
 

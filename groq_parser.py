@@ -1005,6 +1005,122 @@ def parse_tip_image(
     return tips, elapsed
 
 
+TEXT_PROMPT_RACING = (
+    "You are an extraction tool for horse/greyhound RACING betting-tip TEXT "
+    "MESSAGES from a tipster channel. Read the message and extract EVERY "
+    "individual bet/selection the tipster is BACKING. Respond with ONLY valid "
+    "JSON, no markdown fences, in this shape: "
+    '{"tips": [ {"track": str|null, "date": str|null, "race": int|null, '
+    '"saddle": int|null, "runner": str, "odds": number|null, "units": '
+    'number|null, "market": "win"|"place", "rated": number|null} ]}. '
+    "CRITICAL: if the message is NOT an actual bet — chit-chat, 'good luck', "
+    "results/wrap-ups, commentary, a question, thanks, or emoji — return "
+    '{"tips": []}. NEVER invent a bet. '
+    "Rules: `runner` is the horse/greyhound NAME being backed (e.g. 'Adding "
+    "Lingani for tomorrow' -> runner=\"Lingani\"; 'lock of the day is Sea Of "
+    "Class' -> runner=\"Sea Of Class\"). `saddle` is the saddlecloth NUMBER if "
+    "stated (integer), else null. Convert prices to decimal numbers ($4.20 -> "
+    "4.20; if several bookies, use the BEST/highest). Convert stake to a number "
+    "(1.2u -> 1.2), else null. `market` is \"win\" unless it explicitly says "
+    "place or each-way. `rated` is the tipster's rated/assessed price if shown, "
+    "else null. Use null for ANY field NOT stated — do NOT guess a track, race "
+    "or price. "
+    "DATE IS IMPORTANT: copy any day/date the tipster gives EXACTLY-AS-WRITTEN "
+    "into `date` on EVERY tip row ('tomorrow', 'today', 'tonight', 'Saturday', "
+    "'Sat', '6/6', '6/6/2026', 'June 6'). Return weekday words and 'tomorrow'/"
+    "'today'/'tonight' VERBATIM — do NOT convert them to a number. Only use null "
+    "for `date` if NO day/date is mentioned anywhere in the message. "
+    "RACE GROUPING: if several runners sit under one race ('R7'/'Race 7'), set "
+    "`race` to that number on EVERY selection in that group. "
+    "Preserve exact numbers. JSON only."
+)
+
+
+def parse_racing_text(
+    text: str,
+    tipster: str,
+    max_retries: int = 4,
+) -> tuple[list[dict], float]:
+    """Parse a free-TEXT racing tip MESSAGE into RAW racing tip dicts — the SAME
+    schema parse_tip_image emits for racing, so main.py can feed the result into
+    the identical racing pipeline. For Zak/Trial text posts that are real tips
+    ('Adding Lingani for tomorrow', 'R4 Sandown #7 win'). Uses GROQ_MODEL
+    (Llama-4 Scout) as a text call. Returns (tips, elapsed); returns ([], elapsed)
+    on failure OR when the message is chatter (model returns no tips) — the caller
+    then drops it (no manual ping). Rows with no runner are stripped. Never raises.
+    """
+    start = time.time()
+    if not GROQ_API_KEY:
+        log.warning("GROQ_API_KEY not set, skipping racing text parse")
+        return [], 0.0
+    if not (text or "").strip():
+        return [], 0.0
+    body = {
+        "model": GROQ_MODEL,
+        "temperature": 0,
+        "max_tokens": 2000,
+        "messages": [
+            {"role": "system", "content": TEXT_PROMPT_RACING},
+            {"role": "user", "content": text.strip()},
+        ],
+    }
+    content = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=30,
+            )
+            if resp.status_code == 429 and attempt < max_retries:
+                ra = resp.headers.get("retry-after")
+                wait = float(ra) if (ra and ra.replace(".", "", 1).isdigit()) \
+                    else 6.0 * (attempt + 1)
+                log.warning(
+                    f"parse_racing_text: 429 for {tipster}, backing off "
+                    f"{wait:.0f}s (attempt {attempt + 1})"
+                )
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            break
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                time.sleep(4.0 * (attempt + 1))
+                continue
+            log.error(f"parse_racing_text: Groq request failed for {tipster}: {e}")
+            return [], time.time() - start
+        except Exception as e:
+            log.error(f"parse_racing_text: unexpected error for {tipster}: {e}")
+            return [], time.time() - start
+
+    elapsed = time.time() - start
+    if not content:
+        log.error(f"parse_racing_text: no content returned for {tipster}")
+        return [], elapsed
+    content = content.replace("```json", "").replace("```", "").strip()
+    parsed = _parse_json_with_repair(content)
+    if parsed is None:
+        log.error(f"parse_racing_text: invalid JSON (repair failed) for {tipster}")
+        log.error(f"Raw response: {content[:300]}")
+        return [], elapsed
+    tips = parsed.get("tips", [])
+    if not isinstance(tips, list):
+        return [], elapsed
+    # Strip rows with no runner (chatter / placeholder rows the model can emit).
+    tips = [t for t in tips if isinstance(t, dict) and (t.get("runner") or "").strip()]
+    log.info(
+        f"parse_racing_text: {tipster} extracted {len(tips)} raw tip(s) "
+        f"in {elapsed:.2f}s"
+    )
+    return tips, elapsed
+
+
 def parse_with_groq(
     text: str,
     tipster: str,

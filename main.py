@@ -8894,6 +8894,49 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
         )
 
 
+async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
+                                   default_units: float, msg_time,
+                                   channel_name: str):
+    """Parse a free-TEXT racing post (Zak/Trial) and route it through the SAME
+    racing pipeline as an image tip. v5.21 (Wilson 2026-06-06): Zak & Trial post
+    some real tips as TEXT, not images ('Adding Lingani for tomorrow'). The text
+    is parsed with the same racing schema the vision path emits, so the relative-
+    date helper (_img_parse_racing_date: 'tomorrow'/'6/6'/weekday), runner-match,
+    price floor/ceiling, the dedicated 3u image-racing cap, and the runner-only
+    -> manual fallback (missing-race# Guard 2 in _route_image_racing_tips) ALL
+    apply unchanged. If the parser finds NO real runner the post was chatter that
+    slipped past _image_text_is_actionable -> drop silently (no manual ping). On a
+    parse ERROR, fall back to a manual alert so a genuine tip is never lost."""
+    try:
+        from groq_parser import parse_racing_text
+        loop = asyncio.get_event_loop()
+        raw_tips, elapsed = await loop.run_in_executor(
+            None, parse_racing_text, text, tipster
+        )
+    except Exception as e:
+        log.exception(f"[{channel_name}] text racing parse crashed: {e}")
+        try:
+            notifier.notify_image_alert(channel_name, text)  # never lose a real tip
+        except Exception:
+            pass
+        return
+
+    if not raw_tips:
+        log.info(
+            f"[{channel_name}] text post parsed to 0 racing tips (chatter) -> "
+            f"dropped: {text[:80]}"
+        )
+        return
+
+    log.info(
+        f"[{channel_name}] text extracted {len(raw_tips)} racing tip(s) in "
+        f"{elapsed:.2f}s; routing as racing"
+    )
+    await _route_image_racing_tips(
+        raw_tips, tipster, channel_name, unit_size, default_units, msg_time
+    )
+
+
 # ── Roster Freshness ────────────────────────────────────────────────
 
 ROSTER_STALE_DAYS = 1
@@ -9319,8 +9362,25 @@ async def main():
                 # drop plain chatter (logged, never lost) to stop flooding
                 # manual with 'thanks'/'good luck'/emoji noise (2026-06-03).
                 if _image_text_is_actionable(text):
-                    log.info(f"[{channel_name}] text-only post on image channel (actionable) -> manual alert")
-                    notifier.notify_image_alert(channel_name, text)
+                    if (img_sport or "").lower() == "racing":
+                        # v5.21 (Wilson 2026-06-06): Zak/Trial post some real tips
+                        # as TEXT, not images ('Adding Lingani for tomorrow').
+                        # PARSE the text + route through the racing pipeline so a
+                        # genuine text tip PLACES — a full tip (track+race#) places;
+                        # runner-only / no-race# -> manual (Guard 2); chatter that
+                        # slipped the keyword filter -> parser finds no runner ->
+                        # dropped (no manual ping). AFL image channels (Eddie) keep
+                        # the old manual-alert behaviour.
+                        log.info(f"[{channel_name}] actionable racing TEXT post -> parsing for placement")
+                        asyncio.create_task(
+                            _process_text_racing_tip(
+                                text, img_tipster, img_unit_size,
+                                img_default_units, msg_time, channel_name,
+                            )
+                        )
+                    else:
+                        log.info(f"[{channel_name}] text-only post on image channel (actionable) -> manual alert")
+                        notifier.notify_image_alert(channel_name, text)
                 else:
                     log.info(f"[{channel_name}] text-only chatter on image channel -> dropped (not bet-like): {text[:80]}")
             return
