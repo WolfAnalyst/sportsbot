@@ -886,6 +886,10 @@ hb = HyperBotClient()
 # ── Duplicate Detection ────────────────────────────────────────────
 _recent_tips: dict = {}  # {fingerprint: timestamp}
 DUPE_WINDOW_SECS = 600  # 10 minutes
+# v5.22: the racing path (image AND text) had NO dedup — a reposted / re-delivered
+# racing tip double-placed real money. Fingerprint racing selections here and skip
+# a repeat within DUPE_WINDOW_SECS. Keyed in _route_image_racing_tips.
+_racing_recent_fps: dict = {}  # {racing fingerprint tuple: timestamp}
 
 
 def _tip_fingerprint(tip: ParsedTip) -> str:
@@ -8632,6 +8636,26 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
                 )
                 continue
 
+            # v5.22 DEDUP (image + text racing): a reposted / re-delivered tip must
+            # NOT double-place real money — the racing path previously had NO dedup.
+            # Fingerprint the selection; skip a repeat within DUPE_WINDOW_SECS.
+            # Registered BEFORE placing so a rapid re-delivery during the ~seconds of
+            # placement is also caught (a failed tip won't auto-retry within the
+            # window — acceptable, it routes to manual anyway).
+            _rfp = (tipster, (parsed.get("track") or "").lower(), parsed.get("race_num"),
+                    (parsed.get("runner") or "").lower(), parsed.get("saddle"),
+                    parsed.get("market"), parsed.get("date"))
+            _rnow = datetime.now()
+            for _rk in [k for k, t in _racing_recent_fps.items()
+                        if (_rnow - t).total_seconds() > DUPE_WINDOW_SECS]:
+                del _racing_recent_fps[_rk]
+            if _rfp in _racing_recent_fps:
+                log.info(f"[{channel_name}] DUPLICATE racing tip (seen <{DUPE_WINDOW_SECS}s "
+                         f"ago) -> skipped (no double-bet): {parsed.get('runner')} "
+                         f"{parsed.get('track')} R{parsed.get('race_num')}")
+                continue
+            _racing_recent_fps[_rfp] = _rnow
+
             # Stake = units × unit_size, capped at the DEDICATED racing-image
             # cap (Zak/Trial max 3u — survives a global MAX_UNITS bump) AND the
             # global MAX_UNITS — the per-runner typo/wrong-parse guard. While
@@ -8894,6 +8918,22 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
         )
 
 
+_RESULT_MARKERS_RE = re.compile(
+    r"(\bwon\b|\bresults?\b|\bsaluted\b|\bgot up\b|\bbagged\b|\bcollected\b|"
+    r"\bcashed\b|\bbanked\b|\b(placed|ran|finished|came)\s+(2nd|3rd|second|third)\b|"
+    r"\bpaid\b\s*\$?\d)",
+    re.IGNORECASE,
+)
+
+
+def _text_looks_like_result(text: str) -> bool:
+    """True if a text post reads like a RESULT/recap of a settled race rather than
+    a forward tip (v5.22). Conservative: 'X to win' does NOT match; 'X won' does.
+    Keeps a results post off the auto-place text racing path (it can carry a race
+    code + runner + price and would otherwise place on an already-run race)."""
+    return bool(_RESULT_MARKERS_RE.search(text or ""))
+
+
 async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
                                    default_units: float, msg_time,
                                    channel_name: str):
@@ -8907,6 +8947,18 @@ async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
     apply unchanged. If the parser finds NO real runner the post was chatter that
     slipped past _image_text_is_actionable -> drop silently (no manual ping). On a
     parse ERROR, fall back to a manual alert so a genuine tip is never lost."""
+    # v5.22 RESULTS GUARD: a results/recap post ('R7 Lingani WON at 4.50') carries
+    # a race code + runner + price and would otherwise auto-place on a settled race.
+    # Route obvious results/past-tense posts to manual (never auto-place) BEFORE the
+    # Groq call — a deterministic backstop on top of the parser's own results rule.
+    if _text_looks_like_result(text):
+        log.info(f"[{channel_name}] text looks like a RESULT/recap -> manual "
+                 f"(not auto-placed): {text[:80]}")
+        try:
+            notifier.notify_image_alert(channel_name, text)
+        except Exception:
+            pass
+        return
     try:
         from groq_parser import parse_racing_text
         loop = asyncio.get_event_loop()

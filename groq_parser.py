@@ -1045,14 +1045,16 @@ def parse_racing_text(
     schema parse_tip_image emits for racing, so main.py can feed the result into
     the identical racing pipeline. For Zak/Trial text posts that are real tips
     ('Adding Lingani for tomorrow', 'R4 Sandown #7 win'). Uses GROQ_MODEL
-    (Llama-4 Scout) as a text call. Returns (tips, elapsed); returns ([], elapsed)
-    on failure OR when the message is chatter (model returns no tips) — the caller
-    then drops it (no manual ping). Rows with no runner are stripped. Never raises.
+    (Llama-4 Scout) as a text call. Returns (tips, elapsed). A VALID-but-empty
+    parse (the message is chatter / no runner) returns ([], elapsed) so the caller
+    DROPS it (no manual ping). A HARD failure (no Groq key, request error after
+    retries, bad JSON) RAISES (v5.22) so the caller routes the tip to MANUAL —
+    NOT silently dropping a genuine tip on a Groq outage. Rows with no runner are
+    stripped from a successful parse.
     """
     start = time.time()
     if not GROQ_API_KEY:
-        log.warning("GROQ_API_KEY not set, skipping racing text parse")
-        return [], 0.0
+        raise RuntimeError("parse_racing_text: GROQ_API_KEY not set")
     if not (text or "").strip():
         return [], 0.0
     body = {
@@ -1094,24 +1096,22 @@ def parse_racing_text(
                 time.sleep(4.0 * (attempt + 1))
                 continue
             log.error(f"parse_racing_text: Groq request failed for {tipster}: {e}")
-            return [], time.time() - start
+            raise  # v5.22: hard failure -> caller routes to MANUAL (don't lose a real tip)
         except Exception as e:
             log.error(f"parse_racing_text: unexpected error for {tipster}: {e}")
-            return [], time.time() - start
+            raise
 
     elapsed = time.time() - start
     if not content:
-        log.error(f"parse_racing_text: no content returned for {tipster}")
-        return [], elapsed
+        raise RuntimeError("parse_racing_text: no content returned")
     content = content.replace("```json", "").replace("```", "").strip()
     parsed = _parse_json_with_repair(content)
     if parsed is None:
-        log.error(f"parse_racing_text: invalid JSON (repair failed) for {tipster}")
-        log.error(f"Raw response: {content[:300]}")
-        return [], elapsed
+        log.error(f"parse_racing_text: invalid JSON (repair failed) for {tipster}; raw: {content[:300]}")
+        raise RuntimeError("parse_racing_text: invalid JSON")
     tips = parsed.get("tips", [])
     if not isinstance(tips, list):
-        return [], elapsed
+        raise RuntimeError("parse_racing_text: 'tips' not a list")
     # Strip rows with no runner (chatter / placeholder rows the model can emit).
     tips = [t for t in tips if isinstance(t, dict) and (t.get("runner") or "").strip()]
     log.info(
