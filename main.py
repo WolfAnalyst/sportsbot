@@ -3142,11 +3142,12 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
          notifications and audit log as _place_singles_v4 (a maybe-landed
          outcome is NOT re-prompted for manual placement).
 
-    "Unfilled" here = accounts sized to place whose POST FAILED, plus any silent
-    bookie auto-cap shortfall — NOT (unit size − placed). With 4 SB accounts at
-    ~$99-$117 each the even split exceeds each cap, so every account maxes out;
-    the unit size above the summed caps is expected headroom for future
-    accounts, not an underfill.
+    "Unfilled" here = (unit size − placed − maybe-landed) — the FULL remainder vs
+    the intended unit (Wilson 2026-06-05, v5.20). With 4 SB accounts capped at
+    ~$99-$117 each the even split exceeds each cap, so the unit rarely fills from
+    Sportsbet alone; the WHOLE shortfall (the structural bracket headroom AND any
+    ladder-down) is routed to Manual Bets so Wilson places the rest by hand.
+    (Was previously treated as expected headroom, NOT unfilled — reversed v5.20.)
 
     RESIDUAL RISK (accepted): the wrong-selection ceiling is back (v5.13), but the
     price-FLOOR is off, so a fill at LONGER odds than the sized catalog/tipped
@@ -3433,28 +3434,22 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # stake (rung fired), NOT r.stake (None on a failure) — v5.13 fix so the
     # maybe-landed exposure isn't reported as $0.
     ambiguous_total = round(sum(_at_risk_stake(r) for r in ambiguous_results), 2)
-    # "Unfilled" = stake we WANTED but did not land on the bookie. A success at a
-    # LOWER liability rung (graceful bracket degradation, e.g. $117 rejected ->
-    # placed $87) is NOT unfilled — that is the intended ladder behaviour. Only
-    # (a) accounts that placed NOTHING (their top rung) and (b) a silent bookie
-    # auto-cap on a winning rung (requested rung - actual stake) count. Mirrors
-    # the list-mode "lower brackets are expected" rule in _place_singles_v4.
-    unfilled = 0.0
-    for r in failed_results:
-        unfilled += top_by_sid.get(str(r.session_id), 0.0)
-    for r in placed_results:
-        _req = getattr(r, "_requested_stake", None) or (r.stake or 0)
-        _short = max(0.0, round(_req - (r.stake or 0), 2))  # auto-cap shortfall
-        # Ignore sub-$1 cent jitter (matches _execute_bet's $1 auto-cap deadband)
-        # so a bookie echoing $86.96 for a $87 request doesn't fire a phantom
-        # unfilled alert on an otherwise fully-filled tip. v5.13.
-        if _short > 1.0:
-            unfilled += _short
-    unfilled = round(unfilled, 2)
-    # Displayed "intended" = placed + couldn't-place + maybe-landed, so the
-    # summary's "placed of intended" stays consistent (bracket degradation just
-    # lowers the displayed intended honestly, rather than showing phantom unfill).
-    display_intended = round(total_placed + unfilled + ambiguous_total, 2)
+    # "Unfilled" = the FULL gap between the intended UNIT and what landed (Wilson
+    # 2026-06-05, v5.20): intended_stake - placed - ambiguous(maybe-landed).
+    # PRIOR (v5.13) a ladder-DOWN was treated as "expected, not unfilled", so the
+    # remainder was silently dropped — e.g. Tim English placed $340 of a $600 unit
+    # (4 accts laddered $114->$85) yet the summary read "placed $340 of $340".
+    # Wilson wants the WHOLE remainder routed to Manual Bets: BOTH the ladder-down
+    # shortfall AND the part the accounts' liability brackets could never hold (the
+    # 4 SB accounts cap well under the per-account split), so the rest is placed by
+    # hand. Ambiguous (maybe-landed) stake is treated as COMMITTED (not unfilled)
+    # so a bet that may have landed is not re-placed. ALL AFL fan-out (Saiyan +
+    # Eddie). The old per-account failed-rung + auto-cap shortfall are subsumed by
+    # this unit gap (a failed/short account placed less -> counts in intended-placed).
+    unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
+    # Displayed "intended" is the true unit, so the summary reads "placed $X of
+    # $UNIT" + "Unfilled $Y" honestly (no longer lowered to what landed).
+    display_intended = round(intended_stake, 2)
 
     ambiguous_outcomes = [
         {
@@ -3523,10 +3518,10 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             f"({len(failed_results)} failed, {len(ambiguous_results)} ambiguous)"
         )
 
-    # Manual top-up alert on a hard failure OR a genuine underfill (a silent
-    # bookie auto-cap leaves a success with a reduced stake -> unfilled>0 but no
-    # failed_result). Gate matches _place_singles_v4 ('if unfilled > 0').
-    if failed_results or unfilled > 0.01:
+    # Manual top-up alert: a hard failure OR any remainder vs the intended unit
+    # (v5.20: includes the ladder-down + the bracket headroom no SB account could
+    # hold). $1 deadband ignores cent-jitter. Routes the rest to Manual Bets.
+    if failed_results or unfilled > 1.0:
         log.warning(
             f"AFL fan-out: ${unfilled:.2f} unfilled "
             f"({len(failed_results)} account(s) failed)"
