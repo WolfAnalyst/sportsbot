@@ -4869,12 +4869,21 @@ def _resolve_mlb_player(tip_player: str, selections: list):
         if p:
             cat.setdefault(_norm(p), p)
     if not cat:
+        # v5.16: log the empty pool — distinguishes a HyperBot-side dropped
+        # catalog (suspended rows / pool=[]) from a name-match miss.
+        log.info(
+            f"MLB player resolve: '{tip_player}' -> manual (catalog pool EMPTY: "
+            f"no players in price_check selections — likely HyperBot-side)"
+        )
         return None
     # Exact (normalised) match — covers correct spellings and accent-only diffs.
     if tip_n in cat:
         return cat[tip_n]
     # Guarded fuzzy fallback.
-    tip_tokens = {t for t in tip_n.split() if len(t) >= 3}
+    tip_parts = tip_n.split()
+    tip_surname = tip_parts[-1] if tip_parts else ""
+    tip_first = tip_parts[0] if len(tip_parts) >= 2 else ""
+    tip_tokens = {t for t in tip_parts if len(t) >= 3}
     scored = []
     for cn, orig in cat.items():
         ratio = difflib.SequenceMatcher(None, tip_n, cn).ratio()
@@ -4882,11 +4891,54 @@ def _resolve_mlb_player(tip_player: str, selections: list):
         scored.append((ratio, shares, orig))
     scored.sort(key=lambda x: -x[0])
     best_ratio, best_shares, best_orig = scored[0]
+
+    # SURNAME ANCHOR (v5.16, fixes the Kyle Tucker 'not carried' miss): a batter
+    # is keyed by surname. If EXACTLY ONE catalog player in this game shares the
+    # tip's surname AND the first name is compatible (same, shared initial, a
+    # prefix/abbrev, or ratio>=0.6), match it regardless of first-name spelling.
+    # The first-name guard means a same-surname DIFFERENT player ("Kyle"->"Cole
+    # Tucker") is NOT matched — it falls through to manual. So this rescues
+    # variants/typos without ever drifting to a different player.
+    if len(tip_surname) >= 3:
+        surname_hits = []
+        for cn, orig in cat.items():
+            cp = cn.split()
+            if not cp or cp[-1] != tip_surname:
+                continue
+            cf = cp[0] if len(cp) >= 2 else ""
+            first_ok = (
+                not tip_first or not cf
+                or tip_first == cf or tip_first[0] == cf[0]
+                or tip_first.startswith(cf) or cf.startswith(tip_first)
+                or difflib.SequenceMatcher(None, tip_first, cf).ratio() >= 0.6
+            )
+            if first_ok:
+                surname_hits.append(orig)
+        if len(surname_hits) == 1:
+            log.info(
+                f"MLB player surname-anchored: '{tip_player}' -> "
+                f"'{surname_hits[0]}' (unique '{tip_surname}' in {len(cat)} "
+                f"game players, first-name compatible)"
+            )
+            return surname_hits[0]
+
     if best_ratio < 0.82 or not best_shares:
+        log.info(
+            f"MLB player NOT matched: '{tip_player}' best='{best_orig}' "
+            f"ratio={best_ratio:.2f} shares={best_shares} -> manual. "
+            f"Pool({len(cat)})={list(cat.values())}"
+        )
         return None
     # Ambiguity guard: the runner-up must be clearly behind (e.g. two players
-    # who share a surname) — else refuse and route to manual.
+    # who share a surname) — else refuse and route to manual. The surname anchor
+    # above already handles the common unique-surname case, so this now only
+    # bites on a genuine near-tie between DIFFERENT surnames.
     if len(scored) > 1 and scored[1][0] >= best_ratio - 0.08:
+        log.info(
+            f"MLB player AMBIGUOUS: '{tip_player}' top2=["
+            f"{best_orig} {best_ratio:.2f}, {scored[1][2]} {scored[1][0]:.2f}] "
+            f"-> manual. Pool({len(cat)})={list(cat.values())}"
+        )
         return None
     log.info(
         f"MLB player fuzzy-matched: '{tip_player}' -> '{best_orig}' "
@@ -6911,6 +6963,23 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
             )
         except Exception as e:
             log.error(f"MLB HRRBI placed-summary notify failed: {e}")
+        # v5.16 (Wilson 2026-06-05): also send the LEFTOVER to the Manual Bets
+        # channel so the rest gets placed by hand — not just the inline
+        # "Unfilled $X" tag in the summary above. Previously the per-account MLB
+        # model suppressed this entirely (Happ's $52 went only to the tag).
+        # Fires whenever a real remainder is left after every account took its
+        # rung (i.e. an account couldn't fill / fewer accounts than the stake).
+        if remaining > 1.0:
+            try:
+                notifier.notify_tip_unfilled_with_placements(
+                    tip, intended, round(placed, 2), round(remaining, 2),
+                    successes, [],
+                )
+                log.info(
+                    f"MLB HRRBI: ${remaining:.2f} leftover -> Manual Bets alert"
+                )
+            except Exception as e:
+                log.error(f"MLB HRRBI leftover manual notify failed: {e}")
     return all_results
 
 
