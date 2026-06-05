@@ -9455,17 +9455,21 @@ async def main():
 
     # Send startup summary to Telegram. Owned-session count only — the
     # Telegram message is the operator-facing view, foreign noise stays in
-    # logs.
+    # logs. Version NUMBER only (not the full changelog): TIPBOT_VERSION is a
+    # multi-paragraph changelog now and overflowed Telegram's 4096-char limit
+    # (HTTP 400 "message is too long", v5.18 deploy). The file-log banner above
+    # (line ~9257) still logs the full TIPBOT_VERSION for reference.
+    _ver_short = TIPBOT_VERSION.split(" (", 1)[0]
     if owned_sessions:
         notifier.notify_info(
-            f"TipBot {TIPBOT_VERSION}\n"
+            f"TipBot {_ver_short}\n"
             f"code fingerprint {CODE_FINGERPRINT}\n"
             f"Started with {len(owned_sessions)} owned session(s):\n" +
             "\n".join(f"• {l}" for l in session_lines)
         )
     else:
         notifier.notify_critical(
-            f"TipBot {TIPBOT_VERSION} (fingerprint {CODE_FINGERPRINT}) "
+            f"TipBot {_ver_short} (fingerprint {CODE_FINGERPRINT}) "
             f"started but NO owned HyperBot sessions are active!"
         )
 
