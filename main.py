@@ -8657,6 +8657,21 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
     market_type = (raw.get("market_type") or "").strip().lower()
     player = (raw.get("player") or "").strip()
     team = (raw.get("team") or "").strip()
+    # PERIOD guard (v5.17): Eddie sometimes tips a HALF/QUARTER market (e.g.
+    # "Hawthorn -5.5 2nd Half Line"). The AFL catalog the bot places against is
+    # FULL-GAME only, so placing a full-game line/total for a half/quarter tip is
+    # the WRONG market. Detect a non-full-game period (from the vision `period`
+    # field, or a 'half'/'quarter' marker left in any text field) and force the
+    # tip to MANUAL. Wilson 2026-06-05 (the Hawthorn -5.5 2nd-half misparse).
+    _period = (raw.get("period") or "").strip().lower()
+    _label = " ".join(str(raw.get(k) or "") for k in
+                      ("period", "market", "market_detail", "title", "selection")).lower()
+    _partial_period = (
+        (_period not in ("", "full", "match", "fulltime", "full time", "game", "full game")
+         and any(w in _period for w in ("half", "quarter", "1st", "2nd", "3rd", "4th",
+                                        "1h", "2h", "q1", "q2", "q3", "q4", "h1", "h2")))
+        or "half" in _label or "quarter" in _label
+    )
     stat = _normalise_afl_image_stat(raw.get("stat"))
     side = (raw.get("side") or "").strip().lower()
     line = _img_coerce_float(raw.get("line")) or 0.0
@@ -8718,6 +8733,16 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
             )
         leg = ParsedLeg(market="player_prop", team_full=inferred, player=player,
                         stat=stat, line=line, selection=side)
+
+    # v5.17: a half/quarter period overrides everything -> manual (full-game
+    # catalog only). Applies even to player props, since the bot can't place a
+    # 2nd-half disposals line either.
+    if _partial_period and not alert_only:
+        alert_only = True
+        alert_reason = (
+            f"AFL {_period or 'half/quarter'} market (image tip) — bot places "
+            f"FULL-GAME markets only; place this period bet manually"
+        )
 
     tip = ParsedTip(
         tipster=tipster, sport="afl", is_sgm=False, legs=[leg],

@@ -855,7 +855,9 @@ IMAGE_PROMPT_AFL = (
     "ONLY valid JSON, no markdown fences, in this shape: "
     '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
     '"side": "over"|"under"|null, "line": number|null, "odds": number|null, '
-    '"bookie": str|null, "units": number|null, "market_type": "player_prop"|'
+    '"bookie": str|null, "units": number|null, "period": "full"|"1st_half"|'
+    '"2nd_half"|"1st_quarter"|"2nd_quarter"|"3rd_quarter"|"4th_quarter"|null, '
+    '"market_type": "player_prop"|'
     '"team_line"|"margin"|"total"|"other"} ]}. '
     "EXTRACT ONLY THE TIPSTER'S ACTUAL SELECTION(S) — the bet(s) they are "
     "backing. This is the HIGHLIGHTED / boxed / bold / centred / largest "
@@ -883,7 +885,13 @@ IMAGE_PROMPT_AFL = (
     "For a match/quarter total (combined points, e.g. 'Under 172.5') use "
     "market_type=\"total\", `side`=over/under, `line`=the number, and put one "
     "competing team in `team`. For a winning-margin bet use \"margin\"; "
-    "anything else \"other\". Use null for ANY field not printed. JSON only."
+    "anything else \"other\". PERIOD: capture any half/quarter qualifier on the "
+    "bet — '1st/2nd Half', a 'Half Line'/'Half Total', or a quarter ('1st "
+    "Quarter' etc.) -> set `period` to e.g. \"2nd_half\" / \"1st_quarter\"; a "
+    "full-game/full-match bet uses \"full\" or null. The period is CRITICAL — "
+    "NEVER drop a Half/Quarter qualifier ('Hawthorn -5.5 2nd Half Line' is a "
+    "2nd-half line, NOT a full-game line). Use null for ANY field not printed. "
+    "JSON only."
 )
 
 
