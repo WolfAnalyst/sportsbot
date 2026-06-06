@@ -387,6 +387,31 @@ RULES:
 - For over/under line tips (Over 29.5 P), set: line = 29.5, selection = "over", is_threshold = false
 - Deobfuscate Kev's player names and return the REAL name
 - For Kev, resolve last-name-only to full name if you know it (e.g. "Jokic" -> "Nikola Jokic")
+- ETR NBA tips: player-prop tips with OBFUSCATED (leetspeak) names — DEOBFUSCATE to the
+  REAL full NBA player name using your NBA roster knowledge. Substitutions include
+  Kev's (! -> i, @ -> a, 0 -> o, 3 -> e, 1 -> l/i, $ or 5 -> s) PLUS context-sensitive
+  digit-for-letter where a digit stands in for a letter (e.g. "2" can be e OR o:
+  "Lu2e Ko2net" -> "Luke Kornet", "Dyl@n H@rp3r" -> "Dylan Harper"). Pick the real
+  active player the obfuscated text most plausibly spells. Also fix obvious OCR typos
+  ("Reounds" -> rebounds).
+  ETR format: "<Player> (<TEAM>) ABOVE|BELOW <line> <Stat phrase> <odds range> /
+  Projection: <Y> / Game N <AWAY> at <HOME>".
+    * ABOVE -> selection = "over"; BELOW -> selection = "under".
+    * team = the player's FULL team name from the (TEAM) code (e.g. SAS -> San Antonio
+      Spurs, NYK -> New York Knicks); sport = "nba"; market = "player_prop";
+      is_threshold = false (lines are .5 over/under, NOT N+ thresholds).
+    * Stat phrase -> stat: "Points" -> points, "Rebounds" -> rebounds, "Assists" ->
+      assists, "3-Pointers Made"/"Threes" -> threes, "Blocks" -> blocks, "Steals" ->
+      steals; COMPOUNDS: "Points + Rebounds + Assists" -> points_rebounds_assists,
+      "Points + Rebounds" -> points_rebounds, "Points + Assists" -> points_assists,
+      "Rebounds + Assists" -> rebounds_assists.
+    * CRITICAL: set odds = 0 for EVERY ETR tip. IGNORE the quoted odds range
+      ("-138 to -150") and the "Projection" — ETR places blind and the quoted price
+      must not arm the odds guards.
+  Example: "Lu2e Ko2net (SAS) ABOVE 1.5 Points -138 to -150 / Projection: 2.6 / Game 2
+  NYK at SAS" -> {player:"Luke Kornet", team:"San Antonio Spurs", stat:"points",
+  line:1.5, selection:"over", market:"player_prop", odds:0, sport:"nba",
+  is_threshold:false}.
 - SGMs (multiple legs in one bet) should have is_sgm = true, alert_only = false. Put legs in raw_legs.
 - For SGM same-player legs: if a leg has stat but no explicit player, USE THE PREVIOUS LEG'S PLAYER
   Example: "Sam Darcy 10+ Disposals/2+ Goals" -> leg 1 = Sam Darcy 10 Disp over, is_threshold=true, leg 2 = Sam Darcy 2 Goals over, is_threshold=true
@@ -868,10 +893,14 @@ IMAGE_PROMPT_AFL = (
     "tipster clearly lists several distinct selections. NEVER output both the "
     "OVER and the UNDER of the same line (only one side can be the tip). "
     "Rules: for a player statistic bet set market_type=\"player_prop\", "
-    "`player`= the player's FULL name EXACTLY as printed — BOTH first AND last "
-    "name (e.g. \"Caleb Daniel\", NEVER just \"Daniel\"); do NOT drop the first "
-    "name. ALSO set `team` to the player's AFL team if it appears ANYWHERE on the "
-    "image (it disambiguates a shared surname like Daniel/Smith). `stat` to ONE "
+    "`player`= the player's name EXACTLY as printed: the FULL name (BOTH first "
+    "AND last, e.g. \"Caleb Daniel\") when both are shown — do NOT drop a printed "
+    "first name. BUT if ONLY a surname is printed (Eddie often posts last-name-"
+    "only at game time, e.g. just \"Daniel\" or \"Bailey\"), output THAT surname "
+    "alone and do NOT invent or guess a first name — the bot resolves it from the "
+    "game about to start. ALSO set `team` to the player's AFL team if it appears "
+    "ANYWHERE on the image (it disambiguates a shared surname like Daniel/Smith). "
+    "`stat` to ONE "
     "lowercase word from: "
     "disposals, goals, marks, tackles, kicks, handballs, clearances, hitouts, "
     "fantasy_points. `side` is \"over\" for 'over'/'N+'/'2+' lines and "

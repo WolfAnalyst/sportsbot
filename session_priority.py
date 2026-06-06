@@ -59,12 +59,29 @@ KNOWN_NBA_MARKETS = {
 KNOWN_AFL_MARKETS = {
     # main lines
     "h2h", "line", "total_points", "sgm",
-    # O/U + threshold player markets (caps apply to both O/U and threshold
-    # variant of the same stat — disposals=400 covers both player_disposals
-    # and player_disposals_threshold)
-    "player_disposals", "player_marks", "player_tackles", "player_kicks",
+    # O/U + threshold player markets. By default a stat's cap covers BOTH its
+    # O/U and threshold variant (sibling fallback: player_disposals covers
+    # player_disposals_threshold). A stat MAY also declare its threshold cap
+    # EXPLICITLY to give overs a different ladder — e.g. player_disposals_threshold
+    # = [300,250,200,150] (overs) vs player_disposals = [124,99,74,50] (unders),
+    # added 2026-06-06; the explicit key then wins over the sibling fallback.
+    "player_disposals", "player_disposals_threshold",
+    "player_marks", "player_tackles", "player_kicks",
     "player_handballs", "player_clearances", "player_hitouts",
     "player_fantasy", "player_goals",
+    # Over-ladder sizing keys (2026-06-07, Task B). For 8 of 9 stats the OVER
+    # actually PLACES on the base player_* O/U market (dir=over, half-line ladder
+    # per the live catalog probe) — these *_threshold names are INTERNAL sizing
+    # keys only (Task A swaps to them at sizing time so overs get the higher
+    # ladder; the suffix never goes on the wire). GOALS is the exception:
+    # goalscorer_threshold_afl is a REAL Sportsbet market AND a DIRECT yaml key
+    # (the _threshold_afl normaliser would strip it to goalscorer_threshold ->
+    # sibling goalscorer -> None = UNCAPPED, so it MUST resolve via a direct hit).
+    "goalscorer_threshold_afl",
+    "player_fantasy_threshold", "player_marks_threshold",
+    "player_tackles_threshold", "player_kicks_threshold",
+    "player_handballs_threshold", "player_clearances_threshold",
+    "player_hitouts_threshold",
 }
 
 # MLB markets (2026-06-01). For the gated rollout only `sgm` is reachable
@@ -497,17 +514,27 @@ def lookup_liability_cap(
     if market in sport_block:
         return _normalise_cap(sport_block[market])
 
+    # Normalise an AFL "_threshold_afl" suffix to "_threshold" so BOTH the
+    # HyperBot market name (e.g. player_disposals_threshold_afl) and the
+    # internal one (player_disposals_threshold) resolve to the same cap. Without
+    # this, the _afl form fell through every branch below and returned None
+    # (uncapped) — a real risk once thresholds got their own high ladder.
+    norm = market[: -len("_afl")] if market.endswith("_threshold_afl") else market
+    if norm != market and norm in sport_block:
+        return _normalise_cap(sport_block[norm])
+
     # Threshold fallbacks. NBA: all *_threshold markets share player_threshold.
-    # AFL: each *_threshold stat shares its O/U sibling (e.g.
-    # player_disposals_threshold -> player_disposals). Spec says AFL stat caps
-    # cover both O/U and threshold variants of the same stat. Goals special
-    # case: HyperBot only has goalscorer_threshold_afl (no O/U variant) so
-    # callers should look it up via player_goals directly.
-    if market.endswith("_threshold"):
+    # AFL: an EXPLICIT <stat>_threshold key (e.g. player_disposals_threshold,
+    # 2026-06-06: its own 300/250/200/150 ladder) wins via the direct hit above.
+    # Otherwise fall back to the O/U sibling (drop "_threshold") so a stat
+    # WITHOUT its own threshold cap still inherits the base O/U cap. Goals
+    # special case: HyperBot only has goalscorer_threshold_afl (no O/U variant)
+    # so callers look it up via player_goals directly.
+    if norm.endswith("_threshold"):
         if "player_threshold" in sport_block:
             return _normalise_cap(sport_block["player_threshold"])
         # AFL-style sibling fallback: drop "_threshold" and retry
-        sibling = market[: -len("_threshold")]
+        sibling = norm[: -len("_threshold")]
         if sibling in sport_block:
             return _normalise_cap(sport_block[sibling])
 

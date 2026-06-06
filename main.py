@@ -29,6 +29,8 @@ from config import (
     TIPSTER_CHANNELS, MAX_UNITS, SESSIONS_YAML_PATH,
     USE_LEGACY_PLACEMENT, BOOKIE_AFL_ALIASES, TIPBOT_VERSION,
     AFL_CONCURRENT_FANOUT, AFL_FANOUT_MIN_STAKE,
+    ETR_NBA_CONCURRENT_FANOUT, ETR_NBA_SESSION_IDS, ETR_NBA_FIXED_LADDER,
+    ETR_NBA_TEST_MODE, ETR_NBA_UNIT_SIZE_TEST,
     RECONCILE_AMBIGUOUS, RECONCILE_SPILL,
     X_TIPSTER, X_FORCE_BOOKIE, X_MAX_ODDS_MULT, MAX_ODDS_MULT,
     AUTO_MANUAL_HANDICAP_SGM, MLB_STAT_MAP, MLB_FLAT_STAKE,
@@ -50,9 +52,9 @@ except ModuleNotFoundError:
     parse_kev_message = None
 from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
-from resolver import resolve_afl_event
+from resolver import resolve_afl_event, afl_games_in_play, team_key
 from nba_resolver import resolve_nba_event, resolve_mlb_event
-from roster import resolve_player_name, get_player_team
+from roster import resolve_player_name, get_player_team, afl_surname_candidates
 import notifier
 import session_priority
 import stat_fallback
@@ -136,7 +138,7 @@ STAKE_FLOOR = 0.0  # Don't bother with bets below this (currently no minimum)
 # 53523 is not in NBA_SESSION_PRIORITY (since bet365 sports is broken).
 # Adding kev_nba and ausbets_nba here makes both flow through to the
 # sportsbet sessions in NBA_SESSION_PRIORITY.
-TIPSTERS_IGNORE_SUGGESTED_BOOKIE: set[str] = {"kev_nba", "ausbets_nba", "saiyan_afl"}
+TIPSTERS_IGNORE_SUGGESTED_BOOKIE: set[str] = {"kev_nba", "ausbets_nba", "saiyan_afl", "etr_nba"}
 
 # Tipsters whose tips MUST carry an explicit unit/stake to be placed. A tip with
 # no unit (we'd otherwise default it) is NOT a confirmed bet for these cappers —
@@ -157,6 +159,9 @@ if X_TIPSTER and X_FORCE_BOOKIE:
 # else is available for sports (Wilson 2026-06-03). If no Sportsbet session,
 # the tip routes to manual (never placed on another bookie).
 TIPSTERS_FORCE_BOOKIE["eddie_afl"] = "sportsbet"
+# ETR NBA (2026-06-07): sportsbet-only (the blind fan-out targets the 4 sportsbet
+# accounts). Guarantees ETR never places on tab/bet365 even if a session list drifts.
+TIPSTERS_FORCE_BOOKIE["etr_nba"] = "sportsbet"
 
 # ── Max-odds CEILING (wrong-selection sanity guard) ────────────────
 # Applies to ALL sports tipsters via the global MAX_ODDS_MULT (default 1.25×).
@@ -168,6 +173,11 @@ TIPSTERS_FORCE_BOOKIE["eddie_afl"] = "sportsbet"
 TIPSTERS_MAX_ODDS_MULT: dict[str, float] = {}
 if X_TIPSTER and X_MAX_ODDS_MULT and X_MAX_ODDS_MULT > 1.0:
     TIPSTERS_MAX_ODDS_MULT[X_TIPSTER] = X_MAX_ODDS_MULT
+# ETR NBA: IGNORE the quoted odds entirely (Wilson — "pure fast as possible, no
+# price-check"). mult <= 1.0 disables the ceiling for the tipster. Belt-and-braces:
+# the parser already emits odds=0 (which no-ops both guards) and the blind fan-out
+# never captures a live price; this guarantees a leaked quoted price can't arm it.
+TIPSTERS_MAX_ODDS_MULT["etr_nba"] = 0.0
 
 
 def _exceeds_odds_ceiling(tipster: str, tipped_odds, matched_odds) -> bool:
@@ -1669,6 +1679,17 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
         notifier.notify_manual_alert(tip)
         return []
 
+    # ETR NBA is SINGLES-ONLY (Wilson 2026-06-07): the blind fixed-ladder fan-out
+    # handles ONE player prop per message. A multi/SGM from ETR routes to MANUAL
+    # rather than falling through to _place_sgm_v4 (a different path/accounts that
+    # was never designed for ETR's blind no-price-check placement).
+    if (tip.tipster or "").lower() == "etr_nba" and tip.is_sgm:
+        log.info("ETR multi/SGM -> routing to manual (ETR auto-places singles only)")
+        if not tip.alert_reason:
+            tip.alert_reason = "ETR multi/SGM — routed to manual (ETR auto-places singles only)"
+        notifier.notify_manual_alert(tip)
+        return []
+
     # SGM: v4.0 uses _place_sgm_v4 (priority list + liability cap from yaml
     # 'sgm' key + boost-eligible flag from yaml). USE_LEGACY_PLACEMENT=true
     # falls back to v3.10 _place_sgm (legacy SESSION_PRIORITY + binary
@@ -1695,6 +1716,12 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
     # comparison). Set USE_LEGACY_PLACEMENT=true in .env to fall back to
     # v3.10 behaviour (raw SESSION_PRIORITY + stake ladder, no liability caps).
     if not USE_LEGACY_PLACEMENT:
+        # ETR NBA: BLIND concurrent fan-out (no price-check, fixed [100,90,80,70]
+        # ladder) across the 4 sportsbet accounts. Gated by ETR_NBA_CONCURRENT_FANOUT.
+        # Singles only (multi/SGM already routed to manual above).
+        if (ETR_NBA_CONCURRENT_FANOUT and (tip.tipster or "").lower() == "etr_nba"
+                and (tip.sport or "").lower() == "nba"):
+            return _place_etr_nba_fanout(tip)
         # AFL (Saiyan + Eddie): concurrent fan-out across all eligible
         # Sportsbet accounts (v5.11) instead of the sequential spillover.
         # Gated by AFL_CONCURRENT_FANOUT; NBA/MLB keep _place_singles_v4.
@@ -3280,6 +3307,42 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         f"-> ${per_account_target:.2f}/account (even split), tipped_odds={tipped_odds}"
     )
 
+    # ── Direction-aware OVER liability cap (Task A, 2026-06-07) ─────────
+    # Over and under SHARE one placement market (the live catalog has NO
+    # dedicated *_threshold market for disposals/marks/etc — only goals do — so a
+    # disposals OVER places on the base player_disposals market, dir=over). The
+    # OVER-specific liability ladder therefore CANNOT be selected by market name;
+    # it is selected HERE, at sizing time, by the bet's DIRECTION. The placement
+    # market is UNCHANGED (already resolved by the resolve-once step /
+    # _match_afl_player_prop) — only the cap-lookup key `liability_market` flips
+    # to the *_threshold ladder for an OVER. Detect OVER explicitly so an
+    # ambiguous/empty selection falls to the UNDER (smaller/safer) ladder — never
+    # overstake an under with the $300 over ladder. Gate on EVERY eligible session
+    # carrying the threshold cap (else stay on the base O/U cap), so a missing
+    # yaml key can never leave an over UNCAPPED (the goalscorer_threshold_afl risk
+    # — its _threshold_afl form normalises to a sibling that doesn't exist -> None).
+    _side = (first_leg.selection or "").strip().lower()
+    _is_over = (
+        (_side == "over" or _side.endswith(" over")
+         or getattr(tip, "_is_threshold", False))
+        and "under" not in _side
+    )
+    if sport == "afl" and _is_over:
+        _stat = _afl_stat_from_leg(
+            {"stat": first_leg.stat, "market": liability_market})
+        _thr = _AFL_THRESHOLD_MARKET_BY_STAT.get(_stat)  # disposals -> player_disposals_threshold
+        _elig_sids = [str(s.get("session_id", "")) for s in sessions]
+        if _thr and _elig_sids and all(
+            session_priority.lookup_liability_cap(_s, sport, _thr) is not None
+            for _s in _elig_sids
+        ):
+            log.info(
+                f"AFL fan-out: OVER detected (stat={_stat}, sel='{_side}') — "
+                f"sizing off threshold ladder '{_thr}' "
+                f"(placement market unchanged at sizing time)"
+            )
+            liability_market = _thr
+
     # ── Resolve the catalog line ONCE per bookie ───────────────────────
     # All fan-out sessions are the same bookie (Sportsbet) in practice, so this
     # is a single catalog lookup; per-bookie caching keeps it correct if the
@@ -3582,6 +3645,306 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
 
     # AMBIGUOUS critical alert (maybe-landed) — fires regardless of fill state
     # so Wilson verifies at the bookie. Mirrors the _place_singles_v4 tail.
+    if ambiguous_outcomes:
+        _emit_sports_ambiguous_alert(tip, ambiguous_outcomes)
+
+    return results
+
+
+def _place_etr_nba_fanout(tip: ParsedTip) -> list[BetResult]:
+    """ETR NBA BLIND concurrent fan-out (2026-06-07, Wilson).
+
+    A dedicated sibling of _place_afl_fanout for the ETR tipster. ETR posts
+    obfuscated NBA player props and wants the FASTEST possible placement, so this
+    path differs from the AFL fan-out in three deliberate ways:
+
+      1. BLIND — NO price-check. The leg is resolved by the PURE transform
+         _resolve_leg_for_hyperbot (stat -> player_points/player_pra/..., selection
+         -> "Player Name Over/Under", no network) and that payload is POSTed
+         straight away. NBA player props place WITHOUT a proposition_id, so no
+         catalog lookup is needed. The quoted odds are IGNORED (target_odds=None ->
+         fills at any price); the odds ceiling/floor are disabled for etr_nba.
+      2. FIXED stake ladder ETR_NBA_FIXED_LADDER ([100,90,80,70]) — NOT the
+         liability-bracket ladder. $400 unit / 4 accounts = $100 top each, then
+         90/80/70 on a stake-too-high reject. (No sessions.yaml cap lookup; the
+         bookie MBL is the only backstop above the fixed ladder — the explicit
+         "blind, ignore caps" tradeoff.)
+      3. Sessions are the FIXED ETR_NBA_SESSION_IDS (the 4 sportsbet accounts),
+         not a priority list — kept separate from NBA_SESSION_PRIORITY.
+
+    Everything else mirrors the AFL fan-out: concurrent ThreadPoolExecutor, each
+    account ladders down on a stake reject in its own thread (_fanout_place_account),
+    stops on success/ambiguous/non-stake-error (no double-stake), and the FULL
+    remainder vs the $400 unit (incl. any account that couldn't place) routes to
+    Manual Bets. ETR is SINGLES-ONLY (a multi/SGM is routed to manual upstream in
+    place_tip). Event is resolved by resolve_event() in place_tip before dispatch;
+    an unresolved fixture already routes to manual there.
+
+    TEST GATE: when ETR_NBA_TEST_MODE the intended stake is ETR_NBA_UNIT_SIZE_TEST
+    (default $1) so only the first account places (the rest are budget-skipped) —
+    one blind $1 probe end-to-end. Default OFF (Wilson launched live at $400).
+    """
+    import time as _time_mod
+    import concurrent.futures
+    _t_start = _time_mod.time()
+
+    first_leg = tip.legs[0] if tip.legs else None
+    if not first_leg:
+        log.warning("ETR fan-out: tip has no legs")
+        return [BetResult(success=False, tip=tip, error="no legs",
+                          timestamp=datetime.now())]
+
+    # ETR is SINGLES-ONLY (Wilson). A multi/SGM is routed to manual upstream
+    # (the is_sgm guard in place_tip), and the parser only builds >1 leg when
+    # is_sgm=True — so a multi-leg tip should never reach here. This is
+    # defense-in-depth: a misparsed multi-leg (is_sgm=False with >1 leg) must NOT
+    # silently place only leg[0] and drop the rest — route the whole tip to manual.
+    if len(tip.legs) != 1:
+        log.warning(
+            f"ETR fan-out: expected exactly 1 leg, got {len(tip.legs)} — "
+            f"routing to manual (no silent leg-drop)"
+        )
+        if not tip.alert_reason:
+            tip.alert_reason = "ETR multi-leg tip — routed to manual (ETR auto-places singles only)"
+        notifier.notify_manual_alert(tip)
+        return [BetResult(success=False, tip=tip,
+                          error="ETR multi-leg — manual", timestamp=datetime.now())]
+
+    # Stake: the unit ($400) split /4, or the $1 test stake (test gate enforced in
+    # CODE, not just .env — the $600 lesson).
+    if ETR_NBA_TEST_MODE:
+        intended_stake = round(ETR_NBA_UNIT_SIZE_TEST * (tip.units or 1.0), 2)
+        log.info(
+            f"ETR fan-out: TEST MODE — staking ${intended_stake:.2f} "
+            f"(not the ${tip.stake_dollars:.2f} unit)"
+        )
+    else:
+        intended_stake = tip.stake_dollars
+
+    # ── BLIND resolve (no price-check): pure leg -> payload transform ──
+    try:
+        _r = _resolve_leg_for_hyperbot(
+            first_leg, "nba", is_threshold=False, tipster=tip.tipster)
+    except Exception as e:
+        log.warning(f"ETR fan-out: leg resolve failed: {e} — routing to manual")
+        _r = {}
+    resolved = {
+        "market": _r.get("market"),
+        "selection": _r.get("selection"),
+        "player": _r.get("player"),
+        "stat": _r.get("stat"),
+        "line": _r.get("line"),
+        "target_odds": None,       # ignore odds -> no floor sent -> fills at any price
+        "proposition_id": None,    # NBA player props place blind (no prop_id)
+        "live_odds": None,
+    }
+    # Validate the resolved market against the KNOWN player-prop O/U markets, NOT
+    # just truthiness: when a stat doesn't map (unknown/unsupported), the market
+    # stays the unmapped "player_prop" sentinel, which is truthy but HyperBot
+    # rejects ("Market player_prop not found"). Whitelisting routes that straight
+    # to manual instead of burning the fast-placement window on a doomed blind POST.
+    if resolved["market"] not in _OU_PLAYER_PROP_MARKETS or not resolved["selection"]:
+        log.info(
+            f"ETR fan-out: leg did not resolve to a known NBA player-prop market "
+            f"(player={first_leg.player!r} stat={first_leg.stat!r} "
+            f"sel={first_leg.selection!r} -> market={resolved['market']!r}) — "
+            f"routing to manual (no blind POST)"
+        )
+        notifier.notify_bet_failed(BetResult(
+            success=False, tip=tip,
+            error=f"ETR fan-out: leg did not resolve to a known market "
+                  f"({resolved['market']}) — manual",
+            timestamp=datetime.now()))
+        return [BetResult(success=False, tip=tip,
+                          error="ETR leg unresolved — manual",
+                          timestamp=datetime.now())]
+
+    # ── Eligible sessions: the FIXED 4 sportsbet accounts (active + owned) ──
+    raw_sessions = _v4_get_active_sessions_unfiltered(tip)
+    _ids = set(ETR_NBA_SESSION_IDS)
+    sessions = [
+        s for s in (raw_sessions or [])
+        if str(s.get("session_id", "")) in _ids
+        and (s.get("bookie", "") or "").lower() == "sportsbet"
+    ]
+    if not sessions:
+        log.warning("ETR fan-out: no active sportsbet sessions from ETR_NBA_SESSION_IDS — manual")
+        notifier.notify_bet_failed(BetResult(
+            success=False, tip=tip,
+            error="ETR fan-out: no active sportsbet sessions — manual",
+            timestamp=datetime.now()))
+        return [BetResult(success=False, tip=tip,
+                          error="ETR no active sessions — manual",
+                          timestamp=datetime.now())]
+    if len(sessions) < len(_ids):
+        _missing = _ids - {str(s.get("session_id", "")) for s in sessions}
+        log.warning(
+            f"ETR fan-out: only {len(sessions)}/{len(_ids)} ETR accounts active "
+            f"(missing {sorted(_missing)}); their share routes to Manual Bets"
+        )
+
+    log.info(
+        f"ETR fan-out: {len(sessions)} session(s), intended ${intended_stake:.2f}, "
+        f"fixed ladder {ETR_NBA_FIXED_LADDER}, market={resolved['market']} "
+        f"sel='{resolved['selection']}' (BLIND, no price-check)"
+    )
+
+    # ── Build each account's FIXED ladder, budget-capped, de-duped ─────
+    jobs: list[tuple[dict, list, dict]] = []
+    seen_sids: set[str] = set()
+    allocated = 0.0
+    for sess in sessions:
+        sid = str(sess.get("session_id", ""))
+        if sid in seen_sids:
+            continue
+        seen_sids.add(sid)
+        remaining_budget = round(intended_stake - allocated, 2)
+        if remaining_budget <= 0:
+            log.info(
+                f"ETR fan-out: intended ${intended_stake:.2f} fully allocated — "
+                f"sportsbet {sid} not needed (skip)"
+            )
+            continue
+        steps = [round(min(s, remaining_budget), 2) for s in ETR_NBA_FIXED_LADDER if s and s > 0]
+        ladder: list = []
+        for s in steps:
+            if s > 0 and (not ladder or ladder[-1] != s):
+                ladder.append(s)
+        if not ladder:
+            continue
+        allocated = round(allocated + ladder[0], 2)  # budget tracks the top rung
+        log.info(f"ETR fan-out: sportsbet {sid} -> ladder {ladder}")
+        jobs.append((sess, ladder, resolved))
+
+    if not jobs:
+        log.warning("ETR fan-out: no placeable accounts after sizing — manual")
+        notifier.notify_bet_failed(BetResult(
+            success=False, tip=tip,
+            error="ETR fan-out: no placeable accounts — manual",
+            timestamp=datetime.now()))
+        return [BetResult(success=False, tip=tip,
+                          error="ETR no placeable accounts — manual",
+                          timestamp=datetime.now())]
+
+    # ── Fire all accounts CONCURRENTLY (reuses the AFL per-account ladder) ──
+    results: list[BetResult] = []
+    log.info(f"ETR fan-out: firing {len(jobs)} concurrent BLIND placement(s)")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        futures = {
+            ex.submit(_fanout_place_account, tip, sess, ladder, resolved): sess
+            for (sess, ladder, resolved) in jobs
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            sess = futures[fut]
+            sid = str(sess.get("session_id", ""))
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                log.error(f"ETR fan-out: placement on {sid} raised: {e}")
+                results.append(BetResult(
+                    success=False, tip=tip, session_id=sid,
+                    bookie=sess.get("bookie", "unknown"),
+                    error=f"ETR fan-out placement exception: {e}",
+                    timestamp=datetime.now()))
+
+    # ── Roll up: placed / ambiguous / unfilled->manual (mirrors AFL fan-out) ──
+    placed_results: list[BetResult] = []
+    ambiguous_results: list[BetResult] = []
+    failed_results: list[BetResult] = []
+    for r in results:
+        if r.success:
+            placed_results.append(r)
+        elif _is_ambiguous_result(r):
+            ambiguous_results.append(r)
+        else:
+            failed_results.append(r)
+
+    top_by_sid = {str(s.get("session_id", "")): ladder[0]
+                  for (s, ladder, _r) in jobs}
+
+    def _at_risk_stake(r: BetResult) -> float:
+        return round(
+            (getattr(r, "_requested_stake", None) or r.stake
+             or top_by_sid.get(str(r.session_id), 0.0) or 0.0), 2)
+
+    attempted_stake = round(sum(top_by_sid.values()), 2)
+    total_placed = round(sum(r.stake or 0 for r in placed_results), 2)
+    ambiguous_total = round(sum(_at_risk_stake(r) for r in ambiguous_results), 2)
+    unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
+    display_intended = round(intended_stake, 2)
+
+    ambiguous_outcomes = [
+        {
+            "bookie": r.bookie, "session_id": r.session_id,
+            "stake": _at_risk_stake(r), "odds": (r.odds or 0),
+            "elapsed_sec": round(getattr(r, "elapsed_sec", None) or 0.0, 2),
+            "error": (r.error or "")[:200],
+            "reason": ("fast_ambiguous" if getattr(r, "is_ambiguous", False)
+                       else "slow_rejection"),
+            "correlation_id": getattr(r, "correlation_id", None),
+        }
+        for r in ambiguous_results
+    ]
+    session_timing = [
+        {
+            "session_id": r.session_id, "bookie": r.bookie,
+            "elapsed_sec": getattr(r, "elapsed_sec", None) or 0.0,
+            "attempts": 1, "fails": 0 if r.success else 1, "succeeded": r.success,
+        }
+        for r in results
+    ]
+
+    _log_jsonl(AUDIT_LOG, {
+        "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
+        "intended_stake": round(intended_stake, 2), "attempted_stake": attempted_stake,
+        "placed_stake": total_placed, "ambiguous_stake": ambiguous_total,
+        "unfilled_stake": unfilled, "fanout": "etr_nba", "accounts": len(jobs),
+        "placements": [
+            {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
+             "fill_odds": r.odds, "bet_id": r.bet_id}
+            for r in placed_results
+        ],
+        "ambiguous": [
+            {"session_id": r.session_id, "bookie": r.bookie, "stake": _at_risk_stake(r),
+             "error": r.error, "correlation_id": getattr(r, "correlation_id", None)}
+            for r in ambiguous_results
+        ],
+        "failures": [
+            {"session_id": r.session_id, "bookie": r.bookie, "error": r.error}
+            for r in failed_results
+        ],
+    })
+
+    if placed_results:
+        notifier.notify_tip_placed_summary(
+            tip, placed_results, display_intended, unfilled,
+            total_elapsed_sec=round(_time_mod.time() - _t_start, 2),
+            session_timing=session_timing,
+        )
+        log.info(
+            f"ETR fan-out: placed ${total_placed:.2f} across "
+            f"{len(placed_results)}/{len(jobs)} account(s) "
+            f"({len(failed_results)} failed, {len(ambiguous_results)} ambiguous)"
+        )
+
+    if failed_results or unfilled > 1.0:
+        log.warning(
+            f"ETR fan-out: ${unfilled:.2f} unfilled "
+            f"({len(failed_results)} account(s) failed)"
+        )
+        notifier.notify_tip_unfilled_with_placements(
+            tip, display_intended, total_placed, unfilled,
+            placed_results, failed_results,
+            session_timing=session_timing,
+        )
+        _log_jsonl(ERROR_LOG, {
+            "type": "tip_unfilled", "tipster": tip.tipster, "event": tip.event,
+            "intended_stake": intended_stake, "attempted_stake": attempted_stake,
+            "placed_stake": total_placed, "unfilled_stake": unfilled,
+            "last_error": failed_results[-1].error if failed_results else None,
+            "message": tip.raw_message, "fanout": "etr_nba",
+        })
+
     if ambiguous_outcomes:
         _emit_sports_ambiguous_alert(tip, ambiguous_outcomes)
 
@@ -4637,6 +5000,11 @@ _AFL_THRESHOLD_MARKET_BY_STAT = {
     "clearances": "player_clearances_threshold",
     "hitouts": "player_hitouts_threshold",
     "fantasy_points": "player_fantasy_threshold",
+    # The text parser's _normalise_stat leaves "fantasy" un-canonicalised (it
+    # does NOT map fantasy -> fantasy_points like the image path does), so a
+    # text fantasy over carries stat="fantasy". Alias it so the over still
+    # selects the threshold ladder (else it under-sizes off the base cap). 2026-06-07.
+    "fantasy": "player_fantasy_threshold",
 }
 _AFL_OU_MARKET_BY_STAT = {
     "disposals": "player_disposals",
@@ -4648,6 +5016,7 @@ _AFL_OU_MARKET_BY_STAT = {
     "clearances": "player_clearances",
     "hitouts": "player_hitouts",
     "fantasy_points": "player_fantasy",
+    "fantasy": "player_fantasy",  # text-path alias (see threshold dict above)
 }
 
 
@@ -4828,7 +5197,13 @@ def _match_afl_player_prop(leg_dict: dict, markets: dict):
     cand = _catalog_lookup(markets, thr_market, player_l, "over", over_line)
     if cand:
         return cand
-    # Fallback: the over may be the base O/U market's main line.
+    # v5.28 (2026-06-06): REVERTED the v5.27 disposals-threshold-only routing.
+    # Live catalog probe confirmed Sportsbet carries NO separate disposals/marks/
+    # etc threshold market (only goalscorer_threshold_afl for goals) — the over
+    # lives in the BASE O/U market's over ladder (selection = bare player name,
+    # direction=over). So overs MUST fall back to the base market, else they all
+    # route to manual (the v5.27 regression). Over/under-specific liability
+    # ladders are applied at SIZING via liability_market (see HANDOFF), not here.
     cand = _catalog_lookup(markets, ou_market, player_l, "over", over_line)
     if cand:
         return cand
@@ -8718,6 +9093,209 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
         log.info(f"[{channel_name}] no placeable racing tips after guards")
 
 
+def _afl_disambiguate_surname_by_odds(scoped: list, game_labels: list, token: str,
+                                      stat: str, line, side, tip_odds,
+                                      odds_tol: float = 0.20):
+    """Break a same-surname collision using the live catalog + the tip's odds.
+
+    `scoped` is the list of same-surname candidates ({"name","team"}) on the
+    in-play teams (len >= 2). For each candidate we look up their catalog
+    proposition for the tipped stat+line+side (via _match_afl_player_prop on a
+    single-session price_check_sports catalog) and compare the catalog odds to
+    the tip's quoted odds (`tip_odds`). The candidate whose catalog price is
+    within `odds_tol` (fractional, default 20%) of the tip price is the bet.
+
+    Resolution rule (money-path safe — never guess a $400 bet):
+      - EXACTLY ONE candidate's catalog odds in tolerance -> resolve to it.
+      - ZERO in tolerance, or TWO+ in tolerance -> None (caller -> manual).
+    Also returns None on any missing context (no tip odds / stat / line / side),
+    no owned sportsbet session, or a price-check failure. Returns (name, team)
+    or None.
+
+    NOTE: this is the SECONDARY tie-break only — it runs AFTER game-scoping has
+    already collapsed league-wide ambiguity, so the pool is the same-surname
+    players on the two teams playing now (typically exactly 2)."""
+    # Require full tip context + a usable tip price; otherwise we cannot do an
+    # odds tie-break -> manual (the conservative default).
+    try:
+        tip_odds_f = float(tip_odds or 0)
+    except (TypeError, ValueError):
+        tip_odds_f = 0.0
+    if tip_odds_f <= 1.0 or not stat or line is None or not side:
+        log.info(
+            f"Eddie surname '{token}': collision, no odds tie-break possible "
+            f"(stat={stat!r} line={line!r} side={side!r} tip_odds={tip_odds}) -> manual"
+        )
+        return None
+    side_l = (side or "").strip().lower()
+    if side_l not in ("over", "under"):
+        log.info(f"Eddie surname '{token}': collision, side {side!r} not over/under -> manual")
+        return None
+    # An owned SPORTSBET session for the catalog probe (Eddie is sportsbet-locked).
+    try:
+        sb_sids = [
+            str(s.get("session_id", "")) for s in (hb.get_sessions() or [])
+            if (s.get("bookie", "") or "").lower() == "sportsbet"
+            and _is_owned_session(s.get("session_id", ""))
+        ]
+    except Exception as e:
+        log.warning(f"Eddie surname collision: get_sessions failed: {e}")
+        return None
+    if not sb_sids:
+        log.info(f"Eddie surname '{token}': collision, no owned sportsbet session for catalog -> manual")
+        return None
+    sid = sb_sids[0]
+    in_range = []   # (name, team, catalog_odds)
+    probed = 0      # candidates we actually got a catalog price for
+    for cand in scoped:
+        name, team = cand.get("name"), cand.get("team", "")
+        event = resolve_afl_event(team) or ""
+        if not event:
+            continue
+        try:
+            event_pc = _bookie_event(event, "sportsbet", "afl")
+            pc = hb.price_check_sports(
+                session_id=sid, sport="afl", event=event_pc,
+                markets_filter=["player_props"],
+            )
+        except Exception as e:
+            log.debug(f"Eddie surname collision: price_check_sports failed for {name}: {e}")
+            continue
+        if not pc.get("success"):
+            continue
+        leg_dict = {
+            "market": _AFL_OU_MARKET_BY_STAT.get((stat or "").lower(), ""),
+            "selection": side_l, "player": name,
+            "stat": (stat or "").lower(), "line": line,
+        }
+        m = _match_afl_player_prop(leg_dict, pc.get("markets") or {})
+        if not m:
+            continue
+        try:
+            cat_odds = float(m.get("odds") or 0)
+        except (TypeError, ValueError):
+            cat_odds = 0.0
+        if cat_odds <= 1.0:
+            continue
+        probed += 1
+        if abs(cat_odds - tip_odds_f) / tip_odds_f <= odds_tol:
+            in_range.append((name, team, cat_odds))
+            log.info(
+                f"Eddie surname '{token}' collision: candidate '{name}' ({team}) "
+                f"catalog {side_l} {line} {stat} @ {cat_odds} within {odds_tol:.0%} "
+                f"of tip {tip_odds_f}"
+            )
+        else:
+            log.info(
+                f"Eddie surname '{token}' collision: candidate '{name}' ({team}) "
+                f"catalog @ {cat_odds} OUTSIDE {odds_tol:.0%} of tip {tip_odds_f} -> excluded"
+            )
+    # Resolve ONLY when we priced EVERY same-surname candidate and exactly one is
+    # in range. If a candidate was missing from the catalog (no event / no prop /
+    # price-check fail), we did NOT see its price — the lone in-range hit could be
+    # the WRONG player while the intended one is simply absent. Incomplete info ->
+    # manual (never guess a $400 bet). Wilson's "exactly one in range" rule still
+    # holds; this just refuses to apply it on a partial probe.
+    if len(in_range) == 1 and probed == len(scoped):
+        name, team, cat_odds = in_range[0]
+        log.info(
+            f"Eddie surname-collision RESOLVED '{token}' -> '{name}' ({team}) "
+            f"via odds tie-break (catalog @ {cat_odds} ~ tip {tip_odds_f}; "
+            f"priced all {probed}/{len(scoped)} candidates) [{'; '.join(game_labels)}]"
+        )
+        return name, team
+    log.info(
+        f"Eddie surname '{token}' collision odds tie-break inconclusive "
+        f"({len(in_range)} in range, priced {probed}/{len(scoped)} candidates) -> manual"
+    )
+    return None
+
+
+def _resolve_eddie_surname_to_player(token: str, msg_time, stat: str = None,
+                                     line=None, side: str = None, tip_odds=None):
+    """Resolve an Eddie BARE-SURNAME player prop to a unique full-name player on
+    a team in the AFL game about to start.
+
+    Eddie posts last-name-only player props right at game time ("Daniel 25+
+    disposals"). This finds the AFL game(s) about to start / in progress near
+    the post time (Squiggle `afl_games_in_play`), then surname-anchors the token
+    to a UNIQUE player on those teams (roster `afl_surname_candidates` scoped via
+    `team_key`). Game-scoping is what makes it safe: league-wide a surname can be
+    ambiguous (and 'Daniel'/'Bailey' are common FIRST names), but inside the ~44
+    players on the two teams playing now, the surname is almost always unique.
+
+    Same-surname COLLISION on the in-play teams (e.g. Harley Reid + Archer Reid,
+    both West Coast): when the optional tip context (stat/line/side/tip_odds) is
+    supplied, attempt a secondary odds tie-break against the live Sportsbet
+    catalog (_afl_disambiguate_surname_by_odds) — resolve only when EXACTLY ONE
+    candidate's catalog price is within tolerance of the tip's quoted odds.
+    Without that context, or if the tie-break is inconclusive, the collision
+    still routes to manual.
+
+    Returns (full_name, team) on a unique hit, else None (caller -> manual).
+    Routes to manual (None) on ANY ambiguity: no game in the window, surname not
+    in the roster for those teams, or the surname matching >1 player across the
+    in-play teams that the odds tie-break can't uniquely resolve. Never guesses a
+    $400 bet."""
+    token = (token or "").strip()
+    if not token or len(token.split()) != 1:
+        return None  # only the bare-single-token (surname) case
+    try:
+        ref_ts = msg_time.timestamp() if hasattr(msg_time, "timestamp") else time.time()
+    except Exception:
+        ref_ts = time.time()
+    try:
+        games = afl_games_in_play(ref_ts)
+    except Exception as e:
+        log.warning(f"Eddie surname resolve: afl_games_in_play failed: {e}")
+        return None
+    if not games:
+        log.info(f"Eddie surname '{token}': no AFL game in the start window -> manual")
+        return None
+    in_play_keys = set()
+    game_labels = []
+    for g in games:
+        h, a = g.get("hteam", ""), g.get("ateam", "")
+        if h:
+            in_play_keys.add(team_key(h))
+        if a:
+            in_play_keys.add(team_key(a))
+        game_labels.append(f"{h} v {a}")
+    try:
+        cands = afl_surname_candidates(token)
+    except Exception as e:
+        log.warning(f"Eddie surname resolve: afl_surname_candidates failed: {e}")
+        return None
+    scoped = [c for c in cands if team_key(c.get("team", "")) in in_play_keys]
+    unique_names = {c["name"] for c in scoped}
+    if len(unique_names) == 1:
+        hit = scoped[0]
+        log.info(
+            f"Eddie surname-anchored '{token}' -> '{hit['name']}' ({hit['team']}) "
+            f"via game about to start [{'; '.join(game_labels)}]"
+        )
+        return hit["name"], hit["team"]
+    if len(unique_names) >= 2:
+        # Same-surname collision on the in-play teams (the Reid case). Try the
+        # secondary catalog-odds tie-break before giving up. De-dup `scoped` to
+        # one entry per distinct full name so we probe each player once.
+        _by_name: dict = {}
+        for c in scoped:
+            _by_name.setdefault(c["name"], c)
+        tie = _afl_disambiguate_surname_by_odds(
+            list(_by_name.values()), game_labels, token,
+            stat=stat, line=line, side=side, tip_odds=tip_odds,
+        )
+        if tie:
+            return tie
+    log.info(
+        f"Eddie surname '{token}' did NOT uniquely resolve -> manual "
+        f"(in-play games: [{'; '.join(game_labels)}]; surname hits on those teams: "
+        f"{sorted(unique_names) or 'none'})"
+    )
+    return None
+
+
 def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
                               default_units: float, msg_time) -> ParsedTip:
     """Build a ParsedTip from one raw vision-extracted AFL dict. Player props
@@ -8790,15 +9368,31 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
         # Player prop: infer team from the roster so resolve_afl_event works.
         inferred = team
         if not inferred and player:
-            try:
-                inferred = get_player_team(player, "afl") or ""
-            except Exception as e:
-                log.warning(f"get_player_team failed for {player!r}: {e}")
-                inferred = ""
+            if len(player.split()) == 1:
+                # Eddie posts LAST-NAME-ONLY props at game time. Resolve the
+                # bare surname to a UNIQUE player on a team in the game about to
+                # start (game-scoped surname anchor) — NOT get_player_team's
+                # fuzzy match, which can wrongly hit a FIRST-name 'Daniel' ->
+                # Daniel Turner. None (no game / not unique) stays manual; we
+                # deliberately do NOT fuzzy-fall-back (never guess a $400 bet).
+                # Pass the tip's stat/line/side/odds so a same-surname COLLISION
+                # (Reid case) can attempt the catalog-odds tie-break (v5.30).
+                hit = _resolve_eddie_surname_to_player(
+                    player, msg_time, stat=stat, line=line, side=side, tip_odds=odds,
+                )
+                if hit:
+                    player, inferred = hit
+            else:
+                try:
+                    inferred = get_player_team(player, "afl") or ""
+                except Exception as e:
+                    log.warning(f"get_player_team failed for {player!r}: {e}")
+                    inferred = ""
         if not inferred:
             alert_only = True
             alert_reason = (
-                f"could not infer AFL team for '{player}' (not in roster) — "
+                f"could not infer AFL team for '{player}' (not in roster / no "
+                f"unique surname match in the AFL game about to start) — "
                 f"place manually"
             )
         leg = ParsedLeg(market="player_prop", team_full=inferred, player=player,

@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from pathlib import Path
 from difflib import SequenceMatcher
 
@@ -636,6 +637,49 @@ def get_player_team(query: str, sport: str = "nba", team: str = "") -> str:
     """
     match = fuzzy_match_player(query, sport, team=team)
     return match.get("team", "")
+
+
+def _afl_token_norm(s: str) -> str:
+    """Lowercase + strip accents + collapse whitespace, for surname matching of
+    Eddie's bare-token player props. Keeps word chars, spaces, apostrophes and
+    hyphens; drops other punctuation."""
+    s = (s or "").replace(" ", " ")
+    s = "".join(c for c in unicodedata.normalize("NFKD", s)
+                if not unicodedata.combining(c))
+    s = s.lower().strip()
+    s = re.sub(r"[^\w\s'-]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def afl_surname_candidates(token: str) -> list:
+    """All AFL roster players whose SURNAME matches `token` (normalised).
+
+    A player matches if `token` equals their last-name token OR their full
+    surname (everything after the first name, e.g. 'Ah Chee'). Returns
+    [{"name": full_name, "team": team}, ...] — possibly empty, possibly several
+    (the caller scopes to the game about to start and requires uniqueness).
+
+    FIRST names are NOT matched: Eddie sends last-name-only player props, and a
+    first-name hit ('Bailey' -> Bailey Smith, 'Daniel' -> Daniel Rioli) would be
+    a wrong-player mismatch. So 'Daniel' -> Caleb Daniel (surname), never the
+    several players whose FIRST name is Daniel; 'Bailey' -> Zac Bailey (surname),
+    never Bailey Smith/Dale/etc."""
+    _load_rosters()
+    tok = _afl_token_norm(token)
+    if not tok:
+        return []
+    out = []
+    for _, info in _afl_roster.items():
+        name = info.get("name", "")
+        parts = name.split()
+        if len(parts) < 2:
+            continue  # need a first + last name to have a surname
+        last_tok = _afl_token_norm(parts[-1])
+        full_surname = _afl_token_norm(" ".join(parts[1:]))
+        if tok == last_tok or tok == full_surname:
+            out.append({"name": name, "team": info.get("team", "")})
+    return out
 
 
 def update_roster_from_api():

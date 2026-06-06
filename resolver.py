@@ -46,6 +46,44 @@ def _fetch_afl_fixtures_by_year() -> list[dict]:
         return []
 
 
+def afl_games_in_play(ref_ts: float = None, ahead_sec: int = 2700,
+                      behind_sec: int = 10800) -> list:
+    """AFL games about to start / in progress near ref_ts (default now).
+
+    A game qualifies if its start (Squiggle `unixtime`, UTC epoch) is within
+    [ref_ts - behind_sec, ref_ts + ahead_sec] — default: started up to 3h ago
+    (in-progress) through starting in 45 min (about to jump). unixtime is used
+    so there is NO timezone reasoning (the `date` field is naive local venue
+    time; unixtime is UTC epoch). Source is _fetch_afl_fixtures_by_year
+    (complete=!100, so finished games are already excluded). Returns the
+    qualifying game dicts (each has hteam/ateam/unixtime).
+
+    Used by the Eddie image pipeline to scope a bare-surname player prop to the
+    teams playing right now (Eddie posts last-name-only props at game time)."""
+    ref = ref_ts if ref_ts is not None else time.time()
+    out = []
+    for g in _fetch_afl_fixtures_by_year():
+        ut = g.get("unixtime")
+        if not ut:
+            continue
+        try:
+            delta = float(ut) - ref
+        except (ValueError, TypeError):
+            continue
+        if -behind_sec <= delta <= ahead_sec:
+            out.append(g)
+    return out
+
+
+def team_key(name: str) -> str:
+    """Normalised team key for cross-source matching (Squiggle hteam/ateam vs
+    roster_afl.json team names). Lowercases, strips punctuation, and drops a
+    trailing AFL nickname suffix so 'Adelaide Crows' == Squiggle 'Adelaide' and
+    'Sydney Swans' == 'Sydney'. 'Greater Western Sydney' / 'Western Bulldogs'
+    have no strippable nickname and stay distinct (no false collision)."""
+    return _strip_nickname(_normalise_team(name))
+
+
 def _normalise_team(name: str) -> str:
     if not name:
         return ""
