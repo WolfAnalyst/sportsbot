@@ -136,7 +136,7 @@ STAKE_FLOOR = 0.0  # Don't bother with bets below this (currently no minimum)
 # 53523 is not in NBA_SESSION_PRIORITY (since bet365 sports is broken).
 # Adding kev_nba and ausbets_nba here makes both flow through to the
 # sportsbet sessions in NBA_SESSION_PRIORITY.
-TIPSTERS_IGNORE_SUGGESTED_BOOKIE: set[str] = {"kev_nba", "ausbets_nba"}
+TIPSTERS_IGNORE_SUGGESTED_BOOKIE: set[str] = {"kev_nba", "ausbets_nba", "saiyan_afl"}
 
 # Tipsters whose tips MUST carry an explicit unit/stake to be placed. A tip with
 # no unit (we'd otherwise default it) is NOT a confirmed bet for these cappers —
@@ -219,6 +219,24 @@ def _is_handicap_sgm(tip) -> bool:
         (getattr(l, "market", "") or "").lower() in ("line", "first_half_line")
         for l in (tip.legs or [])
     )
+
+
+_HANDICAP_MARKETS = ("line", "first_half_line", "handicap", "margin", "team_line")
+
+
+def _tip_has_handicap_leg(tip) -> bool:
+    """True if ANY leg is a team HANDICAP (line/first_half_line/handicap/margin/
+    team_line) OR a mis-parsed team-level leg (no player AND no stat — a handicap
+    whose market label got mangled, e.g. the Fremantle +0.5 SGM leg that the
+    same-player carry-over turned into a fake player prop). v5.23 (Wilson
+    2026-06-06): routes ALL Saiyan handicap bets — SGM or single — to manual."""
+    for l in (getattr(tip, "legs", None) or []):
+        if (getattr(l, "market", "") or "").lower() in _HANDICAP_MARKETS:
+            return True
+        if (not (getattr(l, "player", "") or "").strip()
+                and not (getattr(l, "stat", "") or "").strip()):
+            return True
+    return False
 
 # ── Auto alt-line retry config ─────────────────────────────────────
 # When primary line fails to place anywhere, we try tipped_line ±1 for
@@ -1018,13 +1036,15 @@ def _promote_misparsed_sgms(tips: list[ParsedTip]) -> list[ParsedTip]:
     for group in groups.values():
         if len(group) < 2:
             continue
-        # Distinct (stat, line) check — if all are identical the dedupe
-        # path catches them, no need to promote.
-        signatures = {
-            ((t.legs[0].stat or "").lower(), t.legs[0].line)
-            for t in group
-        }
-        if len(signatures) < 2:
+        # v5.23 (Wilson 2026-06-06): require 2+ DISTINCT STATS to promote to an
+        # SGM. Same player + same stat differing only by LINE is a staggered/
+        # ladder play of INDEPENDENT singles (AusBets "Fox over 14.5 P / over
+        # 15.5 P"), NOT an SGM — the legs are fully correlated, there is no SGM
+        # edge, and merging them placed nothing (routed to manual). A real
+        # same-player SGM spans DIFFERENT stats (Brunson "points / assists").
+        # Same-stat-same-line repeats also fall through here to the dedupe path.
+        stats = {(t.legs[0].stat or "").lower() for t in group}
+        if len(stats) < 2:
             continue
 
         primary = group[0]
@@ -1636,6 +1656,18 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
             f"is_live={tip.is_live} units={tip.units} "
             f"legs={legs_summary}"
         )
+
+    # Saiyan handicap bets (SGM OR single) -> MANUAL (Wilson 2026-06-06): a
+    # mis-parsed "FRE +0.5" handicap leg broke a Saiyan SGM ("over not found").
+    # Wilson wants ALL Saiyan handicap/team-line bets placed by hand rather than
+    # risk a mis-placed team-line leg. Catches both placement paths below, incl.
+    # a handicap leg whose market label was mangled (no player + no stat).
+    if tip.tipster == "saiyan_afl" and _tip_has_handicap_leg(tip):
+        log.info("Saiyan handicap/team-line bet -> routing to manual (Wilson 2026-06-06)")
+        if not tip.alert_reason:
+            tip.alert_reason = "Saiyan handicap/team-line bet — routed to manual (not auto-placed)"
+        notifier.notify_manual_alert(tip)
+        return []
 
     # SGM: v4.0 uses _place_sgm_v4 (priority list + liability cap from yaml
     # 'sgm' key + boost-eligible flag from yaml). USE_LEGACY_PLACEMENT=true

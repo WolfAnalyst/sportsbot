@@ -868,7 +868,11 @@ IMAGE_PROMPT_AFL = (
     "tipster clearly lists several distinct selections. NEVER output both the "
     "OVER and the UNDER of the same line (only one side can be the tip). "
     "Rules: for a player statistic bet set market_type=\"player_prop\", "
-    "`player`=full printed name, and `stat` to ONE lowercase word from: "
+    "`player`= the player's FULL name EXACTLY as printed — BOTH first AND last "
+    "name (e.g. \"Caleb Daniel\", NEVER just \"Daniel\"); do NOT drop the first "
+    "name. ALSO set `team` to the player's AFL team if it appears ANYWHERE on the "
+    "image (it disambiguates a shared surname like Daniel/Smith). `stat` to ONE "
+    "lowercase word from: "
     "disposals, goals, marks, tackles, kicks, handballs, clearances, hitouts, "
     "fantasy_points. `side` is \"over\" for 'over'/'N+'/'2+' lines and "
     "\"under\" for 'under'. `line` is the number (23.5, or for 'N+' use N-0.5 "
@@ -1214,8 +1218,14 @@ def parse_with_groq(
                 prev_player = ""
                 for rl in td["raw_legs"]:
                     player = rl.get("player", "")
-                    # If no player specified, use previous leg's player (Sam Darcy 10+ Disp/2+ Goals)
-                    if not player and prev_player:
+                    # If no player specified, use previous leg's player (Sam Darcy
+                    # 10+ Disp / 2+ Goals). v5.23 (Wilson 2026-06-06): ONLY carry
+                    # over into a leg that has a player STAT — i.e. a genuine
+                    # player-prop leg missing its name. A TEAM-LINE / handicap leg
+                    # (e.g. "FRE +0.5") has no stat and must NOT inherit a player,
+                    # or it masquerades as a player prop and evades the handicap->
+                    # manual guard (the Fremantle +0.5 SGM bug).
+                    if not player and prev_player and (rl.get("stat") or "").strip():
                         player = prev_player
                         log.info(f"SGM same-player inference: using '{prev_player}' for leg")
                     if player:
