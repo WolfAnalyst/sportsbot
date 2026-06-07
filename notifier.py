@@ -165,6 +165,14 @@ def _send_alert(text: str) -> bool:
 
 def notify_bet_placed(result) -> bool:
     tip = result.tip
+    # v5.36: SGM consolidation. When _place_sgm_v4 (non-orchestrated) sets
+    # tip._sgm_consolidate, the per-account placements are rolled up into ONE
+    # notify_tip_placed_summary at the SGM tail (which ALSO writes the per-leg
+    # ledger rows), so suppress the per-placement BET PLACED message + its
+    # ledger write here — this is what fixes the "2 messages for a 2-account
+    # SGM spillover" Wilson flagged.
+    if getattr(tip, "_sgm_consolidate", False):
+        return True
     legs_lines = []
 
     # For singles where we recorded the actual placed values, prefer those

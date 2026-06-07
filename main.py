@@ -6674,6 +6674,16 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
     first_placed_odds: float | None = None
     original_target_odds = target_odds  # Snapshot for first-session use
 
+    # v5.36: end-to-end timer + consolidate the per-account placements into ONE
+    # notify_tip_placed_summary at the success tail (instead of a per-account
+    # notify_bet_placed each — the "2 messages for a 2-account spillover" fix).
+    # The flag makes notify_bet_placed no-op (telegram + its ledger write); the
+    # tail summary writes the per-leg ledger rows. Orchestrated (MLB) keeps its
+    # own summary, so it is NOT flagged here.
+    _sgm_v4_t_start = time.time()
+    if not _orchestrated:
+        tip._sgm_consolidate = True
+
     def _emit_sgm_aux_alerts():
         """Fire ladder/MBL alerts before any return path. MBL takes priority
         — sending both would just duplicate the same data across Maintenance
@@ -7329,6 +7339,27 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
             f"v4 SGM: completed with {len(placed_results)} placement(s), "
             f"remaining ${remaining_stake:.2f} unfilled"
         )
+        # v5.36: ONE consolidated placed-summary (rolls up every account, avg
+        # odds, per-account timing + unfilled tag) — replaces the per-account
+        # notify_bet_placed (suppressed via tip._sgm_consolidate). Writes the
+        # per-leg ledger rows. SGM placement is SEQUENTIAL spillover, so
+        # concurrent_bookies=False (bookie span = SUM). Skipped when orchestrated
+        # (the MLB HRRBI orchestrator owns its own consolidated summary).
+        if not _orchestrated:
+            _sgm_session_timing = [{
+                "session_id": r.session_id, "bookie": r.bookie,
+                "elapsed_sec": getattr(r, "elapsed_sec", None),
+                "attempts": 1, "fails": 0, "succeeded": True,
+            } for r in placed_results]
+            try:
+                notifier.notify_tip_placed_summary(
+                    tip, placed_results, intended_stake, round(remaining_stake, 2),
+                    total_elapsed_sec=round(time.time() - _sgm_v4_t_start, 2),
+                    session_timing=_sgm_session_timing,
+                    concurrent_bookies=False,
+                )
+            except Exception as e:
+                log.error(f"v4 SGM consolidated summary notify failed: {e}")
         # Partial-fill alert: some stake placed but remainder could not be
         # filled across all priority sessions. Mirrors _place_singles_v4's
         # notify_tip_unfilled_with_placements path.
