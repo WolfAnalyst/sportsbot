@@ -28,7 +28,7 @@ from config import (
     TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE,
     TIPSTER_CHANNELS, MAX_UNITS, SESSIONS_YAML_PATH,
     USE_LEGACY_PLACEMENT, BOOKIE_AFL_ALIASES, TIPBOT_VERSION,
-    AFL_CONCURRENT_FANOUT, AFL_FANOUT_MIN_STAKE,
+    AFL_CONCURRENT_FANOUT, AFL_FANOUT_MIN_STAKE, SGM_CONCURRENT_FANOUT,
     ETR_NBA_CONCURRENT_FANOUT, ETR_NBA_SESSION_IDS, ETR_NBA_FIXED_LADDER,
     ETR_NBA_TEST_MODE, ETR_NBA_UNIT_SIZE_TEST,
     RECONCILE_AMBIGUOUS, RECONCILE_SPILL,
@@ -1781,6 +1781,12 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
         if (tip.sport or "").lower() == "mlb" and _is_mlb_hrrbi_sgm(tip):
             return _place_mlb_hrrbi(tip)
         if not USE_LEGACY_PLACEMENT:
+            # v5.38: AFL SGMs (saiyan) place CONCURRENTLY (even-split + per-account
+            # liability ladder off est combined odds) via _place_sgm_fanout, which
+            # delegates back to _place_sgm_v4 on any non-happy-path. NBA SGMs stay
+            # on the sequential _place_sgm_v4. Gated by SGM_CONCURRENT_FANOUT.
+            if SGM_CONCURRENT_FANOUT and (tip.sport or "").lower() == "afl":
+                return _place_sgm_fanout(tip)
             return _place_sgm_v4(tip)
         return _place_sgm(tip)
 
@@ -5871,12 +5877,20 @@ def _sgm_unnormalised_leg(legs: list):
 
 
 def _enrich_sgm_legs_with_prop_ids(
-    hb_legs: list, tip, session_id: str, bookie: str = "",
+    hb_legs: list, tip, session_id: str, bookie: str = "", odds_out: list = None,
 ) -> tuple:
     """
     Resolve each player-prop SGM leg against the live single-session catalog
     (price_check_sports) and inject what the bookie actually carries. Team
     legs (h2h, line, total) pass through unchanged.
+
+    v5.38: when `odds_out` (a list) is passed, the per-leg CATALOG ODDS are
+    appended to it IN LEG ORDER (None for a leg with no catalog price, e.g. a
+    team leg). The caller multiplies them to ESTIMATE the combined SGM odds (an
+    SGM has no pre-placement price) for liability sizing. The odds are NEVER put
+    on the leg dict (place_sgm_bet sends `legs` verbatim — see hyperbot_client),
+    so this side-channel can't pollute the wire payload. Backward-compatible:
+    existing callers omit odds_out -> no behaviour change.
 
     2026-05-31 — TWO problems this fixes (both confirmed against the live
     "Melbourne v GWS Giants" sportsbet catalog):
@@ -5970,6 +5984,7 @@ def _enrich_sgm_legs_with_prop_ids(
     enriched = []
     for leg in hb_legs:
         new_leg = dict(leg)
+        _leg_odds = None  # v5.38: per-leg catalog odds for the combined-odds estimate
         if _afl_pp(leg):
             match = _match_afl_player_prop(leg, markets)
             if match is None:
@@ -5986,6 +6001,7 @@ def _enrich_sgm_legs_with_prop_ids(
             new_leg["line"] = match["line"]
             new_leg["selection"] = match["selection"]
             new_leg["proposition_id"] = match["proposition_id"]
+            _leg_odds = match.get("odds")
             log.info(
                 f"SGM AFL leg catalog-matched: {leg.get('player')} "
                 f"{_afl_stat_from_leg(leg)} tip-line={leg.get('line')} -> "
@@ -6018,6 +6034,7 @@ def _enrich_sgm_legs_with_prop_ids(
             # fuzzy-resolved a typo/accent) so the payload's player field agrees
             # with the matched prop_id/selection.
             new_leg["player"] = match["selection"]
+            _leg_odds = match.get("odds")
             log.info(
                 f"SGM MLB leg catalog-matched: {leg.get('player')} "
                 f"{match['stat']} tip-line={leg.get('line')} -> "
@@ -6035,6 +6052,7 @@ def _enrich_sgm_legs_with_prop_ids(
                     f"line={leg.get('line')} on session {session_id}",
                 )
             new_leg["proposition_id"] = prop_id
+            _leg_odds = bookie_odds
             log.info(
                 f"SGM leg prop_id: '{leg.get('selection')}' line={leg.get('line')} "
                 f"→ prop_id={prop_id}, bookie_odds={bookie_odds}"
@@ -6065,12 +6083,20 @@ def _enrich_sgm_legs_with_prop_ids(
                 new_leg.pop("line", None)
             else:
                 new_leg["line"] = hm["line"]
+            _leg_odds = hm.get("odds")
             log.info(
                 f"SGM handicap leg catalog-matched: '{leg.get('selection')}' "
                 f"line={leg.get('line')} -> market={hm['market']} "
                 f"sel='{hm['selection']}' prop_id={hm.get('proposition_id')} "
                 f"odds={hm['odds']}"
             )
+        # v5.38: record this leg's catalog odds (None for a team leg with no
+        # price) so the caller can estimate the combined SGM odds = product.
+        if odds_out is not None:
+            try:
+                odds_out.append(float(_leg_odds) if _leg_odds is not None else None)
+            except (TypeError, ValueError):
+                odds_out.append(None)
         enriched.append(new_leg)
 
     # Fix D (2026-06-01): final guard — never return a leg list containing an
@@ -6474,6 +6500,34 @@ def _place_sgm(tip: ParsedTip) -> list[BetResult]:
 #  - retry without boost on boost-related errors
 #  - team-ML+total → manual rule
 
+def _sgm_est_combined_odds(leg_odds: list) -> "float | None":
+    """Estimate an SGM's combined decimal odds as the PRODUCT of the per-leg
+    catalog odds (v5.38). An SGM returns no combined price until it's placed, so
+    to size a LIABILITY cap (afl.sgm [400,300,200] / mlb.sgm [130,100,87]) into a
+    stake we estimate the combined odds from the legs the catalog priced.
+
+    Returns None unless EVERY leg has a usable price (>1.0): a missing leg would
+    make the product incomplete and UNDER-state the combined odds, which would
+    OVER-size the liability->stake conversion (stake = liab/(odds-1)) — refusing
+    (None) routes the caller to its safe fallback / manual instead. NOTE the
+    product OVER-states a positively-correlated SGM's TRUE combined odds (e.g.
+    HRRBI 1+ & 2+ are correlated, so the real SGM price < the product), which
+    makes the derived stake UNDER-size — i.e. realised liability lands UNDER the
+    cap. That's the safe direction; the bookie MBL backstops the rest."""
+    if not leg_odds:
+        return None
+    prod = 1.0
+    for o in leg_odds:
+        try:
+            o = float(o)
+        except (TypeError, ValueError):
+            return None
+        if o <= 1.0:
+            return None
+        prod *= o
+    return round(prod, 4) if prod > 1.0 else None
+
+
 def _sgm_ladder_steps(list_ladder: list, effective_stake: float) -> list[float]:
     """Stake steps for a list-cap (e.g. MLB [87,85,80]) SGM ladder: each rung
     clamped to what's left to fill (effective_stake), de-duped, >0. Keeps the
@@ -6820,8 +6874,9 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
         # line/market encoding (N+ -> over N-0.5 in the threshold ladder).
         # Team legs pass through unchanged. If any leg isn't carried, skip
         # this session (ultimately routes to manual).
+        _sgm_session_odds: list = []  # v5.38: per-leg catalog odds for est combined
         session_hb_legs, enrich_err = _enrich_sgm_legs_with_prop_ids(
-            hb_legs, tip, sid, bookie=bookie,
+            hb_legs, tip, sid, bookie=bookie, odds_out=_sgm_session_odds,
         )
         if enrich_err:
             log.warning(
@@ -6830,33 +6885,46 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
             )
             used_session_ids.add(sid)
             continue
+        _sgm_est_odds = _sgm_est_combined_odds(_sgm_session_odds)
 
         # Resolve per-session sgm cap from yaml.
-        #  - LIST cap (e.g. MLB [87,85,80]) = a STAKE ladder. SGMs have no
-        #    pre-placement combined price (each bookie computes it internally),
-        #    so we can't convert a liability to a stake — the rungs are used
-        #    DIRECTLY as stake steps: start at the top ($87), ladder down to 85
-        #    then 80 on a stake rejection (Wilson 2026-06-01: the account takes
-        #    ~$80-87 per MLB SGM depending on the 2+ HRRBI price; the bookie MBL
-        #    is the real liability backstop). max_stake = the top rung.
-        #  - SCALAR / unlimited cap = existing behaviour (resolve_max_stake when
-        #    tipped odds exist, else pass intended through). AFL/NBA SGMs (scalar
-        #    sgm caps) are byte-identical to before.
+        #  - LIST cap (afl.sgm [400,300,200] / mlb.sgm [130,100,87]) = a LIABILITY
+        #    ladder. v5.38 (Wilson): an SGM returns no combined price pre-place, so
+        #    we ESTIMATE it as the PRODUCT of the per-leg catalog odds
+        #    (_sgm_est_odds) and convert each liability bracket to a stake via
+        #    resolve_stake_steps (liability/(est_odds-1)), laddering down on a
+        #    reject. This RETIRES the v5.15 MLB "$100 stake rung" hack — the
+        #    [130,100,87] values are now real liabilities, not raw stakes. If the
+        #    estimate is unavailable (a leg lacked a catalog price), resolve_stake_
+        #    steps falls back to its no-odds seeded ladder (capped at intended), so
+        #    a list cap is NEVER treated as a raw stake. (The CONCURRENT fan-out,
+        #    _place_sgm_fanout, is the PRIMARY path for AFL + MLB SGMs; this
+        #    sequential branch is the fallback when SGM_CONCURRENT_FANOUT=false or
+        #    the estimate can't be formed.)
+        #  - SCALAR / unlimited cap (NBA sgm: 600) = existing behaviour
+        #    (resolve_max_stake when tipped odds exist, else pass intended through).
+        #    Byte-identical to before.
         sgm_cap = session_priority.lookup_liability_cap(sid, sport, "sgm")
         list_ladder = None
         if isinstance(sgm_cap, tuple) and sgm_cap:
             list_ladder = [float(v) for v in sgm_cap]
-            # MLB HRRBI: try a $100 STAKE rung FIRST, then the configured ladder
-            # (e.g. [87,85,80]). There is no pre-place SGM combined price to
-            # convert a liability, so 100 is applied as a stake step like the
-            # others (Wilson 2026-06-05, v5.15). MLB-scoped so AFL/NBA list-cap
-            # SGMs (none today) are unaffected. max_stake rises to 100 so the
-            # effective_stake clamp below doesn't truncate the first attempt.
-            if (sport or "").lower() == "mlb":
-                list_ladder = [100.0] + list_ladder
-            max_stake = max(list_ladder)
-            cap_reason = f"list stake ladder {list_ladder}"
-            sizing_odds = 0
+            sizing_odds = _sgm_est_odds or 0  # est combined odds for liability sizing
+            _top_liab = max(list_ladder)
+            if sizing_odds and sizing_odds > 1.0:
+                # Top liability bracket -> its stake (the ladder's biggest try).
+                max_stake = session_priority.liability_to_max_stake(_top_liab, sizing_odds)
+                cap_reason = f"list liability ladder {list_ladder} @ est_odds={_sgm_est_odds}"
+            else:
+                # No est odds (a leg lacked a catalog price): we can't convert the
+                # liability brackets to stakes, so seed the ceiling at the SMALLEST
+                # bracket (the most conservative — adversarial-pass fix v5.38). The
+                # old MLB path's blind first try was ~$100; min([130,100,87])=$87 is
+                # tighter, not looser (MAX would have staked the $130 LIABILITY as a
+                # raw stake — over-exposed). The bookie MBL is the only true backstop
+                # without odds; keep it small.
+                max_stake = min(intended_stake, min(list_ladder))
+                cap_reason = (f"list liability ladder {list_ladder} (no est odds — "
+                              f"seeded ceiling at min bracket ${min(list_ladder):.0f})")
         else:
             sizing_odds = tipped_odds if tipped_odds and tipped_odds > 1.0 else 0
             if sizing_odds:
@@ -6904,12 +6972,18 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
         else:
             target_odds = original_target_odds
 
-        # Stake steps. List-cap (MLB [87,85,80]) -> the rungs themselves, each
-        # clamped to what's left to fill (so the ladder is 87 -> 85 -> 80, not a
-        # percentage ladder). Scalar/unlimited -> the percentage ladder from
-        # effective_stake (AFL/NBA SGMs unchanged).
+        # Stake steps. v5.38: a LIST cap (afl.sgm [400,300,200] / mlb.sgm
+        # [130,100,87]) is a LIABILITY ladder -> resolve_stake_steps converts each
+        # bracket to a stake via the est combined odds (liability/(est_odds-1)),
+        # capped at effective_stake; with no est odds it falls back to the seeded
+        # percentage ladder (capped at effective_stake) so a list value is never a
+        # raw stake. Scalar/unlimited -> the percentage ladder (NBA SGMs unchanged).
         if list_ladder is not None:
-            steps = _sgm_ladder_steps(list_ladder, effective_stake)
+            steps, _step_reason, _ = session_priority.resolve_stake_steps(
+                sid, sport, "sgm",
+                sizing_odds if (sizing_odds and sizing_odds > 1.0) else 0,
+                effective_stake, _v4_ladder_steps,
+            )
         else:
             steps = _v4_ladder_steps(effective_stake)
         success_on_session = False
@@ -7448,6 +7522,383 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
     )]
 
 
+def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
+                              session_hb_legs: list, target_odds) -> BetResult:
+    """Place ONE account in the concurrent SGM fan-out, walking its liability-
+    derived stake ladder via hb.place_sgm_bet: top rung first; on a stake-too-high
+    reject drop to the next bracket; STOP on the first success, on a non-stake
+    error, or on an AMBIGUOUS (maybe-landed) outcome — never ladder past an
+    ambiguous (that could double-stake). Mirrors _fanout_place_account (the
+    singles worker) but for the multi-leg SGM payload. NO boost path: every SGM
+    account is boost_eligible:false and SGM_BOOST_SESSIONS is empty, so a boost
+    branch would add risk for no gain. Returns the terminal BetResult; the rung
+    requested is stashed as _requested_stake for the at-risk/ambiguous reporting."""
+    import time as _t
+    sid = str(sess.get("session_id", ""))
+    bk = sess.get("bookie", "unknown")
+    event_for_hb = _bookie_event(tip.event, bk, tip.sport)
+    last: BetResult | None = None
+    for i, step in enumerate(ladder):
+        _t0 = _t.time()
+        resp = hb.place_sgm_bet(
+            session_id=sid, sport=tip.sport, event=event_for_hb,
+            legs=session_hb_legs, stake=step, target_odds=target_odds,
+        )
+        _el = round(_t.time() - _t0, 2)
+        if resp.get("success"):
+            try:
+                actual = float(resp.get("stake", step))
+            except (TypeError, ValueError):
+                actual = step
+            if actual <= 0:
+                actual = step
+            if abs(actual - step) > 1.0:
+                log.warning(
+                    f"SGM fan-out AUTO-CAP on {bk}:{sid}: requested=${step:.2f} "
+                    f"actual=${actual:.2f}")
+            r = BetResult(
+                success=True, tip=tip, session_id=sid, bookie=bk,
+                bet_id=resp.get("bet_id"), odds=resp.get("odds"), stake=actual,
+                timestamp=datetime.now(), elapsed_sec=_el,
+                placed_leg_summary=_format_tip_placement_summary(tip))
+            try:
+                r._requested_stake = step
+            except Exception:
+                pass
+            if i > 0:
+                log.info(f"SGM fan-out: {bk}:{sid} laddered to rung {i + 1} "
+                         f"(${step:.2f}) after {i} stake-reject(s)")
+            return r
+        err = str(resp.get("error", "") or "")
+        # Erasmus: a slow (>=threshold) or hyperbot-ambiguous failure may have
+        # LANDED at the bookie -> stop, flag ambiguous, NEVER ladder/re-bet (a
+        # lower rung after a maybe-landed top rung = double-stake). A definitely-
+        # pre-placement error ("did not match"/"line moved") walks on. NOTE: like
+        # the AFL singles fan-out (_fanout_place_account), this worker does NOT
+        # call reconcile.decide_ambiguous per-account (the /api/pending_bets
+        # confirm/deny) — stopping the ladder already prevents the double-stake;
+        # the ambiguous CRITICAL alert + the orchestrator treating the at-risk
+        # stake as COMMITTED cover the maybe-landed money. Reported at-risk = the
+        # rung fired (may over-state vs a confirmed smaller auto-cap — a reporting
+        # refinement deferred, consistent with the AFL fan-out).
+        _slow = _el >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
+        if (_slow or bool(resp.get("ambiguous"))) and not _is_definitely_pre_placement(err):
+            r = BetResult(
+                success=False, tip=tip, session_id=sid, bookie=bk,
+                error=f"ambiguous ({'slow_rejection' if _slow else 'fast_ambiguous'}): "
+                      f"{err[:120]}",
+                is_ambiguous=True, stake=step, elapsed_sec=_el,
+                timestamp=datetime.now(),
+                placed_leg_summary=_format_tip_placement_summary(tip))
+            try:
+                r._requested_stake = step
+            except Exception:
+                pass
+            log.warning(f"SGM fan-out: {bk}:{sid} AMBIGUOUS on ${step:.2f} "
+                        f"(elapsed {_el:.1f}s) — stopping ladder (may have landed)")
+            return r
+        last = BetResult(success=False, tip=tip, session_id=sid, bookie=bk,
+                         error=err, elapsed_sec=_el, timestamp=datetime.now())
+        try:
+            last._requested_stake = step
+        except Exception:
+            pass
+        if not _is_stake_error(err):
+            log.info(f"SGM fan-out: {bk}:{sid} non-stake error on ${step:.2f} — "
+                     f"abandoning ladder: {err[:80]}")
+            return last
+        log.info(f"SGM fan-out: {bk}:{sid} stake-reject ${step:.2f}, laddering down")
+    return last if last is not None else BetResult(
+        success=False, tip=tip, session_id=sid, bookie=bk,
+        error="SGM fan-out: empty ladder", timestamp=datetime.now())
+
+
+def _place_sgm_fanout(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult]:
+    """v5.38 CONCURRENT SGM fan-out (Saiyan AFL + Shook MLB HRRBI) — Wilson.
+
+    Even-splits the intended unit across the SGM-capable accounts, then places ALL
+    accounts CONCURRENTLY (ThreadPoolExecutor), each capped by its yaml `sgm`
+    LIABILITY ladder (afl.sgm [400,300,200] / mlb.sgm [130,100,87]) sized off the
+    ESTIMATED combined SGM odds (= PRODUCT of the per-leg catalog odds, since an
+    SGM has no pre-placement price), each laddering DOWN a bracket on a stake-too-
+    high reject in its own thread. The even-split's liability lands below the top
+    bracket, so the cap normally doesn't bind — it only ladders down on a reject
+    or caps a long-odds SGM. Mirrors _place_afl_fanout (the singles fan-out).
+
+    `_orchestrated=True` (MLB, from _place_mlb_hrrbi): return the placement
+    results WITHOUT emitting the consolidated summary / unfilled->manual (the MLB
+    orchestrator owns those + adds Alex as the single-account backstop). The
+    AMBIGUOUS (maybe-landed) critical alert still fires (independent of the
+    summary). Non-orchestrated (AFL): emit the one consolidated summary +
+    unfilled->manual + ambiguous, exactly like _place_afl_fanout.
+
+    FALLBACK: on ANY non-happy-path (team+total SGM, no priority list, no active/
+    eligible sessions, legs not carried on any bookie, or no usable combined-odds
+    estimate) it DELEGATES to the sequential _place_sgm_v4(tip, _orchestrated) —
+    the proven path that owns the manual-alert routing AND now sizes the same
+    liability lists off est_odds too. So the fan-out only takes over the happy
+    path; everything else is byte-identical to pre-v5.38."""
+    import time as _time_mod
+    import concurrent.futures
+    sport = (tip.sport or "nba").lower()
+    intended_stake = tip.stake_dollars
+
+    def _fallback(reason: str) -> list[BetResult]:
+        log.info(f"SGM fan-out: delegating to sequential _place_sgm_v4 ({reason})")
+        return _place_sgm_v4(tip, _orchestrated=_orchestrated)
+
+    # ── Gating (mirrors _place_sgm_v4; delegate on any miss) ───────────
+    if _is_team_plus_total_sgm(tip):
+        return _fallback("team ML/handicap + total SGM — manual rule")
+    if not session_priority.get_priority_for(sport, is_sgm=True):
+        return _fallback(f"no {sport} SGM priority list")
+    raw_sessions = _v4_get_active_sessions_unfiltered(tip)
+    if not raw_sessions:
+        return _fallback("no active sessions after sport filter")
+    sessions = session_priority.filter_and_order_sessions(raw_sessions, sport, is_sgm=True)
+    sgm_blacklist_env = os.getenv("SGM_BLACKLIST_SESSIONS", "").strip()
+    if sgm_blacklist_env:
+        _blk = {s.strip() for s in sgm_blacklist_env.split(",") if s.strip()}
+        sessions = [s for s in sessions if str(s.get("session_id")) not in _blk]
+    if not sessions:
+        return _fallback("no priority/eligible SGM sessions")
+    # De-dup by session_id BEFORE the split (a duplicated priority entry would
+    # inflate n_accounts + double-POST the same account).
+    _seen_pre: set[str] = set()
+    _ded: list[dict] = []
+    for s in sessions:
+        _sid = str(s.get("session_id", ""))
+        if _sid and _sid in _seen_pre:
+            log.warning(f"SGM fan-out: duplicate session {_sid} in priority — de-duped")
+            continue
+        _seen_pre.add(_sid)
+        _ded.append(s)
+    sessions = _ded
+
+    # ── Build the bookmaker-agnostic legs once (mirror _place_sgm_v4) ──
+    hb_legs: list[dict] = []
+    for leg in tip.legs:
+        leg_is_threshold = getattr(leg, "_is_threshold", False)
+        if tip.is_pyo_sgm and leg_is_threshold:
+            leg_is_threshold = False
+            if leg.line and leg.line == int(leg.line):
+                leg.line = float(leg.line) - 0.5
+            if not leg.selection or leg.selection in ("", "over"):
+                leg.selection = "over"
+        resolved = _resolve_leg_for_hyperbot(
+            leg, tip.sport, is_threshold=leg_is_threshold, for_sgm=True,
+            tipster=tip.tipster,
+        )
+        hb_leg = {"market": resolved["market"], "selection": resolved["selection"]}
+        if resolved["player"]:
+            hb_leg["player"] = resolved["player"]
+        if resolved["stat"]:
+            hb_leg["stat"] = resolved["stat"]
+        if resolved["line"] is not None:
+            hb_leg["line"] = resolved["line"]
+        hb_legs.append(hb_leg)
+
+    # Target odds: 90% of suggested, floored at 1.01 — usually None for SGMs
+    # (saiyan/Shook quote no combined price). est_odds is for SIZING only, NOT a
+    # price floor (an SGM fills at any price when target_odds is None).
+    target_odds = None
+    if tip.suggested_odds and tip.suggested_odds > 1.0:
+        target_odds = round(max(1.01, tip.suggested_odds * 0.9), 2)
+
+    _t_start = _time_mod.time()
+    # ── Resolve ONCE per bookie: enrich legs + estimate combined odds ──
+    legs_by_bookie: dict[str, list | None] = {}
+    est_by_bookie: dict[str, float | None] = {}
+    _pc_t0 = _time_mod.time()
+    for sess in sessions:
+        bk = (sess.get("bookie", "") or "").lower()
+        if bk in legs_by_bookie:
+            continue
+        _leg_odds: list = []
+        enriched, enrich_err = _enrich_sgm_legs_with_prop_ids(
+            hb_legs, tip, str(sess.get("session_id", "")), bookie=bk, odds_out=_leg_odds,
+        )
+        if enrich_err:
+            log.info(f"SGM fan-out: enrich failed on {bk}: {enrich_err}")
+            legs_by_bookie[bk] = None
+            continue
+        legs_by_bookie[bk] = enriched
+        est_by_bookie[bk] = _sgm_est_combined_odds(_leg_odds)
+    _tm = getattr(tip, "_timing", None)
+    if isinstance(_tm, dict):
+        _tm["price_check_sec"] = round(_time_mod.time() - _pc_t0, 2)
+
+    if not any(legs_by_bookie.values()):
+        return _fallback("SGM legs not carried on any eligible bookie")
+    if not any(est_by_bookie.get(bk) for bk, lg in legs_by_bookie.items() if lg):
+        return _fallback("no usable combined-odds estimate (a leg lacked catalog odds)")
+
+    # ── Size each account: even-split, capped by the liability ladder ──
+    n_accounts = len(sessions)
+    per_account_target = round(intended_stake / n_accounts, 2)
+    log.info(
+        f"SGM fan-out: {n_accounts} session(s), intended ${intended_stake:.2f} -> "
+        f"${per_account_target:.2f}/account (even split), est_odds={est_by_bookie}"
+    )
+    jobs: list[tuple[dict, list, list]] = []  # (session, stake-ladder, enriched legs)
+    seen_sids: set[str] = set()
+    allocated = 0.0
+    for sess in sessions:
+        sid = str(sess.get("session_id", ""))
+        if sid in seen_sids:
+            continue
+        seen_sids.add(sid)
+        bk = (sess.get("bookie", "") or "").lower()
+        enriched = legs_by_bookie.get(bk)
+        est = est_by_bookie.get(bk)
+        if enriched is None or not est:
+            log.info(f"SGM fan-out: {bk} session {sid} skipped (legs/odds unresolved)")
+            continue
+        remaining_budget = round(intended_stake - allocated, 2)
+        if remaining_budget <= 0:
+            log.info(f"SGM fan-out: intended fully allocated — {bk} {sid} not needed")
+            continue
+        # resolve_stake_steps (list-cap mode) converts each liability bracket to a
+        # stake at the est combined odds, capped at the even-split target.
+        steps, cap_reason, _ = session_priority.resolve_stake_steps(
+            sid, sport, "sgm", est, per_account_target, _v4_ladder_steps,
+        )
+        steps = [round(min(s, remaining_budget), 2) for s in steps if s and s > 0]
+        ladder = [s for s in steps if s >= AFL_FANOUT_MIN_STAKE]
+        if not ladder and steps:
+            ladder = [round(min(AFL_FANOUT_MIN_STAKE, remaining_budget), 2)]
+        _dedup: list = []
+        for s in ladder:
+            if s > 0 and (not _dedup or _dedup[-1] != s):
+                _dedup.append(s)
+        ladder = _dedup
+        if not ladder:
+            log.info(f"SGM fan-out: {bk} {sid} no usable stake ({cap_reason}) — skip")
+            continue
+        allocated = round(allocated + ladder[0], 2)
+        log.info(f"SGM fan-out: {bk} {sid} -> ladder {ladder} ({cap_reason}, est_odds={est})")
+        jobs.append((sess, ladder, enriched))
+
+    if not jobs:
+        return _fallback("no placeable SGM accounts after sizing")
+
+    # ── Fire all accounts CONCURRENTLY (each ladders in its own thread) ─
+    results: list[BetResult] = []
+    log.info(f"SGM fan-out: firing {len(jobs)} concurrent SGM placement(s)")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        futures = {
+            ex.submit(_sgm_fanout_place_account, tip, sess, ladder, enriched, target_odds): sess
+            for (sess, ladder, enriched) in jobs
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            sess = futures[fut]
+            sid = str(sess.get("session_id", ""))
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                log.error(f"SGM fan-out: placement on {sid} raised: {e}")
+                results.append(BetResult(
+                    success=False, tip=tip, session_id=sid,
+                    bookie=sess.get("bookie", "unknown"),
+                    error=f"SGM fan-out placement exception: {e}",
+                    timestamp=datetime.now()))
+
+    # ── Roll up: placed / ambiguous / unfilled (mirror _place_afl_fanout) ──
+    placed_results = [r for r in results if r.success]
+    ambiguous_results = [r for r in results if not r.success and _is_ambiguous_result(r)]
+    failed_results = [r for r in results if not r.success and not _is_ambiguous_result(r)]
+
+    top_by_sid = {str(s.get("session_id", "")): ladder[0] for (s, ladder, _e) in jobs}
+
+    def _at_risk_stake(r: BetResult) -> float:
+        return round((getattr(r, "_requested_stake", None) or r.stake
+                      or top_by_sid.get(str(r.session_id), 0.0) or 0.0), 2)
+
+    attempted_stake = round(sum(top_by_sid.values()), 2)
+    total_placed = round(sum(r.stake or 0 for r in placed_results), 2)
+    ambiguous_total = round(sum(_at_risk_stake(r) for r in ambiguous_results), 2)
+    unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
+    display_intended = round(intended_stake, 2)
+
+    session_timing = [{
+        "session_id": r.session_id, "bookie": r.bookie,
+        "elapsed_sec": getattr(r, "elapsed_sec", None) or 0.0,
+        "attempts": 1, "fails": 0 if r.success else 1, "succeeded": r.success,
+    } for r in results]
+    ambiguous_outcomes = [{
+        "bookie": r.bookie, "session_id": r.session_id, "stake": _at_risk_stake(r),
+        "odds": (r.odds or 0), "elapsed_sec": round(getattr(r, "elapsed_sec", None) or 0.0, 2),
+        "error": (r.error or "")[:200],
+        "reason": ("fast_ambiguous" if getattr(r, "is_ambiguous", False) else "slow_rejection"),
+        "correlation_id": getattr(r, "correlation_id", None),
+    } for r in ambiguous_results]
+
+    _log_jsonl(AUDIT_LOG, {
+        "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
+        "intended_stake": round(intended_stake, 2), "attempted_stake": attempted_stake,
+        "placed_stake": total_placed, "ambiguous_stake": ambiguous_total,
+        "unfilled_stake": unfilled, "fanout": "sgm", "sgm": True,
+        "orchestrated": _orchestrated, "accounts": len(jobs),
+        "placements": [
+            {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
+             "fill_odds": r.odds, "bet_id": r.bet_id} for r in placed_results],
+        "ambiguous": [
+            {"session_id": r.session_id, "bookie": r.bookie, "stake": _at_risk_stake(r),
+             "error": r.error} for r in ambiguous_results],
+        "failures": [
+            {"session_id": r.session_id, "bookie": r.bookie, "error": r.error}
+            for r in failed_results],
+    })
+
+    # ORCHESTRATED (MLB): the orchestrator owns the consolidated summary +
+    # leftover->manual (it still has Alex's single to place). Only the AMBIGUOUS
+    # critical fires here (maybe-landed — independent of fill state). Return.
+    if _orchestrated:
+        if ambiguous_outcomes:
+            _emit_sports_ambiguous_alert(tip, ambiguous_outcomes)
+        log.info(
+            f"SGM fan-out (orchestrated): placed ${total_placed:.2f} across "
+            f"{len(placed_results)}/{len(jobs)} account(s) "
+            f"({len(failed_results)} failed, {len(ambiguous_results)} ambiguous)")
+        return results
+
+    # NON-ORCHESTRATED (AFL saiyan): the one consolidated summary + unfilled.
+    if placed_results:
+        notifier.notify_tip_placed_summary(
+            tip, placed_results, display_intended, unfilled,
+            total_elapsed_sec=round(_time_mod.time() - _t_start, 2),
+            session_timing=session_timing,
+            concurrent_bookies=True,  # fan-out: bookie wall-clock = MAX not SUM
+        )
+        log.info(
+            f"SGM fan-out: placed ${total_placed:.2f} across "
+            f"{len(placed_results)}/{len(jobs)} account(s) "
+            f"({len(failed_results)} failed, {len(ambiguous_results)} ambiguous)")
+
+    if failed_results or unfilled > 1.0:
+        log.warning(
+            f"SGM fan-out: ${unfilled:.2f} unfilled ({len(failed_results)} failed)")
+        notifier.notify_tip_unfilled_with_placements(
+            tip, display_intended, total_placed, unfilled,
+            placed_results, failed_results,
+            session_timing=session_timing,
+            total_elapsed_sec=round(_time_mod.time() - _t_start, 2),
+            concurrent_bookies=True,
+        )
+        _log_jsonl(ERROR_LOG, {
+            "type": "tip_unfilled", "tipster": tip.tipster, "event": tip.event,
+            "intended_stake": intended_stake, "attempted_stake": attempted_stake,
+            "placed_stake": total_placed, "unfilled_stake": unfilled,
+            "last_error": failed_results[-1].error if failed_results else None,
+            "message": tip.raw_message, "fanout": "sgm",
+        })
+
+    if ambiguous_outcomes:
+        _emit_sports_ambiguous_alert(tip, ambiguous_outcomes)
+
+    return results
+
+
 def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
     """Place the 2+ HRRBI as a SINGLE on the MLB single-only account(s)
     (MLB_HRRBI_SINGLE_SESSIONS — Alex Liu, who can't do multis). Per-account
@@ -7595,38 +8046,68 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
     the validated HRRBI shape reaches here (place_tip gates on _is_mlb_hrrbi_sgm)."""
     _t_start = time.time()  # v5.37: end-to-end timing for the consolidated summary
     intended = tip.stake_dollars
-    # SGM accounts first (reuses the audited SGM path; _orchestrated suppresses
-    # its terminal manual alert so this function owns final alerting).
-    sgm_results = _place_sgm_v4(tip, _orchestrated=True)
+    # SGM accounts first. v5.38: even-split + per-account liability ladder
+    # ([130,100,87] off est combined odds), placed CONCURRENTLY across the 3 SGM
+    # accounts via _place_sgm_fanout(_orchestrated=True) — it returns the
+    # placements WITHOUT a summary (this function owns the ONE consolidated
+    # summary + leftover->manual). Falls back to the sequential _place_sgm_v4
+    # internally on any non-happy-path. SGM_CONCURRENT_FANOUT=false -> sequential.
+    # _orchestrated suppresses the SGM path's own terminal manual alert.
+    if SGM_CONCURRENT_FANOUT:
+        sgm_results = _place_sgm_fanout(tip, _orchestrated=True)
+    else:
+        sgm_results = _place_sgm_v4(tip, _orchestrated=True)
     placed = sum((r.stake or 0) for r in sgm_results if r.success)
-    remaining = round(intended - placed, 2)
+    # v5.38 (adversarial-pass fix): an AMBIGUOUS (maybe-landed) SGM rung is
+    # COMMITTED — its at-risk stake MUST reduce the remainder handed to Alex, else
+    # Alex backstops a slice that may already be on the books (Erasmus/Dawson
+    # double-stake). Mirror the fan-out's own rollup (which excludes ambiguous
+    # from unfilled). At-risk = _requested_stake (the rung fired; r.stake on an
+    # ambiguous fan-out result is the step, but be defensive).
+    _sgm_ambiguous = [r for r in sgm_results if not r.success and _is_ambiguous_result(r)]
+    _sgm_ambiguous_total = sum(
+        (getattr(r, "_requested_stake", None) or r.stake or 0) for r in _sgm_ambiguous)
+    remaining = round(intended - placed - _sgm_ambiguous_total, 2)
     # Then the single-only account(s) for the next rung(s).
     alex_results = _place_mlb_alex_single(tip, remaining) if remaining > STAKE_FLOOR else []
     placed += sum((r.stake or 0) for r in alex_results if r.success)
-    remaining = round(intended - placed, 2)
+    remaining = round(intended - placed - _sgm_ambiguous_total, 2)
 
     all_results = list(sgm_results) + list(alex_results)
     successes = [r for r in all_results if r.success]
-    # v5.37: per-account timing for the consolidated summary's reconciling
-    # breakdown (else, with tip._timing.t0 set by the text handler, the BET
-    # PLACED summary would lump ALL placement time into "other" with no bookies
-    # split). MLB places SEQUENTIALLY here (SGM spillover + Alex single), so
-    # concurrent_bookies=False -> bookies = SUM (the per-account times don't
-    # overlap). [Deploy 2 makes the SGM accounts concurrent -> flips this.]
+    # v5.38: the 3 SGM accounts now place CONCURRENTLY (via _place_sgm_fanout's
+    # ThreadPoolExecutor) when SGM_CONCURRENT_FANOUT; Alex's single runs
+    # sequentially AFTER. So the bookie wall-clock is ~MAX(SGM accounts) + Alex,
+    # closer to MAX than SUM -> concurrent_bookies=SGM_CONCURRENT_FANOUT (Alex's
+    # tail lands in "other"; SUM would 3x-overstate the dominant concurrent SGM
+    # block — the v5.35 fix this restores). Per-account timing for the summary's
+    # reconciling breakdown (else all placement time lumps into "other").
+    _mlb_concurrent = bool(SGM_CONCURRENT_FANOUT)
     _mlb_session_timing = [{
         "session_id": r.session_id, "bookie": r.bookie,
         "elapsed_sec": getattr(r, "elapsed_sec", None),
         "attempts": 1, "fails": 0, "succeeded": True,
     } for r in successes]
     log.info(
-        f"MLB HRRBI per-account: placed ${placed:.2f} across "
-        f"{len(successes)} account(s); ${remaining:.2f} of ${intended:.2f} leftover"
+        f"MLB HRRBI per-account: placed ${placed:.2f} across {len(successes)} "
+        f"account(s); ${remaining:.2f} of ${intended:.2f} leftover"
+        + (f"; ${_sgm_ambiguous_total:.2f} ambiguous (maybe-landed, committed)"
+           if _sgm_ambiguous_total else "")
     )
-    if not successes:
+    if not successes and not _sgm_ambiguous:
         # Nothing landed anywhere -> manual (the play could not be auto-placed).
         if not tip.alert_reason:
             tip.alert_reason = "MLB HRRBI: no auto-placement on any account"
         notifier.notify_manual_alert(tip)
+    elif not successes:
+        # No CONFIRMED placement, but >=1 SGM account is AMBIGUOUS (maybe-landed).
+        # The fan-out already fired the CRITICAL ambiguous alert; do NOT also
+        # re-prompt a FULL manual re-place of a play that may already be (partly)
+        # on the books — that's the double-stake the ambiguous handling prevents.
+        log.warning(
+            f"MLB HRRBI: no CONFIRMED placement but ${_sgm_ambiguous_total:.2f} "
+            f"ambiguous (maybe-landed) — full manual re-place SUPPRESSED (the "
+            f"ambiguous critical alert owns reconciliation)")
     else:
         # ONE consolidated success message per tip (Wilson 2026-06-02: like
         # Tip Titans / singles-v4 — not 3 separate "BET PLACED" msgs). Rolls up
@@ -7638,7 +8119,7 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
                 tip, successes, intended, round(remaining, 2),
                 total_elapsed_sec=round(time.time() - _t_start, 2),
                 session_timing=_mlb_session_timing,
-                concurrent_bookies=False,
+                concurrent_bookies=_mlb_concurrent,
             )
         except Exception as e:
             log.error(f"MLB HRRBI placed-summary notify failed: {e}")
@@ -7666,7 +8147,7 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
                     successes, [],
                     session_timing=_mlb_session_timing,
                     total_elapsed_sec=round(time.time() - _t_start, 2),
-                    concurrent_bookies=False,
+                    concurrent_bookies=_mlb_concurrent,
                 )
                 log.info(
                     f"MLB HRRBI: ${remaining:.2f} leftover -> Manual Bets alert"
