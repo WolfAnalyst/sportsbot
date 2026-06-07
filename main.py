@@ -1693,8 +1693,23 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
         log.warning("No legs in tip, skipping")
         return []
 
-    # Resolve event
+    # Resolve event. v5.37: time the resolve step on its own (was lumped into the
+    # _process_tip "resolve+place" log) + stash it on tip._timing so the BET
+    # PLACED summary can show a reconciling parse/resolve/place-wall breakdown.
+    # tip._timing carries t0 + parse_sec from the message handler; we ADD
+    # resolve_sec here. If the handler didn't stamp t0 (a direct place_tip call /
+    # test), the notifier ignores the phase split — resolve_sec is then unused.
+    _t_resolve = time.time()
     event = resolve_event(tip)
+    _tm = getattr(tip, "_timing", None)
+    if not isinstance(_tm, dict):
+        _tm = {}
+        try:
+            tip._timing = _tm
+        except Exception:
+            _tm = None
+    if _tm is not None:
+        _tm["resolve_sec"] = round(time.time() - _t_resolve, 3)
     if not event:
         search = tip.primary_team or (tip.legs[0].player if tip.legs else "unknown")
         log.warning(f"No fixture found for {search}")
@@ -3407,6 +3422,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # priority list ever spans bookies (each bookie carries its own lines).
     resolved_by_bookie: dict[str, dict | None] = {}
     manual_by_bookie: dict[str, BetResult] = {}
+    _pc_t0 = _time_mod.time()  # v5.37: time the resolve-once (catalog price-check)
     for sess in sessions:
         bk = (sess.get("bookie", "") or "").lower()
         if bk in resolved_by_bookie:
@@ -3417,6 +3433,12 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         resolved_by_bookie[bk] = _resolved  # None when routed to manual
         if _manual is not None:
             manual_by_bookie[bk] = _manual
+    # v5.37: stash the resolve-once span (the per-bookie catalog price-check) so
+    # the summary's reconciling breakdown can show "price-check Ns" as its own
+    # phase (it happens BEFORE the concurrent place-wall, so it's additive).
+    _tm = getattr(tip, "_timing", None)
+    if isinstance(_tm, dict):
+        _tm["price_check_sec"] = round(_time_mod.time() - _pc_t0, 3)
 
     if not any(resolved_by_bookie.values()):
         log.info(
@@ -3688,6 +3710,8 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             tip, display_intended, total_placed, unfilled,
             placed_results, failed_results,
             session_timing=session_timing,
+            total_elapsed_sec=round(_time_mod.time() - _t_start, 2),
+            concurrent_bookies=True,  # fan-out: bookie wall-clock = MAX not SUM
         )
         _log_jsonl(ERROR_LOG, {
             "type": "tip_unfilled",
@@ -3996,6 +4020,8 @@ def _place_etr_nba_fanout(tip: ParsedTip) -> list[BetResult]:
             tip, display_intended, total_placed, unfilled,
             placed_results, failed_results,
             session_timing=session_timing,
+            total_elapsed_sec=round(_time_mod.time() - _t_start, 2),
+            concurrent_bookies=True,  # fan-out: bookie wall-clock = MAX not SUM
         )
         _log_jsonl(ERROR_LOG, {
             "type": "tip_unfilled", "tipster": tip.tipster, "event": tip.event,
@@ -7567,6 +7593,7 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
     left over after all accounts have taken their rung is routed to a single
     manual-placement Telegram notification (NOT a per-tip 'partial fill'). Only
     the validated HRRBI shape reaches here (place_tip gates on _is_mlb_hrrbi_sgm)."""
+    _t_start = time.time()  # v5.37: end-to-end timing for the consolidated summary
     intended = tip.stake_dollars
     # SGM accounts first (reuses the audited SGM path; _orchestrated suppresses
     # its terminal manual alert so this function owns final alerting).
@@ -7580,6 +7607,17 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
 
     all_results = list(sgm_results) + list(alex_results)
     successes = [r for r in all_results if r.success]
+    # v5.37: per-account timing for the consolidated summary's reconciling
+    # breakdown (else, with tip._timing.t0 set by the text handler, the BET
+    # PLACED summary would lump ALL placement time into "other" with no bookies
+    # split). MLB places SEQUENTIALLY here (SGM spillover + Alex single), so
+    # concurrent_bookies=False -> bookies = SUM (the per-account times don't
+    # overlap). [Deploy 2 makes the SGM accounts concurrent -> flips this.]
+    _mlb_session_timing = [{
+        "session_id": r.session_id, "bookie": r.bookie,
+        "elapsed_sec": getattr(r, "elapsed_sec", None),
+        "attempts": 1, "fails": 0, "succeeded": True,
+    } for r in successes]
     log.info(
         f"MLB HRRBI per-account: placed ${placed:.2f} across "
         f"{len(successes)} account(s); ${remaining:.2f} of ${intended:.2f} leftover"
@@ -7598,6 +7636,9 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
         try:
             notifier.notify_tip_placed_summary(
                 tip, successes, intended, round(remaining, 2),
+                total_elapsed_sec=round(time.time() - _t_start, 2),
+                session_timing=_mlb_session_timing,
+                concurrent_bookies=False,
             )
         except Exception as e:
             log.error(f"MLB HRRBI placed-summary notify failed: {e}")
@@ -7623,6 +7664,9 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
                 notifier.notify_tip_unfilled_with_placements(
                     tip, intended, round(placed, 2), round(remaining, 2),
                     successes, [],
+                    session_timing=_mlb_session_timing,
+                    total_elapsed_sec=round(time.time() - _t_start, 2),
+                    concurrent_bookies=False,
                 )
                 log.info(
                     f"MLB HRRBI: ${remaining:.2f} leftover -> Manual Bets alert"
@@ -8894,6 +8938,19 @@ async def _process_tip(text: str, tipster: str, sport: str,
     for tip in tips:
         tip.timestamp = msg_time
 
+        # v5.37: per-step timing carrier. t0 = the exact moment this message
+        # arrived at the handler (pipeline_start), parse_sec = the Groq+regex
+        # parse phase. place_tip ADDS resolve_sec; the AFL/ETR fan-outs ADD
+        # price_check_sec. The notifier renders one reconciling end-to-end line
+        # (parse / resolve / price-check / bookies / other) that SUMS to
+        # time.time()-t0. All tips on this path share the one parse phase.
+        tip._timing = {
+            "t0": pipeline_start,
+            "parse_sec": round(
+                (timing.get("groq_parse", 0) or 0)
+                + (timing.get("regex_parse", 0) or 0), 3),
+        }
+
         # Cap at max units
         if tip.units > MAX_UNITS:
             notifier.notify_info(
@@ -9223,15 +9280,25 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
 
 async def _route_image_racing_tips(raw_tips: list, tipster: str,
                                    channel_name: str, unit_size: float,
-                                   default_units: float, msg_time) -> None:
+                                   default_units: float, msg_time,
+                                   pipeline_start: float = None,
+                                   parse_sec: float = None) -> None:
     """Route vision-extracted RACING tips (Zak/Trial) to the racing pipeline.
 
     Stake = units (capped at IMAGE_RACING_MAX_UNITS=3u) × unit_size, unless
     IMAGE_RACING_TEST_MODE is on (then $1/u). v5.15: previously the production
     branch multiplied by default_units (the channel's 1.0 field) instead of
     unit_size, so it never actually staked at the configured size — fixed.
+
+    v5.37: pipeline_start (image/text arrival t0) + parse_sec (vision/text parse)
+    are threaded into process_image_racing_tip -> notify_tiptitans_placed so the
+    auto-place racing summary shows a TRUE end-to-end (arrival -> placement) with
+    the parse split — same reconciling line as the sports paths.
     """
     from tiptitans_processor import process_image_racing_tip
+    _phase_timing = None
+    if pipeline_start is not None:
+        _phase_timing = {"t0": pipeline_start, "parse_sec": round(parse_sec or 0.0, 3)}
 
     placed_any = False
     last_race_num = None  # forward-fill across selections grouped under a race
@@ -9311,6 +9378,7 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
             await process_image_racing_tip(
                 parsed, intended_stake, hb, notifier,
                 source=channel_name, test_mode=IMAGE_RACING_TEST_MODE,
+                phase_timing=_phase_timing,
             )
             placed_any = True
         except Exception as e:
@@ -9689,10 +9757,15 @@ def _image_afl_conflicting_indices(raw_tips: list) -> set:
 
 
 def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
-                          default_units: float, msg_time, channel_name: str) -> None:
+                          default_units: float, msg_time, channel_name: str,
+                          pipeline_start: float = None, parse_sec: float = None) -> None:
     """Route vision-extracted AFL tips through the sports pipeline (place_tip,
     Sportsbet-locked via TIPSTERS_FORCE_BOOKIE). Mirrors the per-tip steps of
-    _process_tip (cap units, flat/test-stake clamp, dupe-check, place_tip)."""
+    _process_tip (cap units, flat/test-stake clamp, dupe-check, place_tip).
+
+    v5.37: pipeline_start (image arrival t0) + parse_sec (vision parse) are
+    stamped onto each tip._timing so the BET PLACED summary shows the true
+    end-to-end + the parse/resolve/price-check breakdown, same as the text path."""
     conflicted = _image_afl_conflicting_indices(raw_tips)
     for idx, raw in enumerate(raw_tips):
         try:
@@ -9730,6 +9803,12 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                 log.info(f"[{channel_name}] DUPE image tip skipped: {_tip_fingerprint(tip)}")
                 continue
 
+            # v5.37: stamp arrival t0 + vision parse so the summary reconciles a
+            # true end-to-end. place_tip ADDS resolve_sec; the fan-out price_check_sec.
+            if pipeline_start is not None:
+                tip._timing = {"t0": pipeline_start,
+                               "parse_sec": round(parse_sec or 0.0, 3)}
+
             _audit_tip(tip, msg_time)
             results = place_tip(tip)
             # v5.13: also lock the fingerprint on an ambiguous (maybe-landed)
@@ -9757,6 +9836,10 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
                              msg_time, channel_name: str, raw_caption: str = ""):
     """Vision-parse an image-tip post and route to the right pipeline."""
     sport_l = (sport or "").lower()
+    # v5.37: t0 = the moment the image arrived (before the vision parse), so the
+    # BET PLACED summary's end-to-end spans arrival -> last placement, with the
+    # vision parse as its own phase. Threaded into the AFL + racing routers.
+    _t0 = time.time()
     try:
         loop = asyncio.get_event_loop()
         raw_tips, elapsed = await loop.run_in_executor(
@@ -9782,11 +9865,13 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
 
     if sport_l == "racing":
         await _route_image_racing_tips(
-            raw_tips, tipster, channel_name, unit_size, default_units, msg_time
+            raw_tips, tipster, channel_name, unit_size, default_units, msg_time,
+            pipeline_start=_t0, parse_sec=round(elapsed, 3),
         )
     else:
         _route_image_afl_tips(
-            raw_tips, tipster, unit_size, default_units, msg_time, channel_name
+            raw_tips, tipster, unit_size, default_units, msg_time, channel_name,
+            pipeline_start=_t0, parse_sec=round(elapsed, 3),
         )
 
 
@@ -9819,6 +9904,7 @@ async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
     apply unchanged. If the parser finds NO real runner the post was chatter that
     slipped past _image_text_is_actionable -> drop silently (no manual ping). On a
     parse ERROR, fall back to a manual alert so a genuine tip is never lost."""
+    _t0 = time.time()  # v5.37: arrival t0 for the end-to-end timing breakdown
     # v5.22 RESULTS GUARD: a results/recap post ('R7 Lingani WON at 4.50') carries
     # a race code + runner + price and would otherwise auto-place on a settled race.
     # Route obvious results/past-tense posts to manual (never auto-place) BEFORE the
@@ -9857,7 +9943,8 @@ async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
         f"{elapsed:.2f}s; routing as racing"
     )
     await _route_image_racing_tips(
-        raw_tips, tipster, channel_name, unit_size, default_units, msg_time
+        raw_tips, tipster, channel_name, unit_size, default_units, msg_time,
+        pipeline_start=_t0, parse_sec=round(elapsed, 3),
     )
 
 

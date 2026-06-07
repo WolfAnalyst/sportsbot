@@ -11,6 +11,7 @@ All four chat IDs are optional. If unset, fall back to NOTIFY_CHAT_ID
 """
 
 import re
+import time
 import requests
 import logging
 import os
@@ -67,6 +68,85 @@ def _session_label(session_id, fallback_bookie: str = "") -> str:
     if bookie:
         return f"{bookie} (s{sid})"
     return f"s{sid}"
+
+
+def _render_timing_block(
+    phase_timing, total_elapsed_sec=None,
+    session_timing=None, concurrent_bookies=False,
+) -> str:
+    """Render the consolidated 'End-to-end' timing line for a placement summary.
+
+    Shared by notify_tip_placed_summary / notify_tip_unfilled_with_placements /
+    notify_tiptitans_placed so every BET PLACED summary renders the same
+    RECONCILING breakdown (v5.37). The named phases SUM to the end-to-end:
+
+        parse + resolve + price-check + place-wall (bookies) + other == end-to-end
+
+    `phase_timing` is the tip._timing dict (set by the message handlers + the
+    place_tip resolve wrap; threaded explicitly for racing). Optional keys:
+      t0             — epoch (time.time()) the tip ARRIVED at the Telegram handler
+      parse_sec      — Groq/regex/vision/text parse time
+      resolve_sec    — resolve_event(tip) time
+      price_check_sec— the resolve-once / enrichment catalog price-check time
+
+    When t0 IS present, the end-to-end is the TRUE arrival->now span
+    (time.time() - t0) and the parse/resolve/price-check splits are shown;
+    whatever is left after the named phases is 'other' (price-shop overhead,
+    audit, the Telegram send itself) so the line ALWAYS reconciles.
+
+    When t0 is ABSENT (a direct placement call in a test, or a path that didn't
+    stamp arrival) it FALLS BACK to total_elapsed_sec + the v5.35 bookies/other
+    split only — byte-identical to the prior behaviour, so existing callers and
+    tests are unaffected.
+
+    place-wall = MAX(session elapsed) for a CONCURRENT fan-out (accounts place in
+    parallel, so the bookie-phase wall-clock is the slowest account), else SUM
+    (sequential spillover, where the per-session times don't overlap). Returns ""
+    (no line) when there's nothing to show, else a leading-newline HTML fragment.
+    """
+    pt = phase_timing if isinstance(phase_timing, dict) else {}
+    t0 = pt.get("t0")
+    use_phase = bool(t0)
+    if use_phase:
+        try:
+            end_to_end = max(0.0, time.time() - float(t0))
+        except (TypeError, ValueError):
+            use_phase = False
+            end_to_end = total_elapsed_sec
+    else:
+        end_to_end = total_elapsed_sec
+    if end_to_end is None:
+        return ""
+
+    _elapseds = [t.get("elapsed_sec", 0) or 0 for t in (session_timing or [])]
+    place_wall = (max(_elapseds) if _elapseds else 0.0) if concurrent_bookies \
+        else sum(_elapseds)
+
+    named: list[str] = []   # the components that SUM toward end-to-end
+    accounted = 0.0
+    if use_phase:
+        for key, label in (("parse_sec", "parse"),
+                           ("resolve_sec", "resolve"),
+                           ("price_check_sec", "price-check")):
+            v = pt.get(key)
+            if v is not None:
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    continue
+                named.append(f"{label} {v:.1f}s")
+                accounted += max(0.0, v)
+    if session_timing:
+        bk_label = "bookies concurrent, slowest" if concurrent_bookies else "bookies"
+        named.append(f"{bk_label} {place_wall:.1f}s")
+        accounted += place_wall
+
+    if not named:
+        # No phase data and no session timing -> just the total (legacy fallback).
+        return f"\n<b>End-to-end:</b> {end_to_end:.1f}s"
+    other = max(0.0, end_to_end - accounted)
+    return (f"\n<b>End-to-end:</b> {end_to_end:.1f}s "
+            f"({', '.join(named)}, other {other:.1f}s)")
 
 
 def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
@@ -576,35 +656,15 @@ def notify_tip_placed_summary(
     if unfilled >= 1:
         fill_tag = f"\n<b>⚠️ Unfilled:</b> ${unfilled:.2f}"
 
-    elapsed_tag = ""
-    if total_elapsed_sec is not None:
-        # 2026-05-18 v4.3: break out bookie vs other time. End-to-end
-        # always exceeds Σ(bookie session times) because of price-shop
-        # API calls, event resolution, and the Telegram alert send.
-        # Showing the split makes overhead visible — a single tip's
-        # price-shop alone is typically 2-4s, and multi-bookie spillover
-        # stacks per-session price-shops on top. Failure case to watch
-        # for: "other" climbing >10s means upstream is slow (HyperBot
-        # price-check endpoint), not us. Falls back to plain end-to-end
-        # when session_timing is empty (legacy callers / racing test mode).
-        # v5.35: bookie wall-clock. For CONCURRENT fan-outs (AFL/ETR) the
-        # accounts place in parallel, so the bookie phase wall-clock is the
-        # SLOWEST account (MAX), not the SUM — summing parallel work overstates
-        # "bookies" and drives "other" negative -> clamped to 0.0 (the old
-        # misleading "(bookies 8s, other 0.0s)"). For SEQUENTIAL paths the
-        # per-session times don't overlap, so SUM is correct.
-        _elapseds = [t.get("elapsed_sec", 0) or 0 for t in (session_timing or [])]
-        bookie_wall = (max(_elapseds) if _elapseds else 0.0) if concurrent_bookies \
-            else sum(_elapseds)
-        other = max(0.0, total_elapsed_sec - bookie_wall)
-        if session_timing:
-            _bk_label = "bookies concurrent, slowest" if concurrent_bookies else "bookies"
-            elapsed_tag = (
-                f"\n<b>End-to-end:</b> {total_elapsed_sec:.1f}s "
-                f"({_bk_label} {bookie_wall:.1f}s, other {other:.1f}s)"
-            )
-        else:
-            elapsed_tag = f"\n<b>End-to-end:</b> {total_elapsed_sec:.1f}s"
+    # v5.37: one RECONCILING end-to-end line. When the message handler stamped
+    # tip._timing (t0 + parse/resolve/price-check), this shows the TRUE arrival->
+    # now span broken into parse / resolve / price-check / bookies(place-wall) /
+    # other (which all SUM to the total). Falls back to the v5.35 bookies/other
+    # split off total_elapsed_sec when no phase data is present (tests, legacy).
+    elapsed_tag = _render_timing_block(
+        getattr(tip, "_timing", None),
+        total_elapsed_sec, session_timing, concurrent_bookies,
+    )
 
     text = (
         f"<b>BET PLACED</b>{sgm_tag}\n"
@@ -664,6 +724,8 @@ def notify_tip_unfilled_with_placements(
     tip, intended_stake, placed_stake, unfilled,
     placed_results, failed_results,
     session_timing=None,
+    total_elapsed_sec=None,
+    concurrent_bookies=False,
 ) -> bool:
     """
     Richer unfilled alert that also shows what was already placed (useful when
@@ -673,6 +735,11 @@ def notify_tip_unfilled_with_placements(
     `session_timing` (2026-05-17 v4.2) renders per-session elapsed and
     attempt count alongside each line so failed sessions that ate clock
     are visible. Same shape as notify_tip_placed_summary.
+
+    `total_elapsed_sec` / `concurrent_bookies` (v5.37) feed the shared
+    _render_timing_block so the unfilled alert ALSO shows the reconciling
+    end-to-end (parse / resolve / price-check / bookies / other) when the
+    handler stamped tip._timing. Both optional — sequential callers omit them.
     """
     raw_short = (tip.raw_message or "").strip()[:300]
 
@@ -769,8 +836,16 @@ def notify_tip_unfilled_with_placements(
     parts.extend([
         f"<b>Placed:</b> ${placed_stake:.2f} of ${intended_stake:.2f}",
         f"<b>Remaining:</b> ${unfilled:.2f}",
-        f"<b>Last error:</b>\n<pre>{_escape_html(last_err_short)}</pre>",
     ])
+    # v5.37: same reconciling end-to-end line as the placed summary (when the
+    # handler stamped tip._timing). Leading newline stripped — parts are joined.
+    _timing = _render_timing_block(
+        getattr(tip, "_timing", None),
+        total_elapsed_sec, session_timing, concurrent_bookies,
+    )
+    if _timing:
+        parts.append(_timing.lstrip("\n"))
+    parts.append(f"<b>Last error:</b>\n<pre>{_escape_html(last_err_short)}</pre>")
     return _send_alert("\n".join(parts))
 
 
@@ -778,7 +853,7 @@ def notify_tip_unfilled_with_placements(
 
 def notify_tiptitans_placed(
     tip_id, parsed, intended_stake, placed, unfilled, test_mode=False,
-    total_elapsed_sec=None, session_timing=None,
+    total_elapsed_sec=None, session_timing=None, phase_timing=None,
 ) -> bool:
     """Success message for a Tip Titans placement - goes to Bet Log (#2).
 
@@ -786,6 +861,13 @@ def notify_tiptitans_placed(
     notify call. `session_timing` is per-session bookie elapsed from
     racing_placer's session_elapsed timer. Both render inline so slow
     bookies are visible at a glance — same pattern as AFL/NBA alerts.
+
+    `phase_timing` (v5.37) is the optional racing-handler timing dict
+    ({t0, parse_sec}) — when present (the Zak/Trial image+text auto-place
+    path threads it), the end-to-end is measured from the tip's ARRIVAL at
+    the Telegram handler and the vision/text parse split is shown. When
+    absent (the Tip Titans channel, which has no upstream parse), it falls
+    back to total_elapsed_sec + the bookies/other split — UNCHANGED.
     """
     test_tag = " [TEST MODE]" if test_mode else ""
 
@@ -816,27 +898,15 @@ def notify_tiptitans_placed(
     if unfilled >= 1:
         unfilled_tag = f"\n<b>⚠️ Unfilled:</b> ${unfilled:.2f}"
 
-    elapsed_tag = ""
-    if total_elapsed_sec is not None:
-        # 2026-05-18 v4.3: same breakdown as singles. racing_placer
-        # populates timing.session_elapsed for every session attempted
-        # (including failures), so the math works without further wiring.
-        # "other" here is mostly the pre-loop race-time check + the
-        # initial price-shop + post-loop result reconciliation. Spillover
-        # tips can have "bookies" > end-to-end momentarily if parallel
-        # placement lands inside the same wall-clock window — clamp to
-        # zero via max() so we never display a negative "other".
-        bookie_total = sum(
-            t.get("elapsed_sec", 0) or 0 for t in (session_timing or [])
-        )
-        other = max(0.0, total_elapsed_sec - bookie_total)
-        if session_timing:
-            elapsed_tag = (
-                f"\n<b>End-to-end:</b> {total_elapsed_sec:.1f}s "
-                f"(bookies {bookie_total:.1f}s, other {other:.1f}s)"
-            )
-        else:
-            elapsed_tag = f"\n<b>End-to-end:</b> {total_elapsed_sec:.1f}s"
+    # v5.37: shared reconciling end-to-end line. Racing places SEQUENTIALLY
+    # (spillover), so concurrent_bookies=False -> bookies = SUM (unchanged). When
+    # the Zak/Trial racing handler threads phase_timing (t0 + vision/text parse),
+    # the end-to-end is measured from arrival and the parse split is shown; the
+    # Tip Titans channel passes phase_timing=None -> falls back to the prior
+    # total_elapsed_sec + bookies/other split (byte-identical).
+    elapsed_tag = _render_timing_block(
+        phase_timing, total_elapsed_sec, session_timing, concurrent_bookies=False,
+    )
 
     saddle_str = f"{parsed.get('saddle')}. " if parsed.get("saddle") else ""
     text = (
