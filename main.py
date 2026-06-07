@@ -9211,6 +9211,17 @@ def _afl_disambiguate_surname_by_odds(scoped: list, game_labels: list, token: st
     return None
 
 
+# Eddie posts bare-surname props anywhere from ~30 min to ~2 h before bounce, not
+# reliably at the 45-min mark. v5.32 (Wilson): widen the game-scan LOOK-AHEAD to 2
+# HOURS so the surname still scopes to the right team when the game is up to 2 h
+# out — the 2026-06-07 14:24 batch (Mills / Wilson / McInerney / Owens) all went
+# to manual with "no AFL game in the start window" because the games were >45 min
+# away. In-progress games (the behind window) are unchanged. A wider window can
+# surface MORE same-surname candidates, but the odds tie-break + the
+# manual-on-any-ambiguity safety below still apply (never guess a $400 bet).
+EDDIE_GAME_LOOKAHEAD_SEC = 7200  # 2 hours (was the resolver default 2700 = 45 min)
+
+
 def _resolve_eddie_surname_to_player(token: str, msg_time, stat: str = None,
                                      line=None, side: str = None, tip_odds=None):
     """Resolve an Eddie BARE-SURNAME player prop to a unique full-name player on
@@ -9245,12 +9256,15 @@ def _resolve_eddie_surname_to_player(token: str, msg_time, stat: str = None,
     except Exception:
         ref_ts = time.time()
     try:
-        games = afl_games_in_play(ref_ts)
+        games = afl_games_in_play(ref_ts, ahead_sec=EDDIE_GAME_LOOKAHEAD_SEC)
     except Exception as e:
         log.warning(f"Eddie surname resolve: afl_games_in_play failed: {e}")
         return None
     if not games:
-        log.info(f"Eddie surname '{token}': no AFL game in the start window -> manual")
+        log.info(
+            f"Eddie surname '{token}': no AFL game within "
+            f"{EDDIE_GAME_LOOKAHEAD_SEC // 3600}h ahead / in progress -> manual"
+        )
         return None
     in_play_keys = set()
     game_labels = []

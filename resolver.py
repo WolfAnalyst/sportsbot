@@ -52,7 +52,10 @@ def afl_games_in_play(ref_ts: float = None, ahead_sec: int = 2700,
 
     A game qualifies if its start (Squiggle `unixtime`, UTC epoch) is within
     [ref_ts - behind_sec, ref_ts + ahead_sec] — default: started up to 3h ago
-    (in-progress) through starting in 45 min (about to jump). unixtime is used
+    (in-progress) through starting in 45 min (about to jump). The Eddie surname
+    pipeline overrides ahead_sec to 2h (EDDIE_GAME_LOOKAHEAD_SEC) so a bare
+    surname still scopes to the right team when Eddie posts up to 2h pre-bounce.
+    unixtime is used
     so there is NO timezone reasoning (the `date` field is naive local venue
     time; unixtime is UTC epoch). Source is _fetch_afl_fixtures_by_year
     (complete=!100, so finished games are already excluded). Returns the
