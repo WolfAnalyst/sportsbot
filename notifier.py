@@ -431,6 +431,7 @@ def notify_tip_placed_summary(
     tip, placed_results, intended_stake, unfilled,
     total_elapsed_sec=None,
     session_timing=None,
+    concurrent_bookies=False,
 ) -> bool:
     """One consolidated success message per tip with all placements rolled up.
 
@@ -578,14 +579,21 @@ def notify_tip_placed_summary(
         # for: "other" climbing >10s means upstream is slow (HyperBot
         # price-check endpoint), not us. Falls back to plain end-to-end
         # when session_timing is empty (legacy callers / racing test mode).
-        bookie_total = sum(
-            t.get("elapsed_sec", 0) or 0 for t in (session_timing or [])
-        )
-        other = max(0.0, total_elapsed_sec - bookie_total)
+        # v5.35: bookie wall-clock. For CONCURRENT fan-outs (AFL/ETR) the
+        # accounts place in parallel, so the bookie phase wall-clock is the
+        # SLOWEST account (MAX), not the SUM — summing parallel work overstates
+        # "bookies" and drives "other" negative -> clamped to 0.0 (the old
+        # misleading "(bookies 8s, other 0.0s)"). For SEQUENTIAL paths the
+        # per-session times don't overlap, so SUM is correct.
+        _elapseds = [t.get("elapsed_sec", 0) or 0 for t in (session_timing or [])]
+        bookie_wall = (max(_elapseds) if _elapseds else 0.0) if concurrent_bookies \
+            else sum(_elapseds)
+        other = max(0.0, total_elapsed_sec - bookie_wall)
         if session_timing:
+            _bk_label = "bookies concurrent, slowest" if concurrent_bookies else "bookies"
             elapsed_tag = (
                 f"\n<b>End-to-end:</b> {total_elapsed_sec:.1f}s "
-                f"(bookies {bookie_total:.1f}s, other {other:.1f}s)"
+                f"({_bk_label} {bookie_wall:.1f}s, other {other:.1f}s)"
             )
         else:
             elapsed_tag = f"\n<b>End-to-end:</b> {total_elapsed_sec:.1f}s"

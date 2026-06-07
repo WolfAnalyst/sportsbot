@@ -3668,6 +3668,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             tip, placed_results, display_intended, unfilled,
             total_elapsed_sec=round(_time_mod.time() - _t_start, 2),
             session_timing=session_timing,
+            concurrent_bookies=True,  # fan-out: bookie wall-clock = MAX not SUM
         )
         log.info(
             f"AFL fan-out: placed ${total_placed:.2f} across "
@@ -3978,6 +3979,7 @@ def _place_etr_nba_fanout(tip: ParsedTip) -> list[BetResult]:
             tip, placed_results, display_intended, unfilled,
             total_elapsed_sec=round(_time_mod.time() - _t_start, 2),
             session_timing=session_timing,
+            concurrent_bookies=True,  # fan-out: bookie wall-clock = MAX not SUM
         )
         log.info(
             f"ETR fan-out: placed ${total_placed:.2f} across "
