@@ -24,11 +24,13 @@ ROSTER_DIR = Path(__file__).parent
 NBA_ROSTER_FILE = ROSTER_DIR / "roster_nba.json"
 NBL_ROSTER_FILE = ROSTER_DIR / "roster_nbl.json"
 AFL_ROSTER_FILE = ROSTER_DIR / "roster_afl.json"
+MLB_ROSTER_FILE = ROSTER_DIR / "roster_mlb.json"
 
 # Cached rosters: {full_name_lower: {"name": full_name, "team": team}}
 _nba_roster: dict = {}
 _nbl_roster: dict = {}
 _afl_roster: dict = {}
+_mlb_roster: dict = {}
 _loaded = False
 
 
@@ -123,11 +125,12 @@ AFL_NICKNAMES = {
 
 def _load_rosters():
     """Load roster JSON files into memory."""
-    global _nba_roster, _nbl_roster, _afl_roster, _loaded
+    global _nba_roster, _nbl_roster, _afl_roster, _mlb_roster, _loaded
     if _loaded:
         return
 
-    for path, cache in [(NBA_ROSTER_FILE, "_nba"), (NBL_ROSTER_FILE, "_nbl"), (AFL_ROSTER_FILE, "_afl")]:
+    for path, cache in [(NBA_ROSTER_FILE, "_nba"), (NBL_ROSTER_FILE, "_nbl"),
+                        (AFL_ROSTER_FILE, "_afl"), (MLB_ROSTER_FILE, "_mlb")]:
         roster = {}
         if path.exists():
             try:
@@ -143,8 +146,10 @@ def _load_rosters():
             _nba_roster = roster
         elif cache == "_nbl":
             _nbl_roster = roster
-        else:
+        elif cache == "_afl":
             _afl_roster = roster
+        else:
+            _mlb_roster = roster
 
     _loaded = True
 
@@ -184,6 +189,8 @@ def _upgrade_to_full_name(match: dict, sport: str) -> dict:
         roster = _nbl_roster
     elif sport == "afl":
         roster = _afl_roster
+    elif sport == "mlb":
+        roster = _mlb_roster
     else:
         return match
     full_name_candidates: list[str] = []
@@ -354,6 +361,8 @@ def exact_match_player(query: str, sport: str = "nba", team: str = "") -> dict:
         roster = _nbl_roster
     elif sport == "afl":
         roster = _afl_roster
+    elif sport == "mlb":
+        roster = _mlb_roster
     else:
         return {}
 
@@ -401,6 +410,8 @@ def fuzzy_match_player(
         roster = _nbl_roster
     elif sport == "afl":
         roster = _afl_roster
+    elif sport == "mlb":
+        roster = _mlb_roster
     else:
         roster = {}
 
@@ -545,6 +556,8 @@ def fuzzy_match_all(
         roster = _nbl_roster
     elif sport == "afl":
         roster = _afl_roster
+    elif sport == "mlb":
+        roster = _mlb_roster
     else:
         roster = {}
 
@@ -743,12 +756,92 @@ def update_roster_from_api():
     return roster
 
 
+def update_mlb_roster_from_api(season: int = 2026):
+    """Fetch current MLB rosters from the MLB Stats API (statsapi.mlb.com).
+    No API key needed. Run locally: python roster.py --update-mlb
+
+    Builds {full_name: team_name} where team_name is the MLB Stats API team
+    name (e.g. "Atlanta Braves") — the SAME full names ESPN uses, so
+    resolve_mlb_event substring-matches them straight to the fixture. Adds a
+    surname-only alias for fuzzy matching (skipped when the surname is
+    ambiguous across teams). Used ONLY when Shook omits the team (v5.33):
+    get_player_team(player, "mlb") -> team -> resolve_mlb_event.
+    """
+    import urllib.request
+
+    def _get(url):
+        req = urllib.request.Request(url, headers={"User-Agent": "tipbot/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+
+    log.info(f"Fetching MLB roster from statsapi.mlb.com (season {season})...")
+    roster: dict = {}
+    try:
+        teams = _get(
+            f"https://statsapi.mlb.com/api/v1/teams?sportId=1&season={season}"
+        ).get("teams", [])
+        tmap = {t["id"]: t["name"] for t in teams if t.get("id") and t.get("name")}
+        people = _get(
+            f"https://statsapi.mlb.com/api/v1/sports/1/players?season={season}"
+        ).get("people", [])
+
+        # First pass: full names. Track surnames (ACCENT-NORMALISED, so
+        # 'Díaz'/'Diaz' count as the SAME surname) to skip ambiguous aliases.
+        def _surnorm(s: str) -> str:
+            s = unicodedata.normalize("NFD", s or "")
+            return "".join(c for c in s if not unicodedata.combining(c)).lower()
+
+        surname_count: dict = {}
+        for p in people:
+            name = (p.get("fullName") or "").strip()
+            tid = (p.get("currentTeam") or {}).get("id")
+            team = tmap.get(tid)
+            if not (name and team):
+                continue
+            roster[name] = team
+            parts = name.split()
+            if len(parts) >= 2:
+                key = _surnorm(parts[-1])
+                surname_count[key] = surname_count.get(key, 0) + 1
+
+        # Second pass: surname-only aliases, ONLY when the surname is unambiguous
+        # (exactly one player, accent-insensitive) and not already a full-name
+        # key. These aliases are currently unused by the MLB path (which requires
+        # a 2+ token exact full name), but keeping them clean avoids a latent
+        # wrong-team alias if a 1-token lookup is ever enabled.
+        for p in people:
+            name = (p.get("fullName") or "").strip()
+            tid = (p.get("currentTeam") or {}).get("id")
+            team = tmap.get(tid)
+            if not (name and team):
+                continue
+            parts = name.split()
+            if len(parts) >= 2:
+                last = parts[-1]
+                if surname_count.get(_surnorm(last)) == 1 and last not in roster:
+                    roster[last] = team
+
+        log.info(f"Got {len(people)} MLB players across {len(tmap)} teams")
+    except Exception as e:
+        log.error(f"MLB roster update failed: {e}")
+        return {}
+
+    if roster:
+        with open(MLB_ROSTER_FILE, "w", encoding="utf-8") as f:
+            json.dump(roster, f, indent=2, ensure_ascii=False)
+        log.info(f"Saved {len(roster)} entries to {MLB_ROSTER_FILE}")
+
+    return roster
+
+
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO)
 
     if "--update" in sys.argv:
         update_roster_from_api()
+    elif "--update-mlb" in sys.argv:
+        update_mlb_roster_from_api()
     else:
         # Quick test
         _load_rosters()

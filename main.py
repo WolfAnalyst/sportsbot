@@ -1372,15 +1372,46 @@ def resolve_event(tip: ParsedTip) -> str:
 
     if tip.sport == "mlb":
         # MLB (2026-06-01): resolve the team to a "Home v Away" fixture via
-        # ESPN baseball/mlb. There's no MLB roster for player->team, so the
-        # tip MUST carry the team (Shook posts it in a context line, e.g.
-        # "Dodgers" / "LAD/CIN"). Groq is asked to emit the full team name;
-        # resolve_mlb_event substring-matches it to the ESPN fixture. A miss
-        # (no team, abbreviation we can't match, or no game) returns "" ->
-        # place_tip routes to manual (no wrong bet, just a missed auto-place).
+        # ESPN baseball/mlb. Shook USUALLY posts the team in a context line
+        # (e.g. "Dodgers" / "LAD/CIN"); Groq emits the full team name and
+        # resolve_mlb_event substring-matches it to the ESPN fixture.
+        #
+        # v5.33 (2026-06-07, Wilson): when Shook OMITS the team (e.g.
+        # "Matt Olson 2+ HRRBI" with no team — 15:53 went to manual with
+        # "no team"), infer the team from the MLB roster (roster_mlb.json,
+        # MLB Stats API) via the PLAYER name, then resolve the fixture. This
+        # fires ONLY when no team is announced — a stated team is never
+        # overridden. Inference is EXACT full-name match only (see the gated
+        # block below) — NO fuzzy, NO bare-surname — so it can never drift to a
+        # same-surname player on the wrong team (adversarial-verified).
         team = tip.primary_team
         if not team:
-            log.warning("MLB tip has no team — cannot resolve fixture, routing to manual")
+            # Infer the team from the MLB roster ONLY for a full (2+ token)
+            # player name via an EXACT match (Shook sends full names). NO fuzzy
+            # and NO bare-surname inference: with no team to disambiguate, a
+            # fuzzy/surname-only match drifts to an arbitrary same-surname player
+            # on the WRONG team (e.g. 'Soto' -> Gregory Soto / Pirates when the
+            # tip meant Juan Soto / Mets). roster_mlb.json keys are full names +
+            # UNAMBIGUOUS surname aliases; restricting to a 2+ token EXACT hit
+            # means only a confident full-name match infers a team — everything
+            # else (bare surname, partial, typo, unknown) -> manual (safe miss).
+            # v5.33 (hardened after the adversarial verification flagged the
+            # fuzzy path as a wrong-game-bet vector).
+            player = tip.legs[0].player if (tip.legs and tip.legs[0].player) else ""
+            if player and len(player.split()) >= 2:
+                from roster import exact_match_player as _exact_mlb
+                _rm = _exact_mlb(player, "mlb")
+                if _rm and _rm.get("team"):
+                    team = _rm["team"]
+                    log.info(
+                        f"MLB no-team: inferred '{player}' -> '{team}' from roster "
+                        f"(exact full-name match)"
+                    )
+        if not team:
+            log.warning(
+                "MLB tip has no team and no exact full-name roster match — "
+                "routing to manual"
+            )
             return ""
         return resolve_mlb_event(team) or ""
 
@@ -5156,6 +5187,110 @@ def _catalog_nearest(markets: dict, market_name: str, player_l: str,
     return best
 
 
+# Curated AFL first-name short<->full equivalences for catalog name-matching
+# (roster short form vs Sportsbet formal full name). ONLY genuine diminutives
+# where the short form IS that full name's nickname — NOT generic prefixes:
+# 'Jack'/'Jackson' and 'Sam'/'Samuel' can be DIFFERENT players, so a same-
+# surname sibling whose first name merely shares a prefix must NEVER resolve.
+# Each set is one equivalence group (lowercased). Add pairs as needed.
+_AFL_FIRST_NAME_GROUPS = [
+    {"brad", "bradley"}, {"matt", "matthew"}, {"josh", "joshua"},
+    {"mitch", "mitchell"}, {"nick", "nicholas"}, {"will", "william"},
+    {"ben", "benjamin"}, {"dan", "daniel"}, {"alex", "alexander"},
+    {"zac", "zach", "zachary"}, {"tom", "thomas"}, {"charlie", "charles"},
+    {"nat", "nathan"}, {"ollie", "oliver"}, {"sam", "samuel"},
+    {"gus", "angus"}, {"ed", "edward"}, {"cam", "cameron"},
+    {"lachie", "lachlan"}, {"paddy", "patrick"},
+]
+_AFL_FIRST_NAME_CANON: dict = {}
+for _grp in _AFL_FIRST_NAME_GROUPS:
+    _ck = sorted(_grp)[0]
+    for _v in _grp:
+        _AFL_FIRST_NAME_CANON[_v] = _ck
+
+
+def _afl_first_name_compatible(a: str, b: str) -> bool:
+    """First names match for AFL catalog name resolution: exactly equal, OR a
+    curated short<->full nickname pair (Brad<->Bradley). Deliberately NOT a
+    generic prefix — 'Jack'/'Jackson', 'Sam'/'Samuel'(*) are distinct names, so
+    we never silently resolve to a same-surname sibling. (*) genuine diminutive
+    pairs are in the allowlist; anything else requires exact equality."""
+    a, b = (a or "").lower(), (b or "").lower()
+    if a == b:
+        return True
+    return _AFL_FIRST_NAME_CANON.get(a, a) == _AFL_FIRST_NAME_CANON.get(b, b)
+
+
+def _afl_canonical_catalog_player(markets: dict, market_names: list, player_l: str):
+    """Resolve a tip's AFL player name to the EXACT spelling the live catalog
+    uses, tolerating a roster short-form vs the catalog's formal full name
+    (roster 'Brad Hill' vs Sportsbet 'Bradley Hill'). Scoped to `market_names`
+    and SURNAME-ANCHORED + unambiguous, so it never guesses a different player.
+
+    Returns the catalog player name LOWERCASED (ready for _catalog_lookup), or
+    None when no confident, unambiguous match exists (caller keeps player_l and
+    will miss -> manual; never a wrong-player bet).
+
+    Why (v5.33, 2026-06-07): _catalog_lookup matches the player by EXACT
+    (lowercased) string. The AFL roster canonicalises names ('Bradley Hill' ->
+    'Brad Hill', score 0.945), but Sportsbet lists formal full names
+    ('Bradley Hill'), so the exact match missed and a live 'Brad Hill over 19.5'
+    (which WAS carried) routed to manual. Surname is the anchor (as in the Eddie
+    matcher); a short/full first-name form (Brad<->Bradley, Matt<->Matthew) is
+    only the collision tiebreak.
+    """
+    def _norm(s):
+        s = unicodedata.normalize("NFD", s or "")
+        s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+        return " ".join(s.lower().split())
+
+    q = _norm(player_l)
+    if not q:
+        return None
+    # Distinct catalog player names across the relevant markets: {norm: lower}.
+    names: dict = {}
+    for mn in market_names:
+        if not mn:
+            continue
+        mdata = markets.get(mn)
+        if isinstance(mdata, dict):
+            sels = mdata.get("selections", []) or []
+        elif isinstance(mdata, list):
+            sels = mdata
+        else:
+            sels = []
+        for s in sels:
+            p = (s.get("player") or "").strip()
+            if p:
+                names[_norm(p)] = p.lower()
+    if not names:
+        return None
+    # 1) Exact (accent/case-normalised) match -> the catalog's own spelling.
+    if q in names:
+        return names[q]
+    # 2) Surname-anchored (need a first + last name to have a surname).
+    q_parts = q.split()
+    if len(q_parts) < 2:
+        return None
+    q_first, q_last = q_parts[0], q_parts[-1]
+    same_surname = [(nrm, low) for nrm, low in names.items()
+                    if nrm.split() and nrm.split()[-1] == q_last]
+    # Require first-name compatibility for EVERY candidate, INCLUDING a lone
+    # same-surname hit. The exact match already failed, so a single same-surname
+    # candidate could be a DIFFERENT player who happens to share the surname
+    # (e.g. tip 'Archer Reid' but only 'Harley Reid' is carried). Resolving on
+    # surname alone would place a wrong-player bet; the prior exact-only code
+    # routed that to manual. So: keep only candidates whose first name is equal
+    # or a curated nickname pair (Brad<->Bradley); resolve iff EXACTLY ONE
+    # remains, else None (-> manual, never a guess). Hardened after the
+    # adversarial verification flagged the surname-only + prefix paths.
+    compat = [low for nrm, low in same_surname
+              if nrm.split() and _afl_first_name_compatible(q_first, nrm.split()[0])]
+    if len(compat) == 1:
+        return compat[0]
+    return None
+
+
 def _match_afl_player_prop(leg_dict: dict, markets: dict):
     """Resolve an AFL player-prop SGM leg against the live catalog and return
     the exact proposition to bet, or None if it isn't carried.
@@ -5178,6 +5313,19 @@ def _match_afl_player_prop(leg_dict: dict, markets: dict):
         tip_line = float(line)
     except (TypeError, ValueError):
         return None
+
+    # Resolve the tip player to the catalog's EXACT spelling before looking up
+    # the line (roster short-form 'Brad Hill' vs catalog 'Bradley Hill').
+    # Surname-anchored + unambiguous; leaves player_l unchanged on no confident
+    # match. v5.33 (2026-06-07 Brad Hill over 19.5 wrongly routed to manual).
+    _canon = _afl_canonical_catalog_player(
+        markets,
+        [_AFL_OU_MARKET_BY_STAT.get(stat), _AFL_THRESHOLD_MARKET_BY_STAT.get(stat)],
+        player_l,
+    )
+    if _canon and _canon != player_l:
+        log.info(f"AFL catalog name-match: '{player_l}' -> '{_canon}' (catalog spelling)")
+        player_l = _canon
 
     if sel.endswith(" under") or sel == "under":
         # Under bets live only in the base O/U market, at the tipped line.
