@@ -10784,7 +10784,11 @@ CODE_FINGERPRINT = _code_fingerprint()
 
 async def main():
     log.info("Starting TipBot...")
-    log.info(f"=== TipBot {TIPBOT_VERSION} | code fingerprint {CODE_FINGERPRINT} ===")
+    # Banner: version NUMBER + fingerprint only (v5.39, Wilson) — the full
+    # TIPBOT_VERSION is a multi-KB accumulated changelog; it stays in config.py +
+    # CHANGELOG.md as the audit record, no need to dump it into every startup log.
+    log.info(f"=== TipBot {TIPBOT_VERSION.split(' (', 1)[0]} | "
+             f"code fingerprint {CODE_FINGERPRINT} ===")
 
     if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
         log.error("TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in .env")
@@ -11004,8 +11008,9 @@ async def main():
     # Telegram message is the operator-facing view, foreign noise stays in
     # logs. Version NUMBER only (not the full changelog): TIPBOT_VERSION is a
     # multi-paragraph changelog now and overflowed Telegram's 4096-char limit
-    # (HTTP 400 "message is too long", v5.18 deploy). The file-log banner above
-    # (line ~9257) still logs the full TIPBOT_VERSION for reference.
+    # (HTTP 400 "message is too long", v5.18 deploy). v5.39: the file-log startup
+    # banner is ALSO trimmed to the version number — the full TIPBOT_VERSION lives
+    # in config.py + CHANGELOG.md as the audit record.
     _ver_short = TIPBOT_VERSION.split(" (", 1)[0]
     if owned_sessions:
         notifier.notify_info(
