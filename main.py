@@ -125,6 +125,33 @@ STAKE_LADDER = [1.00, 0.75, 0.50, 0.40, 0.25, 0.20, 0.15, 0.10, 0.05]
 # Titans floors. Raise once you want to enforce a real minimum stake.
 STAKE_FLOOR = 0.0  # Don't bother with bets below this (currently no minimum)
 
+# $1 deadband for deciding a sports bet "fully filled" (ignores cent-jitter),
+# matching the AFL fan-out's $1 deadband.
+MBL_FILLED_DEADBAND = 1.0
+
+
+def _should_alert_mbl_violation(mbl_violations, unfilled_stake: float,
+                                orchestrated: bool = False,
+                                deadband: float = MBL_FILLED_DEADBAND) -> bool:
+    """Whether to fire the CRITICAL 'MBL VIOLATION (sports)' alert.
+
+    An MBL 'violation' is a stake REJECTED at-or-below our configured cap. But
+    the SGM/singles ladder is DESIGNED to start at the cap-max and ladder DOWN on
+    a `code 538 stake too high`, then spill — so a 538 on the top rung that then
+    FILLS via lower rungs / spillover is the intended behaviour (cf. the racing
+    circuit-breaker treating 'stake too high' as BENIGN), NOT a violation worth a
+    CRITICAL ping. v5.34 (Wilson): only escalate when the bet did NOT fully fill
+    — a GENUINE shortfall (the cap exceeded the live MBL AND we couldn't place
+    the intended stake). A fully-filled bet (unfilled <= deadband) or the MLB
+    per-account model (orchestrated, where leftover is expected and the unfilled
+    alert is itself suppressed) does NOT alert. Fixes the saiyan SGM $600/$600
+    false-positive CRITICALs (2026-06-07 09:03/09:05)."""
+    if not mbl_violations:
+        return False
+    if orchestrated:
+        return False
+    return unfilled_stake > deadband
+
 # ── Tipsters whose suggested_bookie field should be ignored ─────────
 # Some tipsters quote odds at bookmakers we can't actually place at, e.g.
 # Kev posts "with 365" for NBA but bet365 sports placement on HyperBot
@@ -4912,11 +4939,16 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
     # alert would just duplicate the same stakes/sessions across two
     # channels (Maintenance + Critical). Same suppression rule as racing
     # in tiptitans_processor. Both are safe-to-skip on exception.
-    if mbl_violations:
+    if _should_alert_mbl_violation(mbl_violations, unfilled):
         try:
             notifier.notify_sports_mbl_violation(tip, mbl_violations)
         except Exception as e:
             log.error(f"notify sports MBL violation failed: {e}")
+    elif mbl_violations:
+        log.info(
+            f"v4: {len(mbl_violations)} stake-too-high ladder-down(s) on a "
+            f"fully-filled tip — benign (designed ladder behaviour), no MBL alert"
+        )
     elif ladder_attempts:
         try:
             notifier.notify_sports_ladder_maintenance(tip, ladder_attempts)
@@ -6433,8 +6465,10 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
     `_orchestrated=True` (set by `_place_mlb_hrrbi`): suppress the terminal
     "all sessions failed -> manual" alert, because the MLB orchestrator owns
     final alerting (it still has Alex's single to try, then decides the one
-    leftover/failure notification). Per-bet placed alerts + MBL/ambiguous aux
-    alerts still fire."""
+    leftover/failure notification). Per-bet placed alerts + the ambiguous aux
+    alert still fire; the MBL-violation alert is SUPPRESSED when orchestrated
+    (v5.34: the MLB per-account model leaves expected leftover, and a 538
+    ladder-down is benign — see _should_alert_mbl_violation)."""
 
     # Wilson's rule: team ML/handicap + total SGMs always go to manual.
     # Different bet sizing rules apply for this combination — skip auto-place.
@@ -6649,11 +6683,17 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
         of problem (bookie may have placed the bet) and warrant their own
         critical alert.
         """
-        if mbl_violations:
+        if _should_alert_mbl_violation(mbl_violations, remaining_stake, _orchestrated):
             try:
                 notifier.notify_sports_mbl_violation(tip, mbl_violations)
             except Exception as e:
                 log.error(f"notify sports MBL violation failed: {e}")
+        elif mbl_violations:
+            log.info(
+                f"v4 SGM: {len(mbl_violations)} stake-too-high ladder-down(s) on a "
+                f"{'fully-filled' if remaining_stake <= MBL_FILLED_DEADBAND else 'orchestrated'} "
+                f"bet — benign (designed ladder behaviour), no MBL alert"
+            )
         elif ladder_attempts:
             try:
                 notifier.notify_sports_ladder_maintenance(tip, ladder_attempts)

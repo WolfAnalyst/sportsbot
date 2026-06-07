@@ -329,6 +329,14 @@ def _passes_token_overlap_gate(query: str, matched: str) -> bool:
     return bool(orig_tokens & matched_tokens)
 
 
+def _fold_accents(s: str) -> str:
+    """Strip diacritics for accent-insensitive matching (José -> jose). Used by
+    the MLB exact-match retry so an ASCII Shook tip matches the accented roster
+    key. Lowercase is applied by the caller."""
+    return "".join(c for c in unicodedata.normalize("NFD", s or "")
+                   if not unicodedata.combining(c))
+
+
 def exact_match_player(query: str, sport: str = "nba", team: str = "") -> dict:
     """
     Strict exact-match lookup against the roster — no fuzzy scoring, no
@@ -367,6 +375,19 @@ def exact_match_player(query: str, sport: str = "nba", team: str = "") -> dict:
         return {}
 
     info = roster.get(query.strip().lower())
+    if not info and sport == "mlb":
+        # Accent-insensitive retry for MLB (v5.34): the MLB Stats API stores
+        # accented names ('José Alvarado', 'Yandy Díaz'), but Shook tips them
+        # ASCII ('Jose Alvarado'), so the direct lookup misses. Fold accents on
+        # BOTH sides and match exact-on-the-folded-form. This is still an EXACT
+        # match (no fuzzy/partial), so it cannot drift to a different player; an
+        # accent-only collision across DIFFERENT teams (essentially impossible)
+        # is guarded by requiring a single team. Low-frequency path (only a
+        # teamless MLB tip), so the O(n) fold scan is fine.
+        q_fold = _fold_accents(query.strip().lower())
+        folded = [v for k, v in roster.items() if _fold_accents(k) == q_fold]
+        if folded and len({m["team"] for m in folded}) == 1:
+            info = folded[0]
     if info:
         # Team filter: lenient match against the entry's team
         if team and not _team_matches(info["team"], team):
