@@ -667,6 +667,31 @@ class HyperBotClient:
                 log.error(f"get_pending_bets failed for {account_id}: {e}")
         return {"success": False, "error": last_err or "Request failed"}
 
+    def get_transactions(self, session_id: str, days_back: int = 14,
+                         limit: int = 200) -> list:
+        """POST /v3/transactions (async — 202 + cid, poll /api/bet_status) — returns
+        SETTLED bets (+ deposits/withdrawals) for a session. Used by the bet-record
+        feed to AUTO-RESULT placed bets: each settled bet of type 'bet' has
+        {id (= the bookie bet_id, matches the ledger's bet_id), status
+        ('won'|'lost'|'void'|...), pnl (net $ profit/loss, signed), winnings,
+        stake, odds, bet_type, selections[]}. Returns the transactions list, or []
+        on failure. Read-only / idempotent (never places — safe to retry/poll)."""
+        if not session_id:
+            return []
+        try:
+            res = self._post_v3_async(
+                "/v3/transactions",
+                {"session_id": str(session_id), "days_back": days_back, "limit": limit},
+            )
+            for s in (res or {}).get("statuses") or []:
+                result = s.get("result") or {}
+                if isinstance(result, dict) and isinstance(result.get("transactions"), list):
+                    return result["transactions"]
+            return []
+        except Exception as e:
+            log.error(f"get_transactions failed for {session_id}: {e}")
+            return []
+
     def get_balance(self, session_id: str) -> dict:
         """v4.2: migrated to /v3/balance. Stays SYNC (per docs: 'Unlike
         other v3 endpoints, Get Balance is synchronous - it does not
