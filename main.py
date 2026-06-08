@@ -10002,6 +10002,16 @@ def _afl_disambiguate_surname_by_odds(scoped: list, game_labels: list, token: st
 # manual-on-any-ambiguity safety below still apply (never guess a $400 bet).
 EDDIE_GAME_LOOKAHEAD_SEC = 7200  # 2 hours (was the resolver default 2700 = 45 min)
 
+# Eddie AFL image tips: when the vision parse can't read the unit sizing off the
+# image (units null/0 — e.g. Eddie put it in a SEPARATE follow-up message we don't
+# merge), fall back to 2.5u (Eddie's typical play) instead of 1u, but CAP the TOTAL
+# stake so a misread can't balloon. Wilson 2026-06-08 (the Collingwood v Melbourne
+# under 180.5 read 1u -> placed $400 instead of the intended 2.5u -> $1000). At the
+# live $400/u this is exactly 2.5u = $1000; a larger unit_size scales the fallback
+# units down so units * unit_size never exceeds the cap.
+EDDIE_IMAGE_NO_UNITS_FALLBACK_UNITS = 2.5
+EDDIE_IMAGE_NO_UNITS_MAX_STAKE = 1000.0
+
 
 def _resolve_eddie_surname_to_player(token: str, msg_time, stat: str = None,
                                      line=None, side: str = None, tip_odds=None):
@@ -10121,8 +10131,23 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
     odds = _img_coerce_float(raw.get("odds")) or 0.0
     bookie = (raw.get("bookie") or "").strip()
     units = _img_coerce_float(raw.get("units"))
+    no_units_fallback = False
     if units is None or units <= 0:
-        units = float(default_units)
+        # v5.42: no unit sizing in the image -> fall back to 2.5u (Eddie's typical),
+        # capped so the TOTAL stake can't exceed $1000 (Wilson). At $400/u that is
+        # exactly 2.5u = $1000; a larger unit_size scales the fallback units down so
+        # units * unit_size <= the cap. Only fires when units are unreadable — a
+        # correctly-read 1u / 3u tip places its real size.
+        no_units_fallback = True
+        fb_units = EDDIE_IMAGE_NO_UNITS_FALLBACK_UNITS
+        if unit_size and unit_size > 0:
+            fb_units = min(fb_units, EDDIE_IMAGE_NO_UNITS_MAX_STAKE / unit_size)
+        units = fb_units
+        log.info(
+            f"[{tipster}] image tip has NO unit sizing -> fallback {units:.2f}u "
+            f"x ${unit_size:.0f} = ${round(units * unit_size, 2)} "
+            f"(capped at ${EDDIE_IMAGE_NO_UNITS_MAX_STAKE:.0f} total)"
+        )
 
     raw_msg = (
         f"[Eddie image] {player or team} {side} {line} {stat} "
@@ -10210,6 +10235,10 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
         suggested_bookie="sportsbet", suggested_odds=odds,
         alert_only=alert_only, alert_reason=alert_reason,
     )
+    # v5.42: mark a no-units fallback so the route can (a) guard a per-image
+    # over-parse [>1 fallback tip from one image -> manual] and (b) flag the
+    # guessed size in the alert.
+    tip._units_fallback = no_units_fallback
     return tip
 
 
@@ -10248,6 +10277,14 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
     stamped onto each tip._timing so the BET PLACED summary shows the true
     end-to-end + the parse/resolve/price-check breakdown, same as the text path."""
     conflicted = _image_afl_conflicting_indices(raw_tips)
+    # v5.42: per-image over-parse guard for the no-units FALLBACK. The vision can
+    # over-read a betslip grid into several tips; with the 2.5u/$1000 fallback,
+    # MULTIPLE no-units tips from ONE image would each auto-stake $1000. A single
+    # no-units tip is Wilson's intended case (place 2.5u); >1 is the over-parse
+    # signature -> route the guessed-size tips to manual instead of N x $1000.
+    no_units_count = sum(
+        1 for r in raw_tips if (_img_coerce_float(r.get("units")) or 0) <= 0
+    )
     for idx, raw in enumerate(raw_tips):
         try:
             # Over+under of the same line parsed from one image = background-grid
@@ -10275,6 +10312,17 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
             if forced:
                 tip.suggested_bookie = forced
 
+            # v5.42: >1 no-units tip from one image = likely vision over-parse —
+            # don't auto-stake N x the $1000 fallback; route the guessed-size tips
+            # to manual. A lone no-units tip still auto-places at 2.5u (intended).
+            if getattr(tip, "_units_fallback", False) and no_units_count > 1:
+                tip.alert_only = True
+                tip.alert_reason = (
+                    f"{no_units_count} tips in one image had NO unit sizing "
+                    f"(likely vision over-parse) — place by hand to avoid an "
+                    f"over-staked $1000 guess on each"
+                )
+
             if tip.units > MAX_UNITS:
                 tip.units = MAX_UNITS
             _apply_mlb_flat_stake(tip)       # no-op for AFL
@@ -10300,6 +10348,21 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                 for r in results:
                     if r.success:
                         log.info(f"[{channel_name}] PLACED image tip: {r.bet_id} on {r.bookie} @ {r.odds}")
+                # v5.42: the size was a GUESS (no units in the image) — flag it so
+                # Wilson can verify (a misread of a genuine 1u tip would silently
+                # stake the 2.5u/$1000 fallback otherwise).
+                if getattr(tip, "_units_fallback", False) and any(r.success for r in results):
+                    try:
+                        notifier.notify_info(
+                            f"Eddie tip placed at the NO-UNITS FALLBACK "
+                            f"({tip.units:g}u x ${tip.unit_size:.0f} = "
+                            f"${round(tip.units * tip.unit_size, 2):.0f}, capped "
+                            f"${EDDIE_IMAGE_NO_UNITS_MAX_STAKE:.0f}) — the image had no "
+                            f"readable unit sizing, so the size was assumed. Verify: "
+                            f"{tip.raw_message}"
+                        )
+                    except Exception as e:
+                        log.error(f"no-units fallback notify failed: {e}")
             else:
                 log.info(f"[{channel_name}] AFL image tip {idx} not placed (routed to manual): {tip.raw_message}")
         except Exception as e:
