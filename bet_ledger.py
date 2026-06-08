@@ -21,7 +21,23 @@ from threading import Lock
 
 log = logging.getLogger("tipbot")
 
-_LEDGER_PATH = os.path.join("logs", "bets_placed.csv")
+def _default_ledger_path() -> str:
+    """Resolve the ledger file path. v5.41 (2026-06-08): the unit suite was
+    POLLUTING the production logs/bets_placed.csv with fixture rows (bet_id
+    X1/X2) on every run — `notify_*` tests incidentally trigger a ledger write,
+    and the path was hard-coded. Now: BET_LEDGER_PATH env override wins; else
+    TIPBOT_TESTING (set by the test harness) forces a temp file so a test can
+    NEVER touch the real ledger; else the production path."""
+    env = os.getenv("BET_LEDGER_PATH")
+    if env:
+        return env
+    if os.getenv("TIPBOT_TESTING"):
+        import tempfile
+        return os.path.join(tempfile.gettempdir(), "tipbot_test_bets_placed.csv")
+    return os.path.join("logs", "bets_placed.csv")
+
+
+_LEDGER_PATH = _default_ledger_path()
 COLUMNS = [
     "placed_at", "date", "tipster", "sport", "event", "market", "selection",
     "line", "side", "bookie", "account", "stake", "odds", "potential_return",
