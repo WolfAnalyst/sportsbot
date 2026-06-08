@@ -656,6 +656,17 @@ def notify_tip_placed_summary(
     if unfilled >= 1:
         fill_tag = f"\n<b>⚠️ Unfilled:</b> ${unfilled:.2f}"
 
+    # v5.43: when the size was a no-units FALLBACK (the image had no readable unit
+    # sizing, so 2.5u was assumed, capped $1000 stake / $1000 liability), make it
+    # CLEAR in the bet log so a misread of a genuine 1u tip is visible (Wilson —
+    # replaces the v5.42 maintenance ping).
+    fallback_tag = ""
+    if getattr(tip, "_units_fallback", False):
+        fallback_tag = (
+            f"\n<b>⚠️ FALLBACK SIZING</b> — image had NO unit size; assumed "
+            f"{tip.units:g}u (capped $1000 stake / $1000 liability). Verify the size."
+        )
+
     # v5.37: one RECONCILING end-to-end line. When the message handler stamped
     # tip._timing (t0 + parse/resolve/price-check), this shows the TRUE arrival->
     # now span broken into parse / resolve / price-check / bookies(place-wall) /
@@ -667,7 +678,7 @@ def notify_tip_placed_summary(
     )
 
     text = (
-        f"<b>BET PLACED</b>{sgm_tag}\n"
+        f"<b>BET PLACED</b>{sgm_tag}{fallback_tag}\n"
         f"<b>Tipster:</b> {_escape_html(tip.tipster)}\n"
         f"<b>Event:</b> {_escape_html(tip.event or 'N/A')}\n"
         f"<pre>{_escape_html(legs_str)}</pre>\n"

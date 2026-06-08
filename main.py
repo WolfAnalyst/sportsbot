@@ -9166,6 +9166,13 @@ def _execute_bet(
 
 def _audit_tip(tip: ParsedTip, msg_time: datetime):
     """Log tip to audit JSONL."""
+    # v5.43: redirect to a temp file under TIPBOT_TESTING so the unit suite never
+    # pollutes the production logs/audit.jsonl (same class as the bet_ledger X1/X2
+    # fix — the suite was writing Soligo/Cook fixture rows into the real audit).
+    audit_path = AUDIT_LOG
+    if os.getenv("TIPBOT_TESTING"):
+        import tempfile
+        audit_path = os.path.join(tempfile.gettempdir(), "tipbot_test_audit.jsonl")
     if tip.legs and tip.legs[0].market == "player_prop":
         payload = {
             "player": tip.legs[0].player,
@@ -9182,7 +9189,7 @@ def _audit_tip(tip: ParsedTip, msg_time: datetime):
     else:
         payload = {"raw": tip.raw_message, "stake": tip.stake_dollars}
 
-    _log_jsonl(AUDIT_LOG, {
+    _log_jsonl(audit_path, {
         "msg_sent_at": str(msg_time),
         "tipster": tip.tipster,
         "is_sgm": tip.is_sgm,
@@ -10011,6 +10018,11 @@ EDDIE_GAME_LOOKAHEAD_SEC = 7200  # 2 hours (was the resolver default 2700 = 45 m
 # units down so units * unit_size never exceeds the cap.
 EDDIE_IMAGE_NO_UNITS_FALLBACK_UNITS = 2.5
 EDDIE_IMAGE_NO_UNITS_MAX_STAKE = 1000.0
+# ...AND cap the bookie LIABILITY (winnings = stake*(odds-1)) at $1000 too, so a
+# high-odds bet can't put $1000 down (Wilson: "don't accidentally put $1000 on a
+# $10 odder"). At odds o the stake is capped at 1000/(o-1): e.g. o=10 -> $111 stake
+# ($1000 to-win), o=3 -> $500, o<=2 -> the $1000 stake cap binds first.
+EDDIE_IMAGE_NO_UNITS_MAX_LIABILITY = 1000.0
 
 
 def _resolve_eddie_surname_to_player(token: str, msg_time, stat: str = None,
@@ -10141,12 +10153,22 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
         no_units_fallback = True
         fb_units = EDDIE_IMAGE_NO_UNITS_FALLBACK_UNITS
         if unit_size and unit_size > 0:
+            # cap 1: total STAKE <= $1000
             fb_units = min(fb_units, EDDIE_IMAGE_NO_UNITS_MAX_STAKE / unit_size)
+            # cap 2: total bookie LIABILITY (winnings = stake*(odds-1)) <= $1000, so
+            # a high-odds bet can't stake the full $1000 (the $10-odder case). Uses
+            # the tipped odds; the >1.25x ceiling guard backstops a higher fill.
+            if odds and odds > 1.0:
+                fb_units = min(
+                    fb_units,
+                    EDDIE_IMAGE_NO_UNITS_MAX_LIABILITY / (unit_size * (odds - 1.0)),
+                )
         units = fb_units
         log.info(
-            f"[{tipster}] image tip has NO unit sizing -> fallback {units:.2f}u "
-            f"x ${unit_size:.0f} = ${round(units * unit_size, 2)} "
-            f"(capped at ${EDDIE_IMAGE_NO_UNITS_MAX_STAKE:.0f} total)"
+            f"[{tipster}] image tip has NO unit sizing -> fallback {units:.3f}u "
+            f"x ${unit_size:.0f} = ${round(units * unit_size, 2)} stake "
+            f"(odds={odds or '?'}; caps: stake<=${EDDIE_IMAGE_NO_UNITS_MAX_STAKE:.0f}, "
+            f"liability<=${EDDIE_IMAGE_NO_UNITS_MAX_LIABILITY:.0f})"
         )
 
     raw_msg = (
@@ -10348,21 +10370,9 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                 for r in results:
                     if r.success:
                         log.info(f"[{channel_name}] PLACED image tip: {r.bet_id} on {r.bookie} @ {r.odds}")
-                # v5.42: the size was a GUESS (no units in the image) — flag it so
-                # Wilson can verify (a misread of a genuine 1u tip would silently
-                # stake the 2.5u/$1000 fallback otherwise).
-                if getattr(tip, "_units_fallback", False) and any(r.success for r in results):
-                    try:
-                        notifier.notify_info(
-                            f"Eddie tip placed at the NO-UNITS FALLBACK "
-                            f"({tip.units:g}u x ${tip.unit_size:.0f} = "
-                            f"${round(tip.units * tip.unit_size, 2):.0f}, capped "
-                            f"${EDDIE_IMAGE_NO_UNITS_MAX_STAKE:.0f}) — the image had no "
-                            f"readable unit sizing, so the size was assumed. Verify: "
-                            f"{tip.raw_message}"
-                        )
-                    except Exception as e:
-                        log.error(f"no-units fallback notify failed: {e}")
+                # v5.43: the no-units FALLBACK flag (tip._units_fallback) is surfaced
+                # in the BET PLACED bet-log summary itself (notifier.notify_tip_placed_summary)
+                # — no separate maintenance ping (Wilson). The flag rides on the tip.
             else:
                 log.info(f"[{channel_name}] AFL image tip {idx} not placed (routed to manual): {tip.raw_message}")
         except Exception as e:
