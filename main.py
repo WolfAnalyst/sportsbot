@@ -989,9 +989,19 @@ def _is_duplicate(tip: ParsedTip) -> bool:
     return fp in _recent_tips
 
 
-def _register_tip_fingerprint(tip: ParsedTip) -> None:
-    """Register a tip fingerprint in the dedup cache after successful placement."""
-    fp = f"{tip.tipster}::{_tip_fingerprint(tip)}"
+def _register_tip_fingerprint(tip: ParsedTip, fp: str = None) -> None:
+    """Register a tip fingerprint after a successful/ambiguous placement.
+
+    PASS THE PRE-PLACEMENT fp (captured before place_tip). place_tip MUTATES the
+    legs — the catalog match rewrites a leg's selection (e.g. 'James Wood Over' ->
+    'James Wood'), so recomputing _tip_fingerprint AFTER placement yields a
+    DIFFERENT string than the one _is_duplicate checks on a re-send. That defeated
+    the dedup: a re-sent Shook HRRBI re-placed an extra $100 on 2026-06-09 (James
+    Wood) because the registered (post-mutation) fp never matched the re-send's
+    (pre-mutation) fp. Registering the captured pre-placement fp keeps
+    check == register. v5.49. (fp=None recomputes — legacy/direct callers.)"""
+    if fp is None:
+        fp = f"{tip.tipster}::{_tip_fingerprint(tip)}"
     _recent_tips[fp] = datetime.now()
 
 
@@ -9495,7 +9505,11 @@ async def _process_tip(text: str, tipster: str, sport: str,
         # _process_image_tip, which also applies this).
         _apply_image_test_stake(tip)
 
-        # Dupe detection: same tipster + same bet fingerprint within 10 min
+        # Dupe detection: same tipster + same bet fingerprint within 10 min.
+        # Capture the fp BEFORE place_tip — placement mutates legs (catalog match
+        # rewrites a leg selection), so a post-place fp wouldn't match a re-send's
+        # pre-place fp and the dedup would be defeated (v5.49 James Wood HRRBI).
+        _dupe_fp = f"{tip.tipster}::{_tip_fingerprint(tip)}"
         if _is_duplicate(tip):
             log.info(f"DUPE detected, skipping: {tip.tipster} {_tip_fingerprint(tip)}")
             continue
@@ -9526,7 +9540,7 @@ async def _process_tip(text: str, tipster: str, sport: str,
             # already landed (double-stake). A clean total failure stays
             # unregistered so genuine re-tips aren't locked out for 10 min. v5.13.
             if any_success or any(_is_ambiguous_result(r) for r in results):
-                _register_tip_fingerprint(tip)
+                _register_tip_fingerprint(tip, fp=_dupe_fp)
 
             for r in results:
                 if r.success:
@@ -10389,6 +10403,7 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
             _apply_mlb_flat_stake(tip)       # no-op for AFL
             _apply_image_test_stake(tip)      # $1/unit while test mode
 
+            _dupe_fp = f"{tip.tipster}::{_tip_fingerprint(tip)}"  # capture pre-place (v5.49)
             if _is_duplicate(tip):
                 log.info(f"[{channel_name}] DUPE image tip skipped: {_tip_fingerprint(tip)}")
                 continue
@@ -10405,7 +10420,7 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
             # outcome so a re-post can't double-stake an account that may have
             # already placed.
             if any(r.success for r in results) or any(_is_ambiguous_result(r) for r in results):
-                _register_tip_fingerprint(tip)
+                _register_tip_fingerprint(tip, fp=_dupe_fp)
                 for r in results:
                     if r.success:
                         log.info(f"[{channel_name}] PLACED image tip: {r.bet_id} on {r.bookie} @ {r.odds}")
