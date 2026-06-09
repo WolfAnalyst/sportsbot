@@ -6541,6 +6541,25 @@ def _sgm_ladder_steps(list_ladder: list, effective_stake: float) -> list[float]:
     return steps
 
 
+def _sgm_outcome_record(tip, intended_stake, placed_results, remaining_stake,
+                        orchestrated) -> dict:
+    """Build the audit.jsonl `tip_outcome` record for a SEQUENTIAL SGM placement
+    (_place_sgm_v4). v5.47: this path emitted NO outcome before — only the
+    concurrent _place_sgm_fanout did — so a placed NBA SGM (sequential) was
+    missing from the audit trail (2026-06-09 KAT/Brunson). Pure (no I/O) so it's
+    unit-testable; the caller does the once-guarded, try/except'd _log_jsonl."""
+    return {
+        "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
+        "intended_stake": round(intended_stake, 2),
+        "placed_stake": round(sum(r.stake or 0 for r in placed_results), 2),
+        "unfilled_stake": round(max(0.0, remaining_stake), 2),
+        "fanout": "sgm_sequential", "sgm": True, "orchestrated": orchestrated,
+        "placements": [
+            {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
+             "fill_odds": r.odds, "bet_id": r.bet_id} for r in placed_results],
+    }
+
+
 def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult]:
     """v4.0 SGM placement. See block comment above for design notes.
 
@@ -6764,6 +6783,7 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
     # (MLB) keeps its own summary, so it is NOT flagged here.
     _sgm_v4_t_start = time.time()
     _sgm_summary_sent = [False]  # once-guard for the consolidated summary
+    _sgm_outcome_logged = [False]  # v5.47: once-guard for the audit.jsonl tip_outcome
     if not _orchestrated:
         tip._sgm_consolidate = True
 
@@ -6825,6 +6845,25 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
         # (different class of problem — bookie may have placed the bet).
         if ambiguous_outcomes:
             _emit_sports_ambiguous_alert(tip, ambiguous_outcomes)
+
+        # v5.47: write the SGM tip_outcome to audit.jsonl from this universal
+        # terminal hook (once-guarded). _place_sgm_v4 (the SEQUENTIAL SGM path
+        # NBA SGMs use) previously wrote NO tip_outcome at all — only the
+        # concurrent _place_sgm_fanout did — so a placed sequential SGM was
+        # missing from the audit trail (2026-06-09 KAT u20.5/Brunson o21.5 $400
+        # placed + recorded in bets_placed.csv, but with no audit.jsonl row).
+        # The hook is the universal terminal (it covers the early full-fill
+        # returns AND the partial/exhausted post-loop paths), so logging here
+        # catches every non-orchestrated exit exactly once. Orchestrated (MLB)
+        # outcomes are owned by the orchestrator. Best-effort: an audit write
+        # must never break a placement.
+        if not _orchestrated and not _sgm_outcome_logged[0]:
+            _sgm_outcome_logged[0] = True
+            try:
+                _log_jsonl(AUDIT_LOG, _sgm_outcome_record(
+                    tip, intended_stake, placed_results, remaining_stake, _orchestrated))
+            except Exception as e:
+                log.error(f"v4 SGM tip_outcome audit write failed: {e}")
 
     def _accumulate_and_check_done(result: BetResult) -> bool:
         """Record a successful SGM placement and update spillover state.
