@@ -150,7 +150,13 @@ def _render_timing_block(
 
 
 def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
-    """Send a message via the notification bot."""
+    """Send a message via the notification bot.
+
+    v5.56 (audit): transient failures (network exception, HTTP 5xx, 429) get
+    ONE retry after a short pause, and a FINAL failure always logs the
+    distinctive needle 'NOTIFY LOST (final)' — previously a single failed
+    POST silently dropped the message (including CRITICALs and manual-bet
+    alerts) with only a generic error line."""
     target = chat_id or NOTIFY_CHAT_ID
     if not NOTIFY_BOT_TOKEN or not target:
         log.warning("Notification bot not configured, skipping")
@@ -163,55 +169,80 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
     preview = text.replace("\n", " ")[:80]
 
     url = f"{TELEGRAM_API.format(token=NOTIFY_BOT_TOKEN)}/sendMessage"
-    try:
-        resp = requests.post(
-            url,
-            json={
-                "chat_id": target,
-                "text": text,
-                "parse_mode": parse_mode,
-            },
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            log.error(
-                f"Telegram send FAILED (chat={target}, status={resp.status_code}): "
-                f"{resp.text[:300]} | preview: {preview}"
+    for attempt in (1, 2):
+        try:
+            resp = requests.post(
+                url,
+                json={
+                    "chat_id": target,
+                    "text": text,
+                    "parse_mode": parse_mode,
+                },
+                timeout=10,
             )
-            if "can't parse entities" in resp.text:
-                # H (2026-05-31): the retry already omits parse_mode (so Telegram
-                # does NOT re-parse entities and the message DOES deliver) — but
-                # the raw "<b>...</b>" tags would show literally. Strip tags so
-                # the plain-text fallback is readable. Decode the handful of HTML
-                # entities our templates emit (&lt; &gt; &amp;) so they don't show
-                # as escapes.
-                plain = re.sub(r"<[^>]+>", "", text)
-                plain = (
-                    plain.replace("&lt;", "<")
-                         .replace("&gt;", ">")
-                         .replace("&amp;", "&")
-                )
+        except Exception as e:
+            log.error(f"Telegram send EXCEPTION (chat={target}, attempt "
+                      f"{attempt}/2): {e} | preview: {preview}")
+            if attempt == 1:
+                time.sleep(2)
+                continue
+            log.error(f"NOTIFY LOST (final): NOT delivered after retry "
+                      f"(chat={target}) | preview: {preview}")
+            return False
+
+        if resp.status_code == 200:
+            log.info(f"Telegram send ok (chat={target}): {preview}")
+            return True
+
+        log.error(
+            f"Telegram send FAILED (chat={target}, status={resp.status_code}, "
+            f"attempt {attempt}/2): {resp.text[:300]} | preview: {preview}"
+        )
+        if "can't parse entities" in resp.text:
+            # H (2026-05-31): the retry already omits parse_mode (so Telegram
+            # does NOT re-parse entities and the message DOES deliver) — but
+            # the raw "<b>...</b>" tags would show literally. Strip tags so
+            # the plain-text fallback is readable. Decode the handful of HTML
+            # entities our templates emit (&lt; &gt; &amp;) so they don't show
+            # as escapes.
+            plain = re.sub(r"<[^>]+>", "", text)
+            plain = (
+                plain.replace("&lt;", "<")
+                     .replace("&gt;", ">")
+                     .replace("&amp;", "&")
+            )
+            try:
                 resp2 = requests.post(
                     url,
                     json={"chat_id": target, "text": plain},
                     timeout=10,
                 )
-                if resp2.status_code == 200:
-                    log.info(
-                        f"Telegram send ok (plain-text retry, chat={target}): {preview}"
-                    )
-                    return True
+            except Exception as e2:
+                log.error(f"Telegram plain-text retry EXCEPTION "
+                          f"(chat={target}): {e2}")
+                resp2 = None
+            if resp2 is not None and resp2.status_code == 200:
+                log.info(
+                    f"Telegram send ok (plain-text retry, chat={target}): {preview}"
+                )
+                return True
+            if resp2 is not None:
                 log.error(
                     f"Telegram plain-text retry also failed (chat={target}): "
                     f"{resp2.text[:300]}"
                 )
-                return False
+            log.error(f"NOTIFY LOST (final): NOT delivered (chat={target}) "
+                      f"| preview: {preview}")
             return False
-        log.info(f"Telegram send ok (chat={target}): {preview}")
-        return True
-    except Exception as e:
-        log.error(f"Telegram send EXCEPTION (chat={target}): {e} | preview: {preview}")
+        # Transient server-side classes get the one retry; other 4xx
+        # (chat not found, bot blocked...) won't improve — fail loud now.
+        if attempt == 1 and (resp.status_code == 429 or resp.status_code >= 500):
+            time.sleep(2)
+            continue
+        log.error(f"NOTIFY LOST (final): NOT delivered (chat={target}) "
+                  f"| preview: {preview}")
         return False
+    return False
 
 
 # ── Destination helpers ─────────────────────────────────────────────

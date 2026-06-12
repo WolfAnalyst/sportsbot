@@ -39,7 +39,11 @@ log = logging.getLogger("tipbot.reconcile")
 
 # Defaults — tune via the caller. dt_grace covers clock skew between this
 # machine and HyperBot's server-side dt stamps (assume NTP-synced, ~seconds).
-DEFAULT_MAX_WAIT_SEC = 20.0
+# v5.56 (audit): max wait 20s -> 30s — trader-review bets (Pointsbet, over-MBL)
+# can land >20s after submission and were reading as "not found" right at the
+# edge of the window. Normal placements appear in pending_bets <10s, so the
+# extra 10s only extends the RARE ambiguous path, never the happy path.
+DEFAULT_MAX_WAIT_SEC = 30.0
 DEFAULT_POLL_INTERVAL_SEC = 4.0
 DEFAULT_DT_GRACE_SEC = 12.0
 DEFAULT_STAKE_TOL = 0.5
@@ -71,8 +75,16 @@ def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=Non
       - event matches (normalized substring, either direction) when both present
       - stake: 0 < pending_stake <= attempted_stake + tol  (auto-cap => smaller OK)
       - sport matches when both present
-    selection_text, if given, is logged as a soft confirmation but is NOT a gate
-    (racing pending bets had empty runner text in one sample).
+      - selection (v5.56, audit): when BOTH the pending record's bet text and
+        selection_text are non-empty, at least ONE significant token (>=3
+        alnum chars) of selection_text must appear in the bet text — a HARD
+        gate. The old soft version could match a DIFFERENT bet on the same
+        event in the same window, a real scenario since v5.54's concurrent
+        tips (two runners in ONE race on ONE account, seconds apart). Token
+        matching (not full-string) keeps name-format drift safe ("Victor
+        Wembanyama Over" matches "Victor Wembanyama 26.5+ points (...)" via
+        the 'wembanyama' token). Stays SOFT only when the pending bet text is
+        EMPTY (racing pending bets had empty runner text in one sample).
     """
     if pending.get("result") is not None:
         return False
@@ -101,11 +113,27 @@ def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=Non
             return False
 
     if selection_text:
-        if _norm(selection_text) and _norm(selection_text) not in _norm(pending.get("bet")):
+        pbet = _norm(pending.get("bet"))
+        # Significant tokens of the selection (>=3 alnum chars): runner /
+        # player-name fragments survive format drift; "over"/"under" ride along.
+        toks = [t for t in "".join(
+            c.lower() if c.isalnum() else " " for c in selection_text
+        ).split() if len(t) >= 3]
+        if pbet and toks and not any(t in pbet for t in toks):
+            # v5.56 (audit): HARD reject — same account, same event, same
+            # window, but the bet text names a DIFFERENT selection. Without
+            # this, an ambiguous runner-A attempt could "confirm" against
+            # runner-B's pending bet (concurrent tips on one race).
+            log.info(
+                f"reconcile: dt/event/stake matched but NO selection token of "
+                f"'{selection_text}' in pending bet '{pending.get('bet')}' — "
+                f"rejecting (different selection, not our bet)"
+            )
+            return False
+        if not pbet:
             log.debug(
-                f"reconcile: dt/event/stake matched but selection text "
-                f"'{selection_text}' not in pending bet '{pending.get('bet')}' "
-                f"(soft — not rejecting)"
+                f"reconcile: pending bet text empty — selection "
+                f"'{selection_text}' unverifiable (soft accept, racing sample)"
             )
     return True
 
