@@ -3329,15 +3329,31 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
             actual = float(decision.get("actual_stake", step) or step)
         except (TypeError, ValueError):
             actual = step
+        # v5.55 (audit, verified-critical): convert to a full SUCCESS — the
+        # bet IS on the books (pending_bets confirmed it), so it must flow
+        # into placed accounting / the BET PLACED summary / the ledger, NOT
+        # sit in the ambiguous bucket firing a maybe-landed CRITICAL with a
+        # contradictory CONFIRMED PLACED error text (the v5.53 behaviour).
+        # NOTE clearing is_ambiguous alone is NOT enough — the elapsed-time
+        # prong of _is_ambiguous_result would still classify it; success=True
+        # short-circuits that correctly.
+        match = decision.get("match") or {}
+        r.success = True
+        r.is_ambiguous = False
         r.stake = actual
+        r.error = None
+        if not getattr(r, "bet_id", None):
+            r.bet_id = match.get("bookie_bet_id") or match.get("id")
+        if not getattr(r, "odds", None):
+            r.odds = match.get("odds")
         try:
             r._requested_stake = actual
+            r._reconcile_confirmed_placed = True
         except Exception:
             pass
-        r.error = (f"ambiguous CONFIRMED PLACED ${actual:.2f} (reconcile): "
-                   f"{(r.error or '')[:100]}")
-        log.warning(f"{label}: reconcile CONFIRMED placed ${actual:.2f} — "
-                    f"debiting the actual stake")
+        log.warning(f"{label}: reconcile CONFIRMED placed ${actual:.2f} "
+                    f"(bet_id={r.bet_id}) — recording as PLACED at the "
+                    f"actual stake")
         return r
     if action == "not_placed":
         r.is_ambiguous = False
@@ -8200,8 +8216,8 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
             err = str(resp.get("error", "") or "")
             _slow = _el >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
             if (_slow or bool(resp.get("ambiguous"))) and not _is_definitely_pre_placement(err):
-                # Erasmus: maybe-placed -> debit (gated reconcile), flag, STOP
-                # this account. Never re-bet/ladder on uncertainty.
+                # Erasmus: maybe-placed -> reconcile (gated), STOP this account
+                # either way. Never re-bet/ladder on uncertainty.
                 import reconcile as _recon
                 _acct = sess.get("account_id")
                 _decision = _recon.decide_ambiguous(
@@ -8209,9 +8225,51 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
                     selection=m["selection"], submit_ts=_t.time() - _el,
                     reconcile_enabled=RECONCILE_AMBIGUOUS, spill_enabled=False,
                 )
-                _debit = (_decision.get("actual_stake", step_stake)
-                          if _decision.get("action") == "placed" else step_stake)
+                _action = _decision.get("action")
                 _reason = "slow_rejection" if _slow else "fast_ambiguous"
+                if _action == "placed":
+                    # v5.55 (audit): the bet IS on the books — record a real
+                    # PLACED result at the ACTUAL stake (auto-cap: smaller
+                    # counts) instead of an ambiguous debit (v5.52 flagged
+                    # is_ambiguous=True even when reconcile confirmed).
+                    _match = _decision.get("match") or {}
+                    try:
+                        _actual = float(
+                            _decision.get("actual_stake", step_stake) or step_stake)
+                    except (TypeError, ValueError):
+                        _actual = step_stake
+                    r = BetResult(
+                        success=True, tip=tip, session_id=sid, bookie=bookie,
+                        bet_id=_match.get("bookie_bet_id") or _match.get("id"),
+                        odds=_match.get("odds") or resp.get("odds"),
+                        stake=_actual, elapsed_sec=_el, timestamp=datetime.now(),
+                        placed_market="player_stats", placed_player=player,
+                        placed_stat="h_r_rbi", placed_line=m["line"],
+                        placed_selection=m["selection"],
+                        placed_leg_summary=_format_tip_placement_summary(tip),
+                    )
+                    log.warning(
+                        f"MLB single reconcile CONFIRMED placed on {bookie}:{sid} "
+                        f"${_actual:.2f} (bet_id={r.bet_id}) — recording as PLACED"
+                    )
+                    results.append(r)
+                    remaining = round(remaining - _actual, 2)
+                    break
+                if _action == "not_placed":
+                    # v5.55: pending_bets POSITIVELY confirmed nothing landed —
+                    # no debit, no ambiguous critical; the stake stays in the
+                    # orchestrator's leftover -> manual alert. Still STOP this
+                    # account (a confirmed-not-placed re-bet is Tier-2 spill,
+                    # deliberately off for sports).
+                    log.error(
+                        f"MLB single CONFIRMED NOT placed on {bookie}:{sid} "
+                        f"(reconcile, {_reason}) err='{err[:80]}' — no debit, "
+                        f"stake stays leftover->manual; stopping this account"
+                    )
+                    break
+                # Conservative (reconcile off / API down / no account_id):
+                # debit-as-placed, flag, alert — unchanged behaviour.
+                _debit = step_stake
                 log.error(
                     f"MLB single AMBIGUOUS ({_reason}) on {bookie}:{sid} "
                     f"stake=${_debit:.2f} elapsed={_el:.1f}s err='{err[:80]}'. "
