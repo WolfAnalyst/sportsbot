@@ -1412,6 +1412,25 @@ def _mlb_hrrbi_to_sgm(tips: list[ParsedTip]) -> list[ParsedTip]:
             stat = MLB_STAT_MAP.get((leg.stat or "").lower(), (leg.stat or "").lower())
             sel = (leg.selection or "").lower()
             is_over = sel.endswith("over") or sel in ("over", "")
+            # v5.53: HRR lines only exist at X.5 (0.5/1.5/2.5/3.5) — an INTEGER
+            # 5/15/25/35 is impossible for this market and means the tipster
+            # dropped the decimal point. 2026-06-12 Corbin Carroll: Shook posted
+            # "M 15 HRR" (= 1.5; the -134 price proves the 2+ line) -> parsed as
+            # line 15.0 -> missed the 2+ transform below -> routed to manual
+            # instead of auto-placing $400. Snap exactly {5,15,25,35} -> /10
+            # with a loud flag; anything else non-standard still goes manual.
+            if stat == "h_r_rbi":
+                try:
+                    _ln = float(leg.line)
+                    if _ln in (5.0, 15.0, 25.0, 35.0):
+                        leg.line = _ln / 10.0
+                        log.warning(
+                            f"MLB HRR line snap: {leg.player} line {_ln:g} is "
+                            f"impossible (HRR lines are X.5) -> snapped to "
+                            f"{leg.line} (tipster dropped the decimal point)"
+                        )
+                except (TypeError, ValueError):
+                    pass
             try:
                 line_is_2plus = abs(float(leg.line) - 1.5) < 0.01
             except (TypeError, ValueError):
@@ -3248,6 +3267,12 @@ def _is_ambiguous_result(r: BetResult) -> bool:
     (AttributeError on str). Fixed v5.13."""
     if r.success:
         return False
+    # v5.53: Tier-1 reconcile POSITIVELY confirmed nothing landed (a clean
+    # /api/pending_bets miss) — NOT ambiguous regardless of elapsed/flags.
+    # Set only by _reconcile_fanout_ambiguous; keeps the rollups' at-risk and
+    # CRITICAL-alert buckets honest (2026-06-12 Eddie Geelong $250 case).
+    if getattr(r, "_reconcile_confirmed_not_placed", False):
+        return False
     if getattr(r, "is_ambiguous", False):
         return True
     _el = getattr(r, "elapsed_sec", None) or 0.0
@@ -3255,6 +3280,81 @@ def _is_ambiguous_result(r: BetResult) -> bool:
         _el >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
         and not _is_definitely_pre_placement(r.error or "")
     )
+
+
+def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
+    """v5.53: Tier-1 reconciliation for a fan-out AMBIGUOUS rung (shared by the
+    AFL singles worker `_fanout_place_account` and the SGM worker
+    `_sgm_fanout_place_account`). Polls /api/pending_bets via
+    reconcile.decide_ambiguous — gated by RECONCILE_AMBIGUOUS, spill ALWAYS off
+    (never re-bet; trader-review bets can land >30s after the poll window):
+
+      'placed'      -> the bet IS on the books: stay COMMITTED but debit the
+                       ACTUAL stake (auto-cap: smaller counts) and mark the
+                       error CONFIRMED PLACED so the alert reads confirmed,
+                       not maybe.
+      'not_placed'  -> pending_bets POSITIVELY confirmed nothing landed:
+                       convert to a CLEAN failure (no debit, no ambiguous
+                       CRITICAL; the stake surfaces as UNFILLED -> the normal
+                       unfilled/manual alert). 2026-06-12 Eddie Geelong o178.5:
+                       $250 on 65465 was debited maybe-placed + CRITICAL'd;
+                       Wilson manually confirmed at the bookie it never landed
+                       — this branch automates that check.
+      'conservative'/'spill'/error -> unchanged Erasmus default: debit-as-
+                       placed, ambiguous CRITICAL, ladder stays stopped.
+
+    NEVER continues the ladder, whatever the outcome — a confirmed not-placed
+    re-bet is Tier-2 spill, deliberately OFF for sports."""
+    import time as _t
+    import reconcile as _recon
+    try:
+        leg0 = tip.legs[0] if getattr(tip, "legs", None) else None
+        sel = ""
+        if leg0 is not None:
+            sel = (getattr(leg0, "player", "") or getattr(leg0, "selection", "") or "")
+        _el = getattr(r, "elapsed_sec", None) or 0.0
+        decision = _recon.decide_ambiguous(
+            hb, sess.get("account_id"), event=tip.event, stake=step,
+            sport=(tip.sport or "afl"), selection=sel,
+            submit_ts=_t.time() - _el,
+            reconcile_enabled=RECONCILE_AMBIGUOUS, spill_enabled=False,
+        )
+    except Exception as e:
+        log.error(f"{label}: reconcile errored ({e}) — staying conservative "
+                  f"(debit-as-placed)")
+        return r
+    action = decision.get("action")
+    if action == "placed":
+        try:
+            actual = float(decision.get("actual_stake", step) or step)
+        except (TypeError, ValueError):
+            actual = step
+        r.stake = actual
+        try:
+            r._requested_stake = actual
+        except Exception:
+            pass
+        r.error = (f"ambiguous CONFIRMED PLACED ${actual:.2f} (reconcile): "
+                   f"{(r.error or '')[:100]}")
+        log.warning(f"{label}: reconcile CONFIRMED placed ${actual:.2f} — "
+                    f"debiting the actual stake")
+        return r
+    if action == "not_placed":
+        r.is_ambiguous = False
+        r.stake = 0
+        try:
+            r._requested_stake = 0
+            r._reconcile_confirmed_not_placed = True
+        except Exception:
+            pass
+        r.error = f"confirmed not-placed (reconcile): {(r.error or '')[:120]}"
+        log.info(f"{label}: reconcile CONFIRMED not-placed — clean failure, "
+                 f"stake stays UNFILLED (no debit, no ambiguous critical)")
+        return r
+    log.info(f"{label}: reconcile inconclusive "
+             f"({decision.get('reason', action)}) — conservative "
+             f"debit-as-placed stands")
+    return r
 
 
 def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetResult:
@@ -3287,7 +3387,10 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
                 f"AFL fan-out: {bk}:{sid} AMBIGUOUS on ${step:.2f} — stopping ladder "
                 f"(bet may have landed; not retrying a lower rung)"
             )
-            return r
+            # v5.53: Tier-1 confirm/deny via /api/pending_bets. Ladder stays
+            # stopped either way; only the accounting + alert severity change.
+            return _reconcile_fanout_ambiguous(
+                tip, sess, r, step, f"AFL fan-out {bk}:{sid}")
         last = r
         if not _is_stake_error(r.error or ""):
             log.info(
@@ -7668,14 +7771,10 @@ def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
         # Erasmus: a slow (>=threshold) or hyperbot-ambiguous failure may have
         # LANDED at the bookie -> stop, flag ambiguous, NEVER ladder/re-bet (a
         # lower rung after a maybe-landed top rung = double-stake). A definitely-
-        # pre-placement error ("did not match"/"line moved") walks on. NOTE: like
-        # the AFL singles fan-out (_fanout_place_account), this worker does NOT
-        # call reconcile.decide_ambiguous per-account (the /api/pending_bets
-        # confirm/deny) — stopping the ladder already prevents the double-stake;
-        # the ambiguous CRITICAL alert + the orchestrator treating the at-risk
-        # stake as COMMITTED cover the maybe-landed money. Reported at-risk = the
-        # rung fired (may over-state vs a confirmed smaller auto-cap — a reporting
-        # refinement deferred, consistent with the AFL fan-out).
+        # pre-placement error ("did not match"/"line moved") walks on. v5.53:
+        # both fan-out workers now run the Tier-1 /api/pending_bets confirm/deny
+        # (_reconcile_fanout_ambiguous) — the ladder STAYS stopped either way;
+        # only the accounting (actual stake vs no-debit) + alert severity change.
         _slow = _el >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
         if (_slow or bool(resp.get("ambiguous"))) and not _is_definitely_pre_placement(err):
             r = BetResult(
@@ -7691,7 +7790,8 @@ def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
                 pass
             log.warning(f"SGM fan-out: {bk}:{sid} AMBIGUOUS on ${step:.2f} "
                         f"(elapsed {_el:.1f}s) — stopping ladder (may have landed)")
-            return r
+            return _reconcile_fanout_ambiguous(
+                tip, sess, r, step, f"SGM fan-out {bk}:{sid}")
         last = BetResult(success=False, tip=tip, session_id=sid, bookie=bk,
                          error=err, elapsed_sec=_el, timestamp=datetime.now())
         try:
