@@ -173,6 +173,47 @@ TIPSTERS_IGNORE_SUGGESTED_BOOKIE: set[str] = {"kev_nba", "ausbets_nba", "saiyan_
 # AusBets "Knicks 5.5" had no unit yet attempted a $400 line bet).
 UNITS_REQUIRED_TIPSTERS: set[str] = {"kev_nba", "ausbets_nba"}
 
+# v5.52 BELT for the gate above: Groq can INVENT a unit value (2026-06-11
+# AusBets "nothin today ... none quite get to my price threshold" parsed as
+# 4 tips WITH units, units_explicit=True, and Spurs ML PLACED $400). So for
+# UNITS_REQUIRED_TIPSTERS the RAW message must ALSO contain a literal unit
+# token before units_explicit is trusted. Real formats covered (audit.jsonl,
+# 209/222 distinct aus+kev messages carry one; the 13 without are exactly the
+# no-bet/commentary/bare messages that SHOULD gate):
+#   AusBets: "1U - Miami +6 (SB: $1.9)", "1.5U - Golden State +5.5"
+#   Kev:     "... with SB - 1 unit", "- 1.25 units", "- 0.2 units"
+# Deliberately does NOT match "2+ threes", "u226.5", "u12.5pra", "under",
+# "$1.9", "@ 1.8". [ \t]* (not \s*) so a digit at end-of-line can't pair with
+# a 'u' word on the next line; after the 'u' only a word boundary or "nit(s)"
+# may follow, so "5 under" / "1 Utah" don't match.
+_UNIT_TOKEN_RE = re.compile(r"\b\d+(?:\.\d+)?[ \t]*u(?:nits?)?\b", re.IGNORECASE)
+
+# v5.52 BRACES (ausbets_nba only): explicit no-bet framing. AusBets posts
+# near-miss lines under a "these are NOT bets" header and Groq still parses
+# them as tips. Conservative phrases only — validated against all 114 distinct
+# ausbets_nba messages in audit.jsonl (exactly 1 hit: the 2026-06-11 incident;
+# "That's it for today" after a real bet does NOT trip it).
+_NO_BET_FRAMING_RE = re.compile(
+    r"nothin'?g?\s+today"                        # "nothin today" / "nothing today"
+    r"|no\s+bets?\s+today"                       # "no bets today"
+    r"|none\s+quite"                             # "none quite get to my price threshold"
+    r"|close\s+to\s+(?:a\s+)?bets?\s+but\s+no",  # "close to bets but none ..."
+    re.IGNORECASE,
+)
+
+
+def _raw_has_unit_token(raw: str) -> bool:
+    """True if the raw tipster message contains a literal unit token
+    ("1U", "1.5U", "1 unit", "1.25 units"). Belt for UNITS_REQUIRED_TIPSTERS:
+    units_explicit from the LLM is only trusted when this is also True."""
+    return bool(_UNIT_TOKEN_RE.search(raw or ""))
+
+
+def _is_no_bet_framing(raw: str) -> bool:
+    """True if the raw message explicitly frames its lines as NOT bets
+    ("nothin today", "no bets today", "none quite", "close to bets but no")."""
+    return bool(_NO_BET_FRAMING_RE.search(raw or ""))
+
 # ── Tipsters HARD-LOCKED to a single bookie ─────────────────────────
 # Opposite of the ignore-list: these tips are placed ONLY on the named bookie.
 # If that bookie has no active session, the tip routes to manual — it is NEVER
@@ -4540,7 +4581,8 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                     )
                 ):
                     log.error(
-                        f"v4: MBL VIOLATION {chosen_bookie}:{sid} rejected "
+                        f"v4: stake reject below our cap (bookie max-bet limit) "
+                        f"{chosen_bookie}:{sid} rejected "
                         f"${step_stake:.2f} but cap allows ${max_stake:.2f} "
                         f"({cap_reason})"
                     )
@@ -4979,10 +5021,12 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
             "v4": True,
         })
 
-    # Ladder + MBL alerts. MBL takes priority — the ladder maintenance
-    # alert would just duplicate the same stakes/sessions across two
-    # channels (Maintenance + Critical). Same suppression rule as racing
-    # in tiptitans_processor. Both are safe-to-skip on exception.
+    # Ladder + bookie-stake-cap alerts. The stake-cap alert takes priority —
+    # the ladder maintenance alert would just duplicate the same stakes/
+    # sessions on the same Maintenance channel (both non-critical since
+    # v5.52: a bookie capping our stake is NOT a violation of OUR cap).
+    # Same suppression rule as racing in tiptitans_processor. Both are
+    # safe-to-skip on exception.
     if _should_alert_mbl_violation(mbl_violations, unfilled):
         try:
             notifier.notify_sports_mbl_violation(tip, mbl_violations)
@@ -6798,9 +6842,10 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
         tip._sgm_consolidate = True
 
     def _emit_sgm_aux_alerts():
-        """Fire ladder/MBL alerts before any return path. MBL takes priority
-        — sending both would just duplicate the same data across Maintenance
-        and Critical channels. Safe to call multiple times: callers always
+        """Fire ladder/bookie-stake-cap alerts before any return path. The
+        stake-cap alert takes priority — sending both would just duplicate
+        the same data on the Maintenance channel (both non-critical since
+        v5.52). Safe to call multiple times: callers always
         return immediately after.
 
         Slow-rejection ambiguous outcomes also fire from here, in addition
@@ -7465,7 +7510,8 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
                     )
                 ):
                     log.error(
-                        f"v4 SGM: MBL VIOLATION {bookie}:{sid} rejected "
+                        f"v4 SGM: stake reject below our cap (bookie max-bet limit) "
+                        f"{bookie}:{sid} rejected "
                         f"${step_stake:.2f} but cap allows ${max_stake:.2f} "
                         f"({cap_reason})"
                     )
@@ -7956,9 +8002,13 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
     Catalog-resolves the prop_id via _match_mlb_player_prop (incl. the guarded
     fuzzy player match). Erasmus: place_single_sports_bet is max_attempts=1; a
     slow (>=5s) or ambiguous rejection -> stop that account + flag ambiguous
-    (gated reconcile, no re-bet); a stake reject -> ladder down; a pre-placement
-    reject -> stop (no debit). Returns the BetResults (success/ambiguous). The
-    caller (_place_mlb_hrrbi) owns the leftover/manual notification."""
+    (gated reconcile, no re-bet); a stake reject -> ladder down; a FAST
+    price-change (code=535) reject -> retry ONCE per account on the same rung
+    with target_odds dropped (v5.52: slip-validation reject = pre-placement, so
+    retry-safe; slow/ambiguous still wins, a second 535 stops the account);
+    any other pre-placement reject -> stop (no debit). Returns the BetResults
+    (success/ambiguous). The caller (_place_mlb_hrrbi) owns the leftover/manual
+    notification."""
     import time as _t
     single_sids = [s.strip() for s in os.getenv("MLB_HRRBI_SINGLE_SESSIONS", "").split(",") if s.strip()]
     if not single_sids or cap_stake <= STAKE_FLOOR:
@@ -8009,7 +8059,14 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
             continue
         target_odds = (round(max(1.01, float(m["odds"]) * 0.9), 2)
                        if m.get("odds") else None)
-        for step_stake in steps:
+        # v5.52: index-based ladder so ONE fast price-change (code=535) retry
+        # can re-run the SAME rung with target_odds dropped, re-entering the
+        # full classification below — the ambiguous guard keeps precedence on
+        # the retry attempt itself (Erasmus). Flags are per-ACCOUNT.
+        _step_i = 0
+        _price_retried = False
+        while _step_i < len(steps):
+            step_stake = steps[_step_i]
             _t0 = _t.time()
             resp = hb.place_single_sports_bet(
                 session_id=sid, sport="mlb", event=event_for_hb,
@@ -8077,6 +8134,22 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
             if _is_stake_error(err):
                 log.info(f"MLB single stake reject ${step_stake:.2f} on {bookie}:{sid} "
                          f"— laddering down")
+                _step_i += 1
+                continue
+            # v5.52: FAST price-change (code=535) = slip validation rejected
+            # BEFORE submission (definitively pre-placement) -> retry ONCE on
+            # the same rung with target_odds dropped (accept current market),
+            # mirroring the v4 singles retry (~L4726). The ambiguous branch
+            # above already swallowed slow/flagged rejects; the explicit
+            # not-_slow / not-ambiguous guards re-assert that for compound
+            # error strings that also match a pre-placement pattern. A second
+            # 535 (flag spent) falls through to the stop below.
+            if (_is_price_change_error(err) and not _price_retried
+                    and not _slow and not resp.get("ambiguous")):
+                _price_retried = True
+                target_odds = None
+                log.info(f"MLB single price-change retry on {bookie}:{sid} "
+                         f"(target_odds dropped, same rung ${step_stake:.2f})")
                 continue
             log.warning(f"MLB single non-stake fail on {bookie}:{sid}: {err[:120]} "
                         f"— stopping this account")
@@ -9517,13 +9590,37 @@ async def _process_tip(text: str, tipster: str, sport: str,
         # No-unit gate: aus/kev tips MUST carry an explicit unit to be a bet.
         # Without one we'd default the stake and place a bet the capper never
         # actually sized — route to manual instead (Wilson 2026-06-04).
-        if tip.tipster in UNITS_REQUIRED_TIPSTERS and not getattr(tip, "units_explicit", True):
+        # v5.52 belt: units_explicit alone is NOT trusted any more — Groq
+        # invented a unit on 2026-06-11 ("nothin today ... none quite get to
+        # my price threshold" still placed Spurs ML $400). The RAW message
+        # must also contain a literal unit token ("1U -", "- 1 unit").
+        if tip.tipster in UNITS_REQUIRED_TIPSTERS and (
+            not getattr(tip, "units_explicit", True)
+            or not _raw_has_unit_token(tip.raw_message)
+        ):
             log.info(
                 f"No-unit gate: {tip.tipster} tip has no explicit unit/stake "
-                f"-> manual (not placing). Raw: {tip.raw_message[:120]}"
+                f"in the raw message -> manual (not placing). "
+                f"Raw: {tip.raw_message[:120]}"
             )
             tip.alert_only = True
             tip.alert_reason = "no unit/stake specified by the tipster — place manually"
+
+        # v5.52 braces (ausbets_nba only): explicit no-bet framing routes ALL
+        # tips parsed from the message to manual ("nothin today", "no bets
+        # today", "none quite", "close to bets but no" — on 2026-06-11 these
+        # were near-miss lines, explicitly NOT bets, yet one placed $400).
+        # Runs AFTER the belt so its specific alert_reason wins if both fire.
+        if tip.tipster == "ausbets_nba" and _is_no_bet_framing(tip.raw_message):
+            log.info(
+                f"No-bet framing: {tip.tipster} message says these are NOT "
+                f"bets -> manual. Raw: {tip.raw_message[:120]}"
+            )
+            tip.alert_only = True
+            tip.alert_reason = (
+                "tipster framed this message as NO bet ('nothin today' / "
+                "'none quite' phrasing) — review manually, do not place"
+            )
 
         # Time the resolve + place step
         resolve_start = time.time()
@@ -9663,6 +9760,52 @@ _IMAGE_ACTIONABLE_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(kw) for kw in _IMAGE_ACTIONABLE_KEYWORDS) + r")\b"
 )
 
+# v5.52 announcement-guard (2026-06-12): text-only posts that merely ANNOUNCE
+# that tips are coming ("Going to send out match plays soon", "x2 bets coming")
+# kept slipping through as actionable (Eddie 2026-06-11 17:39 manual ping)
+# because announcements often brush a keyword ("tips"/"update"/"double"/"odds")
+# or a stray decimal. Checked BEFORE the keyword list in
+# _image_text_is_actionable: an announcement phrase classifies the post as
+# chatter UNLESS it also carries an URGENT instruction (scratchings /
+# cancellations - never drop a pull-the-bet message) or a CONCRETE selection
+# pattern (R4 / $50 / 2u / 2.50 / "race 5"), which must still ping (Eddie) or
+# parse-and-place (Zak/Trial racing text tips).
+_IMAGE_ANNOUNCEMENT_PHRASES = (
+    "going to send", "gonna send", "about to send", "will be sending",
+    "sending out", "send out", "sending through", "sending a couple",
+    "plays soon", "plays shortly", "plays coming", "play coming",
+    "picks coming", "pick coming", "bets coming", "bet coming",
+    "more coming", "coming soon", "coming shortly",
+    "coming through soon", "coming through shortly",
+)
+_IMAGE_ANNOUNCEMENT_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(p) for p in _IMAGE_ANNOUNCEMENT_PHRASES) + r")\b"
+)
+# Urgent instructions that must ALWAYS surface, even inside an announcement
+# post ("plays coming soon - and scratch the R3 runner" must still ping).
+_IMAGE_URGENT_INSTRUCTION_RE = re.compile(
+    r"\b(?:scratch|scratched|scratching|non runner|non-runner|late mail|"
+    r"cancel|cancelled|remove|removed)\b"
+)
+
+
+def _image_text_selection_pattern(t: str) -> bool:
+    """Racing/odds/stake patterns that imply a CONCRETE selection (not just
+    talk about betting). Shared by _image_text_is_actionable's tail check and
+    the v5.52 announcement-guard (a 'coming soon' post that names R4 @ 2.50
+    is a real tip, not an announcement). Expects pre-lowercased text."""
+    if re.search(r"\br\d{1,2}\b", t):            # race code R1..R12
+        return True
+    if re.search(r"\$\s*\d", t):                 # $50
+        return True
+    if re.search(r"\b\d+(?:\.\d+)?\s*u\b", t):   # 0.5u / 2u units
+        return True
+    if re.search(r"\b\d+\.\d{1,2}\b", t):        # decimal odds e.g. 2.50
+        return True
+    if re.search(r"\brace\s*\d", t):             # "race 5"
+        return True
+    return False
+
 
 _IMG_WEEKDAYS = {
     "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1,
@@ -9748,20 +9891,17 @@ def _image_text_is_actionable(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
         return False
+    # v5.52 announcement-guard: "tips are coming soon" posts are chatter even
+    # when they brush an actionable keyword - unless they also carry an urgent
+    # instruction or a concrete selection (see _IMAGE_ANNOUNCEMENT_PHRASES).
+    if (_IMAGE_ANNOUNCEMENT_RE.search(t)
+            and not _IMAGE_URGENT_INSTRUCTION_RE.search(t)
+            and not _image_text_selection_pattern(t)):
+        return False
     if _IMAGE_ACTIONABLE_RE.search(t):
         return True
     # Racing/odds/stake patterns that imply a concrete selection.
-    if re.search(r"\br\d{1,2}\b", t):            # race code R1..R12
-        return True
-    if re.search(r"\$\s*\d", t):                 # $50
-        return True
-    if re.search(r"\b\d+(?:\.\d+)?\s*u\b", t):   # 0.5u / 2u units
-        return True
-    if re.search(r"\b\d+\.\d{1,2}\b", t):        # decimal odds e.g. 2.50
-        return True
-    if re.search(r"\brace\s*\d", t):             # "race 5"
-        return True
-    return False
+    return _image_text_selection_pattern(t)
 
 
 def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: int,
@@ -10668,6 +10808,59 @@ def _is_owned_session(sid: str) -> bool:
     return session_priority.get_session_meta(str(sid)) is not None
 
 
+def _partition_crashed_alerts(crashed: list, active_count: int):
+    """FIX 4 (2026-06-12): split a confirmed-crashed batch into the CRITICAL
+    message (placeable sessions, inert ones footnoted) and/or the INFO
+    message (inert-only batch). PURE — no sends, unit-tested; the watchdog
+    loop just delivers whatever comes back.
+
+    Placeable = in ANY per-sport priority list AT ALERT TIME
+    (session_priority.is_placeable_session, fail-open on empty config), so
+    racing accounts appended to RACING_SESSION_PRIORITY stay CRITICAL while
+    staged-inert ones (no priority assignment — tipbot never places on them)
+    stop paging the critical channel. Evidence: 2026-06-11 Wilson Unibet
+    s99998 (inert; HyperBot-side it never even logged in) dropped 11:47 and
+    fired a CRITICAL at 12:02.
+
+    `crashed` entries are (sid, info, mins_down) — the shape the watchdog
+    builds. Returns (critical_msg, info_msg); either may be None."""
+    placeable: list[tuple[str, dict, float]] = []
+    inert: list[tuple[str, dict, float]] = []
+    for sid, info, mins in crashed:
+        if session_priority.is_placeable_session(sid):
+            placeable.append((sid, info, mins))
+        else:
+            inert.append((sid, info, mins))
+
+    def _lines(entries):
+        return "\n".join(
+            f"  {_drop_label(sid, info)} (down {mins:.0f}m)"
+            for sid, info, mins in entries
+        )
+
+    critical_msg = None
+    info_msg = None
+    if placeable:
+        critical_msg = (
+            f"{len(placeable)} session(s) confirmed crashed "
+            f"(>={WATCHDOG_CRITICAL_AFTER_SEC // 60}m offline). "
+            f"Active remaining: {active_count}.\n" + _lines(placeable)
+        )
+        if inert:
+            critical_msg += (
+                "\nAlso down (INERT — no priority assignment, no "
+                "auto-placement impact):\n" + _lines(inert)
+            )
+    elif inert:
+        info_msg = (
+            f"{len(inert)} INERT session(s) confirmed crashed "
+            f"(>={WATCHDOG_CRITICAL_AFTER_SEC // 60}m offline) — in NO "
+            f"priority list, tipbot never places on these (no betting "
+            f"impact). Active remaining: {active_count}.\n" + _lines(inert)
+        )
+    return critical_msg, info_msg
+
+
 async def _watchdog_recheck_after(sids: set, parent_first_seen):
     """One-shot follow-up ~60s after a drop batch is detected.
 
@@ -10849,17 +11042,19 @@ async def _session_watchdog():
                 notifier.notify_info(msg)
 
             if crashed:
-                lines = [
-                    f"  {_drop_label(sid, info)} (down {mins:.0f}m)"
-                    for sid, info, mins in crashed
-                ]
-                msg = (
-                    f"{len(crashed)} session(s) confirmed crashed "
-                    f"(>={WATCHDOG_CRITICAL_AFTER_SEC // 60}m offline). "
-                    f"Active remaining: {len(current_active)}.\n"
-                    + "\n".join(lines)
+                # FIX 4 (2026-06-12): inert-only batches (no priority
+                # assignment -> tipbot never places on them) downgrade to
+                # INFO on the maintenance chat; placeable crashes stay
+                # CRITICAL with inert ones footnoted. Partition is computed
+                # from the LIVE priority lists at alert time — see
+                # _partition_crashed_alerts.
+                critical_msg, info_msg = _partition_crashed_alerts(
+                    crashed, len(current_active)
                 )
-                notifier.notify_critical(msg)
+                if critical_msg:
+                    notifier.notify_critical(critical_msg)
+                if info_msg:
+                    notifier.notify_info(info_msg)
                 # Mark so the same crash doesn't fire again next cycle.
                 # Stays in _pending_drops; recovery still moves it back.
                 for sid, _, _ in crashed:
@@ -11002,7 +11197,7 @@ async def main():
                             )
                         )
                     else:
-                        log.info(f"[{channel_name}] text-only post on image channel (actionable) -> manual alert")
+                        log.info(f"[{channel_name}] text-only post on image channel (actionable) -> manual alert: {text[:120]}")
                         notifier.notify_image_alert(channel_name, text)
                 else:
                     log.info(f"[{channel_name}] text-only chatter on image channel -> dropped (not bet-like): {text[:80]}")

@@ -424,6 +424,39 @@ def get_priority_for(sport: str, is_sgm: bool = False) -> list[str]:
     return _priority_config.for_sport(sport, is_sgm)
 
 
+def all_priority_session_ids() -> set[str]:
+    """Union of every per-sport priority list — the session ids tipbot can
+    actually auto-place on. Computed from the LIVE module-state priority
+    config at call time (NOT a startup snapshot), so racing-only accounts
+    appended to RACING_SESSION_PRIORITY (100000/100001/99996/100002) are
+    included the moment the config is (re)loaded. Single source of truth
+    shared by log_startup_summary's "no priority assignment" diagnostic and
+    the FIX 4 inert-crash severity partition (main.py watchdog +
+    check_session_health)."""
+    cfg = _priority_config
+    return set(
+        cfg.nba_singles + cfg.nba_sgm + cfg.afl_singles
+        + cfg.afl_sgm + cfg.mlb_singles + cfg.mlb_sgm + cfg.racing
+    )
+
+
+def is_placeable_session(session_id: str) -> bool:
+    """True if tipbot can auto-place on this session — i.e. it appears in
+    at least ONE per-sport priority list. False = INERT (owned/monitored in
+    sessions.yaml but unreachable for auto-placement), e.g. the staged
+    racing-only accounts (commit 11c0758) — exactly the set the startup log
+    prints as "no priority assignment".
+
+    FAIL-OPEN: when NO priority lists are loaded at all (legacy mode, early
+    startup, or a standalone process that hasn't called
+    load_priority_from_env), every session is treated as placeable so alert
+    severities are never silently downgraded by a missing config."""
+    ids = all_priority_session_ids()
+    if not ids:
+        return True
+    return str(session_id).strip() in ids
+
+
 def filter_and_order_sessions(
     sessions: list[dict], sport: str, is_sgm: bool = False,
 ) -> list[dict]:
@@ -1040,11 +1073,10 @@ def log_startup_summary() -> None:
 
     # Cross-validate: any session referenced in a priority list that's
     # missing from sessions.yaml is a likely typo. Warn loudly so Wilson
-    # spots it before live tips arrive.
-    all_priority_ids = set(
-        cfg.nba_singles + cfg.nba_sgm + cfg.afl_singles
-        + cfg.afl_sgm + cfg.mlb_singles + cfg.mlb_sgm + cfg.racing
-    )
+    # spots it before live tips arrive. Union now comes from
+    # all_priority_session_ids() — single source of truth with the FIX 4
+    # inert-crash severity partition (watchdog + session-health).
+    all_priority_ids = all_priority_session_ids()
     missing = sorted(all_priority_ids - set(_session_meta.keys()))
     if missing:
         log.warning(

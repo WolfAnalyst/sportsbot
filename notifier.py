@@ -1038,11 +1038,17 @@ def notify_sports_ladder_maintenance(tip, attempts) -> bool:
 
 
 def notify_sports_mbl_violation(tip, details) -> bool:
-    """Critical channel alert for sports MBL violations.
+    """Maintenance channel alert: the BOOKIE capped our stake below our cap.
 
-    Triggered when a bookie rejects at or below the liability cap we sized
-    to. Indicates account is being limited below its legally-guaranteed
-    floor, OR balance is too low. Either way wants Wilson's eyes on it.
+    Triggered when a bookie rejects a stake at or below the liability cap we
+    sized to — i.e. its own max-bet limit is lower than our configured cap
+    (e.g. sportsbet's automated in-play max, 2026-06-11 Vassell PRA 19.5:
+    $400 config cap, ~$60-80 bookie cap, code 538 down the whole ladder).
+    That is NOT a violation of OUR cap, so v5.52 (Wilson) relabelled it
+    'BOOKIE STAKE CAP' and downgraded it Critical -> Maintenance. Label +
+    severity ONLY: the _should_alert_mbl_violation gate, call sites, and
+    placement logic are unchanged, and the genuine-shortfall action alert
+    still fires separately via notify_tip_unfilled_with_placements (manual).
 
     `details` is a list of dicts with keys: bookie, session_id, stake_tried,
     mbl_max, liability_cap, odds, error, market.
@@ -1059,12 +1065,12 @@ def notify_sports_mbl_violation(tip, details) -> bool:
     detail_str = "\n".join(lines) or "  (no detail captured)"
 
     text = (
-        f"<b>🚨 CRITICAL: MBL VIOLATION (sports)</b>\n"
+        f"<b>⚠️ BOOKIE STAKE CAP (sports)</b>\n"
         f"{_format_sports_tip_header(tip)}\n"
-        f"Account limited or balance too low.\n"
+        f"Bookie max-bet limit below our configured cap — bet underfilled.\n"
         f"<pre>{_escape_html(detail_str)}</pre>"
     )
-    return _send_critical(text)
+    return _send_maintenance(text)
 
 
 def notify_tiptitans_unfilled(
