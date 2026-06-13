@@ -624,7 +624,8 @@ def notify_tip_placed_summary(
         rendered_sids.add(sid_str)
         base = (
             f"  {_session_label(r.session_id, r.bookie)}: "
-            f"${r.stake:.2f} @ {r.odds} [{r.bet_id}]"
+            f"${r.stake:.2f} @ {r.odds if r.odds else '?'} "
+            f"[{r.bet_id if r.bet_id else 'reconcile-confirmed'}]"
         )
         # ALWAYS show the actual placed line/market/stat per account so the
         # operator can verify each bet — lines legitimately differ per account

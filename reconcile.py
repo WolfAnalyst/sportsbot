@@ -113,24 +113,39 @@ def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=Non
             return False
 
     if selection_text:
-        pbet = _norm(pending.get("bet"))
-        # Significant tokens of the selection (>=3 alnum chars): runner /
-        # player-name fragments survive format drift; "over"/"under" ride along.
-        toks = [t for t in "".join(
-            c.lower() if c.isalnum() else " " for c in selection_text
-        ).split() if len(t) >= 3]
-        if pbet and toks and not any(t in pbet for t in toks):
-            # v5.56 (audit): HARD reject — same account, same event, same
-            # window, but the bet text names a DIFFERENT selection. Without
-            # this, an ambiguous runner-A attempt could "confirm" against
-            # runner-B's pending bet (concurrent tips on one race).
+        # v5.57 (soundness check on v5.56): compare TOKEN SETS, not
+        # substring-in-blob. The v5.56 version normalised the pending bet text
+        # into one alnum blob and substring-matched selection tokens against
+        # it — so "ROCK NIEN"'s token 'rock' falsely matched
+        # "ROCKNROLL DA GAMA win" ('rocknrolldagamawin' contains 'rock'),
+        # exactly the concurrent same-meeting pair from 2026-06-12 (tips
+        # 62161/62166). Tokenising BOTH sides (split on non-alnum, >=3 chars,
+        # EXACT token equality) kills prefix/suffix accidents while keeping
+        # format drift safe ('wembanyama' token matches inside "Victor
+        # Wembanyama 26.5+ points (...)" via its own token). Residual,
+        # documented: two runners SHARING a whole name word ("FLYING FOX" vs
+        # "FLYING SCOTSMAN" share 'flying') still pass this gate — the dt
+        # window + stake gate remain the discriminators there; requiring ALL
+        # tokens would flip the risk to false-REJECTS (-> racing spill ->
+        # double-bet), the worse direction.
+        def _toks(s):
+            return {t for t in "".join(
+                c.lower() if c.isalnum() else " " for c in (s or "")
+            ).split() if len(t) >= 3}
+        sel_toks = _toks(selection_text)
+        bet_toks = _toks(pending.get("bet"))
+        if bet_toks and sel_toks and not (sel_toks & bet_toks):
+            # HARD reject — same account, same event, same window, but the
+            # bet text names a DIFFERENT selection. Without this, an
+            # ambiguous runner-A attempt could "confirm" against runner-B's
+            # pending bet (concurrent tips on one race).
             log.info(
                 f"reconcile: dt/event/stake matched but NO selection token of "
                 f"'{selection_text}' in pending bet '{pending.get('bet')}' — "
                 f"rejecting (different selection, not our bet)"
             )
             return False
-        if not pbet:
+        if not bet_toks:
             log.debug(
                 f"reconcile: pending bet text empty — selection "
                 f"'{selection_text}' unverifiable (soft accept, racing sample)"
