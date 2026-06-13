@@ -10081,12 +10081,40 @@ def _image_text_is_actionable(text: str) -> bool:
     return _image_text_selection_pattern(t)
 
 
+# v5.59 (Wilson 2026-06-13): per-tipster track memory for forward-fill. Zak
+# posts his card as an IMAGE (track named) then follow-up tips as TEXT that
+# just say "R1 8. My Zephyr 0.1u" — no track. Today (08:50) those parsed fine
+# (2 tips) but routed to MANUAL as "? R1"/"? R5" because the track was
+# unknown. Remember the last track each racing tipster's tips carried (image
+# or text, fresh within the TTL) and forward-fill a missing track. A WRONG
+# fill is caught downstream: the runner/saddle won't match the wrong track's
+# card -> price-check fails -> manual, i.e. never worse than today. Filled
+# tips are flagged in event_title + a WARNING log. Event-loop only (both the
+# image and text racing paths build dicts on the asyncio loop) — no lock,
+# same as _racing_recent_fps.
+_tipster_last_track: dict = {}  # tipster -> (track, epoch_seen)
+_TRACK_FILL_TTL_SEC = 12 * 3600  # same race day; stale memory never fills
+
+
 def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: int,
                            msg_time=None) -> dict:
     """Build a racing parsed_tip dict (place_racing_tip shape) from one raw
     vision-extracted racing dict. Adds synthetic id/titan/event_title/title
     for logging + Tip-Titans-style notifications."""
     track = _normalise_racing_track(raw.get("track")) or None
+    track_inferred = False
+    if track:
+        _tipster_last_track[tipster] = (track, time.time())
+    else:
+        _prev = _tipster_last_track.get(tipster)
+        if _prev and (time.time() - _prev[1]) < _TRACK_FILL_TTL_SEC:
+            track = _prev[0]
+            track_inferred = True
+            log.warning(
+                f"[{tipster}] tip has NO track — forward-filled '{track}' from "
+                f"this tipster's last tip ({(time.time() - _prev[1]) / 60:.0f}m "
+                f"ago). A wrong fill fails the card match downstream -> manual."
+            )
     race_num = _img_coerce_int(raw.get("race"))
     saddle = _img_coerce_int(raw.get("saddle"))
     runner = (raw.get("runner") or "").strip()
@@ -10120,6 +10148,7 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
         "titan": titan,
         "discipline": discipline,
         "track": track,
+        "track_inferred": track_inferred,  # v5.59: forward-filled from memory
         "race_num": race_num,
         "race_type": race_type,
         "runner": runner,
@@ -10131,7 +10160,11 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
         # day; null defaults to today downstream). 2026-06-03.
         "date": _img_parse_racing_date(raw.get("date"), msg_time),
         # Synthetic fields the racing notifier reads off the raw tip:
-        "event_title": f"{track or '?'} R{race_num if race_num is not None else '?'}",
+        "event_title": (
+            f"{track or '?'}"
+            f"{' (track inferred)' if track_inferred else ''} "
+            f"R{race_num if race_num is not None else '?'}"
+        ),
         "title": f"{saddle if saddle is not None else '?'}. {runner or '?'}",
     }
 

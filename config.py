@@ -14,7 +14,7 @@ load_dotenv()
 # always clear which build is running. The code fingerprint computed in
 # main.py (_code_fingerprint) complements this — it catches partial/stale
 # deploys even when this string wasn't bumped.
-TIPBOT_VERSION = "v5.58 (2026-06-13: IMAGE-CHANNEL MEDIA GATES (Wilson). Vision path now gates on ACTUAL images (photo or image/* file): event.media is also truthy for TEXT posts with link previews/polls, so text messages were being vision-parsed as images (10:24 Groq 400 = non-image hitting the vision API). PDFs/docs drop with a log line (Zak posts a PDF dupe of his placed tip images) -- never a manual ping; other non-image media on a text post falls through to normal TEXT handling. Summary/recap captions (_IMAGE_SUMMARY_RE: summary/recap/results/GL all/next meet/wrap) suppress the 0-tip manual ping; the ping SURVIVES for unexplained 0-tip parses (safety net for fumbled real tips).)"
+TIPBOT_VERSION = "v5.59 (2026-06-13: PER-TIPSTER TRACK FORWARD-FILL (Wilson: Zak 0.1u text tips must PLACE). Zak posts the card as an image (track named) then tips as TEXT without the track -- 08:50 today parsed 2 real tips but routed manual as ?-track. _build_racing_tip_dict (shared image+text racing paths) now remembers each tipster's last real track (12h TTL) and forward-fills a missing one, flagged (track inferred) + WARNING log; never cross-tipster, never stale. Safety floor: a wrong fill fails the runner/saddle card match downstream -> manual (never worse than before). Differentiate/ignore-yap already worked (text -> actionable -> parse; 0-tip chatter drops).)"
 
 # ── Telegram ─────────────────────────────────────────────────────────
 _raw_api_id = os.getenv("TELEGRAM_API_ID", "0")
