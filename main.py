@@ -9946,6 +9946,25 @@ _IMAGE_URGENT_INSTRUCTION_RE = re.compile(
     r"cancel|cancelled|remove|removed)\b"
 )
 
+# v5.58 (Wilson 2026-06-13): summary/recap posts in image channels (Zak's
+# end-of-day results image + "GL all / next meet ..." wrap-ups) parse to 0
+# tips BY DESIGN — suppress the 0-tip manual ping when the caption says so.
+# The ping STAYS for unexplained 0-tip parses (the safety net for a real tip
+# image the vision model fumbled).
+_IMAGE_SUMMARY_RE = re.compile(
+    r"\b(?:summary|recap|results?|resulted|wrap(?:ped)?|gl all|"
+    r"good luck all|next meet|that'?s it for|done for the (?:day|night))\b"
+)
+
+
+def _doc_mime_is_image(mime: str) -> bool:
+    """True when a Telegram DOCUMENT post is actually an image sent as a file
+    (mime image/*) and therefore vision-parseable. PDFs / videos / anything
+    else are NOT — Zak posts a PDF DUPE of his already-posted tip images
+    (Wilson 2026-06-13; the 10:24 Groq 400 was a PDF hitting the vision API),
+    so those drop with a log line instead of a manual ping."""
+    return (mime or "").lower().startswith("image/")
+
 
 def _image_text_selection_pattern(t: str) -> bool:
     """Racing/odds/stake patterns that imply a CONCRETE selection (not just
@@ -10757,6 +10776,17 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
         return
 
     if not raw_tips:
+        # v5.58 (Wilson): a summary/recap post (results image captioned
+        # "summary / GL all / next meet ...") parses to 0 tips by design —
+        # drop it silently instead of pinging manual. The ping remains for
+        # an UNEXPLAINED 0-tip parse (a real tip image the model fumbled).
+        if raw_caption and _IMAGE_SUMMARY_RE.search(raw_caption.lower()):
+            log.info(
+                f"[{channel_name}] vision parse returned 0 tips and the "
+                f"caption reads as a summary/recap -> dropped (no manual "
+                f"ping): {raw_caption[:100]}"
+            )
+            return
         log.info(f"[{channel_name}] vision parse returned 0 tips")
         cap = f" — {raw_caption[:120]}" if raw_caption else ""
         notifier.notify_image_alert(
@@ -11315,7 +11345,34 @@ async def main():
             img_sport = channel_cfg.get("sport", "")
             img_unit_size = channel_cfg.get("unit_size", 1.0)
             img_default_units = channel_cfg.get("default_units", 1.0)
-            if event.media:
+            # v5.58 (Wilson): gate the vision path on ACTUAL image posts.
+            # `event.media` is ALSO truthy for a plain TEXT message with a
+            # link preview (MessageMediaWebPage), polls, etc. — those were
+            # being downloaded + vision-parsed "as images" (slow Groq call,
+            # 0 tips, manual-ping noise; the 2026-06-13 10:24 Groq 400). Only
+            # a real PHOTO or an image-sent-as-FILE (mime image/*) is
+            # vision-parseable. A PDF/doc (Zak posts a PDF DUPE of his
+            # already-placed tip images) DROPS with a log line, never a
+            # manual ping. Any other media on a text post falls through to
+            # the normal TEXT handling below.
+            _doc = getattr(event, "document", None)
+            _is_image_post = bool(getattr(event, "photo", None)) or (
+                _doc is not None
+                and _doc_mime_is_image(getattr(_doc, "mime_type", ""))
+            )
+            if event.media and not _is_image_post:
+                if _doc is not None:
+                    log.info(
+                        f"[{channel_name}] non-image media post (mime="
+                        f"{getattr(_doc, 'mime_type', '?')}) -> dropped "
+                        f"(PDF/doc dupe of the image tips; not vision-parseable)"
+                    )
+                    return
+                log.info(
+                    f"[{channel_name}] non-image media (web preview/poll/etc.) "
+                    f"on a text post -> routing to TEXT handling"
+                )
+            if _is_image_post:
                 log.info(f"[{channel_name}] image-tip post from {sender_id}; downloading for vision parse")
                 try:
                     img_bytes = await event.download_media(file=bytes)
