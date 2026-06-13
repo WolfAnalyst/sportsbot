@@ -29,7 +29,8 @@ from config import (
     TIPSTER_CHANNELS, MAX_UNITS, SESSIONS_YAML_PATH,
     USE_LEGACY_PLACEMENT, BOOKIE_AFL_ALIASES, TIPBOT_VERSION,
     AFL_CONCURRENT_FANOUT, AFL_FANOUT_MIN_STAKE, AFL_FANOUT_WEIGHTED,
-    SGM_CONCURRENT_FANOUT,
+    AFL_FANOUT_RATIO_CAP, EDDIE_FANOUT_BIG_UNITS, EDDIE_BIG_LIMITED_STAKE,
+    EDDIE_FANOUT_DECAY, SGM_CONCURRENT_FANOUT,
     ETR_NBA_CONCURRENT_FANOUT, ETR_NBA_SESSION_IDS, ETR_NBA_FIXED_LADDER,
     ETR_NBA_TEST_MODE, ETR_NBA_UNIT_SIZE_TEST,
     RECONCILE_AMBIGUOUS, RECONCILE_SPILL,
@@ -3488,6 +3489,53 @@ def _afl_fanout_weights(sessions: list, sport: str, market: str) -> dict:
     return weights
 
 
+def _afl_fanout_targets(sessions: list, sport: str, market: str,
+                        intended: float, tipster: str, units: float):
+    """v5.66: per-account TARGET stake + ladder mode for the AFL singles fan-out.
+
+    Returns (targets {sid: stake}, decay_factor):
+      - decay_factor is None  -> ladder via the yaml liability brackets
+        (resolve_stake_steps), as before.
+      - decay_factor is a float (e.g. 0.9) -> ladder is a step-down from the
+        target by that factor (Eddie big-bet mode).
+      - targets {} (with None) -> caller falls back to the even split.
+
+    Shapes (Wilson 2026-06-14):
+      NORMAL (Saiyan any size; Eddie units <= EDDIE_FANOUT_BIG_UNITS):
+        capacity-weighted, high-cap account CLAMPED to AFL_FANOUT_RATIO_CAP x the
+        smallest weight -> 4:1:1:1:1. $75 ea + $300 Ryan (Saiyan @600);
+        $125 ea + $500 Ryan (Eddie @2.5u=1000). Scales with the unit.
+      EDDIE BIG (units > EDDIE_FANOUT_BIG_UNITS): each LIMITED account starts at
+        EDDIE_BIG_LIMITED_STAKE (150, ~their late-game disposals capacity); the
+        high-cap account (Ryan) takes the REMAINDER; 10% step-down ladder; the
+        running budget caps the total at the unit; unfilled -> Manual.
+    PURE (no network) so it's unit-tested directly."""
+    weights = _afl_fanout_weights(sessions, sport, market)
+    if not weights:
+        return {}, None
+
+    # Eddie big bets: fixed stake on the limited accounts, remainder on the
+    # highest-cap account, decay ladder.
+    if tipster == "eddie_afl" and (units or 0) > EDDIE_FANOUT_BIG_UNITS:
+        hi_sid = max(weights, key=lambda s: weights[s])  # Ryan = biggest cap
+        limited = [s for s in weights if s != hi_sid]
+        targets = {s: round(float(EDDIE_BIG_LIMITED_STAKE), 2) for s in limited}
+        rest = round(intended - sum(targets.values()), 2)
+        targets[hi_sid] = rest if rest > 0 else 0.0
+        targets = {s: v for s, v in targets.items() if v > 0}
+        return targets, (EDDIE_FANOUT_DECAY if EDDIE_FANOUT_DECAY and 0 < EDDIE_FANOUT_DECAY < 1 else 0.9)
+
+    # Normal: clamp the high-cap account to RATIO_CAP x the smallest -> 4:1:1:1:1.
+    if AFL_FANOUT_RATIO_CAP and AFL_FANOUT_RATIO_CAP > 0:
+        min_w = min(weights.values())
+        if min_w > 0:
+            weights = {s: min(w, AFL_FANOUT_RATIO_CAP * min_w) for s, w in weights.items()}
+    total = sum(weights.values())
+    if total <= 0:
+        return {}, None
+    return {s: round(intended * w / total, 2) for s, w in weights.items()}, None
+
+
 def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     """
     v5.11 AFL concurrent fan-out placement (Saiyan + Eddie).
@@ -3630,14 +3678,19 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # numeric cap (unlimited / mbl / none) we abandon weighting and keep the
     # even split, so weighting can never mis-size. The per-account targets still
     # get budget-capped at the unit + laddered DOWN on reject downstream.
-    weight_by_sid = _afl_fanout_weights(sessions, sport, liability_market) if AFL_FANOUT_WEIGHTED else {}
-    total_weight = sum(weight_by_sid.values())
-    use_weighted = AFL_FANOUT_WEIGHTED and total_weight > 0
+    fanout_targets, fanout_decay = (
+        _afl_fanout_targets(sessions, sport, liability_market, intended_stake,
+                            tip.tipster, tip.units)
+        if AFL_FANOUT_WEIGHTED else ({}, None)
+    )
+    use_weighted = bool(fanout_targets)
     if use_weighted:
+        _mode = (f"decay {int(round((1 - fanout_decay) * 100))}%/step"
+                 if fanout_decay else "yaml-bracket ladder")
         log.info(
             f"AFL fan-out: {n_accounts} session(s), intended ${intended_stake:.2f} "
-            f"-> CAPACITY-WEIGHTED split (caps {weight_by_sid}, total ${total_weight:.0f}), "
-            f"tipped_odds={tipped_odds}"
+            f"-> WEIGHTED split {fanout_targets} ({_mode}; tipster={tip.tipster}, "
+            f"{tip.units}u), tipped_odds={tipped_odds}"
         )
     else:
         log.info(
@@ -3765,19 +3818,25 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         # (player_disposals [100,74,50]) -> a stake per liability bracket; a
         # scalar cap -> the percentage ladder. Each account walks this ladder
         # (top first, drop a bracket on a stake-too-high reject) in its thread.
-        # v5.65: capacity-weighted target (proportional to this account's cap)
-        # when weighting is active; else the even 1/n target. Either way the
-        # rung is budget-capped at remaining_budget just below.
-        acct_target = (
-            round(intended_stake * weight_by_sid.get(sid, 0.0) / total_weight, 2)
-            if use_weighted else per_account_target
-        )
-        steps, cap_reason, is_list_mode = session_priority.resolve_stake_steps(
-            sid, sport, liability_market,
-            sizing_odds if (sizing_odds and sizing_odds > 1.0) else 0,
-            acct_target,
-            _v4_ladder_steps,
-        )
+        # v5.65/v5.66: per-account target from the weighted split when active
+        # (else even 1/n). In Eddie big-bet mode the ladder is a 10% step-down
+        # from the target; otherwise it's the yaml liability brackets. Either way
+        # each rung is budget-capped at remaining_budget just below.
+        acct_target = fanout_targets.get(sid, per_account_target) if use_weighted else per_account_target
+        if use_weighted and fanout_decay:
+            steps, _s = [], float(acct_target)
+            while _s >= AFL_FANOUT_MIN_STAKE and len(steps) < 40:
+                steps.append(round(_s, 2))
+                _s *= fanout_decay
+            cap_reason = f"eddie-big decay {int(round((1 - fanout_decay) * 100))}%/step from ${acct_target:.2f}"
+            is_list_mode = True
+        else:
+            steps, cap_reason, is_list_mode = session_priority.resolve_stake_steps(
+                sid, sport, liability_market,
+                sizing_odds if (sizing_odds and sizing_odds > 1.0) else 0,
+                acct_target,
+                _v4_ladder_steps,
+            )
         # Budget-cap every rung at the remaining unit size (so a surplus of
         # accounts or a small intended can't be exceeded), drop non-positive.
         steps = [round(min(s, remaining_budget), 2) for s in steps if s and s > 0]
