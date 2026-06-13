@@ -10990,6 +10990,32 @@ WATCHDOG_INTERVAL_SEC = 300  # 5 minutes
 WATCHDOG_RECHECK_DELAY_SEC = 60  # +1 min follow-up after a drop
 WATCHDOG_CRITICAL_AFTER_SEC = 900  # 15 min -> Critical
 
+# v5.61 (Wilson 2026-06-14): this in-process watchdog stamps a liveness
+# heartbeat every cycle (and at startup). check_session_health.py — the
+# SEPARATE scheduled BACKUP monitor — reads it and STAYS SILENT while the
+# heartbeat is fresh, because this watchdog already owns session-drop
+# alerting (batched, foreign-filtered, 15-min Critical). That kills the
+# double-alerting Wilson saw: a real drop used to page BOTH monitors
+# (~15 min here + ~20 min there). If the heartbeat goes stale (main.py dead
+# OR this loop stalled/crashed), the backup takes over within ~13 min. See
+# check_session_health._main_watchdog_alive.
+_MAIN_WATCHDOG_HEARTBEAT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "logs", "main_watchdog_heartbeat.txt"
+)
+
+
+def _write_watchdog_heartbeat() -> None:
+    """Stamp the watchdog liveness heartbeat (epoch seconds), atomically.
+    Best-effort — a write failure must never disturb the watchdog itself."""
+    try:
+        tmp = _MAIN_WATCHDOG_HEARTBEAT_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+        os.replace(tmp, _MAIN_WATCHDOG_HEARTBEAT_PATH)
+    except Exception:
+        pass
+
+
 # Sessions tipbot considers active and tracked. On drop, the entry moves
 # to _pending_drops. On recovery, it moves back here.
 _initial_session_state: dict = {}
@@ -11134,8 +11160,13 @@ async def _watchdog_recheck_after(sids: set, parent_first_seen):
             else:
                 still_down.append((sid, entry["info"]))
 
-        if not (recovered or still_down):
-            return  # nothing to report — all rolled forward to next cycle
+        # v5.61 (Wilson 2026-06-14): only speak up when something RECOVERED in
+        # the recheck window (partial good news). An all-still-down recheck is
+        # pure noise — the initial "disconnected" alert already named them and
+        # the 15-min Critical escalates if they stay down. Still-down sessions
+        # remain in _pending_drops either way. (Cuts a message per drop wave.)
+        if not recovered:
+            return
 
         rec_count = len(recovered)
         down_count = len(still_down)
@@ -11156,8 +11187,12 @@ async def _session_watchdog():
     """Poll active sessions every 5 min. Batch alerts; escalate at 15 min."""
     global _initial_session_state
     consecutive_failures = 0
+    _write_watchdog_heartbeat()  # mark alive immediately on (re)start
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL_SEC)
+        # v5.61: stamp liveness BEFORE any work (even if the API is
+        # unreachable below) so the backup monitor knows main.py is alive.
+        _write_watchdog_heartbeat()
         try:
             current = hb.get_sessions_or_none()
             if current is None:
