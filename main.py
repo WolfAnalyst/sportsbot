@@ -36,6 +36,7 @@ from config import (
     AUTO_MANUAL_HANDICAP_SGM, MLB_STAT_MAP, MLB_FLAT_STAKE,
     IMAGE_TIPS_TEST_MODE, IMAGE_TIPS_TEST_UNIT_SIZE, IMAGE_TIP_PARSERS,
     IMAGE_RACING_MAX_UNITS, IMAGE_RACING_TEST_MODE,
+    SAIYAN_SGM_UNIT_SIZE,
 )
 from groq_parser import parse_tip_image
 from models import ParsedTip, ParsedLeg, BetResult
@@ -1352,6 +1353,27 @@ def _apply_image_test_stake(tip: ParsedTip) -> None:
             f"IMAGE_TIPS_TEST_MODE on, change + restart for production stakes"
         )
     tip.unit_size = test_unit
+
+
+def _apply_saiyan_sgm_unit(tip: ParsedTip) -> None:
+    """Saiyan SGMs stake a BIGGER unit than his singles/disposals (Wilson
+    2026-06-14). His singles/disposals keep SAIYAN_UNIT_SIZE (600); his SGMs use
+    SAIYAN_SGM_UNIT_SIZE (750). The SGM fan-out even-splits the unit across the 3
+    SGM accounts (Adam/Wilson/Daniel), so 750 -> $250 stake each. Mirrors
+    _apply_mlb_flat_stake: overrides tip.unit_size in place; `units` (the
+    tipster's recommendation) is preserved, so a 2u SGM = 2 x $750. No-op unless
+    this is a Saiyan SGM (singles/disposals untouched). MUST run AFTER any image
+    test-stake override so a real Saiyan SGM isn't pinned to $1."""
+    if tip.tipster != "saiyan_afl" or not tip.is_sgm or SAIYAN_SGM_UNIT_SIZE <= 0:
+        return
+    new_unit = round(float(SAIYAN_SGM_UNIT_SIZE), 2)
+    if abs(tip.unit_size - new_unit) > 0.001:
+        log.info(
+            f"Saiyan SGM unit: {tip.units}u x ${tip.unit_size} -> ${new_unit}/u "
+            f"(= ${round(tip.units * new_unit, 2)} total; even-split "
+            f"~${round(tip.units * new_unit / 3)}/acct across the 3 SGM accounts)"
+        )
+    tip.unit_size = new_unit
 
 
 def _is_mlb_hrrbi_sgm(tip: ParsedTip) -> bool:
@@ -9749,6 +9771,7 @@ async def _process_tip(text: str, tipster: str, sport: str,
 
         # MLB flat stake (ignore the recommended unit; $1 while gated, prod $).
         _apply_mlb_flat_stake(tip)
+        _apply_saiyan_sgm_unit(tip)   # Saiyan SGM -> 750/u (250 ea x3); no-op otherwise
 
         # Image-tip channels: pin to $1/unit while IMAGE_TIPS_TEST_MODE is on.
         # No-op for every non-image tipster; a safety belt in case an image
@@ -10772,6 +10795,7 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                 tip.units = MAX_UNITS
             _apply_mlb_flat_stake(tip)       # no-op for AFL
             _apply_image_test_stake(tip)      # $1/unit while test mode
+            _apply_saiyan_sgm_unit(tip)       # Saiyan SGM -> 750/u (250 ea x3); after test-stake
 
             _dupe_fp = f"{tip.tipster}::{_tip_fingerprint(tip)}"  # capture pre-place (v5.49)
             if _is_duplicate(tip):
