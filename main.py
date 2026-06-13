@@ -1465,7 +1465,27 @@ def resolve_event(tip: ParsedTip) -> str:
          team is actually playing today (handles "Wiggins" ambiguity).
     """
     if tip.sport == "afl":
-        return resolve_afl_event(tip.primary_team) or ""
+        ev = resolve_afl_event(tip.primary_team)
+        if not ev:
+            # v5.60 (2026-06-13): an SGM's legs can name different (co-playing)
+            # players; if leg 0's player didn't resolve a team (Groq didn't
+            # expand "LDU" -> Luke Davies-Uniacke, so primary_team was empty)
+            # but ANOTHER leg did (Harry Sheezel -> North Melbourne), resolve
+            # the fixture off that team instead of failing "No fixture found
+            # for LDU" -> manual. Singles are unaffected (all_teams == {primary}
+            # or empty, so the loop is a no-op). A malformed cross-game SGM
+            # would still fail at placement on the off-game leg.
+            for t in tip.all_teams:
+                if t and t != tip.primary_team:
+                    ev = resolve_afl_event(t)
+                    if ev:
+                        log.info(
+                            f"AFL event resolved off non-primary leg team "
+                            f"'{t}' (primary_team '{tip.primary_team}' didn't "
+                            f"resolve — likely an unexpanded player name)"
+                        )
+                        break
+        return ev or ""
 
     if tip.sport == "mlb":
         # MLB (2026-06-01): resolve the team to a "Home v Away" fixture via
