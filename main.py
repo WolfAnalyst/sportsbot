@@ -28,7 +28,8 @@ from config import (
     TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE,
     TIPSTER_CHANNELS, MAX_UNITS, SESSIONS_YAML_PATH,
     USE_LEGACY_PLACEMENT, BOOKIE_AFL_ALIASES, TIPBOT_VERSION,
-    AFL_CONCURRENT_FANOUT, AFL_FANOUT_MIN_STAKE, SGM_CONCURRENT_FANOUT,
+    AFL_CONCURRENT_FANOUT, AFL_FANOUT_MIN_STAKE, AFL_FANOUT_WEIGHTED,
+    SGM_CONCURRENT_FANOUT,
     ETR_NBA_CONCURRENT_FANOUT, ETR_NBA_SESSION_IDS, ETR_NBA_FIXED_LADDER,
     ETR_NBA_TEST_MODE, ETR_NBA_UNIT_SIZE_TEST,
     RECONCILE_AMBIGUOUS, RECONCILE_SPILL,
@@ -3462,6 +3463,31 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
         error="fan-out: empty ladder", timestamp=datetime.now())
 
 
+def _afl_fanout_weights(sessions: list, sport: str, market: str) -> dict:
+    """v5.65: capacity weight per session = its TOP liability bracket for
+    `market` (the cap drives how much that account can carry). Returns
+    {sid: weight}, or {} if ANY account lacks a clean numeric cap
+    (unlimited / mbl / none) — the caller then falls back to the even split so
+    weighting never mis-sizes. De-dupes by session_id. PURE (no network), so
+    unit-tested directly. For the uniform 4.5x account (Ryan) vs 1x accounts
+    the weights come out 4.5:1:1:1:1 — exactly Wilson's spec."""
+    weights: dict[str, float] = {}
+    seen: set[str] = set()
+    for s in sessions:
+        sid = str(s.get("session_id", ""))
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        cap = session_priority.lookup_liability_cap(sid, sport, market)
+        if isinstance(cap, (list, tuple)) and cap:
+            weights[sid] = float(cap[0])
+        elif isinstance(cap, (int, float)) and cap > 0:
+            weights[sid] = float(cap)
+        else:
+            return {}  # non-numeric cap -> abandon weighting (even split)
+    return weights
+
+
 def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     """
     v5.11 AFL concurrent fan-out placement (Saiyan + Eddie).
@@ -3593,10 +3619,31 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
 
     n_accounts = len(sessions)
     per_account_target = round(intended_stake / n_accounts, 2)
-    log.info(
-        f"AFL fan-out: {n_accounts} session(s), intended ${intended_stake:.2f} "
-        f"-> ${per_account_target:.2f}/account (even split), tipped_odds={tipped_odds}"
-    )
+
+    # v5.65 (Wilson): CAPACITY-WEIGHTED split. Give each account a target
+    # PROPORTIONAL to its liability cap for this market (top bracket) instead of
+    # an even 1/n, so the high-cap account (Ryan 102506 @ 4.5x) carries
+    # proportionally more and the limited accounts get a share that fits their
+    # cap -> fills more of the unit without overflowing to Manual. For a uniform
+    # 4.5x multiplier the ratio is 4.5:1:1:1:1 (exactly Wilson's spec) and it
+    # self-adjusts if a cap changes. FAIL-SAFE: if any account lacks a clean
+    # numeric cap (unlimited / mbl / none) we abandon weighting and keep the
+    # even split, so weighting can never mis-size. The per-account targets still
+    # get budget-capped at the unit + laddered DOWN on reject downstream.
+    weight_by_sid = _afl_fanout_weights(sessions, sport, liability_market) if AFL_FANOUT_WEIGHTED else {}
+    total_weight = sum(weight_by_sid.values())
+    use_weighted = AFL_FANOUT_WEIGHTED and total_weight > 0
+    if use_weighted:
+        log.info(
+            f"AFL fan-out: {n_accounts} session(s), intended ${intended_stake:.2f} "
+            f"-> CAPACITY-WEIGHTED split (caps {weight_by_sid}, total ${total_weight:.0f}), "
+            f"tipped_odds={tipped_odds}"
+        )
+    else:
+        log.info(
+            f"AFL fan-out: {n_accounts} session(s), intended ${intended_stake:.2f} "
+            f"-> ${per_account_target:.2f}/account (even split), tipped_odds={tipped_odds}"
+        )
 
     # ── Direction-aware OVER liability cap (Task A, 2026-06-07) ─────────
     # Over and under SHARE one placement market (the live catalog has NO
@@ -3718,10 +3765,17 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         # (player_disposals [100,74,50]) -> a stake per liability bracket; a
         # scalar cap -> the percentage ladder. Each account walks this ladder
         # (top first, drop a bracket on a stake-too-high reject) in its thread.
+        # v5.65: capacity-weighted target (proportional to this account's cap)
+        # when weighting is active; else the even 1/n target. Either way the
+        # rung is budget-capped at remaining_budget just below.
+        acct_target = (
+            round(intended_stake * weight_by_sid.get(sid, 0.0) / total_weight, 2)
+            if use_weighted else per_account_target
+        )
         steps, cap_reason, is_list_mode = session_priority.resolve_stake_steps(
             sid, sport, liability_market,
             sizing_odds if (sizing_odds and sizing_odds > 1.0) else 0,
-            per_account_target,
+            acct_target,
             _v4_ladder_steps,
         )
         # Budget-cap every rung at the remaining unit size (so a surplus of
