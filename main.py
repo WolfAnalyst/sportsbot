@@ -30,7 +30,8 @@ from config import (
     USE_LEGACY_PLACEMENT, BOOKIE_AFL_ALIASES, TIPBOT_VERSION,
     AFL_CONCURRENT_FANOUT, AFL_FANOUT_MIN_STAKE, AFL_FANOUT_WEIGHTED,
     AFL_FANOUT_RATIO_CAP, EDDIE_FANOUT_BIG_UNITS, EDDIE_BIG_LIMITED_STAKE,
-    EDDIE_FANOUT_DECAY, SGM_CONCURRENT_FANOUT,
+    EDDIE_FANOUT_DECAY, AFL_FANOUT_PREPLACEMENT_RETRY, AFL_FANOUT_RETRY_DELAY_SEC,
+    SGM_CONCURRENT_FANOUT,
     ETR_NBA_CONCURRENT_FANOUT, ETR_NBA_SESSION_IDS, ETR_NBA_FIXED_LADDER,
     ETR_NBA_TEST_MODE, ETR_NBA_UNIT_SIZE_TEST,
     RECONCILE_AMBIGUOUS, RECONCILE_SPILL,
@@ -3453,6 +3454,38 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
                 tip, sess, r, step, f"AFL fan-out {bk}:{sid}")
         last = r
         if not _is_stake_error(r.error or ""):
+            # v5.68 (Wilson): ONE retry on a TRANSIENT pre-placement reject (proxy
+            # 403 / auth refusal / network) — the bet was NEVER submitted, so
+            # retrying the SAME rung once carries ZERO double-stake risk. Alex
+            # 65463's Bailey $150 on 06-14 was a one-off proxy 403 that placed
+            # fine minutes later -> a retry would have filled it instead of
+            # dropping to Manual. `_is_definitely_pre_placement` is the narrow
+            # provably-not-placed gate. (Stake-rejects ladder DOWN below;
+            # AMBIGUOUS/maybe-landed already stopped above and is NEVER retried.)
+            if AFL_FANOUT_PREPLACEMENT_RETRY and _is_definitely_pre_placement(r.error or ""):
+                log.info(
+                    f"AFL fan-out: {bk}:{sid} transient pre-placement reject on "
+                    f"${step:.2f} ({(r.error or '')[:60]}) — retrying SAME rung once"
+                )
+                time.sleep(AFL_FANOUT_RETRY_DELAY_SEC)
+                r = _execute_bet(tip, sess, step, presolved=resolved)
+                try:
+                    r._requested_stake = step
+                except Exception:
+                    pass
+                if r.success:
+                    log.info(f"AFL fan-out: {bk}:{sid} retry PLACED ${step:.2f} "
+                             f"(first attempt was a transient pre-placement reject)")
+                    return r
+                if _is_ambiguous_result(r):
+                    return _reconcile_fanout_ambiguous(
+                        tip, sess, r, step, f"AFL fan-out {bk}:{sid} (retry)")
+                last = r
+                if _is_stake_error(r.error or ""):
+                    log.info(f"AFL fan-out: {bk}:{sid} retry hit stake-reject "
+                             f"${step:.2f}, laddering down")
+                    continue
+                # retry ALSO a non-stake error -> fall through to abandon.
             log.info(
                 f"AFL fan-out: {bk}:{sid} non-stake error on ${step:.2f} — abandoning "
                 f"ladder: {(r.error or '')[:80]}"
@@ -7970,6 +8003,64 @@ def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
         except Exception:
             pass
         if not _is_stake_error(err):
+            # v5.68 (Wilson): ONE retry on a TRANSIENT pre-placement reject (proxy
+            # 403 / auth / network) — bet never submitted, zero double-stake risk.
+            # Re-issue the SAME rung once + re-classify (success / ambiguous /
+            # stake-reject->ladder-down / else abandon). Mirrors the AFL fan-out.
+            if AFL_FANOUT_PREPLACEMENT_RETRY and _is_definitely_pre_placement(err):
+                log.info(f"SGM fan-out: {bk}:{sid} transient pre-placement reject on "
+                         f"${step:.2f} ({err[:60]}) — retrying SAME rung once")
+                _t.sleep(AFL_FANOUT_RETRY_DELAY_SEC)
+                _t0 = _t.time()
+                resp = hb.place_sgm_bet(
+                    session_id=sid, sport=tip.sport, event=event_for_hb,
+                    legs=session_hb_legs, stake=step, target_odds=target_odds,
+                )
+                _el = round(_t.time() - _t0, 2)
+                if resp.get("success"):
+                    try:
+                        actual = float(resp.get("stake", step))
+                    except (TypeError, ValueError):
+                        actual = step
+                    if actual <= 0:
+                        actual = step
+                    r = BetResult(
+                        success=True, tip=tip, session_id=sid, bookie=bk,
+                        bet_id=resp.get("bet_id"), odds=resp.get("odds"), stake=actual,
+                        timestamp=datetime.now(), elapsed_sec=_el,
+                        placed_leg_summary=_format_tip_placement_summary(tip))
+                    try:
+                        r._requested_stake = step
+                    except Exception:
+                        pass
+                    log.info(f"SGM fan-out: {bk}:{sid} retry PLACED ${step:.2f} "
+                             f"(first attempt was a transient pre-placement reject)")
+                    return r
+                err = str(resp.get("error", "") or "")
+                _slow = _el >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
+                if (_slow or bool(resp.get("ambiguous"))) and not _is_definitely_pre_placement(err):
+                    r = BetResult(
+                        success=False, tip=tip, session_id=sid, bookie=bk,
+                        error=f"ambiguous (retry): {err[:120]}", is_ambiguous=True,
+                        stake=step, elapsed_sec=_el, timestamp=datetime.now(),
+                        placed_leg_summary=_format_tip_placement_summary(tip))
+                    try:
+                        r._requested_stake = step
+                    except Exception:
+                        pass
+                    return _reconcile_fanout_ambiguous(
+                        tip, sess, r, step, f"SGM fan-out {bk}:{sid} (retry)")
+                last = BetResult(success=False, tip=tip, session_id=sid, bookie=bk,
+                                 error=err, elapsed_sec=_el, timestamp=datetime.now())
+                try:
+                    last._requested_stake = step
+                except Exception:
+                    pass
+                if _is_stake_error(err):
+                    log.info(f"SGM fan-out: {bk}:{sid} retry hit stake-reject "
+                             f"${step:.2f}, laddering down")
+                    continue
+                # retry ALSO a non-stake error -> fall through to abandon.
             log.info(f"SGM fan-out: {bk}:{sid} non-stake error on ${step:.2f} — "
                      f"abandoning ladder: {err[:80]}")
             return last
