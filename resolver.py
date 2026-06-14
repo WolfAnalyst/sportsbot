@@ -78,6 +78,27 @@ def afl_games_in_play(ref_ts: float = None, ahead_sec: int = 2700,
     return out
 
 
+def afl_games_on_date(ref_ts: float = None) -> list:
+    """All AFL fixtures on the SAME LOCAL DATE as ref_ts (default now),
+    regardless of time of day. The Eddie surname pipeline uses this as a
+    FALLBACK when no game is within the 2h window (v5.67): a bare surname still
+    resolves if it is unique across every team playing TODAY. Matches the
+    Squiggle `date` field's date part (venue-local, e.g. '2026-06-14 19:40:00')
+    to ref_ts's local calendar date. Source is _fetch_afl_fixtures_by_year
+    (complete=!100, so finished games are already excluded)."""
+    ref = ref_ts if ref_ts is not None else time.time()
+    try:
+        ref_date = datetime.fromtimestamp(ref).strftime("%Y-%m-%d")
+    except (ValueError, OSError, OverflowError):
+        return []
+    out = []
+    for g in _fetch_afl_fixtures_by_year():
+        d = str(g.get("date") or "")[:10]
+        if d and d == ref_date:
+            out.append(g)
+    return out
+
+
 def team_key(name: str) -> str:
     """Normalised team key for cross-source matching (Squiggle hteam/ateam vs
     roster_afl.json team names). Lowercases, strips punctuation, and drops a

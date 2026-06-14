@@ -55,7 +55,7 @@ except ModuleNotFoundError:
     parse_kev_message = None
 from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
-from resolver import resolve_afl_event, afl_games_in_play, team_key
+from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
 from nba_resolver import resolve_nba_event, resolve_mlb_event
 from roster import resolve_player_name, get_player_team, afl_surname_candidates
 import notifier
@@ -10618,57 +10618,77 @@ def _resolve_eddie_surname_to_player(token: str, msg_time, stat: str = None,
     except Exception:
         ref_ts = time.time()
     try:
-        games = afl_games_in_play(ref_ts, ahead_sec=EDDIE_GAME_LOOKAHEAD_SEC)
-    except Exception as e:
-        log.warning(f"Eddie surname resolve: afl_games_in_play failed: {e}")
-        return None
-    if not games:
-        log.info(
-            f"Eddie surname '{token}': no AFL game within "
-            f"{EDDIE_GAME_LOOKAHEAD_SEC // 3600}h ahead / in progress -> manual"
-        )
-        return None
-    in_play_keys = set()
-    game_labels = []
-    for g in games:
-        h, a = g.get("hteam", ""), g.get("ateam", "")
-        if h:
-            in_play_keys.add(team_key(h))
-        if a:
-            in_play_keys.add(team_key(a))
-        game_labels.append(f"{h} v {a}")
-    try:
         cands = afl_surname_candidates(token)
     except Exception as e:
         log.warning(f"Eddie surname resolve: afl_surname_candidates failed: {e}")
         return None
-    scoped = [c for c in cands if team_key(c.get("team", "")) in in_play_keys]
-    unique_names = {c["name"] for c in scoped}
-    if len(unique_names) == 1:
-        hit = scoped[0]
-        log.info(
-            f"Eddie surname-anchored '{token}' -> '{hit['name']}' ({hit['team']}) "
-            f"via game about to start [{'; '.join(game_labels)}]"
-        )
-        return hit["name"], hit["team"]
-    if len(unique_names) >= 2:
-        # Same-surname collision on the in-play teams (the Reid case). Try the
-        # secondary catalog-odds tie-break before giving up. De-dup `scoped` to
-        # one entry per distinct full name so we probe each player once.
-        _by_name: dict = {}
-        for c in scoped:
-            _by_name.setdefault(c["name"], c)
-        tie = _afl_disambiguate_surname_by_odds(
-            list(_by_name.values()), game_labels, token,
-            stat=stat, line=line, side=side, tip_odds=tip_odds,
-        )
-        if tie:
-            return tie
-    log.info(
-        f"Eddie surname '{token}' did NOT uniquely resolve -> manual "
-        f"(in-play games: [{'; '.join(game_labels)}]; surname hits on those teams: "
-        f"{sorted(unique_names) or 'none'})"
-    )
+
+    def _scope_resolve(games: list, via: str):
+        """Resolve `token` to a UNIQUE player among the teams playing in `games`.
+        Returns (name, team) or None. A collision (>1 distinct full name) attempts
+        the catalog-odds tie-break before giving up. Shared by the 2h-window scope
+        (Tier 1) and the today's-fixtures fallback (Tier 2)."""
+        if not games:
+            return None
+        keys, labels = set(), []
+        for g in games:
+            h, a = g.get("hteam", ""), g.get("ateam", "")
+            if h:
+                keys.add(team_key(h))
+            if a:
+                keys.add(team_key(a))
+            labels.append(f"{h} v {a}")
+        scoped = [c for c in cands if team_key(c.get("team", "")) in keys]
+        names = {c["name"] for c in scoped}
+        if len(names) == 1:
+            hit = scoped[0]
+            log.info(f"Eddie surname-anchored '{token}' -> '{hit['name']}' "
+                     f"({hit['team']}) via {via} [{'; '.join(labels)}]")
+            return hit["name"], hit["team"]
+        if len(names) >= 2:
+            _by_name: dict = {}
+            for c in scoped:
+                _by_name.setdefault(c["name"], c)
+            tie = _afl_disambiguate_surname_by_odds(
+                list(_by_name.values()), labels, token,
+                stat=stat, line=line, side=side, tip_odds=tip_odds,
+            )
+            if tie:
+                return tie
+            log.info(f"Eddie surname '{token}' collision via {via} "
+                     f"(hits: {sorted(names)}) — odds tie-break inconclusive")
+        return None
+
+    # Tier 1: teams in a game within the 2h window / in progress — the precise,
+    # safe scope (Eddie usually posts surnames at game time).
+    try:
+        games_2h = afl_games_in_play(ref_ts, ahead_sec=EDDIE_GAME_LOOKAHEAD_SEC)
+    except Exception as e:
+        log.warning(f"Eddie surname resolve: afl_games_in_play failed: {e}")
+        games_2h = []
+    hit = _scope_resolve(games_2h, "game about to start")
+    if hit:
+        return hit
+
+    # Tier 2 (v5.67, Wilson): no 2h-window resolution -> fall back to ALL of
+    # TODAY'S fixtures' rosters, regardless of time (e.g. Greene tipped 10:13 for
+    # a game >2h away). SAME safety: resolves ONLY if the surname is unique across
+    # every team playing today; any ambiguity -> manual.
+    try:
+        games_today = afl_games_on_date(ref_ts)
+    except Exception as e:
+        log.warning(f"Eddie surname resolve: afl_games_on_date failed: {e}")
+        games_today = []
+    hit = _scope_resolve(games_today, "today's fixtures (no game within 2h)")
+    if hit:
+        return hit
+
+    if not games_2h and not games_today:
+        log.info(f"Eddie surname '{token}': no AFL game today / within "
+                 f"{EDDIE_GAME_LOOKAHEAD_SEC // 3600}h -> manual")
+    else:
+        log.info(f"Eddie surname '{token}' did NOT uniquely resolve -> manual "
+                 f"(tried 2h-window + today's fixtures)")
     return None
 
 
