@@ -199,10 +199,13 @@ _UNIT_TOKEN_RE = re.compile(r"\b\d+(?:\.\d+)?[ \t]*u(?:nits?)?\b", re.IGNORECASE
 # "That's it for today" after a real bet does NOT trip it).
 _NO_BET_FRAMING_RE = re.compile(
     r"nothin'?g?\s+today"                        # "nothin today" / "nothing today"
-    # v5.69 (i4): allow filler between "bets" and the day-token so "no bets for
-    # today lads" / "no bets for the day" also trip (was "no bets today" only).
-    r"|no\s+bets?(?:\s+\w+){0,3}\s+(?:today|for\s+the\s+day)"
-    r"|no\s+bets?\s+for\s+the\s+day"             # "no bets for the day"
+    # v5.69 i4 + r2 (#17): match a GENERAL no-bet phrase only. The i4 {0,3}-word
+    # filler also matched "no bets ON the dogs today, but <real bet> 2u" and
+    # suppressed the valid bet (the gate runs on the whole raw_message). Restrict
+    # to "no bets today" or a "for"-led form — never an "on <category>" exclusion
+    # that leaves room for other bets.
+    r"|no\s+bets?\s+today\b"                     # "no bets today"
+    r"|no\s+bets?\s+for\s+(?:the\s+|me\s+|us\s+)?(?:today|day)\b"  # "no bets for today/the day/me today"
     r"|none\s+quite"                             # "none quite get to my price threshold"
     r"|close\s+to\s+(?:a\s+)?bets?\s+but\s+no",  # "close to bets but none ..."
     re.IGNORECASE,
@@ -977,19 +980,24 @@ def route_message(
     timing["parser"] = "regex" if regex_tips else "none"
 
     if not regex_tips:
-        # v5.69 (m9): BOTH Groq AND the regex parser returned 0 tips for a
-        # tipster that HAS a regex parser (saiyan_afl/ausbets_nba/kev_nba). The
-        # Groq-only branch above alerts on a bet-looking miss; mirror it here so
-        # a missed bet on a regex-backed tipster never silently vanishes
-        # (previously it returned [] with no alert). No @everyone requirement
-        # (these tipsters don't use it); gate on numeric + length + a betting
-        # marker to avoid pinging on pure chatter.
+        # v5.69 (m9) + r2 (#5/#7): BOTH Groq AND the regex parser returned 0 tips
+        # for a tipster that HAS a regex parser. Alert so a genuinely missed bet
+        # doesn't vanish silently — but DON'T alert on the no-bet / recap /
+        # commentary messages these tipsters routinely post (which correctly
+        # parse to []), or we re-spam the manual channel and contradict the
+        # v5.52/i4 no-bet-framing design. So require a STRONG bet signal (a
+        # literal unit token OR an "@ <odds>" price) AND explicitly exclude
+        # no-bet framing (round-2 #5/#7: the loose 'over/under/+' token list
+        # over-fired on banter).
         _low = text.lower()
+        _has_strong_bet_token = (
+            _raw_has_unit_token(text)
+            or bool(re.search(r"@\s*\d+(?:\.\d+)?", text))
+        )
         looks_like_bet = (
-            any(c.isdigit() for c in text)
-            and len(text) > 40
-            and any(tok in _low for tok in
-                    ("@", "unit", " u ", "+", "over", "under", " ml", "o/u"))
+            len(text) > 40
+            and _has_strong_bet_token
+            and not _is_no_bet_framing(text)
         )
         if looks_like_bet:
             log.warning(
@@ -1729,11 +1737,28 @@ def resolve_event(tip: ParsedTip) -> str:
             # comparable scores so a genuine collision is DETECTED. Multi-token
             # / nickname inputs keep the collapsed name (collapse helps there).
             _orig_player = (tip.legs[0].player if (tip.legs and tip.legs[0].player) else player) or player
-            disambig_query = _orig_player if len(_orig_player.split()) == 1 else player
+            _is_bare_surname = len(_orig_player.split()) == 1
+            disambig_query = _orig_player if _is_bare_surname else player
             candidates = fuzzy_match_all(disambig_query, tip.sport)
             if not candidates:
                 log.warning(f"No roster candidates for player '{disambig_query}'")
                 return ""
+
+            # v5.69-r2 (round-2 #6): for a BARE SURNAME, prefer candidates whose
+            # SURNAME (last token) equals the query, so a token that coincidentally
+            # matches a prominent player's FIRST name (e.g. 'Grant' -> 'Grant
+            # Williams') can't out-rank the real surname match (Jerami Grant). Fall
+            # back to all candidates if NONE share the surname (a first-name-famous
+            # tip like 'Giannis', whose surname is Antetokounmpo).
+            if _is_bare_surname:
+                _q = _orig_player.strip().lower()
+                _surname_hits = [
+                    c for c in candidates
+                    if (c.get("name") or "").split()
+                    and (c["name"].split()[-1].lower() == _q)
+                ]
+                if _surname_hits:
+                    candidates = _surname_hits
 
             if len(candidates) == 1:
                 # Only one player matches - use their team
@@ -1784,9 +1809,24 @@ def resolve_event(tip: ParsedTip) -> str:
                 tip.legs[0].player = c["name"]
                 return r
             # 2+ playable: candidates are score-sorted, so playable[0] is the
-            # highest-scoring one that plays. Only trust it if it is a CLEAR
-            # leader over the next playable; otherwise it's a same-surname tie.
+            # highest-scoring one that plays.
             best_c, best_r = playable[0]
+            # v5.69-r2 (round-2 #2): a FULL-NAME tip is a confident, specific
+            # match — use the top playable rather than routing to manual just
+            # because a same-surname (or similar-first-name) sibling also plays
+            # within the floor ('Jalen Williams' vs 'Jaylin Williams'). The
+            # strict clear-leader/collision gate applies ONLY to an ambiguous
+            # BARE SURNAME query.
+            if not _is_bare_surname:
+                log.info(
+                    f"Resolved event (full-name): {best_r} via {best_c['name']} "
+                    f"({best_c['team']}, score={best_c['score']}) — confident "
+                    f"full-name match, top playable"
+                )
+                tip.legs[0].player = best_c["name"]
+                return best_r
+            # Bare surname: only trust the top if it is a CLEAR leader over the
+            # next playable; otherwise it's a genuine same-surname tie -> manual.
             second_score = playable[1][0].get("score", 0)
             if (best_c.get("score", 0) - second_score) > CANDIDATE_SCORE_FLOOR:
                 log.info(
@@ -4872,7 +4912,13 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                 # of dropping it; 'placed' debits the ACTUAL (auto-capped) stake.
                 _recon_b = _reconcile_ambiguous(
                     chosen_session.get("account_id"),
-                    event=tip.event, stake=step_stake, sport=tip.sport,
+                    # v5.69-r2 (#10/#11): the M3 bookie-alias fix was applied to
+                    # the fan-out + SGM reconciles but MISSED here, the sequential
+                    # v4 singles reconcile. Harmless today (AFL singles use the
+                    # fan-out), but arms the missed-landed-GWS-bet class if
+                    # AFL_CONCURRENT_FANOUT is reverted. Translate the event too.
+                    event=_bookie_event(tip.event, chosen_session.get("bookie", ""), tip.sport),
+                    stake=step_stake, sport=tip.sport,
                     selection=(result.placed_selection
                                or (tip.legs[0].selection if tip.legs else "")
                                or original_player or ""),
@@ -11222,6 +11268,21 @@ def _image_afl_conflicting_indices(raw_tips: list) -> set:
     manual rather than auto-place BOTH sides (which v5.2 now could, since totals
     /lines place). 2026-06-03 Eddie image. The prompt is the primary fix; this
     is the safety net."""
+    # v5.69-r2 (round-2 #1): the conflict key components come from the RAW vision
+    # dicts, which the model labels inconsistently. Normalise the two that bite:
+    #  - period: every full-game synonym ('', 'full', 'match', 'fulltime', ...)
+    #    collapses to one bucket, so an over labelled 'full' and an under labelled
+    #    null/'' of the SAME full-game market still hash to the same key (else the
+    #    over+under pair ESCAPES the guard and both sides auto-place — the exact
+    #    bug this detector exists to catch, re-opened by the v5.69 period addition).
+    #  - stat: routed through _normalise_afl_image_stat for the same class of
+    #    label drift on player props.
+    _FULLGAME = {"", "full", "match", "fulltime", "full time", "game", "full game", "ft"}
+
+    def _norm_period(raw_period) -> str:
+        p = (raw_period or "").strip().lower()
+        return "full" if p in _FULLGAME else p
+
     groups: dict = {}
     for i, raw in enumerate(raw_tips):
         mkt = (raw.get("market_type") or "").strip().lower()
@@ -11229,14 +11290,14 @@ def _image_afl_conflicting_indices(raw_tips: list) -> set:
         side = (raw.get("side") or "").strip().lower()
         if ln is None or side not in ("over", "under"):
             continue
-        period = (raw.get("period") or "").strip().lower()
+        period = _norm_period(raw.get("period"))
         if mkt == "player_prop":
             # v5.69 (m11): include stat + period so two DISTINCT props on the
             # SAME player at the same numeric line but DIFFERENT stats (e.g.
             # 'Bont over 20.5 disposals' + 'Bont under 20.5 tackles') are NOT
             # falsely treated as an over/under conflict and force-routed manual.
             who = (raw.get("player") or raw.get("team") or "").strip().lower()
-            stat = (raw.get("stat") or "").strip().lower()
+            stat = (_normalise_afl_image_stat(raw.get("stat")) or "").strip().lower()
             key = (mkt, who, stat, period, round(abs(ln), 1))
         elif mkt in ("total", "alternate_total"):
             # v5.69 (m12): key totals on the RESOLVED EVENT, not the raw team
@@ -11385,13 +11446,19 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
         # "summary / GL all / next meet ...") parses to 0 tips by design —
         # drop it silently instead of pinging manual. The ping remains for
         # an UNEXPLAINED 0-tip parse (a real tip image the model fumbled).
-        # v5.69 (m18): only suppress the ping when the caption is a summary AND
-        # is NOT actionable. A real tip image whose caption mentions "results"
-        # but ALSO carries a concrete selection/play (e.g. "results from
-        # yesterday aside, here's the play R4...") is actionable -> we must
-        # still ping, since the vision model fumbled the real tip to 0 tips.
-        if (raw_caption and _IMAGE_SUMMARY_RE.search(raw_caption.lower())
-                and not _image_text_is_actionable(raw_caption)):
+        # v5.69 (m18) + r2 (#3): only suppress the ping when the caption is a
+        # summary AND carries no CONCRETE selection. A real tip image whose
+        # caption mentions "results" but ALSO names a play ("results aside,
+        # here's the play R4 ...") must still ping. NB: gate on
+        # _image_text_selection_pattern (race-code / $ / units / decimal odds) +
+        # an urgent instruction — NOT _image_text_is_actionable, whose keyword
+        # list ('tips'/'odds'/'selections'/'update') ROUTINELY appears in genuine
+        # recap captions and would re-spam the very ping v5.58 added (round-2 #3).
+        _cap_l = (raw_caption or "").lower()
+        _cap_has_play = (_image_text_selection_pattern(_cap_l)
+                         or _IMAGE_URGENT_INSTRUCTION_RE.search(_cap_l))
+        if (raw_caption and _IMAGE_SUMMARY_RE.search(_cap_l)
+                and not _cap_has_play):
             log.info(
                 f"[{channel_name}] vision parse returned 0 tips and the "
                 f"caption reads as a summary/recap (non-actionable) -> dropped "

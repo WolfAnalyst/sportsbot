@@ -590,12 +590,16 @@ def _fix_sgm_threshold_leg(leg: ParsedLeg, is_pyo_sgm: bool, sport: str = "nba")
     if line_f <= 0 or not line_f.is_integer():
         return leg
 
-    # v5.69 (m16): NEVER promote an 'under' leg to a threshold market. Threshold
-    # markets are inherently N+ (over) and downstream routing discards the
-    # direction, so promoting "Player under 30 pts" would place it as "30+" —
-    # the WRONG SIDE. Leave it as an O/U leg at the integer line so it routes to
-    # the under O/U path instead.
+    # v5.69 (m16) + r2 (#8): NEVER let an 'under' leg be a threshold market.
+    # Threshold markets are inherently N+ (over) and downstream routing discards
+    # the direction, so "Player under 30 pts" placed as a threshold = "30+", the
+    # WRONG SIDE. The guard must CLEAR a stale _is_threshold (both build loops set
+    # it from the model's raw is_threshold BEFORE calling this, so a
+    # contradictory {selection:'under', is_threshold:true} leg would otherwise
+    # reach placement still flagged) — not merely skip a new promotion. Leave it
+    # as an O/U under leg at the integer line.
     if (leg.selection or "").strip().lower() in ("under", "u"):
+        leg._is_threshold = False
         return leg
 
     # Integer line on a player-prop SGM leg => threshold market
