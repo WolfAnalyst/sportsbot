@@ -682,6 +682,11 @@ class HyperBotClient:
             res = self._post_v3_async(
                 "/v3/transactions",
                 {"session_id": str(session_id), "days_back": days_back, "limit": limit},
+                # v5.69 (i3): /v3/transactions is read-only/idempotent (never
+                # places), so ride out a transient 5xx/timeout on the initial
+                # POST like the price-check callers do — the default of 1 left
+                # auto-results blank for a session on a single transient error.
+                initial_post_max_attempts=_RETRY_ATTEMPTS,
             )
             for s in (res or {}).get("statuses") or []:
                 result = s.get("result") or {}

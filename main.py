@@ -199,7 +199,10 @@ _UNIT_TOKEN_RE = re.compile(r"\b\d+(?:\.\d+)?[ \t]*u(?:nits?)?\b", re.IGNORECASE
 # "That's it for today" after a real bet does NOT trip it).
 _NO_BET_FRAMING_RE = re.compile(
     r"nothin'?g?\s+today"                        # "nothin today" / "nothing today"
-    r"|no\s+bets?\s+today"                       # "no bets today"
+    # v5.69 (i4): allow filler between "bets" and the day-token so "no bets for
+    # today lads" / "no bets for the day" also trip (was "no bets today" only).
+    r"|no\s+bets?(?:\s+\w+){0,3}\s+(?:today|for\s+the\s+day)"
+    r"|no\s+bets?\s+for\s+the\s+day"             # "no bets for the day"
     r"|none\s+quite"                             # "none quite get to my price threshold"
     r"|close\s+to\s+(?:a\s+)?bets?\s+but\s+no",  # "close to bets but none ..."
     re.IGNORECASE,
@@ -973,6 +976,34 @@ def route_message(
     timing["regex_parse"] = round(time.time() - regex_start, 3)
     timing["parser"] = "regex" if regex_tips else "none"
 
+    if not regex_tips:
+        # v5.69 (m9): BOTH Groq AND the regex parser returned 0 tips for a
+        # tipster that HAS a regex parser (saiyan_afl/ausbets_nba/kev_nba). The
+        # Groq-only branch above alerts on a bet-looking miss; mirror it here so
+        # a missed bet on a regex-backed tipster never silently vanishes
+        # (previously it returned [] with no alert). No @everyone requirement
+        # (these tipsters don't use it); gate on numeric + length + a betting
+        # marker to avoid pinging on pure chatter.
+        _low = text.lower()
+        looks_like_bet = (
+            any(c.isdigit() for c in text)
+            and len(text) > 40
+            and any(tok in _low for tok in
+                    ("@", "unit", " u ", "+", "over", "under", " ml", "o/u"))
+        )
+        if looks_like_bet:
+            log.warning(
+                f"Regex tipster '{tipster}': Groq AND regex both returned 0 "
+                f"tips on a bet-looking message — possible parse failure"
+            )
+            try:
+                notifier.notify_parse_error(
+                    tipster, text[:400],
+                    "Groq + regex both returned empty (possible parse failure)",
+                )
+            except Exception as e:
+                log.error(f"Failed to send parse-error notification: {e}")
+
     return regex_tips, timing
 
 
@@ -1688,85 +1719,89 @@ def resolve_event(tip: ParsedTip) -> str:
                 )
 
             from roster import fuzzy_match_all
-            candidates = fuzzy_match_all(player, tip.sport)
+            # v5.69 (M8): generate candidates from the ORIGINAL tipster text for
+            # a BARE SURNAME, not the resolve_player_name-collapsed full name.
+            # Collapsing "Brown" -> "Bruce Brown" (line 1570) biases
+            # fuzzy_match_all so the real intended player (e.g. Jaylen Brown
+            # 0.836) drops below the score floor and is silently eliminated,
+            # while the in-order loop locks onto the arbitrary collapsed pick.
+            # Querying the raw surname keeps all same-surname players at
+            # comparable scores so a genuine collision is DETECTED. Multi-token
+            # / nickname inputs keep the collapsed name (collapse helps there).
+            _orig_player = (tip.legs[0].player if (tip.legs and tip.legs[0].player) else player) or player
+            disambig_query = _orig_player if len(_orig_player.split()) == 1 else player
+            candidates = fuzzy_match_all(disambig_query, tip.sport)
             if not candidates:
-                log.warning(f"No roster candidates for player '{player}'")
+                log.warning(f"No roster candidates for player '{disambig_query}'")
                 return ""
 
             if len(candidates) == 1:
                 # Only one player matches - use their team
                 c = candidates[0]
-                log.info(f"Single candidate for '{player}': {c['name']} ({c['team']})")
+                log.info(f"Single candidate for '{disambig_query}': {c['name']} ({c['team']})")
                 result = resolve_nba_event(team=c["team"], player=c["name"], sport=tip.sport)
                 if result:
                     log.info(f"Resolved event (single candidate): {result}")
                 return result or ""
 
-            # Multiple candidates - try each in score order, take first with a game.
-            # Confidence threshold: if the top candidate doesn't have a fixture,
-            # only fall through to lower-scoring candidates within
-            # CANDIDATE_SCORE_FLOOR of the top score. Otherwise route to manual.
-            # Prevents the 2026-04-30 Walter Clayton Jr (1.0) -> Terrence
-            # Shannon Jr (0.886) bug where we placed $400 on the wrong player
-            # because Walter's team wasn't playing. Tunable via env if needed.
+            # Multiple candidates. v5.69 (M8): build the set of candidates that
+            # actually have a game today, THEN decide — never return on the
+            # first one found (the old in-order loop placed on whichever
+            # same-surname player came first when 2+ were within the floor and
+            # both played). Rule:
+            #   - exactly one playable           -> use it (unambiguous)
+            #   - top playable clearly ahead     -> use it (next playable is
+            #     more than CANDIDATE_SCORE_FLOOR below = a confident match,
+            #     e.g. a full-name tip; the weaker same-surname guy is noise)
+            #   - 2+ playable within the floor    -> genuine collision -> MANUAL
+            # Prevents the 2026-04-30 Walter Clayton/Terrence Shannon and the
+            # Bruce/Jaylen Brown wrong-player placements. Tunable via env.
             CANDIDATE_SCORE_FLOOR = float(
                 os.getenv("DISAMBIG_SCORE_FLOOR", "0.10")
             )
-            top_score = candidates[0].get("score", 0) if candidates else 0
             log.info(
-                f"Multiple candidates for '{player}': "
+                f"Multiple candidates for '{disambig_query}': "
                 f"{[(c['name'], c['team'], c['score']) for c in candidates[:5]]}"
             )
-            for c in candidates:
-                if top_score - c.get("score", 0) > CANDIDATE_SCORE_FLOOR:
-                    log.info(
-                        f"Skipping '{c['name']}' (score={c['score']}): "
-                        f"more than {CANDIDATE_SCORE_FLOOR} below top "
-                        f"candidate '{candidates[0]['name']}' "
-                        f"(score={top_score}). Routing to manual instead "
-                        f"of risking a wrong-player placement."
-                    )
-                    break
-                result = resolve_nba_event(
-                    team=c["team"], player=c["name"], sport=tip.sport,
-                )
-                if result:
-                    log.info(
-                        f"Resolved event (disambiguated): {result} "
-                        f"via {c['name']} ({c['team']}, score={c['score']})"
-                    )
-                    # Update the leg's player name to the disambiguated one
-                    tip.legs[0].player = c["name"]
-                    return result
-
-            # Fallback (2026-06-04): the top candidate(s) had no game and the
-            # score floor blocked the lower ones. If EXACTLY ONE candidate (any
-            # score) actually has a game today, it's UNAMBIGUOUS -> use it.
-            # ('Robinson' matched Duncan Robinson/Pistons (1.0, no game) over
-            # Mitchell Robinson/Knicks (0.829, playing) -> the floor blocked
-            # Mitchell and it went to manual.) Stays safe: if two same-surname
-            # players BOTH have games today we do NOT guess (keep manual).
             playable = []
             for c in candidates:
                 r = resolve_nba_event(team=c["team"], player=c["name"], sport=tip.sport)
                 if r:
                     playable.append((c, r))
+
+            if not playable:
+                log.warning(
+                    f"None of {len(candidates)} candidates for '{disambig_query}' "
+                    f"have a game scheduled"
+                )
+                return ""
             if len(playable) == 1:
                 c, r = playable[0]
                 log.info(
-                    f"Disambiguation fallback: only '{c['name']}' ({c['team']}, "
+                    f"Disambiguation: only '{c['name']}' ({c['team']}, "
                     f"score={c['score']}) has a game today -> using it (unambiguous)"
                 )
                 tip.legs[0].player = c["name"]
                 return r
-            if len(playable) > 1:
-                log.warning(
-                    f"Disambiguation: {len(playable)} same-surname candidates have "
-                    f"games today ({[p[0]['name'] for p in playable]}) — ambiguous, "
-                    f"routing to manual"
+            # 2+ playable: candidates are score-sorted, so playable[0] is the
+            # highest-scoring one that plays. Only trust it if it is a CLEAR
+            # leader over the next playable; otherwise it's a same-surname tie.
+            best_c, best_r = playable[0]
+            second_score = playable[1][0].get("score", 0)
+            if (best_c.get("score", 0) - second_score) > CANDIDATE_SCORE_FLOOR:
+                log.info(
+                    f"Resolved event (disambiguated): {best_r} via {best_c['name']} "
+                    f"({best_c['team']}, score={best_c['score']}) — clear leader "
+                    f"over next playable (score={second_score})"
                 )
-
-            log.warning(f"None of {len(candidates)} candidates for '{player}' have a game scheduled")
+                tip.legs[0].player = best_c["name"]
+                return best_r
+            log.warning(
+                f"Disambiguation: {len(playable)} same-surname candidates within "
+                f"the score floor have games today "
+                f"({[p[0]['name'] for p in playable]}) — ambiguous, routing to "
+                f"manual instead of guessing the player"
+            )
             return ""
 
         log.warning("No team and no player to resolve event from")
@@ -1798,8 +1833,16 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
         notifier.notify_manual_alert(tip)
         return []
 
-    # Alert-only tips (non-SGM, non-LIVE reasons)
-    if tip.alert_only and not tip.is_sgm:
+    # Alert-only tips (non-LIVE reasons).
+    # v5.69 (M6): the short-circuit is UNCONDITIONAL — it used to be
+    # `and not tip.is_sgm`, which exempted SGMs. That carve-out let an
+    # alert_only tip that had been promoted to an SGM (e.g. an AusBets/Kev
+    # no-unit / no-bet-framing message collapsed into an NBA SGM by
+    # _promote_misparsed_sgms BEFORE the gates fire) sail past the
+    # "do not place" flag straight into _place_sgm_v4/_place_sgm_fanout
+    # (neither re-checks alert_only). An SGM the operator was told to place
+    # by hand must NOT auto-place — this is the v5.52 money-safety gate.
+    if tip.alert_only:
         log.info(f"Alert-only tip: {tip.alert_reason}")
         notifier.notify_manual_alert(tip)
         return []
@@ -2526,7 +2569,13 @@ def _try_auto_alt_lines(
         if alt_success:
             log.info(f"Alt line {new_line} filled. Stopping alt attempts.")
             tip._alt_target_odds_by_bookie = None
-            return new_results  # leave leg.line on the successful alt
+            # v5.69 (m8): restore the tipped line on the leg before returning.
+            # The placed BetResult already records the actual placed_line, so the
+            # placement record is unaffected, but leaving leg.line on the alt
+            # value corrupted any downstream re-read (re-audit / dedup
+            # fingerprint / bet-record). Matches the C1/C2 restore convention.
+            leg.line = original_line
+            return new_results
 
         # Revert for next candidate
         leg.line = original_line
@@ -3358,8 +3407,17 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
         if leg0 is not None:
             sel = (getattr(leg0, "player", "") or getattr(leg0, "selection", "") or "")
         _el = getattr(r, "elapsed_sec", None) or 0.0
+        # v5.69 (M3): reconcile against the BOOKIE-aliased event name, the same
+        # string placement sent to HyperBot (_execute_bet uses _bookie_event),
+        # so /api/pending_bets matches. tip.event is the internal Squiggle name
+        # ("Greater Western Sydney") but the bet lands under the alias ("GWS
+        # Giants" for Sportsbet) — passing the un-translated name made
+        # pending_bet_matches' substring gate fail and a genuinely-landed bet
+        # read as not-found -> converted to a clean failure -> manual re-bet
+        # (double bet by hand) + lost ledger row.
+        _recon_event = _bookie_event(tip.event, sess.get("bookie", ""), tip.sport)
         decision = _recon.decide_ambiguous(
-            hb, sess.get("account_id"), event=tip.event, stake=step,
+            hb, sess.get("account_id"), event=_recon_event, stake=step,
             sport=(tip.sport or "afl"), selection=sel,
             submit_ts=_t.time() - _el,
             reconcile_enabled=RECONCILE_AMBIGUOUS, spill_enabled=False,
@@ -3701,37 +3759,13 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     n_accounts = len(sessions)
     per_account_target = round(intended_stake / n_accounts, 2)
 
-    # v5.65 (Wilson): CAPACITY-WEIGHTED split. Give each account a target
-    # PROPORTIONAL to its liability cap for this market (top bracket) instead of
-    # an even 1/n, so the high-cap account (Ryan 102506 @ 4.5x) carries
-    # proportionally more and the limited accounts get a share that fits their
-    # cap -> fills more of the unit without overflowing to Manual. For a uniform
-    # 4.5x multiplier the ratio is 4.5:1:1:1:1 (exactly Wilson's spec) and it
-    # self-adjusts if a cap changes. FAIL-SAFE: if any account lacks a clean
-    # numeric cap (unlimited / mbl / none) we abandon weighting and keep the
-    # even split, so weighting can never mis-size. The per-account targets still
-    # get budget-capped at the unit + laddered DOWN on reject downstream.
-    fanout_targets, fanout_decay = (
-        _afl_fanout_targets(sessions, sport, liability_market, intended_stake,
-                            tip.tipster, tip.units)
-        if AFL_FANOUT_WEIGHTED else ({}, None)
-    )
-    use_weighted = bool(fanout_targets)
-    if use_weighted:
-        _mode = (f"decay {int(round((1 - fanout_decay) * 100))}%/step"
-                 if fanout_decay else "yaml-bracket ladder")
-        log.info(
-            f"AFL fan-out: {n_accounts} session(s), intended ${intended_stake:.2f} "
-            f"-> WEIGHTED split {fanout_targets} ({_mode}; tipster={tip.tipster}, "
-            f"{tip.units}u), tipped_odds={tipped_odds}"
-        )
-    else:
-        log.info(
-            f"AFL fan-out: {n_accounts} session(s), intended ${intended_stake:.2f} "
-            f"-> ${per_account_target:.2f}/account (even split), tipped_odds={tipped_odds}"
-        )
-
     # ── Direction-aware OVER liability cap (Task A, 2026-06-07) ─────────
+    # v5.69 (m6): this OVER->threshold flip MUST run BEFORE _afl_fanout_targets,
+    # so the capacity-weighted split is computed off the SAME (threshold) caps
+    # the per-account ladder will be sized against (resolve_stake_steps uses
+    # liability_market). It previously ran AFTER the targets call, so an OVER
+    # bet was weighted on the BASE O/U caps while placed on the threshold ladder.
+    #
     # Over and under SHARE one placement market (the live catalog has NO
     # dedicated *_threshold market for disposals/marks/etc — only goals do — so a
     # disposals OVER places on the base player_disposals market, dir=over). The
@@ -3766,6 +3800,36 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                 f"(placement market unchanged at sizing time)"
             )
             liability_market = _thr
+
+    # v5.65 (Wilson): CAPACITY-WEIGHTED split. Give each account a target
+    # PROPORTIONAL to its liability cap for this market (top bracket) instead of
+    # an even 1/n, so the high-cap account (Ryan 102506 @ 4.5x) carries
+    # proportionally more and the limited accounts get a share that fits their
+    # cap -> fills more of the unit without overflowing to Manual. For a uniform
+    # 4.5x multiplier the ratio is 4.5:1:1:1:1 (exactly Wilson's spec) and it
+    # self-adjusts if a cap changes. FAIL-SAFE: if any account lacks a clean
+    # numeric cap (unlimited / mbl / none) we abandon weighting and keep the
+    # even split, so weighting can never mis-size. The per-account targets still
+    # get budget-capped at the unit + laddered DOWN on reject downstream.
+    fanout_targets, fanout_decay = (
+        _afl_fanout_targets(sessions, sport, liability_market, intended_stake,
+                            tip.tipster, tip.units)
+        if AFL_FANOUT_WEIGHTED else ({}, None)
+    )
+    use_weighted = bool(fanout_targets)
+    if use_weighted:
+        _mode = (f"decay {int(round((1 - fanout_decay) * 100))}%/step"
+                 if fanout_decay else "yaml-bracket ladder")
+        log.info(
+            f"AFL fan-out: {n_accounts} session(s), intended ${intended_stake:.2f} "
+            f"-> WEIGHTED split {fanout_targets} ({_mode}; tipster={tip.tipster}, "
+            f"{tip.units}u), tipped_odds={tipped_odds}"
+        )
+    else:
+        log.info(
+            f"AFL fan-out: {n_accounts} session(s), intended ${intended_stake:.2f} "
+            f"-> ${per_account_target:.2f}/account (even split), tipped_odds={tipped_odds}"
+        )
 
     # ── Resolve the catalog line ONCE per bookie ───────────────────────
     # All fan-out sessions are the same bookie (Sportsbet) in practice, so this
@@ -4821,14 +4885,40 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                         f"(no debit/blocklist)"
                     )
                     break  # outer loop places remaining on the next session
-                _debit_b = (_recon_b.get("actual_stake", step_stake)
-                            if _recon_b["action"] == "placed" else step_stake)
+                # v5.69 (M1): a reconcile-CONFIRMED placed bet must flow into
+                # placed accounting / BET PLACED summary / ledger, NOT sit in
+                # the ambiguous bucket firing a contradictory "MAY have placed"
+                # CRITICAL with no ledger row. Mirrors the v5.55 fan-out fix
+                # (_reconcile_fanout_ambiguous) which was never back-ported to
+                # this sequential path used by NBA/MLB singles.
                 if _recon_b["action"] == "placed":
+                    try:
+                        _actual = float(_recon_b.get("actual_stake", step_stake) or step_stake)
+                    except (TypeError, ValueError):
+                        _actual = step_stake
+                    _match = _recon_b.get("match") or {}
+                    result.success = True
+                    result.is_ambiguous = False
+                    result.stake = _actual
+                    result.error = None
+                    if not getattr(result, "bet_id", None):
+                        result.bet_id = _match.get("bookie_bet_id") or _match.get("id")
+                    if not getattr(result, "odds", None):
+                        result.odds = _match.get("odds")
+                    try:
+                        result._requested_stake = _actual
+                        result._reconcile_confirmed_placed = True
+                    except Exception:
+                        pass
                     log.warning(
                         f"v4: reconcile CONFIRMED placed on {chosen_bookie}:{sid} "
-                        f"actual=${_debit_b:.2f} bet_id="
-                        f"{(_recon_b.get('match') or {}).get('bookie_bet_id')}"
+                        f"actual=${_actual:.2f} bet_id={result.bet_id} — "
+                        f"recording as PLACED (not ambiguous)"
                     )
+                    remaining_stake -= _actual
+                    success_on_session = True
+                    break
+                _debit_b = step_stake
                 # C5/v4.6: label the actual trigger so a fast API-level ambiguous
                 # (elapsed<5s) isn't recorded as a contradictory "slow_rejection".
                 _amb_reason = "slow_rejection" if _slow else "fast_ambiguous"
@@ -5093,6 +5183,35 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                     log.info(
                         f"v4: price-change retry placed ${placed:.2f} on {sid}"
                     )
+                    # v5.69 (m7): the price-change retry sends NO target_odds
+                    # (fills at current market). Player props are still
+                    # protected by the pre-place _below_odds_floor guard
+                    # (_resolved_live_odds), but h2h/total markets capture no
+                    # live odds, so a blind fill can land well below the tipped
+                    # price. The bet already landed (cannot un-place), so flag a
+                    # below-floor fill to Maintenance rather than letting it pass
+                    # silently.
+                    try:
+                        _tipped = float(getattr(tip, "suggested_odds", 0) or 0)
+                        _fill = float(retry_result.odds or 0)
+                    except (TypeError, ValueError):
+                        _tipped = _fill = 0.0
+                    if _tipped > 1.0 and _fill > 0 and _below_odds_floor(_tipped, _fill):
+                        log.warning(
+                            f"v4: PRICE-CHANGE FILL BELOW FLOOR on {chosen_bookie}:"
+                            f"{sid}: filled @ {_fill} vs tipped {_tipped} "
+                            f"(floor {_tipped * _ODDS_FLOOR_PCT:.2f}) — review"
+                        )
+                        try:
+                            notifier._send_maintenance(
+                                f"⚠️ Price-change retry filled BELOW odds floor: "
+                                f"{tip.tipster} {tip.event} @ {_fill} "
+                                f"(tipped {_tipped}, floor "
+                                f"{_tipped * _ODDS_FLOOR_PCT:.2f}) on "
+                                f"{chosen_bookie}:{sid}. Bet landed — verify price."
+                            )
+                        except Exception:
+                            pass
                     success_on_session = True
                     break
 
@@ -5183,6 +5302,26 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                 f"v4 alt {alt_idx}/{len(alt_chain)}: stat={alt_leg.stat} "
                 f"line={alt_leg.line} sel={alt_leg.selection}"
             )
+            # v5.69 (m17): an alt prop can be a DIFFERENT market/stat to the
+            # primary, so sizing it off the PRIMARY's liability_market + the
+            # primary's stale live_odds applied the wrong cap (e.g. a points
+            # alt sized on the rebounds cap). Re-resolve the alt leg's own
+            # HyperBot market for cap selection, and size with no-odds (0) so
+            # resolve_stake_steps uses the conservative no-odds fallback for
+            # this market rather than the primary selection's price.
+            _alt_liability_market = alt_leg.market or liability_market
+            try:
+                _alt_rlm = _resolve_leg_for_hyperbot(
+                    alt_leg, sport,
+                    is_threshold=getattr(tip, "_is_threshold", False),
+                    tipster=tip.tipster,
+                )
+                _alt_liability_market = _alt_rlm.get("market") or _alt_liability_market
+            except Exception as _alt_e:
+                log.warning(
+                    f"v4 alt {alt_idx}: leg resolve for liability failed "
+                    f"({_alt_e}); using market '{_alt_liability_market}'"
+                )
             alt_remaining = remaining_for_alts
             alt_blocklist: set[str] = set()
             for sess in priority_sessions:
@@ -5195,8 +5334,8 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                     continue
                 alt_sid = str(sess.get("session_id", ""))
                 steps, _alt_cap_reason, _alt_list_mode = session_priority.resolve_stake_steps(
-                    alt_sid, sport, liability_market,
-                    live_odds if (live_odds and live_odds > 1.0) else 0,
+                    alt_sid, sport, _alt_liability_market,
+                    0,
                     alt_remaining,
                     _v4_ladder_steps,
                 )
@@ -5718,9 +5857,15 @@ def _afl_canonical_catalog_player(markets: dict, market_names: list, player_l: s
     return None
 
 
-def _match_afl_player_prop(leg_dict: dict, markets: dict):
+def _match_afl_player_prop(leg_dict: dict, markets: dict, exact_only: bool = False):
     """Resolve an AFL player-prop SGM leg against the live catalog and return
     the exact proposition to bet, or None if it isn't carried.
+
+    v5.69 (m13): exact_only=True disables the ±1.0 nearest-line snap. The snap
+    is fine for SINGLES (the odds guards in _resolve_single_for_placement gate
+    the snapped price), but SGM legs are placed with NO odds floor, so a silent
+    30+ -> 29+ snap would change the bet. SGM enrichment passes exact_only=True
+    -> a missing exact line returns None -> that bookie routes to manual.
 
     An "N+ stat" / "over X" bet maps to the OVER half-line
     `over_line = ceil(tip_line) - 0.5` in the stat's threshold ladder
@@ -5762,6 +5907,8 @@ def _match_afl_player_prop(leg_dict: dict, markets: dict):
             return cand
         # Exact line not carried -> snap to the nearest carried under line
         # within ±1.0 (Wilson 2026-06-01). Odds guards still gate the price.
+        if exact_only:
+            return None
         return _catalog_nearest(markets, ou_market, player_l, "under", tip_line)
 
     # Over / threshold: the over-equivalent half-line (ceil(tip) - 0.5).
@@ -5784,6 +5931,8 @@ def _match_afl_player_prop(leg_dict: dict, markets: dict):
         return cand
     # Exact half-line not carried -> snap to the nearest carried over line
     # within ±1.0 (threshold ladder first, then base O/U). Wilson 2026-06-01.
+    if exact_only:
+        return None
     return (_catalog_nearest(markets, thr_market, player_l, "over", over_line)
             or _catalog_nearest(markets, ou_market, player_l, "over", over_line))
 
@@ -6202,8 +6351,19 @@ def _find_prop_id_in_sports_catalog(leg_dict: dict, markets: dict) -> tuple:
     for s in selections:
         if (s.get("player") or "").lower() != player:
             continue
-        if direction not in (s.get("selection") or "").lower():
-            continue
+        # v5.69 (m14): match direction on the catalog's `direction` field, else
+        # a TRAILING word — NOT a loose substring. The old `direction not in
+        # selection` test let a player name containing "over"/"under" (Dover,
+        # Grover, Andover) satisfy the wrong side and bet the opposite
+        # proposition. Mirrors _catalog_lookup's exact-direction logic.
+        sdir = (s.get("direction") or "").lower()
+        if sdir:
+            if sdir != direction:
+                continue
+        else:
+            ssel = (s.get("selection") or "").lower()
+            if not (ssel.endswith(f" {direction}") or ssel == direction):
+                continue
         try:
             if abs(float(s.get("line", -999)) - tipped_line) > 0.01:
                 continue
@@ -6347,7 +6507,10 @@ def _enrich_sgm_legs_with_prop_ids(
         new_leg = dict(leg)
         _leg_odds = None  # v5.38: per-leg catalog odds for the combined-odds estimate
         if _afl_pp(leg):
-            match = _match_afl_player_prop(leg, markets)
+            # v5.69 (m13): SGM legs place with no odds floor, so disable the
+            # ±1.0 nearest-line snap — a missing exact line routes this bookie
+            # to manual rather than silently betting a different (easier) line.
+            match = _match_afl_player_prop(leg, markets, exact_only=True)
             if match is None:
                 return (
                     hb_legs,
@@ -6659,7 +6822,13 @@ def _place_sgm(tip: ParsedTip) -> list[BetResult]:
             # it looks boost-related (no tokens, promo disabled, etc),
             # retry once WITHOUT boost on same session before giving up.
             boost_err = str(resp.get("error", ""))
-            if _should_retry_without_boost(boost_err):
+            # v5.69 (M2): never re-fire after a maybe-landed boost attempt
+            # (ambiguous-tagged or ambiguous-pattern error) — a no-boost retry
+            # on the same legs/stake/session would double-stake. Erasmus.
+            _boost_maybe_landed = (
+                bool(resp.get("ambiguous")) or _is_ambiguous_outcome(boost_err)
+            )
+            if _should_retry_without_boost(boost_err) and not _boost_maybe_landed:
                 log.warning(
                     f"SGM boost failed ({boost_err[:80]}), retrying "
                     f"without boost on same session"
@@ -7453,9 +7622,22 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
 
                 boost_err = str(resp.get("error", "") or "")
                 last_error = boost_err
+                # v5.69 (M2): NEVER re-fire after a maybe-landed boost attempt.
+                # A slow (>=5s) or ambiguous-tagged boost reject may already be
+                # ON the books at the bookie; re-placing without boost on the
+                # same legs/stake/session would DOUBLE-STAKE (the Erasmus
+                # class). Skip the retry and let it fall through to the
+                # slow-rejection/ambiguous guard below (debit-as-placed +
+                # reconcile), which is the only safe handling for maybe-landed.
+                _boost_maybe_landed = (
+                    bool(resp.get("ambiguous"))
+                    or _sgm_elapsed >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
+                    or _is_ambiguous_outcome(boost_err)
+                )
                 # Retry once without boost on same session if error looks
-                # boost-related (no tokens, promo disabled, etc).
-                if _should_retry_without_boost(boost_err):
+                # boost-related (no tokens, promo disabled, etc) AND the boost
+                # attempt was provably not landed.
+                if _should_retry_without_boost(boost_err) and not _boost_maybe_landed:
                     log.warning(
                         f"v4 SGM boost failed ({boost_err[:80]}); retrying "
                         f"without boost on same session"
@@ -7577,19 +7759,49 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
                     (s.get("account_id") for s in sessions
                      if str(s.get("session_id", "")) == sid), None)
                 _sgm_recon = _recon_mod.decide_ambiguous(
-                    hb, _sgm_acct, event=tip.event, stake=step_stake,
+                    hb, _sgm_acct, event=event_for_hb, stake=step_stake,
                     sport=tip.sport, selection="",
                     submit_ts=_t_sgm.time() - _sgm_last_elapsed,
                     reconcile_enabled=RECONCILE_AMBIGUOUS, spill_enabled=False,
                 )
-                _sgm_debit = (_sgm_recon.get("actual_stake", step_stake)
-                              if _sgm_recon["action"] == "placed" else step_stake)
+                # v5.69 (M1): a reconcile-CONFIRMED placed SGM must flow through
+                # the normal success accumulator (placed accounting / BET PLACED
+                # summary / ledger), NOT the ambiguous bucket (which fires a
+                # contradictory "MAY have placed" CRITICAL with no ledger row).
+                # Mirrors the v5.55 fan-out fix; event_for_hb (M3) is the
+                # bookie-aliased name so pending_bets actually matches.
                 if _sgm_recon["action"] == "placed":
+                    try:
+                        _sgm_actual = float(_sgm_recon.get("actual_stake", step_stake) or step_stake)
+                    except (TypeError, ValueError):
+                        _sgm_actual = step_stake
+                    _sgm_match = _sgm_recon.get("match") or {}
+                    _conf_result = BetResult(
+                        success=True, tip=tip, session_id=sid, bookie=bookie,
+                        bet_id=_sgm_match.get("bookie_bet_id") or _sgm_match.get("id"),
+                        odds=_sgm_match.get("odds") or (last_resp or {}).get("odds"),
+                        stake=_sgm_actual, timestamp=datetime.now(),
+                        placed_leg_summary=_format_tip_placement_summary(tip),
+                        elapsed_sec=_sgm_last_elapsed,
+                    )
+                    try:
+                        _conf_result._requested_stake = _sgm_actual
+                        _conf_result._reconcile_confirmed_placed = True
+                    except Exception:
+                        pass
                     log.warning(
                         f"v4 SGM: reconcile CONFIRMED placed {bookie}:{sid} "
-                        f"actual=${_sgm_debit:.2f} bet_id="
-                        f"{(_sgm_recon.get('match') or {}).get('bookie_bet_id')}"
+                        f"actual=${_sgm_actual:.2f} bet_id={_conf_result.bet_id} "
+                        f"— recording as PLACED (not ambiguous)"
                     )
+                    if not _orchestrated:
+                        notifier.notify_bet_placed(_conf_result)
+                    if _accumulate_and_check_done(_conf_result):
+                        _emit_sgm_aux_alerts()
+                        return placed_results
+                    success_on_session = True
+                    break
+                _sgm_debit = step_stake
                 _sgm_amb_reason = "slow_rejection" if _sgm_slow else "fast_ambiguous"
                 log.error(
                     f"v4 SGM: AMBIGUOUS OUTCOME ({_sgm_amb_reason.replace('_', ' ')}) "
@@ -8191,11 +8403,28 @@ def _place_sgm_fanout(tip: ParsedTip, _orchestrated: bool = False) -> list[BetRe
         return _fallback("no usable combined-odds estimate (a leg lacked catalog odds)")
 
     # ── Size each account: even-split, capped by the liability ladder ──
-    n_accounts = len(sessions)
+    # v5.69 (m5): split over only the sessions that can ACTUALLY place these
+    # legs (their bookie resolved both legs and an est combined odds). Dividing
+    # by ALL priority sessions and then skipping the unplaceable ones left
+    # (n-k)/n of the unit permanently unfilled -> manual, even when the k
+    # working accounts had spare cap. The per-account budget cap below still
+    # prevents any over-allocation.
+    _placeable_sessions = []
+    _seen_split: set[str] = set()
+    for sess in sessions:
+        _psid = str(sess.get("session_id", ""))
+        if _psid in _seen_split:
+            continue
+        _seen_split.add(_psid)
+        _pbk = (sess.get("bookie", "") or "").lower()
+        if legs_by_bookie.get(_pbk) is not None and est_by_bookie.get(_pbk):
+            _placeable_sessions.append(sess)
+    n_accounts = len(_placeable_sessions) or len(sessions)
     per_account_target = round(intended_stake / n_accounts, 2)
     log.info(
-        f"SGM fan-out: {n_accounts} session(s), intended ${intended_stake:.2f} -> "
-        f"${per_account_target:.2f}/account (even split), est_odds={est_by_bookie}"
+        f"SGM fan-out: {n_accounts} placeable session(s) of {len(sessions)}, "
+        f"intended ${intended_stake:.2f} -> ${per_account_target:.2f}/account "
+        f"(even split over placeable), est_odds={est_by_bookie}"
     )
     jobs: list[tuple[dict, list, list]] = []  # (session, stake-ladder, enriched legs)
     seen_sids: set[str] = set()
@@ -8290,22 +8519,27 @@ def _place_sgm_fanout(tip: ParsedTip, _orchestrated: bool = False) -> list[BetRe
         "correlation_id": getattr(r, "correlation_id", None),
     } for r in ambiguous_results]
 
-    _log_jsonl(AUDIT_LOG, {
-        "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
-        "intended_stake": round(intended_stake, 2), "attempted_stake": attempted_stake,
-        "placed_stake": total_placed, "ambiguous_stake": ambiguous_total,
-        "unfilled_stake": unfilled, "fanout": "sgm", "sgm": True,
-        "orchestrated": _orchestrated, "accounts": len(jobs),
-        "placements": [
-            {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
-             "fill_odds": r.odds, "bet_id": r.bet_id} for r in placed_results],
-        "ambiguous": [
-            {"session_id": r.session_id, "bookie": r.bookie, "stake": _at_risk_stake(r),
-             "error": r.error} for r in ambiguous_results],
-        "failures": [
-            {"session_id": r.session_id, "bookie": r.bookie, "error": r.error}
-            for r in failed_results],
-    })
+    # v5.69 (i2): suppress this per-fan-out audit row when ORCHESTRATED (MLB
+    # HRRBI) — _place_mlb_hrrbi now writes ONE consolidated tip_outcome covering
+    # the SGM accounts AND Alex's single, so the audit trail matches the
+    # consolidated summary instead of recording the SGM slice alone.
+    if not _orchestrated:
+        _log_jsonl(AUDIT_LOG, {
+            "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
+            "intended_stake": round(intended_stake, 2), "attempted_stake": attempted_stake,
+            "placed_stake": total_placed, "ambiguous_stake": ambiguous_total,
+            "unfilled_stake": unfilled, "fanout": "sgm", "sgm": True,
+            "orchestrated": _orchestrated, "accounts": len(jobs),
+            "placements": [
+                {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
+                 "fill_odds": r.odds, "bet_id": r.bet_id} for r in placed_results],
+            "ambiguous": [
+                {"session_id": r.session_id, "bookie": r.bookie, "stake": _at_risk_stake(r),
+                 "error": r.error} for r in ambiguous_results],
+            "failures": [
+                {"session_id": r.session_id, "bookie": r.bookie, "error": r.error}
+                for r in failed_results],
+        })
 
     # ORCHESTRATED (MLB): the orchestrator owns the consolidated summary +
     # leftover->manual (it still has Alex's single to place). Only the AMBIGUOUS
@@ -8688,6 +8922,33 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
                 f"-- suppressing leftover->manual alert (likely a stale/replayed "
                 f"re-delivery, not a live partial fill)"
             )
+
+    # v5.69 (i2): ONE consolidated audit tip_outcome covering BOTH the SGM
+    # accounts AND Alex's single, so the audit trail matches the consolidated
+    # Telegram summary. Previously the SGM fan-out wrote an SGM-only row and
+    # Alex's placements never appeared in any audit tip_outcome. Best-effort:
+    # an audit write must never break a placement.
+    try:
+        _log_jsonl(AUDIT_LOG, {
+            "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
+            "intended_stake": round(intended, 2),
+            "placed_stake": round(placed, 2),
+            "ambiguous_stake": round(_sgm_ambiguous_total, 2),
+            "unfilled_stake": round(max(0.0, remaining), 2),
+            "mlb_hrrbi": True, "accounts": len(successes),
+            "placements": [
+                {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
+                 "fill_odds": r.odds, "bet_id": r.bet_id,
+                 "sgm": bool(r in sgm_results)}
+                for r in successes],
+            "ambiguous": [
+                {"session_id": r.session_id, "bookie": r.bookie,
+                 "stake": (getattr(r, "_requested_stake", None) or r.stake or 0),
+                 "error": r.error}
+                for r in _sgm_ambiguous],
+        })
+    except Exception as e:
+        log.error(f"MLB HRRBI consolidated tip_outcome audit write failed: {e}")
     return all_results
 
 
@@ -9738,6 +9999,10 @@ SHOOK_BUFFER_AGE = 600
 # and wastes API quota). 30s is short enough to catch genuine follow-ups
 # (Shook rarely posts two distinct props within 30s) while stopping rapid-fire.
 _shook_last_trigger_ts: float = 0.0
+# v5.69 (m10): the normalised bet-content of the LAST trigger, so the cooldown
+# can suppress only a REPEAT of the same bet (the announcement+bet double-fire)
+# and NOT silently drop a genuinely distinct second prop posted within 30s.
+_shook_last_trigger_bet: str = ""
 
 # Dedupe set for the bot_id-mismatch diagnostic. One log line per
 # (chat_id, sender_id) per process lifetime. Reset on restart.
@@ -9877,11 +10142,24 @@ def _shook_should_process(text: str) -> bool:
     # posts an @everyone announcement followed immediately by the bet text;
     # without this, both messages trigger separate Groq tasks and place the
     # same bet twice.
-    global _shook_last_trigger_ts
+    # v5.69 (m10): the cooldown is CONTENT-AWARE — it suppresses only a REPEAT
+    # of the same bet content. A genuinely DISTINCT second prop within 30s used
+    # to be silently dropped (buffered but never dispatched); now it triggers.
+    global _shook_last_trigger_ts, _shook_last_trigger_bet
+    _bet_key = re.sub(r"\s+", " ", (bet_match.group(0) or "").strip().lower())
     if time.time() - _shook_last_trigger_ts < 30:
-        return False
+        if _bet_key and _bet_key == _shook_last_trigger_bet:
+            # Same bet content within the window — the announcement+bet
+            # double-trigger this guard exists for. Suppress.
+            return False
+        log.info(
+            f"Shook: distinct bet content within 30s cooldown "
+            f"('{_bet_key[:40]}' vs last '{_shook_last_trigger_bet[:40]}') — "
+            f"processing as a new prop, not suppressing"
+        )
 
     _shook_last_trigger_ts = time.time()
+    _shook_last_trigger_bet = _bet_key
     return True
 
 
@@ -10011,12 +10289,14 @@ async def _process_tip(text: str, tipster: str, sport: str,
             tip.alert_only = True
             tip.alert_reason = "no unit/stake specified by the tipster — place manually"
 
-        # v5.52 braces (ausbets_nba only): explicit no-bet framing routes ALL
-        # tips parsed from the message to manual ("nothin today", "no bets
-        # today", "none quite", "close to bets but no" — on 2026-06-11 these
-        # were near-miss lines, explicitly NOT bets, yet one placed $400).
-        # Runs AFTER the belt so its specific alert_reason wins if both fire.
-        if tip.tipster == "ausbets_nba" and _is_no_bet_framing(tip.raw_message):
+        # v5.52 braces: explicit no-bet framing routes ALL tips parsed from the
+        # message to manual ("nothin today", "no bets today", "none quite",
+        # "close to bets but no" — on 2026-06-11 these were near-miss lines,
+        # explicitly NOT bets, yet one placed $400). Runs AFTER the belt so its
+        # specific alert_reason wins if both fire.
+        # v5.69 (i4): applied to ALL UNITS_REQUIRED_TIPSTERS (was ausbets-only),
+        # since kev_nba can frame a message the same way.
+        if tip.tipster in UNITS_REQUIRED_TIPSTERS and _is_no_bet_framing(tip.raw_message):
             log.info(
                 f"No-bet framing: {tip.tipster} message says these are NOT "
                 f"bets -> manual. Raw: {tip.raw_message[:120]}"
@@ -10945,12 +11225,36 @@ def _image_afl_conflicting_indices(raw_tips: list) -> set:
     groups: dict = {}
     for i, raw in enumerate(raw_tips):
         mkt = (raw.get("market_type") or "").strip().lower()
-        key_team = (raw.get("team") or raw.get("player") or "").strip().lower()
         ln = _img_coerce_float(raw.get("line"))
         side = (raw.get("side") or "").strip().lower()
         if ln is None or side not in ("over", "under"):
             continue
-        groups.setdefault((mkt, key_team, round(abs(ln), 1)), []).append((i, side))
+        period = (raw.get("period") or "").strip().lower()
+        if mkt == "player_prop":
+            # v5.69 (m11): include stat + period so two DISTINCT props on the
+            # SAME player at the same numeric line but DIFFERENT stats (e.g.
+            # 'Bont over 20.5 disposals' + 'Bont under 20.5 tackles') are NOT
+            # falsely treated as an over/under conflict and force-routed manual.
+            who = (raw.get("player") or raw.get("team") or "").strip().lower()
+            stat = (raw.get("stat") or "").strip().lower()
+            key = (mkt, who, stat, period, round(abs(ln), 1))
+        elif mkt in ("total", "alternate_total"):
+            # v5.69 (m12): key totals on the RESOLVED EVENT, not the raw team
+            # label. The vision model can write a different competing team on
+            # the over vs the under row of the SAME game's total, which let both
+            # sides escape the guard and auto-place. Resolving both team labels
+            # to the event collapses them to one key. Falls back to the raw team
+            # string if resolution fails.
+            team_raw = (raw.get("team") or raw.get("player") or "").strip()
+            try:
+                key_event = (resolve_afl_event(team_raw) or team_raw).lower()
+            except Exception:
+                key_event = team_raw.lower()
+            key = (mkt, key_event, period, round(abs(ln), 1))
+        else:
+            who = (raw.get("team") or raw.get("player") or "").strip().lower()
+            key = (mkt, who, period, round(abs(ln), 1))
+        groups.setdefault(key, []).append((i, side))
     conflicted: set = set()
     for items in groups.values():
         if {s for _, s in items} >= {"over", "under"}:
@@ -11081,11 +11385,17 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
         # "summary / GL all / next meet ...") parses to 0 tips by design —
         # drop it silently instead of pinging manual. The ping remains for
         # an UNEXPLAINED 0-tip parse (a real tip image the model fumbled).
-        if raw_caption and _IMAGE_SUMMARY_RE.search(raw_caption.lower()):
+        # v5.69 (m18): only suppress the ping when the caption is a summary AND
+        # is NOT actionable. A real tip image whose caption mentions "results"
+        # but ALSO carries a concrete selection/play (e.g. "results from
+        # yesterday aside, here's the play R4...") is actionable -> we must
+        # still ping, since the vision model fumbled the real tip to 0 tips.
+        if (raw_caption and _IMAGE_SUMMARY_RE.search(raw_caption.lower())
+                and not _image_text_is_actionable(raw_caption)):
             log.info(
                 f"[{channel_name}] vision parse returned 0 tips and the "
-                f"caption reads as a summary/recap -> dropped (no manual "
-                f"ping): {raw_caption[:100]}"
+                f"caption reads as a summary/recap (non-actionable) -> dropped "
+                f"(no manual ping): {raw_caption[:100]}"
             )
             return
         log.info(f"[{channel_name}] vision parse returned 0 tips")

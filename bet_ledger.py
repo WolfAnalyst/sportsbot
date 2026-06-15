@@ -45,6 +45,28 @@ COLUMNS = [
 ]
 _lock = Lock()
 _logged_bet_ids: set = set()
+_seeded = False
+
+
+def _seed_logged_ids() -> None:
+    """v5.69 (i5): seed the dedup set from the existing CSV ONCE so dedup
+    survives a process restart. Without this the in-memory set started empty
+    every process, so a re-notification / replay of a placement made BEFORE the
+    restart appended a DUPLICATE row. Best-effort; never raises. Caller holds
+    _lock."""
+    global _seeded
+    if _seeded:
+        return
+    _seeded = True
+    try:
+        if os.path.exists(_LEDGER_PATH) and os.path.getsize(_LEDGER_PATH) > 0:
+            with open(_LEDGER_PATH, newline="", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    bid = str((r.get("bet_id") or "")).strip()
+                    if bid:
+                        _logged_bet_ids.add(bid)
+    except Exception as e:
+        log.error(f"bet_ledger: failed to seed dedup ids from CSV: {e}")
 
 
 def _num(v):
@@ -69,6 +91,7 @@ def _write_row(row: dict) -> None:
         if not bet_id:
             return  # a landed bet always has a bet_id; skip malformed/blank rows
         with _lock:
+            _seed_logged_ids()  # v5.69 (i5): make dedup survive a restart
             if bet_id in _logged_bet_ids:
                 return
             _logged_bet_ids.add(bet_id)
