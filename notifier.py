@@ -13,6 +13,8 @@ All four chat IDs are optional. If unset, fall back to NOTIFY_CHAT_ID
 import re
 import time
 import requests
+from requests.exceptions import ReadTimeout  # v5.71: module-level so the
+# except clause resolves independently of a mocked `requests` in tests
 import logging
 import os
 from config import NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID, NOTIFY_SUCCESS_CHAT_ID
@@ -178,9 +180,30 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
                     "text": text,
                     "parse_mode": parse_mode,
                 },
-                timeout=10,
+                # v5.71 (notifier dedup): (connect, read) timeouts. Fail fast on
+                # connect (5s) but give Telegram 20s to respond — the 06-16
+                # Turang double-send was a READ timeout at the old flat 10s
+                # where the POST had actually delivered.
+                timeout=(5, 20),
             )
+        except ReadTimeout as e:
+            # v5.71 (notifier dedup): a READ timeout means the request was
+            # TRANSMITTED — Telegram very likely posted the message already, the
+            # HTTP response just didn't return in time. Retrying re-POSTs the
+            # identical message and DELIVERS A SECOND COPY (the 06-16 Turang BET
+            # PLACED / Olson MANUAL double-sends: both the original and the
+            # v5.56 retry read-timed-out, both actually delivered, while the bot
+            # logged NOTIFY LOST). So do NOT retry a read timeout — log it as
+            # delivery-uncertain (the bot genuinely cannot know if it landed).
+            log.error(
+                f"Telegram send DELIVERY-UNCERTAIN (read timeout, chat={target}): "
+                f"{e} | preview: {preview} — request reached Telegram; NOT "
+                f"retrying (a retry would duplicate the message)"
+            )
+            return False
         except Exception as e:
+            # Connect-level failures (ConnectTimeout / ConnectionError / DNS /
+            # refused) mean the request did NOT reach Telegram -> safe to retry.
             log.error(f"Telegram send EXCEPTION (chat={target}, attempt "
                       f"{attempt}/2): {e} | preview: {preview}")
             if attempt == 1:
@@ -215,7 +238,7 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
                 resp2 = requests.post(
                     url,
                     json={"chat_id": target, "text": plain},
-                    timeout=10,
+                    timeout=(5, 20),  # v5.71: match the main send timeout
                 )
             except Exception as e2:
                 log.error(f"Telegram plain-text retry EXCEPTION "
