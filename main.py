@@ -1566,28 +1566,53 @@ def resolve_event(tip: ParsedTip) -> str:
         # block below) — NO fuzzy, NO bare-surname — so it can never drift to a
         # same-surname player on the wrong team (adversarial-verified).
         team = tip.primary_team
-        if not team:
-            # Infer the team from the MLB roster ONLY for a full (2+ token)
-            # player name via an EXACT match (Shook sends full names). NO fuzzy
-            # and NO bare-surname inference: with no team to disambiguate, a
-            # fuzzy/surname-only match drifts to an arbitrary same-surname player
-            # on the WRONG team (e.g. 'Soto' -> Gregory Soto / Pirates when the
-            # tip meant Juan Soto / Mets). roster_mlb.json keys are full names +
-            # UNAMBIGUOUS surname aliases; restricting to a 2+ token EXACT hit
-            # means only a confident full-name match infers a team — everything
-            # else (bare surname, partial, typo, unknown) -> manual (safe miss).
-            # v5.33 (hardened after the adversarial verification flagged the
-            # fuzzy path as a wrong-game-bet vector).
-            player = tip.legs[0].player if (tip.legs and tip.legs[0].player) else ""
-            if player and len(player.split()) >= 2:
-                from roster import exact_match_player as _exact_mlb
-                _rm = _exact_mlb(player, "mlb")
-                if _rm and _rm.get("team"):
-                    team = _rm["team"]
+        # Infer/confirm the team from the MLB roster for a full (2+ token) player
+        # name via an EXACT match (Shook sends full names). NO fuzzy and NO
+        # bare-surname inference: a fuzzy/surname-only match drifts to an
+        # arbitrary same-surname player on the WRONG team (e.g. 'Soto' -> Gregory
+        # Soto / Pirates when the tip meant Juan Soto / Mets). roster_mlb.json
+        # keys are full names + UNAMBIGUOUS surname aliases; an EXACT 2+ token hit
+        # means a confident full-name match — everything else (bare surname,
+        # partial, typo, unknown) leaves the stated team / -> manual (safe miss).
+        # v5.33 added this for the no-team case.
+        #
+        # v5.72 (Olson 06-16): the roster is now AUTHORITATIVE — it runs even when
+        # a team IS stated and OVERRIDES it on an exact full-name disagreement,
+        # mirroring the NBA team-override. The old `if not team` gate meant a
+        # Groq-HALLUCINATED team (context bleed: a teamless 'Matt Olson 2+ HRRBI'
+        # inherited 'MIL' from the prior Turang/MIL play + a standalone 'MIL'
+        # header) was trusted and resolved the WRONG game (Brewers v Guardians;
+        # Olson is a Brave) -> player absent from the catalog -> manual. Override
+        # is EXACT full-name only, and roster_mlb.json is refreshed daily from the
+        # MLB Stats API (fresher than Groq's training data), so it can only move a
+        # bet from the wrong game to the roster-correct game — never a wrong player.
+        player = tip.legs[0].player if (tip.legs and tip.legs[0].player) else ""
+        if player and len(player.split()) >= 2:
+            from roster import exact_match_player as _exact_mlb
+            _rm = _exact_mlb(player, "mlb")
+            if _rm and _rm.get("team"):
+                _roster_team = _rm["team"]
+                if not team:
+                    team = _roster_team
                     log.info(
                         f"MLB no-team: inferred '{player}' -> '{team}' from roster "
                         f"(exact full-name match)"
                     )
+                else:
+                    # Team WAS stated. Trust the roster's exact full-name team
+                    # (authoritative for the player). Harmless when it's the same
+                    # team in a different form ('MIL' vs 'Milwaukee Brewers');
+                    # corrects a bled/wrong team (the Olson 'MIL' -> 'Atlanta
+                    # Braves' case). resolve_mlb_event handles full team names.
+                    if _roster_team.lower() != (team or "").lower():
+                        log.info(
+                            f"MLB team override: Groq said '{team}', roster says "
+                            f"'{_roster_team}' for '{player}' (exact full-name) — "
+                            f"using roster's team."
+                        )
+                    if tip.legs:
+                        tip.legs[0].team_full = _roster_team
+                    team = _roster_team
         if not team:
             log.warning(
                 "MLB tip has no team and no exact full-name roster match — "

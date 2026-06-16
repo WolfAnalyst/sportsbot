@@ -295,6 +295,12 @@ Tips on DIFFERENT lines (each its own line/emoji) = SEPARATE tips, not SGM.
      "points+assists" instead of "points_assists" breaks downstream market
      mapping.
    - If you see "RECENT CONTEXT" section, use it for game info but the CURRENT MESSAGE has the actual bet
+   - TEAM FROM CONTEXT (especially MLB): only set "team" for a player if THIS bet's own
+     text names their team. Do NOT copy a team from a DIFFERENT play or a standalone team
+     header in RECENT CONTEXT onto a player — a team mentioned for one play does NOT apply to
+     a later, different player. If this player's own team isn't stated, leave team EMPTY
+     (we resolve the team from the roster). E.g. a prior "MIL" header + a "Brice Turang" play
+     must NOT make a following "Matt Olson" bet inherit team "MIL" (Olson is not on MIL).
    - DETECT SPORT from context clues:
      - HRR/Hits/Runs/RBIs/Batting/Pitching/Innings = MLB (sport: "mlb")
      - Rushing/Receiving/Passing Yards/Touchdowns/Sacks = NFL (sport: "nfl")
