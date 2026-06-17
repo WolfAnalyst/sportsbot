@@ -11233,8 +11233,29 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
         if not leg_team or not line:
             alert_only = True
             alert_reason = "team line missing team/line — place manually"
+    elif market_type == "margin":
+        # Winning margin "Team N+" (e.g. 'Adelaide 40+') == that team on the
+        # -(N-0.5) LINE handicap (Wilson 2026-06-18: "40+ winning = -39.5 alt
+        # line / handicap"). Convert to a placeable line bet so the bet is
+        # ATTEMPTED rather than misparsed to a goals prop or dropped to manual.
+        # The handicap matcher (_match_handicap_in_catalog, ±0.5) places the alt
+        # line only if the bookie carries it; a miss routes to manual (never a
+        # blind/wrong line). `line` from the vision parse is the whole margin N.
+        margin_n = abs(line)
+        hc_line = -(margin_n - 0.5) if margin_n else 0.0
+        leg = ParsedLeg(market="line", team_full=leg_team, player="",
+                        stat="", line=hc_line, selection=leg_team)
+        if not leg_team or not margin_n:
+            alert_only = True
+            alert_reason = "winning-margin tip missing team/number — place manually"
+        else:
+            raw_msg = (
+                f"[Eddie image] {leg_team} {margin_n:g}+ winning margin "
+                f"({hc_line:g} line) @ {odds or '?'} "
+                f"{('(' + bookie + ')') if bookie else ''}"
+            ).strip()
     elif market_type and market_type != "player_prop":
-        # Margin / other: no clean catalog mapping -> always manual.
+        # Other (non-margin, non-total, non-line): no clean catalog mapping -> manual.
         alert_only = True
         alert_reason = f"{market_type} market (image tip) — place manually"
         leg = ParsedLeg(market="other", team_full=leg_team, player=player,
