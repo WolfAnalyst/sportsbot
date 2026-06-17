@@ -36,7 +36,7 @@ from config import (
     ETR_NBA_TEST_MODE, ETR_NBA_UNIT_SIZE_TEST,
     RECONCILE_AMBIGUOUS, RECONCILE_SPILL,
     X_TIPSTER, X_FORCE_BOOKIE, X_MAX_ODDS_MULT, MAX_ODDS_MULT,
-    AUTO_MANUAL_HANDICAP_SGM, MLB_STAT_MAP, MLB_FLAT_STAKE,
+    AUTO_MANUAL_HANDICAP_SGM, MLB_STAT_MAP, MLB_FLAT_STAKE, MLB_HRRBI_LADDER_PCT,
     IMAGE_TIPS_TEST_MODE, IMAGE_TIPS_TEST_UNIT_SIZE, IMAGE_TIP_PARSERS,
     IMAGE_RACING_MAX_UNITS, IMAGE_RACING_TEST_MODE,
     SAIYAN_SGM_UNIT_SIZE,
@@ -8515,11 +8515,20 @@ def _place_sgm_fanout(tip: ParsedTip, _orchestrated: bool = False) -> list[BetRe
         if remaining_budget <= 0:
             log.info(f"SGM fan-out: intended fully allocated — {bk} {sid} not needed")
             continue
-        # resolve_stake_steps (list-cap mode) converts each liability bracket to a
-        # stake at the est combined odds, capped at the even-split target.
-        steps, cap_reason, _ = session_priority.resolve_stake_steps(
-            sid, sport, "sgm", est, per_account_target, _v4_ladder_steps,
-        )
+        if sport == "mlb":
+            # v5.74 (Wilson): MLB HRRBI uses a fixed-% STAKE ladder off the even
+            # split ($100 -> 100/90/85/80% = $100/$90/$85/$80), NOT the liability
+            # brackets — place the full even-split first, ladder DOWN on a bookie
+            # stake-reject. Any unfilled remainder spills to Alex as a single
+            # (handled by _place_mlb_hrrbi). Even split = $400 / 4 SGM accounts.
+            steps = [round(per_account_target * p, 2) for p in MLB_HRRBI_LADDER_PCT]
+            cap_reason = "mlb-hrrbi-pct-ladder"
+        else:
+            # resolve_stake_steps (list-cap mode) converts each liability bracket
+            # to a stake at the est combined odds, capped at the even-split target.
+            steps, cap_reason, _ = session_priority.resolve_stake_steps(
+                sid, sport, "sgm", est, per_account_target, _v4_ladder_steps,
+            )
         steps = [round(min(s, remaining_budget), 2) for s in steps if s and s > 0]
         ladder = [s for s in steps if s >= AFL_FANOUT_MIN_STAKE]
         if not ladder and steps:
@@ -8867,22 +8876,25 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
 
 
 def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
-    """Per-account MLB HRRBI placement (Wilson 2026-06-01): place ~$87 (ladder
-    85/80) on EACH account — the 2-leg SGM on the SGM-capable accounts
-    (MLB_SGM_SESSION_PRIORITY: Adam/Wilson/Daniel) and the 2+ single on the
-    single-only account(s) (MLB_HRRBI_SINGLE_SESSIONS: Alex, who can't do
-    multis) — sharing the one per-play intended (MLB_FLAT_STAKE). Whatever is
-    left over after all accounts have taken their rung is routed to a single
-    manual-placement Telegram notification (NOT a per-tip 'partial fill'). Only
-    the validated HRRBI shape reaches here (place_tip gates on _is_mlb_hrrbi_sgm)."""
+    """Per-account MLB HRRBI placement. v5.74 (Wilson 2026-06-17): the 1+/2+
+    HRRBI 2-leg SGM (multi) is EVEN-SPLIT $400/4 = $100 and placed CONCURRENTLY
+    across the FOUR SGM-capable accounts (MLB_SGM_SESSION_PRIORITY: Adam 65465 /
+    Wilson 53522 / Daniel 68723 / Ryan 102506), each laddering DOWN 100/90/85/80%
+    of its $100 stake on a bookie reject (MLB_HRRBI_LADDER_PCT). Whatever is
+    UNFILLED after the 4-way SGM (a rejected/under-filled account) SPILLS to Alex
+    65463 (MLB_HRRBI_SINGLE_SESSIONS) as a 2+ HRRBI SINGLE (Alex can't do multis).
+    Anything still unfilled after Alex -> ONE consolidated manual-placement
+    Telegram alert. Only the validated HRRBI shape reaches here (place_tip gates
+    on _is_mlb_hrrbi_sgm). [v5.0/v5.38 history: was 3 SGM accounts on the
+    [130,100,87] liability ladder + Alex single; Ryan added + %-ladder 2026-06-17.]"""
     _t_start = time.time()  # v5.37: end-to-end timing for the consolidated summary
     intended = tip.stake_dollars
-    # SGM accounts first. v5.38: even-split + per-account liability ladder
-    # ([130,100,87] off est combined odds), placed CONCURRENTLY across the 3 SGM
-    # accounts via _place_sgm_fanout(_orchestrated=True) — it returns the
-    # placements WITHOUT a summary (this function owns the ONE consolidated
-    # summary + leftover->manual). Falls back to the sequential _place_sgm_v4
-    # internally on any non-happy-path. SGM_CONCURRENT_FANOUT=false -> sequential.
+    # SGM accounts first: even-split ($400/4=$100) + per-account 100/90/85/80%
+    # stake ladder (v5.74), placed CONCURRENTLY across the 4 SGM accounts via
+    # _place_sgm_fanout(_orchestrated=True) — it returns the placements WITHOUT a
+    # summary (this function owns the ONE consolidated summary + spill->Alex +
+    # leftover->manual). Falls back to the sequential _place_sgm_v4 internally on
+    # any non-happy-path. SGM_CONCURRENT_FANOUT=false -> sequential.
     # _orchestrated suppresses the SGM path's own terminal manual alert.
     if SGM_CONCURRENT_FANOUT:
         sgm_results = _place_sgm_fanout(tip, _orchestrated=True)
