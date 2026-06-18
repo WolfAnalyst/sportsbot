@@ -121,6 +121,18 @@ def _log_jsonl(path: Path, entry: dict):
         f.write(json.dumps(entry) + "\n")
 
 
+def _audit_log_path():
+    """v5.76: resolve the audit.jsonl path at call-time so the unit suite never
+    pollutes the production logs/audit.jsonl. The suite sets TIPBOT_TESTING;
+    v5.43 redirected ONLY _audit_tip, but the placement-path `tip_outcome`
+    writers still hard-coded AUDIT_LOG, leaking ~30 test rows into production on
+    2026-06-18. Every audit write MUST go through this so the redirect is total."""
+    if os.getenv("TIPBOT_TESTING"):
+        import tempfile
+        return os.path.join(tempfile.gettempdir(), "tipbot_test_audit.jsonl")
+    return AUDIT_LOG
+
+
 # ── Stake Search Ladder ─────────────────────────────────────────────
 # Replaces binary search. Try fixed proportions of remaining stake until one
 # succeeds, then move on. Stops when step value would drop below STAKE_FLOOR.
@@ -3278,7 +3290,7 @@ def _place_with_spillover(tip: ParsedTip, sessions: list[dict]) -> list[BetResul
     unfilled = round(intended_stake - total_placed - _ambiguous_total, 2)
 
     # Audit
-    _log_jsonl(AUDIT_LOG, {
+    _log_jsonl(_audit_log_path(), {
         "type": "tip_outcome",
         "tipster": tip.tipster,
         "event": tip.event,
@@ -4150,7 +4162,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         for r in results
     ]
 
-    _log_jsonl(AUDIT_LOG, {
+    _log_jsonl(_audit_log_path(), {
         "type": "tip_outcome",
         "tipster": tip.tipster,
         "event": tip.event,
@@ -4470,7 +4482,7 @@ def _place_etr_nba_fanout(tip: ParsedTip) -> list[BetResult]:
         for r in results
     ]
 
-    _log_jsonl(AUDIT_LOG, {
+    _log_jsonl(_audit_log_path(), {
         "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
         "intended_stake": round(intended_stake, 2), "attempted_stake": attempted_stake,
         "placed_stake": total_placed, "ambiguous_stake": ambiguous_total,
@@ -5485,7 +5497,7 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
     ambiguous_total = round(sum(a.get("stake", 0) for a in ambiguous_outcomes), 2)
     unfilled = round(intended_stake - total_placed - ambiguous_total, 2)
 
-    _log_jsonl(AUDIT_LOG, {
+    _log_jsonl(_audit_log_path(), {
         "type": "tip_outcome",
         "tipster": tip.tipster,
         "event": tip.event,
@@ -7462,7 +7474,7 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
         if not _orchestrated and not _sgm_outcome_logged[0]:
             _sgm_outcome_logged[0] = True
             try:
-                _log_jsonl(AUDIT_LOG, _sgm_outcome_record(
+                _log_jsonl(_audit_log_path(), _sgm_outcome_record(
                     tip, intended_stake, placed_results, remaining_stake, _orchestrated))
             except Exception as e:
                 log.error(f"v4 SGM tip_outcome audit write failed: {e}")
@@ -8604,7 +8616,7 @@ def _place_sgm_fanout(tip: ParsedTip, _orchestrated: bool = False) -> list[BetRe
     # the SGM accounts AND Alex's single, so the audit trail matches the
     # consolidated summary instead of recording the SGM slice alone.
     if not _orchestrated:
-        _log_jsonl(AUDIT_LOG, {
+        _log_jsonl(_audit_log_path(), {
             "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
             "intended_stake": round(intended_stake, 2), "attempted_stake": attempted_stake,
             "placed_stake": total_placed, "ambiguous_stake": ambiguous_total,
@@ -9012,7 +9024,7 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
     # Alex's placements never appeared in any audit tip_outcome. Best-effort:
     # an audit write must never break a placement.
     try:
-        _log_jsonl(AUDIT_LOG, {
+        _log_jsonl(_audit_log_path(), {
             "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
             "intended_stake": round(intended, 2),
             "placed_stake": round(placed, 2),
@@ -10036,13 +10048,10 @@ def _execute_bet(
 
 def _audit_tip(tip: ParsedTip, msg_time: datetime):
     """Log tip to audit JSONL."""
-    # v5.43: redirect to a temp file under TIPBOT_TESTING so the unit suite never
-    # pollutes the production logs/audit.jsonl (same class as the bet_ledger X1/X2
-    # fix — the suite was writing Soligo/Cook fixture rows into the real audit).
-    audit_path = AUDIT_LOG
-    if os.getenv("TIPBOT_TESTING"):
-        import tempfile
-        audit_path = os.path.join(tempfile.gettempdir(), "tipbot_test_audit.jsonl")
+    # v5.43/v5.76: redirect to a temp file under TIPBOT_TESTING (via the shared
+    # _audit_log_path resolver) so the unit suite never pollutes the production
+    # logs/audit.jsonl (same class as the bet_ledger X1/X2 fix).
+    audit_path = _audit_log_path()
     if tip.legs and tip.legs[0].market == "player_prop":
         payload = {
             "player": tip.legs[0].player,
