@@ -31,7 +31,7 @@ from config import (
     AFL_CONCURRENT_FANOUT, AFL_FANOUT_MIN_STAKE, AFL_FANOUT_WEIGHTED,
     AFL_FANOUT_RATIO_CAP, EDDIE_FANOUT_BIG_UNITS, EDDIE_BIG_LIMITED_STAKE,
     EDDIE_FANOUT_DECAY, AFL_FANOUT_PREPLACEMENT_RETRY, AFL_FANOUT_RETRY_DELAY_SEC,
-    EDDIE_OVERS_REDISTRIBUTE,
+    AFL_DISPOSALS_REDISTRIBUTE,
     SGM_CONCURRENT_FANOUT,
     ETR_NBA_CONCURRENT_FANOUT, ETR_NBA_SESSION_IDS, ETR_NBA_FIXED_LADDER,
     ETR_NBA_TEST_MODE, ETR_NBA_UNIT_SIZE_TEST,
@@ -3711,37 +3711,33 @@ def _afl_fanout_targets(sessions: list, sport: str, market: str,
     return {s: round(intended * w / total, 2) for s, w in weights.items()}, None
 
 
-def _is_eddie_disposals_over(tip: ParsedTip) -> bool:
-    """v5.77 (Wilson 2026-06-20): True ONLY for an Eddie AFL DISPOSALS-OVER single
-    — the sole scope for the redistribute-to-successful-bookies top-up. Unders,
-    SGMs, and non-disposals markets are excluded (their liability is harder to
-    navigate). Mirrors the fan-out's own OVER detection (`selection == 'over'` /
-    `... over` / tip._is_threshold, and never 'under')."""
-    if (getattr(tip, "tipster", "") or "").lower() != "eddie_afl":
-        return False
+def _is_afl_disposals_fanout(tip: ParsedTip) -> bool:
+    """v5.78 (Wilson 2026-06-20): True for ANY AFL DISPOSALS fan-out single — the
+    scope for the redistribute-to-successful-bookies top-up. BOTH tipsters (Saiyan
+    + Eddie) and BOTH directions (over + under): whatever the first fan-out round
+    leaves unfilled gets ONE reroute onto the accounts that placed; if that reroute
+    can't fill it either, it's manual ("it is what it is"). v5.77 was Eddie OVERS
+    only ("unders too hard"); Wilson 06-20 widened it — Saiyan bets disposals
+    UNDERS, Eddie OVERS, both should reroute. SGMs are on a different path (never
+    reach _place_afl_fanout) so they're excluded automatically."""
     if (getattr(tip, "sport", "") or "").lower() != "afl":
         return False
     leg = tip.legs[0] if getattr(tip, "legs", None) else None
     if not leg:
-        return False
-    side = (getattr(leg, "selection", "") or "").strip().lower()
-    is_over = ((side == "over" or side.endswith(" over")
-                or getattr(tip, "_is_threshold", False)) and "under" not in side)
-    if not is_over:
         return False
     stat = (getattr(leg, "stat", "") or "").lower()
     mkt = (getattr(leg, "market", "") or "").lower()
     return "disposals" in stat or "disposals" in mkt
 
 
-def _afl_overs_redistribute_topup(tip, placed_results, unfilled,
-                                  sessions_by_sid, resolved_by_sid):
-    """v5.77 (Wilson 2026-06-20): for an Eddie AFL DISPOSALS-OVER fan-out that left
-    stake UNFILLED (an account failed — e.g. Alex 65463 low balance 06-19 — or
-    laddered down), re-split the WHOLE unfilled remainder EVENLY across the accounts
-    that PLACED and fire a top-up on each, laddering 100/90/80/70% of its share and
-    STOPPING on continued reject. Time-sensitive AFL overs: get the unit down on the
-    bookies that worked rather than to manual.
+def _afl_redistribute_topup(tip, placed_results, unfilled,
+                            sessions_by_sid, resolved_by_sid):
+    """v5.78 (Wilson 2026-06-20): for an AFL DISPOSALS fan-out (Saiyan or Eddie,
+    over or under) that left stake UNFILLED (an account failed — e.g. Alex 65463
+    low balance 06-19 — or laddered down), re-split the WHOLE unfilled remainder
+    EVENLY across the accounts that PLACED and fire a top-up on each, laddering
+    100/90/80/70% of its share and STOPPING on continued reject. ONE reroute round:
+    get the unit down on the bookies that worked rather than to manual.
 
     Returns the list of top-up BetResults (the caller classifies + merges them).
     SAFE: each top-up is capped at its 1/n share so total can never exceed the unit
@@ -4208,17 +4204,18 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # this unit gap (a failed/short account placed less -> counts in intended-placed).
     unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
 
-    # v5.77 (Wilson 2026-06-20): Eddie AFL disposals-OVER redistribute-to-successful
-    # top-up. When the fan-out leaves stake unfilled (an account failed — e.g. Alex
-    # 65463 low balance — or laddered down) AND others placed, re-split the WHOLE
-    # unfilled remainder across the accounts that worked and top each up (100/90/80/
-    # 70% ladder). Disposals-OVER singles ONLY. Each top-up is capped at its 1/n
-    # share (no over-stake) and reuses the ladder (ambiguous -> stop, no double).
-    if (EDDIE_OVERS_REDISTRIBUTE and unfilled > AFL_FANOUT_MIN_STAKE
-            and placed_results and _is_eddie_disposals_over(tip)):
+    # v5.78 (Wilson 2026-06-20): AFL DISPOSALS redistribute-to-successful top-up.
+    # When the fan-out leaves stake unfilled (an account failed — e.g. Alex 65463
+    # low balance — or laddered down) AND others placed, re-split the WHOLE unfilled
+    # remainder across the accounts that worked and top each up (100/90/80/70%
+    # ladder). ALL AFL disposals fan-out (Saiyan + Eddie, over + under) — ONE reroute
+    # round. Each top-up is capped at its 1/n share (no over-stake) and reuses the
+    # ladder (ambiguous -> stop, no double-stake).
+    if (AFL_DISPOSALS_REDISTRIBUTE and unfilled > AFL_FANOUT_MIN_STAKE
+            and placed_results and _is_afl_disposals_fanout(tip)):
         _sess_by_sid = {str(s.get("session_id", "")): s for (s, _l, _r) in jobs}
         _res_by_sid = {str(s.get("session_id", "")): _r for (s, _l, _r) in jobs}
-        _topups = _afl_overs_redistribute_topup(
+        _topups = _afl_redistribute_topup(
             tip, placed_results, unfilled, _sess_by_sid, _res_by_sid)
         for _tr in _topups:
             results.append(_tr)
