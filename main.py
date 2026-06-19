@@ -31,6 +31,7 @@ from config import (
     AFL_CONCURRENT_FANOUT, AFL_FANOUT_MIN_STAKE, AFL_FANOUT_WEIGHTED,
     AFL_FANOUT_RATIO_CAP, EDDIE_FANOUT_BIG_UNITS, EDDIE_BIG_LIMITED_STAKE,
     EDDIE_FANOUT_DECAY, AFL_FANOUT_PREPLACEMENT_RETRY, AFL_FANOUT_RETRY_DELAY_SEC,
+    EDDIE_OVERS_REDISTRIBUTE,
     SGM_CONCURRENT_FANOUT,
     ETR_NBA_CONCURRENT_FANOUT, ETR_NBA_SESSION_IDS, ETR_NBA_FIXED_LADDER,
     ETR_NBA_TEST_MODE, ETR_NBA_UNIT_SIZE_TEST,
@@ -58,7 +59,7 @@ from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
 from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
 from nba_resolver import resolve_nba_event, resolve_mlb_event
-from roster import resolve_player_name, get_player_team, afl_surname_candidates
+from roster import resolve_player_name, get_player_team, afl_surname_candidates, afl_fuzzy_surname_candidates
 import notifier
 import session_priority
 import stat_fallback
@@ -3673,24 +3674,30 @@ def _afl_fanout_targets(sessions: list, sport: str, market: str,
         capacity-weighted, high-cap account CLAMPED to AFL_FANOUT_RATIO_CAP x the
         smallest weight -> 4:1:1:1:1. $75 ea + $300 Ryan (Saiyan @600);
         $125 ea + $500 Ryan (Eddie @2.5u=1000). Scales with the unit.
-      EDDIE BIG (units > EDDIE_FANOUT_BIG_UNITS): each LIMITED account starts at
-        EDDIE_BIG_LIMITED_STAKE (150, ~their late-game disposals capacity); the
-        high-cap account (Ryan) takes the REMAINDER; 10% step-down ladder; the
-        running budget caps the total at the unit; unfilled -> Manual.
+      EDDIE BIG (units > EDDIE_FANOUT_BIG_UNITS): v5.77 EVEN split (intended/n) +
+        10% step-down decay ladder per account. The SB accounts are equal-cap now,
+        so the old "$150 floor on the limited accounts + dump the remainder on the
+        single highest-cap account" shape was RETIRED (it concentrated ~$600 on
+        whichever account sorted first — 06-19 Uwland on Adam). The disposals-overs
+        redistribute top-up mops up any unfilled remainder.
     PURE (no network) so it's unit-tested directly."""
     weights = _afl_fanout_weights(sessions, sport, market)
     if not weights:
         return {}, None
 
-    # Eddie big bets: fixed stake on the limited accounts, remainder on the
-    # highest-cap account, decay ladder.
+    # Eddie big bets (units > EDDIE_FANOUT_BIG_UNITS): EVEN split + decay ladder.
+    # v5.77 (Wilson 2026-06-20): was "$150 floor on the limited accounts + dump the
+    # REMAINDER on the single highest-cap account" — designed when Ryan 102506 was
+    # the 4.5x account. Ryan was limited (v5.73) and Adam equalised (v5.77), so all
+    # 4 SB sports accounts are now equal-cap and each can take ~$393; the old logic
+    # arbitrarily concentrated ~$400-600 on whichever account sorted first (Adam,
+    # 06-19 Uwland). Now split intended/n EVENLY and let each account's DECAY ladder
+    # fill up to its own bookie limit; the disposals-overs redistribute top-up
+    # (main.py) mops up any account that failed/under-filled.
     if tipster == "eddie_afl" and (units or 0) > EDDIE_FANOUT_BIG_UNITS:
-        hi_sid = max(weights, key=lambda s: weights[s])  # Ryan = biggest cap
-        limited = [s for s in weights if s != hi_sid]
-        targets = {s: round(float(EDDIE_BIG_LIMITED_STAKE), 2) for s in limited}
-        rest = round(intended - sum(targets.values()), 2)
-        targets[hi_sid] = rest if rest > 0 else 0.0
-        targets = {s: v for s, v in targets.items() if v > 0}
+        n = len(weights)
+        per = round(intended / n, 2) if n else 0.0
+        targets = {s: per for s in weights if per > 0}
         return targets, (EDDIE_FANOUT_DECAY if EDDIE_FANOUT_DECAY and 0 < EDDIE_FANOUT_DECAY < 1 else 0.9)
 
     # Normal: clamp the high-cap account to RATIO_CAP x the smallest -> 4:1:1:1:1.
@@ -3702,6 +3709,75 @@ def _afl_fanout_targets(sessions: list, sport: str, market: str,
     if total <= 0:
         return {}, None
     return {s: round(intended * w / total, 2) for s, w in weights.items()}, None
+
+
+def _is_eddie_disposals_over(tip: ParsedTip) -> bool:
+    """v5.77 (Wilson 2026-06-20): True ONLY for an Eddie AFL DISPOSALS-OVER single
+    — the sole scope for the redistribute-to-successful-bookies top-up. Unders,
+    SGMs, and non-disposals markets are excluded (their liability is harder to
+    navigate). Mirrors the fan-out's own OVER detection (`selection == 'over'` /
+    `... over` / tip._is_threshold, and never 'under')."""
+    if (getattr(tip, "tipster", "") or "").lower() != "eddie_afl":
+        return False
+    if (getattr(tip, "sport", "") or "").lower() != "afl":
+        return False
+    leg = tip.legs[0] if getattr(tip, "legs", None) else None
+    if not leg:
+        return False
+    side = (getattr(leg, "selection", "") or "").strip().lower()
+    is_over = ((side == "over" or side.endswith(" over")
+                or getattr(tip, "_is_threshold", False)) and "under" not in side)
+    if not is_over:
+        return False
+    stat = (getattr(leg, "stat", "") or "").lower()
+    mkt = (getattr(leg, "market", "") or "").lower()
+    return "disposals" in stat or "disposals" in mkt
+
+
+def _afl_overs_redistribute_topup(tip, placed_results, unfilled,
+                                  sessions_by_sid, resolved_by_sid):
+    """v5.77 (Wilson 2026-06-20): for an Eddie AFL DISPOSALS-OVER fan-out that left
+    stake UNFILLED (an account failed — e.g. Alex 65463 low balance 06-19 — or
+    laddered down), re-split the WHOLE unfilled remainder EVENLY across the accounts
+    that PLACED and fire a top-up on each, laddering 100/90/80/70% of its share and
+    STOPPING on continued reject. Time-sensitive AFL overs: get the unit down on the
+    bookies that worked rather than to manual.
+
+    Returns the list of top-up BetResults (the caller classifies + merges them).
+    SAFE: each top-up is capped at its 1/n share so total can never exceed the unit
+    (no over-stake); reuses _fanout_place_account so an ambiguous/maybe-landed top-up
+    STOPS its ladder and is treated as committed (no double-stake); ONE pass only
+    (a top-up's own shortfall is never recursively redistributed)."""
+    import concurrent.futures
+    placed_sids, seen = [], set()
+    for r in placed_results:
+        sid = str(getattr(r, "session_id", "") or "")
+        if sid and sid not in seen and sid in sessions_by_sid and sid in resolved_by_sid:
+            seen.add(sid)
+            placed_sids.append(sid)
+    n = len(placed_sids)
+    if n == 0 or unfilled <= AFL_FANOUT_MIN_STAKE:
+        return []
+    per = round(unfilled / n, 2)
+    ladder = [round(per * f, 2) for f in (1.0, 0.9, 0.8, 0.7)]
+    ladder = [s for s in ladder if s >= AFL_FANOUT_MIN_STAKE]
+    if not ladder:
+        return []
+    log.info(
+        f"AFL overs redistribute: ${unfilled:.2f} unfilled -> ${per:.2f} top-up "
+        f"across {n} placed account(s) {placed_sids} (ladder {ladder})"
+    )
+    jobs = [(sessions_by_sid[s], list(ladder), resolved_by_sid[s]) for s in placed_sids]
+    out: list[BetResult] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        futs = {ex.submit(_fanout_place_account, tip, s, l, res): s
+                for (s, l, res) in jobs}
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                out.append(fut.result())
+            except Exception as e:
+                log.error(f"AFL overs redistribute: top-up raised: {e}")
+    return out
 
 
 def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
@@ -4131,6 +4207,38 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # Eddie). The old per-account failed-rung + auto-cap shortfall are subsumed by
     # this unit gap (a failed/short account placed less -> counts in intended-placed).
     unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
+
+    # v5.77 (Wilson 2026-06-20): Eddie AFL disposals-OVER redistribute-to-successful
+    # top-up. When the fan-out leaves stake unfilled (an account failed — e.g. Alex
+    # 65463 low balance — or laddered down) AND others placed, re-split the WHOLE
+    # unfilled remainder across the accounts that worked and top each up (100/90/80/
+    # 70% ladder). Disposals-OVER singles ONLY. Each top-up is capped at its 1/n
+    # share (no over-stake) and reuses the ladder (ambiguous -> stop, no double).
+    if (EDDIE_OVERS_REDISTRIBUTE and unfilled > AFL_FANOUT_MIN_STAKE
+            and placed_results and _is_eddie_disposals_over(tip)):
+        _sess_by_sid = {str(s.get("session_id", "")): s for (s, _l, _r) in jobs}
+        _res_by_sid = {str(s.get("session_id", "")): _r for (s, _l, _r) in jobs}
+        _topups = _afl_overs_redistribute_topup(
+            tip, placed_results, unfilled, _sess_by_sid, _res_by_sid)
+        for _tr in _topups:
+            results.append(_tr)
+            if _tr.success:
+                placed_results.append(_tr)
+            elif _is_ambiguous_result(_tr):
+                ambiguous_results.append(_tr)
+            else:
+                failed_results.append(_tr)
+        if _topups:
+            total_placed = round(sum(r.stake or 0 for r in placed_results), 2)
+            ambiguous_total = round(sum(_at_risk_stake(r) for r in ambiguous_results), 2)
+            unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
+            log.info(
+                f"AFL overs redistribute: topped up "
+                f"${sum((r.stake or 0) for r in _topups if r.success):.2f} across "
+                f"{sum(1 for r in _topups if r.success)}/{len(_topups)} account(s); "
+                f"unfilled now ${unfilled:.2f}"
+            )
+
     # Displayed "intended" is the true unit, so the summary reads "placed $X of
     # $UNIT" + "Unfilled $Y" honestly (no longer lowered to what landed).
     display_intended = round(intended_stake, 2)
@@ -8888,13 +8996,15 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
 
 
 def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
-    """Per-account MLB HRRBI placement. v5.74 (Wilson 2026-06-17): the 1+/2+
-    HRRBI 2-leg SGM (multi) is EVEN-SPLIT $400/4 = $100 and placed CONCURRENTLY
-    across the FOUR SGM-capable accounts (MLB_SGM_SESSION_PRIORITY: Adam 65465 /
-    Wilson 53522 / Daniel 68723 / Ryan 102506), each laddering DOWN 100/90/85/80%
-    of its $100 stake on a bookie reject (MLB_HRRBI_LADDER_PCT). Whatever is
-    UNFILLED after the 4-way SGM (a rejected/under-filled account) SPILLS to Alex
-    65463 (MLB_HRRBI_SINGLE_SESSIONS) as a 2+ HRRBI SINGLE (Alex can't do multis).
+    """Per-account MLB HRRBI placement. v5.77 (Wilson 2026-06-20): the 1+/2+ HRRBI
+    2-leg SGM (multi) is EVEN-SPLIT across the THREE SGM-capable accounts
+    (MLB_SGM_SESSION_PRIORITY: Adam 65465 / Wilson 53522 / Daniel 68723 = $400/3 ~=
+    $133 each), each laddering DOWN 100/90/85/80% of its share on a bookie reject
+    (MLB_HRRBI_LADDER_PCT). Ryan 102506 was DROPPED from the SGM split (Sportsbet
+    returns "outcome is suspended code=540" on every HRRBI SGM for Ryan). Whatever
+    is UNFILLED after the SGM SPILLS to the SINGLE-only accounts in order
+    (MLB_HRRBI_SINGLE_SESSIONS = Alex 65463 then Ryan 102506) as 2+ HRRBI SINGLES
+    (neither can do multis). [v5.74 history: was a 4-way SGM incl. Ryan + Alex single.]
     Anything still unfilled after Alex -> ONE consolidated manual-placement
     Telegram alert. Only the validated HRRBI shape reaches here (place_tip gates
     on _is_mlb_hrrbi_sgm). [v5.0/v5.38 history: was 3 SGM accounts on the
@@ -10521,15 +10631,24 @@ def _img_coerce_int(v):
 # the cost of keeping chatter is just a ping. Bet TYPES + race/odds/stake
 # patterns are handled separately below.
 _IMAGE_ACTIONABLE_KEYWORDS = (
-    # instructions / changes
+    # instructions / changes (NEVER drop a pull-the-bet / line-change message —
+    # the cost of missing a scratching is a bet you should've pulled).
     "scratch", "scratched", "scratching", "non runner", "non-runner",
     "late mail", "mail", "update", "remove", "removed", "cancel", "cancelled",
-    "off the", "adding", "added", "add",
-    # bet types / racing terms
+    "off the", "adding", "added",
+    # bet TYPES — a concrete bet STRUCTURE, not betting vocabulary.
     "each way", "e/w", "multi", "double", "treble", "quaddie", "quadrella",
     "trifecta", "quinella", "exacta", "exotic", "first 4", "first four",
-    "sgm", "srm", "same race", "back", "lay", "selection", "selections",
-    "runner", "runners", "to win", "the win", "the place", "odds", "tip", "tips",
+    "sgm", "srm", "same race",
+    # v5.77 (Wilson 2026-06-20): REMOVED the soft betting-VOCABULARY words that
+    # fire on commentary, NOT a tip — "odds"/"tip"/"tips"/"back"/"lay"/"selection"/
+    # "selections"/"runner"/"runners"/"to win"/"the win"/"the place"/"add". They
+    # pinged manual on Eddie chatter ("Just running the ODDS for the last bets",
+    # "Not sure many would've picked X last night", 06-19). A REAL text tip still
+    # pings via a concrete selection pattern (race/$/units/decimal-odds/X+) or a
+    # bet-type/instruction above — so no real tip is missed (tips carry structure;
+    # the actual play is posted as an IMAGE anyway). "add" dropped too ("add me");
+    # "adding"/"added" kept (leg changes). The image channel is the primary path.
 )
 # Matched as whole words (\b...\b) so "multi" doesn't fire on "multiple",
 # "tip" doesn't fire on inflections we didn't mean, etc.
@@ -10596,7 +10715,24 @@ def _image_text_selection_pattern(t: str) -> bool:
         return True
     if re.search(r"\b\d+(?:\.\d+)?\s*u\b", t):   # 0.5u / 2u units
         return True
-    if re.search(r"\b\d+\.\d{1,2}\b", t):        # decimal odds e.g. 2.50
+    # v5.77: X+ threshold (a strong tip signal — "25+ disposals", "2+ goals").
+    if re.search(r"\b\d{1,2}\+", t):
+        return True
+    # v5.77: an OVER/UNDER LINE ("over 30", "under 23.5", "o30", "u23") — a concrete
+    # player-prop selection even with no unit/decimal-odds. Keeps a real text tip
+    # like "Back Bont o30 disposals" pinging after 'back'/'over'/'under' were
+    # dropped from the keyword list, WITHOUT re-pinging chatter ("u18s" / "go30"
+    # don't match — the trailing word char / leading non-boundary fails \b).
+    if re.search(r"\b(?:over|under)\s+\d{1,3}(?:\.\d)?\b", t):
+        return True
+    if re.search(r"\b[ou]\d{1,2}(?:\.\d)?\b", t):
+        return True
+    # decimal odds e.g. 2.50 — but NOT a CLOCK TIME ("8.30 am", "8-8.30 AM SA
+    # time" — 06-19 "eyeing a goal scorer pick for around 8-8.30 AM" pinged manual
+    # because 8.30 matched as odds). A decimal followed by am/pm is a time, skip it.
+    for _m in re.finditer(r"\b\d{1,3}\.\d{1,2}\b", t):
+        if re.match(r"\s*(?:am|pm)\b", t[_m.end():_m.end() + 6]):
+            continue
         return True
     if re.search(r"\brace\s*\d", t):             # "race 5"
         return True
@@ -10915,9 +11051,13 @@ def _afl_disambiguate_surname_by_odds(scoped: list, game_labels: list, token: st
     the tip's quoted odds (`tip_odds`). The candidate whose catalog price is
     within `odds_tol` (fractional, default 20%) of the tip price is the bet.
 
-    Resolution rule (money-path safe — never guess a $400 bet):
-      - EXACTLY ONE candidate's catalog odds in tolerance -> resolve to it.
-      - ZERO in tolerance, or TWO+ in tolerance -> None (caller -> manual).
+    Resolution rule (v5.77, Wilson 2026-06-20):
+      - resolve to the IN-RANGE (within odds_tol of tip) candidate whose catalog
+        odds is CLOSEST to the tip price; ZERO in range -> None (manual); a genuine
+        EQUIDISTANT tie between the top two -> None (manual). WAS: require EVERY
+        candidate priced AND exactly one in range -> bailed to manual when a
+        same-surname sibling simply had no market for the prop (06-19 Noah Anderson
+        o28.5 disposals priced while defender Cody Anderson had no such line).
     Also returns None on any missing context (no tip odds / stat / line / side),
     no owned sportsbet session, or a price-check failure. Returns (name, team)
     or None.
@@ -11000,25 +11140,40 @@ def _afl_disambiguate_surname_by_odds(scoped: list, game_labels: list, token: st
                 f"Eddie surname '{token}' collision: candidate '{name}' ({team}) "
                 f"catalog @ {cat_odds} OUTSIDE {odds_tol:.0%} of tip {tip_odds_f} -> excluded"
             )
-    # Resolve ONLY when we priced EVERY same-surname candidate and exactly one is
-    # in range. If a candidate was missing from the catalog (no event / no prop /
-    # price-check fail), we did NOT see its price — the lone in-range hit could be
-    # the WRONG player while the intended one is simply absent. Incomplete info ->
-    # manual (never guess a $400 bet). Wilson's "exactly one in range" rule still
-    # holds; this just refuses to apply it on a partial probe.
-    if len(in_range) == 1 and probed == len(scoped):
-        name, team, cat_odds = in_range[0]
+    # v5.77 (Wilson 2026-06-20): resolve to the candidate whose catalog odds is
+    # CLOSEST to the tipped odds among those in range. PRIOR rule required EVERY
+    # same-surname candidate to be priced AND exactly one in range — so it bailed
+    # to manual when a same-surname sibling simply had no market for the tipped
+    # prop (06-19 Noah Anderson o28.5 disposals @1.84 priced — the obvious bet for
+    # 28.5 disposals — while defender Cody Anderson had no such line; tie-break
+    # "inconclusive" -> manual). Now: 0 in range -> manual; else pick the in-range
+    # candidate nearest the tip price; a genuine TIE (two equidistant) -> manual.
+    # The 20% odds_tol still gates which candidates are even eligible, and the
+    # placement odds-guard (target = 0.9x tipped) backstops a bad price.
+    if not in_range:
         log.info(
-            f"Eddie surname-collision RESOLVED '{token}' -> '{name}' ({team}) "
-            f"via odds tie-break (catalog @ {cat_odds} ~ tip {tip_odds_f}; "
-            f"priced all {probed}/{len(scoped)} candidates) [{'; '.join(game_labels)}]"
+            f"Eddie surname '{token}' collision odds tie-break inconclusive "
+            f"(0 of {len(scoped)} candidates priced within {odds_tol:.0%} of "
+            f"tip {tip_odds_f}; priced {probed}/{len(scoped)}) -> manual"
         )
-        return name, team
+        return None
+    in_range.sort(key=lambda t: abs(t[2] - tip_odds_f))
+    if (len(in_range) >= 2
+            and abs(abs(in_range[0][2] - tip_odds_f)
+                    - abs(in_range[1][2] - tip_odds_f)) < 0.01):
+        log.info(
+            f"Eddie surname '{token}' collision: top 2 candidates EQUIDISTANT "
+            f"from tip {tip_odds_f} -> manual"
+        )
+        return None
+    name, team, cat_odds = in_range[0]
     log.info(
-        f"Eddie surname '{token}' collision odds tie-break inconclusive "
-        f"({len(in_range)} in range, priced {probed}/{len(scoped)} candidates) -> manual"
+        f"Eddie surname-collision RESOLVED '{token}' -> '{name}' ({team}) via odds "
+        f"tie-break (catalog @ {cat_odds} CLOSEST to tip {tip_odds_f}; "
+        f"{len(in_range)}/{len(scoped)} in range, priced {probed}/{len(scoped)}) "
+        f"[{'; '.join(game_labels)}]"
     )
-    return None
+    return name, team
 
 
 # Eddie posts bare-surname props anywhere from ~30 min to ~2 h before bounce, not
@@ -11030,6 +11185,14 @@ def _afl_disambiguate_surname_by_odds(scoped: list, game_labels: list, token: st
 # surface MORE same-surname candidates, but the odds tie-break + the
 # manual-on-any-ambiguity safety below still apply (never guess a $400 bet).
 EDDIE_GAME_LOOKAHEAD_SEC = 7200  # 2 hours (was the resolver default 2700 = 45 min)
+
+# v5.77 (Wilson 2026-06-20): when the EXACT bare-surname match misses on the
+# in-play teams (a vision typo — 06-19 "D'Ambrossio" vs roster "D'Ambrosio",
+# which scores ~0.95), fall back to a FUZZY surname match SCOPED to just that
+# game's ~44 players, resolving ONLY if a SINGLE player is within threshold
+# (else manual). 0.85 (not 0.95) because D'Ambrossio scores 0.947 — 0.95 would
+# miss it; uniqueness within the tiny game-scoped pool prevents a false match.
+EDDIE_SURNAME_FUZZY_THRESHOLD = float(os.getenv("EDDIE_SURNAME_FUZZY_THRESHOLD", "0.85"))
 
 # Eddie AFL image tips: when the vision parse can't read the unit sizing off the
 # image (units null/0 — e.g. Eddie put it in a SEPARATE follow-up message we don't
@@ -11120,6 +11283,27 @@ def _resolve_eddie_surname_to_player(token: str, msg_time, stat: str = None,
                 return tie
             log.info(f"Eddie surname '{token}' collision via {via} "
                      f"(hits: {sorted(names)}) — odds tie-break inconclusive")
+        if not names:
+            # v5.77 (Wilson): EXACT surname found NO player on the in-play teams —
+            # usually a vision typo (06-19 "D'Ambrossio" -> roster "D'Ambrosio").
+            # Fuzzy-match the token against ONLY these ~44 players; resolve solely
+            # when a SINGLE player is within threshold (else manual — never guess).
+            try:
+                fz = afl_fuzzy_surname_candidates(token, EDDIE_SURNAME_FUZZY_THRESHOLD)
+            except Exception as e:
+                log.warning(f"Eddie surname fuzzy fallback failed: {e}")
+                fz = []
+            fz_scoped = [c for c in fz if team_key(c.get("team", "")) in keys]
+            fz_names = {c["name"] for c in fz_scoped}
+            if len(fz_names) == 1:
+                hit = fz_scoped[0]
+                log.info(f"Eddie surname '{token}' -> '{hit['name']}' ({hit['team']}) "
+                         f"via {via} FUZZY surname (score {hit.get('score')}; "
+                         f"exact missed — likely a typo) [{'; '.join(labels)}]")
+                return hit["name"], hit["team"]
+            if len(fz_names) >= 2:
+                log.info(f"Eddie surname '{token}' FUZZY fallback ambiguous via {via} "
+                         f"(hits: {sorted(fz_names)}) -> manual")
         return None
 
     # Tier 1: teams in a game within the 2h window / in progress — the precise,

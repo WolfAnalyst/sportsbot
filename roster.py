@@ -716,6 +716,40 @@ def afl_surname_candidates(token: str) -> list:
     return out
 
 
+def afl_fuzzy_surname_candidates(token: str, threshold: float = 0.85) -> list:
+    """v5.77: like afl_surname_candidates but FUZZY — AFL players whose surname is
+    within `threshold` (difflib SequenceMatcher ratio) of the normalised `token`.
+
+    For an Eddie bare-surname the EXACT match missed because of a vision typo
+    (2026-06-19: "D'Ambrossio" vision-read vs roster "D'Ambrosio" -> exact miss ->
+    manual; the misspelling scores ~0.95). Returns [{"name","team","score"}, ...]
+    sorted by score desc, possibly empty/several. SAFETY: the CALLER MUST scope to
+    the in-play teams AND require uniqueness — NEVER resolve a $400 bet on a fuzzy
+    surname league-wide. Short tokens (<4 chars) return [] (too risky to fuzz)."""
+    _load_rosters()
+    tok = _afl_token_norm(token)
+    if not tok or len(tok) < 4:
+        return []
+    import difflib
+    out = []
+    for _, info in _afl_roster.items():
+        name = info.get("name", "")
+        parts = name.split()
+        if len(parts) < 2:
+            continue
+        last_tok = _afl_token_norm(parts[-1])
+        full_surname = _afl_token_norm(" ".join(parts[1:]))
+        score = max(
+            difflib.SequenceMatcher(None, tok, last_tok).ratio(),
+            difflib.SequenceMatcher(None, tok, full_surname).ratio(),
+        )
+        if score >= threshold:
+            out.append({"name": name, "team": info.get("team", ""),
+                        "score": round(score, 3)})
+    out.sort(key=lambda c: c["score"], reverse=True)
+    return out
+
+
 def update_roster_from_api():
     """
     Fetch current NBA rosters from NBA.com via nba_api package.

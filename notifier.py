@@ -1130,20 +1130,40 @@ def notify_sports_mbl_violation(tip, details) -> bool:
 
 def notify_tiptitans_unfilled(
     tip_id, parsed, intended_stake, placed_stake, unfilled,
-    failures, below_floor, tipster_odds, bookie_quotes=None,
+    failures, below_floor, tipster_odds, bookie_quotes=None, skipped=None,
 ) -> bool:
     """Unfilled stake alert - goes to Manual Bets (#1).
 
     `bookie_quotes` (optional) shows the price-shop snapshot inline so the
     user can see what was available without log lookup.
+    `skipped` (v5.77, optional): in-range sessions skipped BEFORE any attempt
+    (do-not-bet / cap=0) — surfaced so a partial unfill isn't a blank
+    "(no failure details)" (the Minor Catastrophe 06-19 case).
     """
     saddle_str = f"{parsed.get('saddle')}. " if parsed.get("saddle") else ""
     failure_lines = []
-    for f in failures[-3:]:  # last 3 failures
+    for f in failures[-3:]:  # last 3 placement failures (tried + error)
         err = (f.get("error") or "")[:160]
         failure_lines.append(
             f"  {f.get('bookie', '?')} (s{f.get('session_id', '?')}) "
             f"${f.get('stake_tried', 0):.0f}: {err}"
+        )
+    # v5.77 (Wilson 2026-06-20): explain WHY the in-range sessions didn't take the
+    # rest of the stake, instead of a bare "(no failure details)". List the
+    # in-range sessions that were DISABLED (do-not-bet) and summarise how many
+    # priced-but-BELOW-FLOOR (value gone). Minor Catastrophe 06-19: 13/18 below
+    # floor + 4 placeable accounts do-not-bet at Gloucester Park -> $1009 manual.
+    for s in (skipped or [])[-4:]:
+        failure_lines.append(
+            f"  {s.get('bookie', '?')} (s{s.get('session_id', '?')}): "
+            f"{(s.get('reason') or 'skipped (do-not-bet)')[:80]}"
+        )
+    _bf = [q for q in (bookie_quotes or []) if q.get("status") == "below_floor"]
+    if _bf:
+        _best = max((q.get("odds") or 0) for q in _bf)
+        failure_lines.append(
+            f"  {len(_bf)} bookie(s) below floor"
+            + (f" (best {_best} < tipster {tipster_odds})" if _best else "")
         )
     failures_str = "\n".join(failure_lines) or "  (no failure details)"
 
