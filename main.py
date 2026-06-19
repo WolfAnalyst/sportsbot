@@ -3711,15 +3711,15 @@ def _afl_fanout_targets(sessions: list, sport: str, market: str,
     return {s: round(intended * w / total, 2) for s, w in weights.items()}, None
 
 
-def _is_afl_disposals_fanout(tip: ParsedTip) -> bool:
-    """v5.78 (Wilson 2026-06-20): True for ANY AFL DISPOSALS fan-out single — the
-    scope for the redistribute-to-successful-bookies top-up. BOTH tipsters (Saiyan
-    + Eddie) and BOTH directions (over + under): whatever the first fan-out round
-    leaves unfilled gets ONE reroute onto the accounts that placed; if that reroute
-    can't fill it either, it's manual ("it is what it is"). v5.77 was Eddie OVERS
-    only ("unders too hard"); Wilson 06-20 widened it — Saiyan bets disposals
-    UNDERS, Eddie OVERS, both should reroute. SGMs are on a different path (never
-    reach _place_afl_fanout) so they're excluded automatically."""
+def _is_afl_disposals_over(tip: ParsedTip) -> bool:
+    """v5.79 (Wilson 2026-06-20): True for an AFL DISPOSALS-OVER fan-out single (any
+    tipster — Saiyan or Eddie) — the scope for the redistribute-to-successful reroute.
+    OVERS ONLY: v5.78 briefly widened it to unders too, but the UNDER per-account cap
+    ([124,99,74,50]) is far below the OVER/threshold cap ([300,250,200,150]), so the
+    accounts that already placed an under have little headroom — rerouting an under's
+    leftover just re-rejects. Overs have the headroom, so ONLY overs reroute; an under
+    that doesn't fill first time is left as-is -> manual ("it is what it is"). SGMs are
+    on a different path (never reach _place_afl_fanout) so they're excluded anyway."""
     if (getattr(tip, "sport", "") or "").lower() != "afl":
         return False
     leg = tip.legs[0] if getattr(tip, "legs", None) else None
@@ -3727,7 +3727,11 @@ def _is_afl_disposals_fanout(tip: ParsedTip) -> bool:
         return False
     stat = (getattr(leg, "stat", "") or "").lower()
     mkt = (getattr(leg, "market", "") or "").lower()
-    return "disposals" in stat or "disposals" in mkt
+    if not ("disposals" in stat or "disposals" in mkt):
+        return False
+    side = (getattr(leg, "selection", "") or "").strip().lower()
+    return ((side == "over" or side.endswith(" over")
+             or getattr(tip, "_is_threshold", False)) and "under" not in side)
 
 
 def _afl_redistribute_topup(tip, placed_results, unfilled,
@@ -4208,11 +4212,13 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # When the fan-out leaves stake unfilled (an account failed — e.g. Alex 65463
     # low balance — or laddered down) AND others placed, re-split the WHOLE unfilled
     # remainder across the accounts that worked and top each up (100/90/80/70%
-    # ladder). ALL AFL disposals fan-out (Saiyan + Eddie, over + under) — ONE reroute
-    # round. Each top-up is capped at its 1/n share (no over-stake) and reuses the
-    # ladder (ambiguous -> stop, no double-stake).
+    # ladder). AFL disposals OVERS only (any tipster) — ONE reroute round. v5.79:
+    # UNDERS excluded (their per-account cap [124,99,74,50] is far below the OVER cap
+    # [300,250,200,150], so placed accounts have no headroom to absorb a reroute — it
+    # just re-rejects). Each top-up is capped at its 1/n share (no over-stake) and
+    # reuses the ladder (ambiguous -> stop, no double-stake).
     if (AFL_DISPOSALS_REDISTRIBUTE and unfilled > AFL_FANOUT_MIN_STAKE
-            and placed_results and _is_afl_disposals_fanout(tip)):
+            and placed_results and _is_afl_disposals_over(tip)):
         _sess_by_sid = {str(s.get("session_id", "")): s for (s, _l, _r) in jobs}
         _res_by_sid = {str(s.get("session_id", "")): _r for (s, _l, _r) in jobs}
         _topups = _afl_redistribute_topup(
