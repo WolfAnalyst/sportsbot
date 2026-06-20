@@ -24,6 +24,13 @@ log = logging.getLogger(__name__)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+# v5.80: decouple the text and vision models so they can be tuned/swapped
+# independently (and swapped mid-incident via .env without a redeploy). Vision
+# MUST stay a multimodal model (scout/maverick); text may be a stronger
+# text-only model. Empty env -> the legacy single GROQ_MODEL (no behaviour
+# change). This is the FIRST-STAGE model; the Claude fallback is the recovery.
+GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "").strip() or GROQ_MODEL
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "").strip() or GROQ_MODEL
 
 
 def _parse_json_with_repair(content: str) -> Optional[dict]:
@@ -997,7 +1004,7 @@ def parse_tip_image(
     b64 = base64.b64encode(image_bytes).decode()
     mime = _image_mime(image_bytes)
     body = {
-        "model": GROQ_MODEL,
+        "model": GROQ_VISION_MODEL,
         "temperature": 0,
         "max_tokens": 4000,
         "messages": [{
@@ -1122,7 +1129,7 @@ def parse_racing_text(
     if not (text or "").strip():
         return [], 0.0
     body = {
-        "model": GROQ_MODEL,
+        "model": GROQ_TEXT_MODEL,
         "temperature": 0,
         "max_tokens": 2000,
         "messages": [
@@ -1229,7 +1236,7 @@ def parse_with_groq(
                 "Content-Type": "application/json",
             },
             json={
-                "model": GROQ_MODEL,
+                "model": GROQ_TEXT_MODEL,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": f"Tipster: {tipster}\nSport: {sport if sport != 'auto' else 'DETECT FROM MESSAGE'}\nMessage:\n{groq_input}"},

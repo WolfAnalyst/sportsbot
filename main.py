@@ -63,6 +63,7 @@ from roster import resolve_player_name, get_player_team, afl_surname_candidates,
 import notifier
 import session_priority
 import stat_fallback
+import tip_parser  # v5.80: per-call Claude recovery layer (fallback + resolvers)
 
 # ── Logging ─────────────────────────────────────────────────────────
 
@@ -915,6 +916,15 @@ if parse_ausbets_message is not None:
 if parse_kev_message is not None:
     REGEX_PARSERS["kev_nba"] = parse_kev_message
 
+# v5.80 (5-opus review SHOULD-FIX 1): the Claude TEXT fallback is restricted to
+# this ALLOW-LIST of tipsters that place through a PRICE-CHECKED path. It must
+# NOT fire for blind/no-price-check fan-out tipsters (etr_nba places at any odds
+# with no price gate via _place_etr_nba_fanout) — a Claude-recovered tip there
+# would auto-place blind with no odds backstop. Shook (MLB HRRBI) is the intended
+# + price-gated target. Add a tipster here only after confirming its placement
+# path has a price/odds gate.
+CLAUDE_TEXT_FALLBACK_TIPSTERS = {"shook"}
+
 
 def route_message(
     text: str, tipster: str, sport: str,
@@ -967,6 +977,36 @@ def route_message(
             and len(text) > 40
         )
         if looks_like_bet:
+            # v5.80 RECOVERY: a Groq-only tipster (Shook) lost a real bet to a
+            # Groq parse failure. BEFORE routing to manual, retry the parse with
+            # Claude (Opus 4.8). Gated on looks_like_bet so it can ONLY fire on a
+            # genuine bet-shaped message — never on no-bet/chatter (the AusBets
+            # phantom-bet hole). Claude tips re-enter the identical placement
+            # gates downstream. 2026-06-20: 4 Shook HRRBI SGMs lost this way.
+            # SCOPED to CLAUDE_TEXT_FALLBACK_TIPSTERS (price-checked paths only) —
+            # never a blind fan-out tipster like etr_nba (5-opus review).
+            if tipster in CLAUDE_TEXT_FALLBACK_TIPSTERS and tip_parser._claude_fallback_enabled():
+                try:
+                    c_tips, c_time = tip_parser.parse_text_fallback(
+                        parser_text, tipster, sport, unit_size, default_units,
+                    )
+                    timing["claude_fallback"] = round(c_time, 3)
+                    if c_tips:
+                        log.warning(
+                            f"CLAUDE FALLBACK recovered {len(c_tips)} text tip(s) "
+                            f"for '{tipster}' after Groq returned 0"
+                        )
+                        timing["parser"] = "claude_fallback"
+                        try:
+                            notifier.notify_info(
+                                f"\U0001f7e2 CLAUDE FALLBACK: recovered {len(c_tips)} "
+                                f"'{tipster}' tip(s) after a Groq parse failure"
+                            )
+                        except Exception:
+                            pass
+                        return c_tips, timing
+                except Exception as e:
+                    log.error(f"Claude text fallback failed for {tipster}: {e}")
             log.warning(
                 f"Groq-only tipster '{tipster}' returned 0 tips on a "
                 f"bet-looking message — possible parse failure"
@@ -10861,6 +10901,7 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
     for logging + Tip-Titans-style notifications."""
     track = _normalise_racing_track(raw.get("track")) or None
     track_inferred = False
+    sa_track_claude_resolved = False  # v5.80: track came from the Claude web-search resolver
     if track:
         _tipster_last_track[tipster] = (track, time.time())
     else:
@@ -10901,12 +10942,40 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
     race_type = (raw.get("race_type") or "").strip()
     if not race_type and discipline == "thoroughbred":
         race_type = "(R)"
+
+    # v5.80 RECOVERY (Zak track=None, 2026-06-20): Zak Trussell is SA-only. When
+    # the v5.59 forward-fill found NO prior track (his first post of the day is a
+    # trackless image), ask Claude (web-search) for TODAY's SA thoroughbred
+    # meeting that runs this runner. ONLY the track is supplied -> the existing
+    # price-shop still matches the runner NUMBER+NAME on that track's card and
+    # applies the odds floor, so a wrong/hallucinated track simply fails the card
+    # match -> manual (never a wrong-track bet). Flagged "(track inferred)".
+    if (track is None and tipster == "zak_racing" and runner and race_num is not None
+            and tip_parser._claude_websearch_enabled()):
+        try:
+            import claude_parser
+            import datetime as _dt
+            _date_str = msg_time.strftime("%Y-%m-%d") if msg_time else _dt.date.today().isoformat()
+            _sa_track = claude_parser.resolve_sa_track_today(race_num, runner, _date_str)
+            if _sa_track:
+                track = _normalise_racing_track(_sa_track) or _sa_track
+                track_inferred = True
+                sa_track_claude_resolved = True  # forces NAME-or-manual in racing_placer (no saddle-only)
+                log.warning(
+                    f"[zak_racing] track=None -> CLAUDE WEB-SEARCH resolved SA track "
+                    f"'{track}' for R{race_num} {runner}. NAME match REQUIRED downstream "
+                    f"(saddle-only disabled) + odds floor -> wrong track = manual."
+                )
+        except Exception as e:
+            log.error(f"Claude SA-track resolve failed: {e}")
+
     return {
         "id": f"img-{tipster}-{race_num}-{saddle}-{idx}",
         "titan": titan,
         "discipline": discipline,
         "track": track,
         "track_inferred": track_inferred,  # v5.59: forward-filled from memory
+        "sa_track_claude_resolved": sa_track_claude_resolved,  # v5.80: NAME-or-manual gate
         "race_num": race_num,
         "race_type": race_type,
         "runner": runner,
@@ -11480,6 +11549,25 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
                 except Exception as e:
                     log.warning(f"get_player_team failed for {player!r}: {e}")
                     inferred = ""
+        if (not inferred and len(player.split()) >= 2
+                and tip_parser._claude_websearch_enabled()):
+            # v5.80 RECOVERY (Hugo Hall-Kahan, 2026-06-20): the stale roster
+            # can miss a just-listed player (mid-season rookie draftee). Ask
+            # Claude (web-search) for the player's CURRENT club. This only
+            # supplies the TEAM -> the existing event resolve + bookie
+            # catalog price-check + odds floor still gate the bet, so a wrong
+            # resolve just fails to price -> manual (never a blind bet).
+            try:
+                import claude_parser
+                _team = claude_parser.resolve_afl_player_team(player)
+                if _team:
+                    inferred = _team
+                    log.warning(
+                        f"CLAUDE WEB-SEARCH resolved AFL player '{player}' -> "
+                        f"'{inferred}' (roster miss; still gated on bookie catalog + odds)"
+                    )
+            except Exception as e:
+                log.error(f"Claude player resolve failed for {player!r}: {e}")
         if not inferred:
             alert_only = True
             alert_reason = (
@@ -11719,12 +11807,40 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
                 f"(no manual ping): {raw_caption[:100]}"
             )
             return
-        log.info(f"[{channel_name}] vision parse returned 0 tips")
-        cap = f" — {raw_caption[:120]}" if raw_caption else ""
-        notifier.notify_image_alert(
-            channel_name, f"(image received but no bettable tips parsed){cap}"
-        )
-        return
+        # v5.80 RECOVERY: a GENUINE parse failure on a real tip image (we are
+        # past the v5.58 summary/recap suppress above, so this is NOT a no-bet
+        # image). Retry the VISION parse with Claude (Opus 4.8) BEFORE routing to
+        # manual. 2026-06-20: 5 Eddie evening disposal images lost to a Groq
+        # vision gibberish regression here. Claude tips re-enter the identical
+        # routing/roster/floor gates below.
+        if tip_parser._claude_fallback_enabled():
+            try:
+                c_tips, c_elapsed = await loop.run_in_executor(
+                    None, tip_parser.parse_image_fallback, image_bytes, tipster, sport_l
+                )
+                if c_tips:
+                    log.warning(
+                        f"[{channel_name}] CLAUDE VISION FALLBACK recovered "
+                        f"{len(c_tips)} tip(s) after Groq returned 0"
+                    )
+                    try:
+                        notifier.notify_info(
+                            f"\U0001f7e2 CLAUDE VISION FALLBACK: recovered {len(c_tips)} "
+                            f"'{channel_name}' tip(s) after a Groq vision failure"
+                        )
+                    except Exception:
+                        pass
+                    raw_tips, elapsed = c_tips, c_elapsed
+            except Exception as e:
+                log.error(f"[{channel_name}] Claude vision fallback failed: {e}")
+        if not raw_tips:
+            log.info(f"[{channel_name}] vision parse returned 0 tips")
+            cap = f" — {raw_caption[:120]}" if raw_caption else ""
+            notifier.notify_image_alert(
+                channel_name, f"(image received but no bettable tips parsed){cap}"
+            )
+            return
+        # else: Claude recovered tips -> fall through to normal routing below.
 
     log.info(
         f"[{channel_name}] vision extracted {len(raw_tips)} tip(s) in "
@@ -11793,6 +11909,28 @@ async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
         )
     except Exception as e:
         log.exception(f"[{channel_name}] text racing parse crashed: {e}")
+        # v5.80 RECOVERY: a Groq CRASH on a racing text post (NOT the by-design
+        # "0 tips = chatter" drop below) -> retry with Claude before manual.
+        # Gated to the crash path only so it can never fire on chatter (which
+        # would risk inventing a bet — the AusBets hole).
+        if tip_parser._claude_fallback_enabled():
+            try:
+                _loop = asyncio.get_event_loop()
+                c_tips, c_elapsed = await _loop.run_in_executor(
+                    None, tip_parser.parse_racing_text_fallback, text, tipster
+                )
+                if c_tips:
+                    log.warning(
+                        f"[{channel_name}] CLAUDE RACING-TEXT FALLBACK recovered "
+                        f"{len(c_tips)} tip(s) after Groq crashed"
+                    )
+                    await _route_image_racing_tips(
+                        c_tips, tipster, channel_name, unit_size, default_units, msg_time,
+                        pipeline_start=_t0, parse_sec=round(c_elapsed, 3),
+                    )
+                    return
+            except Exception as ce:
+                log.error(f"[{channel_name}] Claude racing-text fallback failed: {ce}")
         try:
             notifier.notify_image_alert(channel_name, text)  # never lose a real tip
         except Exception:
