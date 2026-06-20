@@ -43,7 +43,7 @@ import os
 
 from config import (
     TIP_PARSER_PROVIDER, ANTHROPIC_API_KEY,
-    CLAUDE_FALLBACK_ENABLED, CLAUDE_WEBSEARCH_RESOLVE,
+    CLAUDE_FALLBACK_ENABLED, CLAUDE_WEBSEARCH_RESOLVE, CLAUDE_PRIMARY,
 )
 from models import ParsedTip, ParsedLeg
 import groq_parser
@@ -93,6 +93,16 @@ def _claude_websearch_enabled() -> bool:
     if os.getenv("TIPBOT_TESTING"):
         return False  # the unit suite must NEVER hit the Claude web_search API
     return CLAUDE_FALLBACK_ENABLED and CLAUDE_WEBSEARCH_RESOLVE and _claude_available()
+
+
+def _claude_primary_enabled() -> bool:
+    """v5.83 CLAUDE PRIMARY gate: parse EVERYTHING with Claude up front, skipping
+    Groq. True only when CLAUDE_PRIMARY is set AND Claude is usable (key + SDK).
+    Inert under TIPBOT_TESTING (tests use the mocked Groq path) and FALSE when
+    Claude is unavailable (so the fork without a key stays on Groq)."""
+    if os.getenv("TIPBOT_TESTING"):
+        return False
+    return CLAUDE_PRIMARY and _claude_available()
 
 
 # ── Per-call fallback wrappers (Opus 4.8) ────────────────────────────

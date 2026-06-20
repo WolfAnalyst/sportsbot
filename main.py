@@ -920,10 +920,15 @@ if parse_kev_message is not None:
 # this ALLOW-LIST of tipsters that place through a PRICE-CHECKED path. It must
 # NOT fire for blind/no-price-check fan-out tipsters (etr_nba places at any odds
 # with no price gate via _place_etr_nba_fanout) — a Claude-recovered tip there
-# would auto-place blind with no odds backstop. Shook (MLB HRRBI) is the intended
-# + price-gated target. Add a tipster here only after confirming its placement
-# path has a price/odds gate.
-CLAUDE_TEXT_FALLBACK_TIPSTERS = {"shook"}
+# would auto-place blind with no odds backstop. Add a tipster here only after
+# confirming its placement path price-checks the market.
+#   - shook: MLB HRRBI -> price-checked SGM/single path.
+#   - saiyan_afl (v5.82): AFL singles/SGM -> price-checked fan-out (_place_afl_fanout
+#     resolves the market in the catalog before placing). Added after a real
+#     2026-06-21 09:00 Saiyan SGM (LDU 24+/Campbell 13+ @1.88) was lost to a Groq
+#     invalid-JSON gibberish failure -> manual, because the v5.80 fallback only
+#     covered Groq-ONLY tipsters and saiyan is a REGEX tipster (Groq+regex both fail).
+CLAUDE_TEXT_FALLBACK_TIPSTERS = {"shook", "saiyan_afl"}
 
 
 def route_message(
@@ -950,15 +955,25 @@ def route_message(
     if tipster == "saiyan_afl":
         parser_text = _preprocess_saiyan_emojis(text)
 
-    # Step 1: Try Groq LLM parser
-    groq_tips, groq_time = parse_with_groq(
-        parser_text, tipster=tipster, sport=sport,
-        unit_size=unit_size, default_units=default_units,
-    )
+    # Step 1: parse. v5.83 CLAUDE PRIMARY skips Groq entirely (scout deprecated +
+    # gibberish-prone; the Groq-fail-then-fallback round-trip was too slow). The
+    # Claude result flows through the IDENTICAL downstream gates — pure parser
+    # swap. Falls back to Groq only when Claude is unavailable (fork without a key).
+    if tip_parser._claude_primary_enabled():
+        groq_tips, groq_time = tip_parser.parse_text_fallback(
+            parser_text, tipster, sport, unit_size, default_units,
+        )
+        _parser_name = "claude_primary"
+    else:
+        groq_tips, groq_time = parse_with_groq(
+            parser_text, tipster=tipster, sport=sport,
+            unit_size=unit_size, default_units=default_units,
+        )
+        _parser_name = "groq"
     timing["groq_parse"] = round(groq_time, 3)
 
     if groq_tips:
-        timing["parser"] = "groq"
+        timing["parser"] = _parser_name
         return groq_tips, timing
 
     # Step 2: Fallback to regex parser
@@ -1057,6 +1072,34 @@ def route_message(
                 f"Regex tipster '{tipster}': Groq AND regex both returned 0 "
                 f"tips on a bet-looking message — possible parse failure"
             )
+            # v5.82 RECOVERY: Groq AND the regex parser BOTH missed a bet-looking
+            # message (STRONG bet token + NOT no-bet framing — the same gate that
+            # decides this is a genuine miss, not chatter). Before routing to
+            # manual, retry with Claude (Opus). Scoped to CLAUDE_TEXT_FALLBACK_TIPSTERS
+            # (price-checked paths). 2026-06-21 09:00: a real Saiyan SGM was lost
+            # here to a Groq invalid-JSON gibberish failure with no fallback.
+            if tipster in CLAUDE_TEXT_FALLBACK_TIPSTERS and tip_parser._claude_fallback_enabled():
+                try:
+                    c_tips, c_time = tip_parser.parse_text_fallback(
+                        parser_text, tipster, sport, unit_size, default_units,
+                    )
+                    timing["claude_fallback"] = round(c_time, 3)
+                    if c_tips:
+                        log.warning(
+                            f"CLAUDE FALLBACK recovered {len(c_tips)} text tip(s) for "
+                            f"'{tipster}' after Groq+regex both returned 0"
+                        )
+                        timing["parser"] = "claude_fallback"
+                        try:
+                            notifier.notify_info(
+                                f"\U0001f7e2 CLAUDE FALLBACK: recovered {len(c_tips)} "
+                                f"'{tipster}' tip(s) after a Groq+regex parse failure"
+                            )
+                        except Exception:
+                            pass
+                        return c_tips, timing
+                except Exception as e:
+                    log.error(f"Claude text fallback failed for {tipster}: {e}")
             try:
                 notifier.notify_parse_error(
                     tipster, text[:400],
@@ -11787,9 +11830,16 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
     _t0 = time.time()
     try:
         loop = asyncio.get_event_loop()
-        raw_tips, elapsed = await loop.run_in_executor(
-            None, parse_tip_image, image_bytes, tipster, sport_l
-        )
+        # v5.83 CLAUDE PRIMARY: parse the image with Claude up front (skip Groq
+        # vision). Same downstream routing. Falls back to Groq if Claude unusable.
+        if tip_parser._claude_primary_enabled():
+            raw_tips, elapsed = await loop.run_in_executor(
+                None, tip_parser.parse_image_fallback, image_bytes, tipster, sport_l
+            )
+        else:
+            raw_tips, elapsed = await loop.run_in_executor(
+                None, parse_tip_image, image_bytes, tipster, sport_l
+            )
     except Exception as e:
         log.exception(f"[{channel_name}] image vision parse crashed: {e}")
         notifier.notify_image_alert(channel_name, f"(vision parse error: {e})")
@@ -11916,9 +11966,15 @@ async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
     try:
         from groq_parser import parse_racing_text
         loop = asyncio.get_event_loop()
-        raw_tips, elapsed = await loop.run_in_executor(
-            None, parse_racing_text, text, tipster
-        )
+        # v5.83 CLAUDE PRIMARY: parse racing text with Claude up front (skip Groq).
+        if tip_parser._claude_primary_enabled():
+            raw_tips, elapsed = await loop.run_in_executor(
+                None, tip_parser.parse_racing_text_fallback, text, tipster
+            )
+        else:
+            raw_tips, elapsed = await loop.run_in_executor(
+                None, parse_racing_text, text, tipster
+            )
     except Exception as e:
         log.exception(f"[{channel_name}] text racing parse crashed: {e}")
         # v5.80 RECOVERY: a Groq CRASH on a racing text post (NOT the by-design
