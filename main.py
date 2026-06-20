@@ -1000,7 +1000,8 @@ def route_message(
             # gates downstream. 2026-06-20: 4 Shook HRRBI SGMs lost this way.
             # SCOPED to CLAUDE_TEXT_FALLBACK_TIPSTERS (price-checked paths only) —
             # never a blind fan-out tipster like etr_nba (5-opus review).
-            if tipster in CLAUDE_TEXT_FALLBACK_TIPSTERS and tip_parser._claude_fallback_enabled():
+            if (tipster in CLAUDE_TEXT_FALLBACK_TIPSTERS and tip_parser._claude_fallback_enabled()
+                    and not tip_parser._claude_primary_enabled()):  # v5.84: primary already ran Claude
                 try:
                     c_tips, c_time = tip_parser.parse_text_fallback(
                         parser_text, tipster, sport, unit_size, default_units,
@@ -1078,7 +1079,8 @@ def route_message(
             # manual, retry with Claude (Opus). Scoped to CLAUDE_TEXT_FALLBACK_TIPSTERS
             # (price-checked paths). 2026-06-21 09:00: a real Saiyan SGM was lost
             # here to a Groq invalid-JSON gibberish failure with no fallback.
-            if tipster in CLAUDE_TEXT_FALLBACK_TIPSTERS and tip_parser._claude_fallback_enabled():
+            if (tipster in CLAUDE_TEXT_FALLBACK_TIPSTERS and tip_parser._claude_fallback_enabled()
+                    and not tip_parser._claude_primary_enabled()):  # v5.84: primary already ran Claude
                 try:
                     c_tips, c_time = tip_parser.parse_text_fallback(
                         parser_text, tipster, sport, unit_size, default_units,
@@ -11875,7 +11877,7 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
         # manual. 2026-06-20: 5 Eddie evening disposal images lost to a Groq
         # vision gibberish regression here. Claude tips re-enter the identical
         # routing/roster/floor gates below.
-        if tip_parser._claude_fallback_enabled():
+        if tip_parser._claude_fallback_enabled() and not tip_parser._claude_primary_enabled():
             try:
                 c_tips, c_elapsed = await loop.run_in_executor(
                     None, tip_parser.parse_image_fallback, image_bytes, tipster, sport_l
@@ -11981,7 +11983,7 @@ async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
         # "0 tips = chatter" drop below) -> retry with Claude before manual.
         # Gated to the crash path only so it can never fire on chatter (which
         # would risk inventing a bet — the AusBets hole).
-        if tip_parser._claude_fallback_enabled():
+        if tip_parser._claude_fallback_enabled() and not tip_parser._claude_primary_enabled():
             try:
                 _loop = asyncio.get_event_loop()
                 c_tips, c_elapsed = await _loop.run_in_executor(

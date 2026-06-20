@@ -200,11 +200,15 @@ def parse_tip_image_claude(image_bytes, tipster, sport, max_retries=4, model=Non
 
 
 def parse_racing_text_claude(text, tipster, model=None):
-    """Free-TEXT racing parse via Claude — mirrors `groq_parser.parse_racing_text`
-    (same RAW racing-dict schema the racing pipeline consumes). Returns
-    `(list[dict], elapsed)`; `([], elapsed)` on failure or chatter (never raises,
-    unlike the Groq version which raises on hard fail). Used as the FALLBACK when
-    Groq's racing-text parse returns nothing / raises."""
+    """Free-TEXT racing parse via Claude — mirrors `groq_parser.parse_racing_text`:
+    uses the dedicated free-text TEXT_PROMPT_RACING (NOT the image OCR prompt) and
+    RAISES on a HARD failure (API error / JSON-repair fail) so the caller routes a
+    genuine tip to MANUAL ('never lose a real tip'), matching Groq's behaviour.
+    Returns `([], elapsed)` ONLY for a clean valid-but-empty parse (real chatter).
+
+    v5.84 (5-opus review BLOCKER): the old version swallowed every error and
+    returned ([],t), so under CLAUDE PRIMARY a transient Claude failure on a real
+    Zak/Trial racing tip was silently dropped as 'chatter' with no manual alert."""
     start = time.time()
     if not ANTHROPIC_API_KEY:
         return [], 0.0
@@ -212,21 +216,20 @@ def parse_racing_text_claude(text, tipster, model=None):
         return [], 0.0
     model = model or CLAUDE_PARSER_MODEL
     user_content = f"Tipster: {tipster}\nMessage:\n{text}"
-    try:
-        content = _complete_text(groq_parser.IMAGE_PROMPT_RACING, user_content, model)
-    except Exception as e:
-        log.error(f"parse_racing_text_claude: request failed for {tipster}: {type(e).__name__}: {e}")
-        return [], time.time() - start
+    # NOTE: deliberately NOT wrapped in try/except — a request exception PROPAGATES
+    # so the caller's crash-recovery routes the tip to manual (do not swallow).
+    content = _complete_text(groq_parser.TEXT_PROMPT_RACING, user_content, model)
     elapsed = time.time() - start
 
     content = content.replace("```json", "").replace("```", "").strip()
     parsed = groq_parser._parse_json_with_repair(content)
     if parsed is None:
-        log.error(f"parse_racing_text_claude: invalid JSON (repair failed) for {tipster}")
-        return [], elapsed
+        # HARD failure (gibberish / repair-fail) -> RAISE so the caller alerts to
+        # manual, instead of returning [] which reads as 'chatter -> dropped'.
+        raise ValueError(f"parse_racing_text_claude: invalid JSON (repair failed) for {tipster}")
     tips = parsed.get("tips", [])
     if not isinstance(tips, list):
-        return [], elapsed
+        raise ValueError(f"parse_racing_text_claude: 'tips' not a list for {tipster}")
     log.info(f"parse_racing_text_claude ({model}): {tipster} extracted {len(tips)} raw tip(s) in {elapsed:.2f}s")
     return tips, elapsed
 
@@ -241,7 +244,10 @@ def parse_racing_text_claude(text, tipster, model=None):
 def _websearch_complete(system_prompt: str, user_content: str, model: str) -> str:
     """Run a web_search agentic loop and return the final text. Handles the
     server-tool `pause_turn` by re-sending until `end_turn` (capped)."""
-    client = _client()
+    # v5.84: bound each web-search round-trip (the resolvers currently run inline
+    # on the event loop; a tight timeout caps the worst-case block + a hung search
+    # fails to {} -> manual). Full run_in_executor offload is a tracked follow-up.
+    client = _client().with_options(timeout=40.0)
     messages = [{"role": "user", "content": user_content}]
     last = None
     for _ in range(_WEBSEARCH_MAX_TURNS):
