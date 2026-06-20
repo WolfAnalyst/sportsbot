@@ -10901,7 +10901,7 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
     for logging + Tip-Titans-style notifications."""
     track = _normalise_racing_track(raw.get("track")) or None
     track_inferred = False
-    sa_track_claude_resolved = False  # v5.80: track came from the Claude web-search resolver
+    track_claude_resolved = False  # v5.80/81: track came from the Claude web-search resolver
     if track:
         _tipster_last_track[tipster] = (track, time.time())
     else:
@@ -10943,31 +10943,43 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
     if not race_type and discipline == "thoroughbred":
         race_type = "(R)"
 
-    # v5.80 RECOVERY (Zak track=None, 2026-06-20): Zak Trussell is SA-only. When
-    # the v5.59 forward-fill found NO prior track (his first post of the day is a
-    # trackless image), ask Claude (web-search) for TODAY's SA thoroughbred
-    # meeting that runs this runner. ONLY the track is supplied -> the existing
-    # price-shop still matches the runner NUMBER+NAME on that track's card and
-    # applies the odds floor, so a wrong/hallucinated track simply fails the card
-    # match -> manual (never a wrong-track bet). Flagged "(track inferred)".
-    if (track is None and tipster == "zak_racing" and runner and race_num is not None
+    # v5.80/v5.81 RECOVERY (track=None): the THOROUGHBRED image tipsters (Zak =
+    # SA-only; Trial Sniper = any AU track) can give a runner+race with NO track
+    # (forward-fill empty). Ask Claude (web-search, Sonnet) which meeting runs
+    # that runner today. ONLY the track is taken -> the existing price-shop still
+    # matches the runner NUMBER+NAME on that card + applies the odds floor, and
+    # the resolved-track flag DISABLES the saddle-only fallback (NAME-or-manual),
+    # so a wrong/hallucinated track fails the card match -> manual (never a
+    # wrong-track bet). Zak uses the SA-scoped lookup; Trial uses the general
+    # runner-name lookup (the OC-harness / racenet style — name is the anchor,
+    # corrects the race#).
+    if (track is None and tipster in ("zak_racing", "trial_sniper")
+            and runner and race_num is not None
             and tip_parser._claude_websearch_enabled()):
         try:
             import claude_parser
             import datetime as _dt
             _date_str = msg_time.strftime("%Y-%m-%d") if msg_time else _dt.date.today().isoformat()
-            _sa_track = claude_parser.resolve_sa_track_today(race_num, runner, _date_str)
-            if _sa_track:
-                track = _normalise_racing_track(_sa_track) or _sa_track
+            _resolved = None
+            if tipster == "zak_racing":
+                _resolved = claude_parser.resolve_sa_track_today(race_num, runner, _date_str)
+            else:  # trial_sniper — general runner-name -> track (+ name-anchored race#)
+                _info = claude_parser.resolve_racing_runner(runner, race_num, _date_str)
+                if _info.get("track"):
+                    _resolved = _info["track"]
+                    if _info.get("race_num"):
+                        race_num = _info["race_num"]
+            if _resolved:
+                track = _normalise_racing_track(_resolved) or _resolved
                 track_inferred = True
-                sa_track_claude_resolved = True  # forces NAME-or-manual in racing_placer (no saddle-only)
+                track_claude_resolved = True  # forces NAME-or-manual in racing_placer (no saddle-only)
                 log.warning(
-                    f"[zak_racing] track=None -> CLAUDE WEB-SEARCH resolved SA track "
-                    f"'{track}' for R{race_num} {runner}. NAME match REQUIRED downstream "
+                    f"[{tipster}] track=None -> CLAUDE WEB-SEARCH resolved track "
+                    f"'{track}' R{race_num} for {runner}. NAME match REQUIRED downstream "
                     f"(saddle-only disabled) + odds floor -> wrong track = manual."
                 )
         except Exception as e:
-            log.error(f"Claude SA-track resolve failed: {e}")
+            log.error(f"Claude track resolve failed for {tipster}: {e}")
 
     return {
         "id": f"img-{tipster}-{race_num}-{saddle}-{idx}",
@@ -10975,7 +10987,7 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
         "discipline": discipline,
         "track": track,
         "track_inferred": track_inferred,  # v5.59: forward-filled from memory
-        "sa_track_claude_resolved": sa_track_claude_resolved,  # v5.80: NAME-or-manual gate
+        "track_claude_resolved": track_claude_resolved,  # v5.80/81: NAME-or-manual gate
         "race_num": race_num,
         "race_type": race_type,
         "runner": runner,

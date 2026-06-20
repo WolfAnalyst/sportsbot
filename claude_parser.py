@@ -35,17 +35,22 @@ import json
 import logging
 import time
 
-from config import ANTHROPIC_API_KEY, CLAUDE_PARSER_MODEL, CLAUDE_FALLBACK_MODEL
+from config import (
+    ANTHROPIC_API_KEY, CLAUDE_PARSER_MODEL, CLAUDE_FALLBACK_MODEL, CLAUDE_WEBSEARCH_MODEL,
+)
 import groq_parser  # reuse SYSTEM_PROMPT, IMAGE_PROMPT_*, repair, helpers
 
 log = logging.getLogger(__name__)
 
 # Match Groq's output budget; 4000 is comfortably below the no-stream timeout.
 _MAX_TOKENS = 4000
-# web_search is a server-side tool that runs its own loop; cap our continuation
-# of pause_turn so a misbehaving search can never spin forever.
-_WEBSEARCH_MAX_TURNS = 6
-_WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search"}
+# web_search is a server-side tool that runs its own loop. COST CONTROL (v5.81):
+# `max_uses` caps the number of searches per call (search fees + each result is
+# billed as input on later turns), and the short pause_turn continuation cap keeps
+# a misbehaving search from spinning. Sonnet (CLAUDE_WEBSEARCH_MODEL) + these caps
+# keep each resolve well under a dollar (the Opus+uncapped path cost ~$2/call).
+_WEBSEARCH_MAX_TURNS = 3
+_WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 5}
 
 _CLIENT = None
 
@@ -259,10 +264,12 @@ def _websearch_complete(system_prompt: str, user_content: str, model: str) -> st
 
 
 def _websearch_json(system_prompt: str, user_content: str, model=None) -> dict:
-    """web_search resolver that returns a parsed JSON object (or {} on failure)."""
+    """web_search resolver that returns a parsed JSON object (or {} on failure).
+    Defaults to CLAUDE_WEBSEARCH_MODEL (Sonnet) — the cheaper model for the costly
+    web-search path; the Opus parse fallback is unaffected."""
     if not ANTHROPIC_API_KEY:
         return {}
-    model = model or CLAUDE_FALLBACK_MODEL
+    model = model or CLAUDE_WEBSEARCH_MODEL
     try:
         content = _websearch_complete(system_prompt, user_content, model)
     except Exception as e:
