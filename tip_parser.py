@@ -106,9 +106,14 @@ def _claude_primary_enabled() -> bool:
 
 
 # ── Per-call fallback wrappers (Opus 4.8) ────────────────────────────
-# main.py calls these on a GENUINE Groq failure. They default the model to
-# CLAUDE_FALLBACK_MODEL and never raise (return the Groq-style sentinels), so a
-# call site is one guarded line. The CALLER owns the genuine-failure gate.
+# main.py calls these on a GENUINE Groq failure, OR as the PRIMARY parser under
+# CLAUDE_PRIMARY. They default the model to CLAUDE_FALLBACK_MODEL. The CALLER owns
+# the genuine-failure gate. CONTRACT DIFFERS PER WRAPPER (v5.85):
+#  - parse_text_fallback / parse_image_fallback: never raise (return the Groq-style
+#    ([], t) sentinel).
+#  - parse_racing_text_fallback: RAISES on a HARD failure BY DESIGN (so the caller
+#    routes a real racing tip to MANUAL, matching Groq's parse_racing_text) — it
+#    MUST be called inside a try/except. Returns ([], t) only on a clean empty parse.
 def parse_text_fallback(text, tipster, sport, unit_size, default_units):
     import claude_parser
     from config import CLAUDE_FALLBACK_MODEL

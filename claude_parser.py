@@ -227,9 +227,18 @@ def parse_racing_text_claude(text, tipster, model=None):
         # HARD failure (gibberish / repair-fail) -> RAISE so the caller alerts to
         # manual, instead of returning [] which reads as 'chatter -> dropped'.
         raise ValueError(f"parse_racing_text_claude: invalid JSON (repair failed) for {tipster}")
+    if not isinstance(parsed, dict):
+        # v5.85: a top-level JSON array/scalar is a hard failure too -> raise
+        # (was an AttributeError on .get below); routes the caller to manual.
+        raise ValueError(f"parse_racing_text_claude: top-level JSON not an object for {tipster}")
     tips = parsed.get("tips", [])
     if not isinstance(tips, list):
         raise ValueError(f"parse_racing_text_claude: 'tips' not a list for {tipster}")
+    # v5.85 (5-opus review): MIRROR groq_parser.parse_racing_text's no-runner-row
+    # strip. A runner-less-but-saddled row (e.g. {"saddle":7,"runner":null}) would
+    # otherwise survive the router guards and place the WRONG horse via the
+    # racing_placer Pass-3 saddle-only fallback under CLAUDE PRIMARY.
+    tips = [t for t in tips if isinstance(t, dict) and (t.get("runner") or "").strip()]
     log.info(f"parse_racing_text_claude ({model}): {tipster} extracted {len(tips)} raw tip(s) in {elapsed:.2f}s")
     return tips, elapsed
 
