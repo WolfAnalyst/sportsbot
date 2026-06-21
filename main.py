@@ -7065,6 +7065,11 @@ def _place_sgm(tip: ParsedTip) -> list[BetResult]:
         resolved = _resolve_leg_for_hyperbot(
             leg, tip.sport, is_threshold=leg_is_threshold, for_sgm=True,
             tipster=tip.tipster,
+            # v5.87: AFL SGM legs are same-game — scope the surname to BOTH event
+            # teams + forbid the cross-game global roster fallback (the BUG A fix,
+            # extended from singles to SGM legs). Non-AFL SGM (MLB/NBA) -> None.
+            event_teams=(_afl_event_teams(tip.event)
+                         if (tip.sport or "").lower() == "afl" else None),
         )
 
         hb_leg = {"market": resolved["market"], "selection": resolved["selection"]}
@@ -7595,6 +7600,11 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
         resolved = _resolve_leg_for_hyperbot(
             leg, tip.sport, is_threshold=leg_is_threshold, for_sgm=True,
             tipster=tip.tipster,
+            # v5.87: AFL SGM legs are same-game — scope the surname to BOTH event
+            # teams + forbid the cross-game global roster fallback (the BUG A fix,
+            # extended from singles to SGM legs). Non-AFL SGM (MLB/NBA) -> None.
+            event_teams=(_afl_event_teams(tip.event)
+                         if (tip.sport or "").lower() == "afl" else None),
         )
         hb_leg = {"market": resolved["market"], "selection": resolved["selection"]}
         if resolved["player"]:
@@ -8722,6 +8732,11 @@ def _place_sgm_fanout(tip: ParsedTip, _orchestrated: bool = False) -> list[BetRe
         resolved = _resolve_leg_for_hyperbot(
             leg, tip.sport, is_threshold=leg_is_threshold, for_sgm=True,
             tipster=tip.tipster,
+            # v5.87: AFL SGM legs are same-game — scope the surname to BOTH event
+            # teams + forbid the cross-game global roster fallback (the BUG A fix,
+            # extended from singles to SGM legs). Non-AFL SGM (MLB/NBA) -> None.
+            event_teams=(_afl_event_teams(tip.event)
+                         if (tip.sport or "").lower() == "afl" else None),
         )
         hb_leg = {"market": resolved["market"], "selection": resolved["selection"]}
         if resolved["player"]:

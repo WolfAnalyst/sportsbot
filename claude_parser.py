@@ -152,10 +152,21 @@ def parse_with_claude(text, tipster, sport="nba", unit_size=1.0, default_units=1
 
 def parse_tip_image_claude(image_bytes, tipster, sport, max_retries=4, model=None):
     """Vision-parse a tip IMAGE via Claude. Mirrors `groq_parser.parse_tip_image`:
-    returns RAW extracted dicts (NOT ParsedTip) + elapsed; `([], elapsed)` on
-    failure. `model` defaults to CLAUDE_PARSER_MODEL; the FALLBACK passes
-    CLAUDE_FALLBACK_MODEL. `max_retries` accepted for signature-compatibility
-    (the SDK handles retry/backoff)."""
+    returns RAW extracted dicts (NOT ParsedTip) + elapsed. `model` defaults to
+    CLAUDE_PARSER_MODEL; the FALLBACK passes CLAUDE_FALLBACK_MODEL. `max_retries`
+    accepted for signature-compatibility (the SDK handles retry/backoff).
+
+    v5.87 (Wilson, after the 10-opus review flagged the silent-drop): RAISES on a
+    HARD failure (API/request error, no content, JSON-repair fail, malformed
+    'tips') — mirroring `parse_racing_text_claude` — so the caller routes a
+    genuinely-unparseable image to MANUAL ('never lose a real tip'). The old
+    version swallowed every error and returned ([], t); combined with the
+    _process_image_tip summary/recap 0-tip suppressor, a hard-failed image whose
+    caption looked like a recap was SILENTLY DROPPED (no manual ping). Now only a
+    CLEAN valid-but-empty parse (real chatter / a genuine 0-tip image) returns
+    `([], elapsed)`; a hard failure propagates and the caller's try/except pings
+    manual. (no-key / no-image stay `([], 0.0)` — Claude-unavailable, not a parse
+    failure; they can't occur under CLAUDE_PRIMARY, which requires a key.)"""
     start = time.time()
     if not ANTHROPIC_API_KEY:
         log.warning("ANTHROPIC_API_KEY not set, skipping Claude image parsing")
@@ -170,28 +181,23 @@ def parse_tip_image_claude(image_bytes, tipster, sport, max_retries=4, model=Non
         if (sport or "").lower() == "racing"
         else groq_parser.IMAGE_PROMPT_AFL
     )
-    try:
-        content = _complete_vision(prompt, image_bytes, model)
-    except Exception as e:
-        log.error(f"parse_tip_image_claude: request failed for {tipster}: {type(e).__name__}: {e}")
-        return [], time.time() - start
+    # NOTE: a request exception PROPAGATES (do NOT swallow) so the caller routes
+    # the tip to manual rather than silently dropping it (v5.87).
+    content = _complete_vision(prompt, image_bytes, model)
     elapsed = time.time() - start
 
     if not content:
-        log.error(f"parse_tip_image_claude: no content returned for {tipster}")
-        return [], elapsed
+        raise ValueError(f"parse_tip_image_claude: no content returned for {tipster}")
 
     content = content.replace("```json", "").replace("```", "").strip()
     parsed = groq_parser._parse_json_with_repair(content)
     if parsed is None:
-        log.error(f"parse_tip_image_claude: invalid JSON (repair failed) for {tipster}")
         log.error(f"Raw response: {content[:500]}")
-        return [], elapsed
+        raise ValueError(f"parse_tip_image_claude: invalid JSON (repair failed) for {tipster}")
 
     tips = parsed.get("tips", [])
     if not isinstance(tips, list):
-        log.error(f"parse_tip_image_claude: 'tips' not a list for {tipster}")
-        return [], elapsed
+        raise ValueError(f"parse_tip_image_claude: 'tips' not a list for {tipster}")
     log.info(
         f"parse_tip_image_claude ({model}): {tipster} ({sport}) extracted "
         f"{len(tips)} raw tip(s) in {elapsed:.2f}s"
