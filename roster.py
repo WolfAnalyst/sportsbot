@@ -398,7 +398,7 @@ def exact_match_player(query: str, sport: str = "nba", team: str = "") -> dict:
 
 def fuzzy_match_player(
     query: str, sport: str = "nba", threshold: float = 0.6,
-    team: str = "",
+    team: str = "", teams: "list | None" = None,
 ) -> dict:
     """
     Fuzzy match a (potentially partial) player name against the roster.
@@ -416,6 +416,18 @@ def fuzzy_match_player(
               filter accepts roster entry 'West Coast Eagles'.
               If team is given but matches no roster entries (unrecognised
               team name), warns and falls back to global match.
+        teams: Optional list of teams to scope to (e.g. BOTH teams of the
+              resolved fixture). When supplied (and at least one is
+              recognised) the match is scoped to the UNION of those teams'
+              players and the guarded GLOBAL FALLBACK is FORBIDDEN — the
+              result is a player on one of those teams or {} (never a
+              wrong-GAME player). BUG A (Wilson 2026-06-21): a bare surname
+              scoped to a single team ('Richards' on 'STK') missed and the
+              global fallback grabbed 'Joe Richards' (Port Adelaide — not in
+              the St Kilda v Western Bulldogs game) instead of Ed Richards
+              (Western Bulldogs). Scoping to both event teams resolves the
+              surname uniquely and never escapes the fixture. Takes
+              precedence over `team` for scoping.
 
     Returns:
         {"name": "Full Name", "team": "Team", "score": 0.85}
@@ -524,6 +536,38 @@ def fuzzy_match_player(
     # 2026-05-31) rather than going straight to manual.
     scoped_to_team = False
     match_roster = roster
+    # BUG A (Wilson 2026-06-21) + v5.86 review: a `teams` list scopes an AFL
+    # surname to the resolved fixture and FORBIDS the cross-game global fallback.
+    # CRITICAL ordering (review BLOCKER): scope to the leg's OWN team FIRST, and
+    # only widen to the UNION of both event teams on a MISS. A bare surname that
+    # ALSO equals an OPPONENT'S FIRST NAME would otherwise out-score the intended
+    # player across the union (e.g. 'Ryan' on Fremantle -> Luke Ryan scores 0.85,
+    # but Ryan Byrnes/St Kilda scores 0.95 on the first name -> WRONG-team player
+    # in the same game). Own-team-first keeps Saiyan singles correct (Luke Ryan)
+    # while the union still rescues EasyMoney's 'Richards' on STK -> Ed Richards
+    # (WB). BOTH steps forbid the global fallback (never a wrong-GAME player).
+    if teams:
+        if team:
+            own = _scope_roster_to_team(roster, team)
+            if own:
+                r = _match_against(own)
+                if r:
+                    return r
+        union: dict = {}
+        for t in teams:
+            sub = _scope_roster_to_team(roster, t)
+            if sub:
+                union.update(sub)
+        if union:
+            return _match_against(union)
+        # No event team matched the roster (malformed event string) -> NO match
+        # (caller routes to manual / keeps the bare surname for the event-scoped
+        # catalog matcher); NEVER a global (wrong-game) match.
+        log.warning(
+            f"Team list {teams} matched no roster entries for '{query}' -> no "
+            f"match (manual; global fallback forbidden when event-scoped)"
+        )
+        return {}
     if team:
         scoped = _scope_roster_to_team(roster, team)
         if not scoped:
@@ -542,6 +586,9 @@ def fuzzy_match_player(
     # the FULL roster. The token-overlap gate inside _match_against still rejects
     # same-surname-different-player collisions (e.g. "Davis" -> "Hugh Davies"),
     # so this trades fewer manual routes for a small, gated wrong-player risk.
+    # (The event-scoped `teams` path above returns early and NEVER reaches this
+    # global fallback — BUG A: it resolved 'Richards' -> Joe Richards/Port
+    # Adelaide, a wrong-GAME player. Only the single-`team` path falls through.)
     if not result and scoped_to_team:
         log.info(
             f"Team-scoped match failed for '{query}' on '{team}'; "
@@ -649,15 +696,19 @@ def fuzzy_match_all(
     return sorted(unique, key=lambda x: x["score"], reverse=True)
 
 
-def resolve_player_name(query: str, sport: str = "nba", team: str = "") -> str:
+def resolve_player_name(query: str, sport: str = "nba", team: str = "",
+                        teams: "list | None" = None) -> str:
     """
     Resolve a query to a full player name for HyperBot.
     Returns the original query if no match found.
 
     `team` is plumbed through to fuzzy_match_player so callers (e.g.
     the SGM leg resolver) can scope to the leg's team prefix when known.
+    `teams` (BUG A) scopes to the UNION of the resolved fixture's teams and
+    forbids the cross-game global fallback (never resolve to a wrong-game
+    player); takes precedence over `team`.
     """
-    match = fuzzy_match_player(query, sport, team=team)
+    match = fuzzy_match_player(query, sport, team=team, teams=teams)
     if match:
         log.info(f"Roster match: '{query}' -> '{match['name']}' ({match['team']}) score={match['score']}")
         return match["name"]
@@ -665,12 +716,57 @@ def resolve_player_name(query: str, sport: str = "nba", team: str = "") -> str:
     return query
 
 
-def get_player_team(query: str, sport: str = "nba", team: str = "") -> str:
+def get_player_team(query: str, sport: str = "nba", team: str = "",
+                    teams: "list | None" = None) -> str:
     """Get a player's team name. Returns empty string if not found.
-    `team` filter optional — same semantics as fuzzy_match_player.
+    `team`/`teams` filter optional — same semantics as fuzzy_match_player.
     """
-    match = fuzzy_match_player(query, sport, team=team)
+    match = fuzzy_match_player(query, sport, team=team, teams=teams)
     return match.get("team", "")
+
+
+def mlb_fuzzy_player(query: str, threshold: float = 0.9) -> dict:
+    """GUARDED fuzzy MLB player resolver for a TYPO / minor VARIANT of a full
+    name. BUG D (Wilson 2026-06-21): 'Jung Ho Lee' (tip) vs roster 'Jung Hoo Lee'
+    (San Francisco Giants) — the exact match missed (1-char), so the tip routed
+    to manual ("No fixture found").
+
+    Deliberately STRICTER than fuzzy_match_player: FULL-STRING similarity ONLY
+    (no surname-token boosting — that is exactly what drifts 'Juan Soto' ->
+    'Gregory Soto'), a high threshold (>=0.9 ≈ a typo, not a different player),
+    a 2+ token query (never a bare surname), AND resolves ONLY when EXACTLY ONE
+    roster player is within threshold (any ambiguity -> {} -> manual). So it can
+    correct a near-identical spelling but can never pick a same-surname player on
+    the wrong team. Returns {"name","team","score"} or {}.
+    """
+    q = (query or "").strip().lower()
+    if not q or len(q.split()) < 2:
+        return {}
+    _load_rosters()
+    if not _mlb_roster:
+        return {}
+    q_fold = _fold_accents(q)
+    hits = []
+    for info in _mlb_roster.values():
+        n = (info.get("name") or "")
+        nl = n.lower()
+        score = max(
+            SequenceMatcher(None, q, nl).ratio(),
+            SequenceMatcher(None, q_fold, _fold_accents(nl)).ratio(),
+        )
+        if score >= threshold:
+            hits.append((score, info))
+    if not hits:
+        return {}
+    names = {info["name"] for _, info in hits}
+    if len(names) != 1:
+        log.warning(
+            f"MLB fuzzy '{query}' ambiguous across {sorted(names)} (>= {threshold}) "
+            f"-> manual (never guess a player)"
+        )
+        return {}
+    score, info = max(hits, key=lambda x: x[0])
+    return {"name": info["name"], "team": info["team"], "score": round(score, 3)}
 
 
 def _afl_token_norm(s: str) -> str:

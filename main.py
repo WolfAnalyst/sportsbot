@@ -60,6 +60,7 @@ from hyperbot_client import HyperBotClient
 from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
 from nba_resolver import resolve_nba_event, resolve_mlb_event
 from roster import resolve_player_name, get_player_team, afl_surname_candidates, afl_fuzzy_surname_candidates
+from roster import _team_matches as _roster_team_matches
 import notifier
 import session_priority
 import stat_fallback
@@ -142,6 +143,16 @@ STAKE_LADDER = [1.00, 0.75, 0.50, 0.40, 0.25, 0.20, 0.15, 0.10, 0.05]
 # Set to 0 so $1 test-channel bets actually get placed. Matches racing/Tip
 # Titans floors. Raise once you want to enforce a real minimum stake.
 STAKE_FLOOR = 0.0  # Don't bother with bets below this (currently no minimum)
+# MINOR (Wilson 2026-06-21): the MLB HRRBI 3-way SGM fills the full $400 unit
+# ($133.33 x3 = $399.99), leaving a $0.01 remainder; with STAKE_FLOOR=0.0 the
+# spillover single fired a degenerate ~$0.01 bookie-minimum bet on Alex/Ryan
+# (06-21 bets 6892885141 / 6892887454, recurring). The spillover single needs a
+# real minimum so a rounding remainder doesn't place a token bet — the SGM
+# already filled the unit. Env-overridable.
+try:
+    MLB_HRRBI_SINGLE_MIN_STAKE = float(os.getenv("MLB_HRRBI_SINGLE_MIN_STAKE", "1.0"))
+except (TypeError, ValueError):
+    MLB_HRRBI_SINGLE_MIN_STAKE = 1.0
 
 # $1 deadband for deciding a sports bet "fully filled" (ignores cent-jitter),
 # matching the AFL fan-out's $1 deadband.
@@ -270,6 +281,28 @@ if X_TIPSTER and X_MAX_ODDS_MULT and X_MAX_ODDS_MULT > 1.0:
 # the parser already emits odds=0 (which no-ops both guards) and the blind fan-out
 # never captures a live price; this guarantees a leaked quoted price can't arm it.
 TIPSTERS_MAX_ODDS_MULT["etr_nba"] = 0.0
+
+
+def _afl_target_odds(sport, basis_odds, *, _round: bool = True):
+    """Price FLOOR (minimum acceptable odds) sent to HyperBot, floored at 1.01.
+
+    BUG C (Wilson 2026-06-21): AFL widens the tolerance to 15% when the BASIS
+    price is OVER $2.00 (else the standard 10%); non-AFL stays 10%. So a tipped
+    $2.16 (Ryley Sanders u23.5) now floors at 1.84 and accepts a 1.87 market
+    instead of rejecting it at the old 1.94 (10%) floor. Boundary: at exactly
+    $2.00 it stays 10% ($2.00 -> 1.80); $2.01 -> 1.71, $3.00 -> 2.55. This only
+    LOWERS the floor (accepts shorter odds = lower liability) — never raises the
+    bet's risk. Racing keeps its own ODDS_DRIFT floor (racing_placer), untouched.
+    """
+    try:
+        b = float(basis_odds or 0)
+    except (TypeError, ValueError):
+        return None
+    if b <= 1.0:
+        return None
+    mult = 0.85 if ((sport or "").lower() == "afl" and b > 2.00) else 0.90
+    val = max(1.01, b * mult)
+    return round(val, 2) if _round else val
 
 
 def _exceeds_odds_ceiling(tipster: str, tipped_odds, matched_odds) -> bool:
@@ -981,15 +1014,29 @@ def route_message(
     regex_fn = REGEX_PARSERS.get(tipster)
     if not regex_fn:
         # Groq-only tipster (Shook) returned no tips. This is usually either
-        # (a) a truly non-bet message like "shop odds" that shouldn't alert,
-        # or (b) a JSON truncation / parse failure that silently lost a real
-        # tip. We can't distinguish here, but if the message LOOKS like a
-        # bet (has @everyone AND numeric odds/line patterns), treat it as a
-        # suspected parse failure and alert.
+        # (a) a truly non-bet message ("shop odds" / follow-up chatter) that
+        # shouldn't alert, or (b) a JSON truncation / parse failure that
+        # silently lost a real tip.
+        #
+        # BUG B (Wilson 2026-06-21): the old gate ("@everyone" + any digit +
+        # len>40) FALSE-FIRED a PARSE ERROR on Shook follow-up CHATTER ("No alt
+        # for Baldwin, I also sprinkled 2+ Hits for both the SF guys if u
+        # wanted...") — the @everyone came from a PREPENDED context msg and "2+"
+        # is not a bet. Require a CONCRETE Shook bet signal: a unit token
+        # ("0.2u"), an "@ <odds>" price, or the HRR/HRRBI line shape ("M 1.5
+        # HRR", "2+ HRRBI") — AND exclude explicit no-bet framing. Chatter with
+        # none of these DROPS silently (no manual noise); a real missed HRRBI
+        # tip still has a unit/HRR signature so it still alerts.
+        _has_bet_signal = (
+            _raw_has_unit_token(text)
+            or bool(re.search(r"@\s*\d+(?:\.\d+)?", text))
+            or bool(re.search(r"\b\d+\s*\+?\s*HRR(?:BI)?\b", text, re.IGNORECASE))
+            or bool(re.search(r"\bM\s*\d+(?:\.\d+)?\s*HRR", text, re.IGNORECASE))
+        )
         looks_like_bet = (
-            "@everyone" in text.lower()
-            and any(c.isdigit() for c in text)
-            and len(text) > 40
+            len(text) > 40
+            and _has_bet_signal
+            and not _is_no_bet_framing(text)
         )
         if looks_like_bet:
             # v5.80 RECOVERY: a Groq-only tipster (Shook) lost a real bet to a
@@ -1023,15 +1070,19 @@ def route_message(
                         return c_tips, timing
                 except Exception as e:
                     log.error(f"Claude text fallback failed for {tipster}: {e}")
+            # BUG E (Wilson 2026-06-21): label the parse error with the ACTUAL
+            # parser. Under CLAUDE_PRIMARY Claude (not Groq) parsed, so the old
+            # hardcoded "Groq returned empty tips" was misleading.
+            _parser_label = "Claude" if tip_parser._claude_primary_enabled() else "Groq"
             log.warning(
-                f"Groq-only tipster '{tipster}' returned 0 tips on a "
+                f"{_parser_label}-only tipster '{tipster}' returned 0 tips on a "
                 f"bet-looking message — possible parse failure"
             )
             try:
                 notifier.notify_parse_error(
                     tipster,
                     text[:400],
-                    "Groq returned empty tips (possible truncation/parse failure)",
+                    f"{_parser_label} returned empty tips (possible truncation/parse failure)",
                 )
             except Exception as e:
                 log.error(f"Failed to send parse-error notification: {e}")
@@ -1069,8 +1120,9 @@ def route_message(
             and not _is_no_bet_framing(text)
         )
         if looks_like_bet:
+            _pp_log = "Claude" if tip_parser._claude_primary_enabled() else "Groq"
             log.warning(
-                f"Regex tipster '{tipster}': Groq AND regex both returned 0 "
+                f"Regex tipster '{tipster}': {_pp_log} AND regex both returned 0 "
                 f"tips on a bet-looking message — possible parse failure"
             )
             # v5.82 RECOVERY: Groq AND the regex parser BOTH missed a bet-looking
@@ -1103,9 +1155,11 @@ def route_message(
                 except Exception as e:
                     log.error(f"Claude text fallback failed for {tipster}: {e}")
             try:
+                # BUG E: reflect the actual primary parser (Claude under CLAUDE_PRIMARY).
+                _pp = "Claude" if tip_parser._claude_primary_enabled() else "Groq"
                 notifier.notify_parse_error(
                     tipster, text[:400],
-                    "Groq + regex both returned empty (possible parse failure)",
+                    f"{_pp} + regex both returned empty (possible parse failure)",
                 )
             except Exception as e:
                 log.error(f"Failed to send parse-error notification: {e}")
@@ -1688,13 +1742,39 @@ def resolve_event(tip: ParsedTip) -> str:
         if player and len(player.split()) >= 2:
             from roster import exact_match_player as _exact_mlb
             _rm = _exact_mlb(player, "mlb")
+            # BUG D (Wilson 2026-06-21): exact missed -> GUARDED fuzzy fallback for
+            # a TYPO/variant of a full name ('Jung Ho Lee' -> 'Jung Hoo Lee', SF
+            # Giants). mlb_fuzzy_player is full-string-only + >=0.9 + UNIQUE, so it
+            # corrects a near-identical spelling but never drifts to a same-surname
+            # player on the wrong team. On a hit, also rewrite the (typo) player
+            # name to the roster's exact spelling on EVERY leg carrying it, so the
+            # bookie catalog match is deterministic (the HRRBI SGM has 2 same-player
+            # legs). Belt-and-braces: the catalog matcher's own game-scoped fuzzy
+            # (_resolve_mlb_player) would also canonicalise it once the fixture is
+            # right — but resolving the TEAM here is what unblocks the fixture.
+            _fuzzy_used = False
+            if not (_rm and _rm.get("team")):
+                from roster import mlb_fuzzy_player as _fz_mlb
+                _fzm = _fz_mlb(player)
+                if _fzm and _fzm.get("team"):
+                    log.warning(
+                        f"MLB fuzzy resolve: '{player}' -> '{_fzm['name']}' "
+                        f"({_fzm['team']}) score={_fzm['score']} (exact missed — "
+                        f"likely a typo; still gated on the bookie catalog)"
+                    )
+                    _rm = {"name": _fzm["name"], "team": _fzm["team"]}
+                    _fuzzy_used = True
+                    _typo_l = player.strip().lower()
+                    for _lg in tip.legs:
+                        if (_lg.player or "").strip().lower() == _typo_l:
+                            _lg.player = _fzm["name"]
             if _rm and _rm.get("team"):
                 _roster_team = _rm["team"]
                 if not team:
                     team = _roster_team
                     log.info(
                         f"MLB no-team: inferred '{player}' -> '{team}' from roster "
-                        f"(exact full-name match)"
+                        f"({'fuzzy' if _fuzzy_used else 'exact full-name'} match)"
                     )
                 else:
                     # Team WAS stated. Trust the roster's exact full-name team
@@ -1704,8 +1784,9 @@ def resolve_event(tip: ParsedTip) -> str:
                     # Braves' case). resolve_mlb_event handles full team names.
                     if _roster_team.lower() != (team or "").lower():
                         log.info(
-                            f"MLB team override: Groq said '{team}', roster says "
-                            f"'{_roster_team}' for '{player}' (exact full-name) — "
+                            f"MLB team override: tip said '{team}', roster says "
+                            f"'{_roster_team}' for '{player}' "
+                            f"({'guarded-fuzzy' if _fuzzy_used else 'exact full-name'}) — "
                             f"using roster's team."
                         )
                     if tip.legs:
@@ -1713,7 +1794,7 @@ def resolve_event(tip: ParsedTip) -> str:
                     team = _roster_team
         if not team:
             log.warning(
-                "MLB tip has no team and no exact full-name roster match — "
+                "MLB tip has no team and no exact-or-guarded-fuzzy roster match — "
                 "routing to manual"
             )
             return ""
@@ -3213,16 +3294,20 @@ def _place_with_spillover(tip: ParsedTip, sessions: list[dict]) -> list[BetResul
                     placed = retry_result.stake or step_stake
                     remaining_stake -= placed
                     # Post-fill tolerance check (informational only — bet placed)
+                    # BUG C: AFL >$2.00 uses the 15% floor, else 10% (matches the
+                    # actual target_odds the bet was placed with).
                     actual_odds = retry_result.odds or 0
+                    _floor = _afl_target_odds(tip.sport, tip.suggested_odds)
                     if (
                         tip.suggested_odds
                         and actual_odds
-                        and actual_odds < tip.suggested_odds * 0.9
+                        and _floor
+                        and actual_odds < _floor
                     ):
                         log.warning(
-                            f"Price-change retry filled OUTSIDE 10% tolerance: "
+                            f"Price-change retry filled OUTSIDE tolerance: "
                             f"actual {actual_odds} vs tipped {tip.suggested_odds} "
-                            f"(floor {round(tip.suggested_odds * 0.9, 2)}). "
+                            f"(floor {_floor}). "
                             f"Bet placed but flag for manual review."
                         )
                     else:
@@ -3936,6 +4021,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             first_leg, sport,
             is_threshold=getattr(tip, "_is_threshold", False),
             tipster=tip.tipster,
+            event_teams=(_afl_event_teams(tip.event) if sport == "afl" else None),
         )
         liability_market = _rlm.get("market") or market
     except Exception as e:
@@ -6999,7 +7085,7 @@ def _place_sgm(tip: ParsedTip) -> list[BetResult]:
     # 1.00 are nonsensical and HyperBot may reject them)
     target_odds = None
     if tip.suggested_odds and tip.suggested_odds > 1.0:
-        target_odds = round(max(1.01, tip.suggested_odds * 0.9), 2)
+        target_odds = _afl_target_odds(tip.sport, tip.suggested_odds)
 
     stake = tip.stake_dollars
 
@@ -7526,7 +7612,7 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
     # Target odds: 90% of suggested, floored at 1.01 (HyperBot rejects < 1.0)
     target_odds = None
     if tip.suggested_odds and tip.suggested_odds > 1.0:
-        target_odds = round(max(1.01, tip.suggested_odds * 0.9), 2)
+        target_odds = _afl_target_odds(tip.sport, tip.suggested_odds)
 
     intended_stake = tip.stake_dollars
     tipped_odds = tip.suggested_odds
@@ -8651,7 +8737,7 @@ def _place_sgm_fanout(tip: ParsedTip, _orchestrated: bool = False) -> list[BetRe
     # price floor (an SGM fills at any price when target_odds is None).
     target_odds = None
     if tip.suggested_odds and tip.suggested_odds > 1.0:
-        target_odds = round(max(1.01, tip.suggested_odds * 0.9), 2)
+        target_odds = _afl_target_odds(tip.sport, tip.suggested_odds)
 
     _t_start = _time_mod.time()
     # ── Resolve ONCE per bookie: enrich legs + estimate combined odds ──
@@ -8895,7 +8981,9 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
     notification."""
     import time as _t
     single_sids = [s.strip() for s in os.getenv("MLB_HRRBI_SINGLE_SESSIONS", "").split(",") if s.strip()]
-    if not single_sids or cap_stake <= STAKE_FLOOR:
+    # MINOR (Wilson 2026-06-21): a sub-$1 remainder (the $0.01 left after a full
+    # 3-way SGM fill) must NOT fire a degenerate bookie-minimum single.
+    if not single_sids or cap_stake < MLB_HRRBI_SINGLE_MIN_STAKE:
         return []
     player = (tip.legs[0].player if tip.legs else "") or ""
     if not player.strip():
@@ -8941,7 +9029,7 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
             log.info(f"MLB single: 2+ HRRBI for {player} not carried on "
                      f"{bookie}:{sid} — skipping (-> leftover/manual)")
             continue
-        target_odds = (round(max(1.01, float(m["odds"]) * 0.9), 2)
+        target_odds = (_afl_target_odds(tip.sport, m["odds"])
                        if m.get("odds") else None)
         # v5.52: index-based ladder so ONE fast price-change (code=535) retry
         # can re-run the SAME rung with target_odds dropped, re-entering the
@@ -9121,8 +9209,11 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
     _sgm_ambiguous_total = sum(
         (getattr(r, "_requested_stake", None) or r.stake or 0) for r in _sgm_ambiguous)
     remaining = round(intended - placed - _sgm_ambiguous_total, 2)
-    # Then the single-only account(s) for the next rung(s).
-    alex_results = _place_mlb_alex_single(tip, remaining) if remaining > STAKE_FLOOR else []
+    # Then the single-only account(s) for the next rung(s). MINOR (2026-06-21):
+    # a sub-$1 rounding remainder after a full SGM fill must not spill a token
+    # single (the gate inside _place_mlb_alex_single enforces the same minimum).
+    alex_results = (_place_mlb_alex_single(tip, remaining)
+                    if remaining >= MLB_HRRBI_SINGLE_MIN_STAKE else [])
     placed += sum((r.stake or 0) for r in alex_results if r.success)
     remaining = round(intended - placed - _sgm_ambiguous_total, 2)
 
@@ -9245,13 +9336,31 @@ def _place_mlb_hrrbi(tip: ParsedTip) -> list[BetResult]:
     return all_results
 
 
+def _afl_event_teams(event: str) -> list:
+    """Split a resolved AFL fixture string ('Home v Away' / 'Home vs Away') into
+    its two team names. BUG A (Wilson 2026-06-21): used to scope an AFL player
+    surname to BOTH teams of the game so the resolver can never resolve to a
+    wrong-GAME player (Richards -> Joe Richards/Port Adelaide). Returns [] if the
+    event doesn't split cleanly (caller then keeps the single-team scope)."""
+    if not event or not isinstance(event, str):
+        return []
+    parts = re.split(r"\s+v(?:s)?\s+", event.strip(), maxsplit=1, flags=re.IGNORECASE)
+    return [p.strip() for p in parts if p.strip()] if len(parts) == 2 else []
+
+
 def _resolve_leg_for_hyperbot(
     leg, sport: str, is_threshold: bool = False, for_sgm: bool = False,
-    tipster: str = "",
+    tipster: str = "", event_teams: "list | None" = None,
 ) -> dict:
     """
     Resolve a parsed leg into HyperBot API payload fields.
     Shared by both single bets and SGM legs.
+
+    `event_teams` (BUG A): when an AFL fixture is known, the player surname is
+    scoped to the UNION of BOTH teams and the cross-game global roster fallback
+    is forbidden — the resolver returns a player in THIS game or leaves the
+    surname unchanged (the event-scoped bookie catalog then resolves it or routes
+    to manual), never a wrong-GAME player.
 
     Returns dict with: market, selection, player, stat, line
     """
@@ -9304,7 +9413,44 @@ def _resolve_leg_for_hyperbot(
             # 2026-05-02 SGM regressions: Davis/O'Sullivan/NWM all routed
             # to wrong players or failed because legs were resolved with
             # no team context.
-            player = resolve_player_name(player, sport, team=leg.team_full or "")
+            #
+            # BUG A (Wilson 2026-06-21): for AFL, scope the surname to BOTH
+            # teams of the resolved fixture (not just the tip's single team)
+            # and FORBID the cross-game global fallback. 'Richards' on 'STK'
+            # missed -> global fallback grabbed Joe Richards (Port Adelaide,
+            # not in St Kilda v Western Bulldogs) instead of Ed Richards (WB).
+            if sport == "afl" and event_teams:
+                _before = player
+                player = resolve_player_name(
+                    player, sport, team=leg.team_full or "", teams=event_teams)
+                if player == _before and len(_before.split()) >= 2 \
+                        and tip_parser._claude_websearch_enabled():
+                    # No roster hit on EITHER event team for a FULL name — the
+                    # roster may be stale (just-listed player). Confirm the
+                    # CURRENT club via Claude web-search; accept ONLY if it is
+                    # one of the two event teams (proves the player is in THIS
+                    # game). A bare surname is left to the event-scoped catalog
+                    # matcher (web-search on a surname is unreliable). Never
+                    # resolves to a wrong-GAME player.
+                    try:
+                        import claude_parser as _cp
+                        _club = _cp.resolve_afl_player_team(_before)
+                    except Exception as _e:
+                        _club = ""
+                        log.warning(f"BUG-A web-search backstop failed for {_before!r}: {_e}")
+                    if _club and any(_roster_team_matches(_club, t) for t in event_teams):
+                        leg.team_full = _club
+                        log.warning(
+                            f"BUG-A: '{_before}' absent from {event_teams} rosters; "
+                            f"Claude web-search confirms current club '{_club}' IS in "
+                            f"this game — proceeding (still gated on bookie catalog)")
+                    elif _club:
+                        log.warning(
+                            f"BUG-A: '{_before}' web-search club '{_club}' NOT in event "
+                            f"{event_teams} — likely wrong game; leaving to catalog gate "
+                            f"(-> manual on a miss, never a wrong-game bet)")
+            else:
+                player = resolve_player_name(player, sport, team=leg.team_full or "")
         # Strip NBSP/narrow-NBSP/zero-width chars that the roster JSON may
         # have introduced. roster_afl.json shipped with U+00A0 between
         # first/last names for all 784 entries — every Saiyan tip ended up
@@ -9720,6 +9866,7 @@ def _resolve_single_for_placement(
     is_threshold = getattr(tip, '_is_threshold', False)
     resolved = _resolve_leg_for_hyperbot(
         leg, tip.sport, is_threshold=is_threshold, tipster=tip.tipster,
+        event_teams=(_afl_event_teams(tip.event) if (tip.sport or "").lower() == "afl" else None),
     )
 
     market = resolved["market"]
@@ -9756,8 +9903,9 @@ def _resolve_single_for_placement(
             basis_label = f"tipped {tip.suggested_odds}"
 
         if basis_odds and basis_odds > 1.0:
-            target_odds = round(max(1.01, basis_odds * 0.9), 2)
-            log.info(f"Target odds: {target_odds} (90% of {basis_label}, floor 1.01)")
+            target_odds = _afl_target_odds(tip.sport, basis_odds)
+            _pct = 85 if ((tip.sport or "").lower() == "afl" and basis_odds > 2.00) else 90
+            log.info(f"Target odds: {target_odds} ({_pct}% of {basis_label}, floor 1.01)")
     else:
         log.info("Target odds: omitted (price-change retry, accepting current market)")
 
@@ -10026,20 +10174,23 @@ def _resolve_single_for_placement(
     # routes cleanly to manual with a clear reason instead of a bookie reject.
     # Only fires when we captured live odds (catalog match); a missing price
     # never blocks. Wilson 2026-06-03.
-    if apply_floor and _resolved_live_odds and _below_odds_floor(
-        tip.suggested_odds, _resolved_live_odds
-    ):
+    # BUG C: single source of truth for the floor — _afl_target_odds (AFL >$2.00
+    # = 15%, else 10%; non-AFL = 10%, identical to the old _below_odds_floor). The
+    # AFL fan-out passes apply_floor=False so this gate is the NON-AFL price-moved
+    # guard, but keying it on the same helper keeps the floor consistent if an AFL
+    # leg is ever routed through this path.
+    _floor_odds = _afl_target_odds(tip.sport, tip.suggested_odds)
+    if apply_floor and _resolved_live_odds and _floor_odds and _resolved_live_odds < _floor_odds:
         log.warning(
             f"ODDS-FLOOR: {tip.tipster} {leg.player or leg.team_full} "
-            f"{selection} {line} {stat} — live odds {_resolved_live_odds} < tipped "
-            f"{tip.suggested_odds} ×{_ODDS_FLOOR_PCT} on {bookie}:{sid}. Price "
+            f"{selection} {line} {stat} — live odds {_resolved_live_odds} < floor "
+            f"{_floor_odds} (tipped {tip.suggested_odds}) on {bookie}:{sid}. Price "
             f"moved / possible wrong selection; NOT placing, routing to manual."
         )
         return (None, BetResult(
             success=False, tip=tip, session_id=sid, bookie=bookie,
-            error=(f"price floor: live {_resolved_live_odds} < tipped "
-                   f"{tip.suggested_odds} ×{_ODDS_FLOOR_PCT} "
-                   f"(price moved / possible wrong selection)"),
+            error=(f"price floor: live {_resolved_live_odds} < floor {_floor_odds} "
+                   f"(tipped {tip.suggested_odds}; price moved / possible wrong selection)"),
             timestamp=datetime.now(),
             placed_market=market, placed_player=player, placed_stat=stat,
             placed_line=line, placed_selection=selection,
@@ -10782,6 +10933,20 @@ _IMAGE_SUMMARY_RE = re.compile(
     r"good luck all|next meet|that'?s it for|done for the (?:day|night))\b"
 )
 
+# BUG B (Wilson 2026-06-21): post-game RECAP / COMMENTARY about bets already
+# taken — distinct multi-word signatures so a forward tip ("R4 Lingani 2u") is
+# never suppressed. These posts brush a stray score/odds/number and used to
+# FALSE-PING manual ("Not the best weekend on the cores, but have copped some
+# tough beats..."; "Have taken these combos as SGMs. Could be better odds
+# elsewhere."). Eddie's real tips arrive as IMAGES; text is supplementary.
+_IMAGE_RECAP_RE = re.compile(
+    r"\b(?:not the best|tough beat|bad beat|rough (?:night|day|one|trot)|"
+    r"have (?:taken|copped)|i'?ve taken|taken these|took these|"
+    r"already (?:taken|on these)|copped (?:a|some|the)|"
+    r"better odds elsewhere|could be better odds|better elsewhere)\b",
+    re.IGNORECASE,
+)
+
 
 def _doc_mime_is_image(mime: str) -> bool:
     """True when a Telegram DOCUMENT post is actually an image sent as a file
@@ -10900,14 +11065,23 @@ def _img_parse_racing_date(raw_date, msg_time) -> "str|None":
     return None
 
 
-def _image_text_is_actionable(text: str) -> bool:
+def _image_text_is_actionable(text: str, sport: str = "") -> bool:
     """True if a text-only post in an image-tip channel looks like a bet or an
-    instruction (keep -> manual ping); False for plain chatter (drop, log only).
+    instruction (keep -> manual ping / parse); False for plain chatter (drop).
 
     These channels post the actual TIP as an image (always processed); text
     posts are supplementary, so we only surface the ones that carry betting
     intent. 2026-06-03: previously EVERY text post pinged manual, flooding it
-    with 'thanks lads' / 'good luck' / emoji chatter from Zak & Trial."""
+    with 'thanks lads' / 'good luck' / emoji chatter from Zak & Trial.
+
+    `sport`: the channel's sport. The BUG B recap guard (which drops a recap even
+    when it brushes a stray score/odds) applies ONLY to NON-racing channels
+    (Eddie AFL — text only pings manual, so dropping a numbered recap is the
+    whole point). For RACING (Zak/Trial) the text path PARSES+PLACES real money
+    and has its OWN results guard (_text_looks_like_result) + a runner-not-found
+    drop downstream, so the recap guard is SKIPPED here to avoid silently
+    vanishing a real forward tip whose text happens to contain a recap word
+    ('R4 7 Lingani 2u for the next meet'). v5.86 review BLOCKER."""
     t = (text or "").strip().lower()
     if not t:
         return False
@@ -10917,6 +11091,19 @@ def _image_text_is_actionable(text: str) -> bool:
     if (_IMAGE_ANNOUNCEMENT_RE.search(t)
             and not _IMAGE_URGENT_INSTRUCTION_RE.search(t)
             and not _image_text_selection_pattern(t)):
+        return False
+    # BUG B (Wilson 2026-06-21): a RECAP / results / post-game commentary post
+    # (which brushes a stray score/odds and used to false-ping manual) is
+    # chatter — drop it UNLESS it ALSO carries an urgent instruction (never drop
+    # a "scratch the R3 leg" message). Unlike the announcement guard, there is
+    # NO concrete-selection exception: recaps routinely contain stray
+    # numbers/odds, which is exactly why they false-fired. v5.86 review BLOCKER:
+    # SKIP this for RACING — that text path PARSES+PLACES real money and already
+    # has its own results guard, so a recap word in a real forward tip
+    # ('R4 7 Lingani 2u for the next meet') must NOT be silently dropped here.
+    if ((sport or "").lower() != "racing"
+            and (_IMAGE_SUMMARY_RE.search(t) or _IMAGE_RECAP_RE.search(t))
+            and not _IMAGE_URGENT_INSTRUCTION_RE.search(t)):
         return False
     if _IMAGE_ACTIONABLE_RE.search(t):
         return True
@@ -11743,6 +11930,25 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
     )
     for idx, raw in enumerate(raw_tips):
         try:
+            # BUG B (Wilson 2026-06-21): an Eddie AFL PLAYER-PROP image tip with NO
+            # odds is a MULTI/SGM leg — Eddie posts SGM combos as a legs-only image
+            # with no per-leg price, and the user does NOT take Eddie multis. DROP
+            # it QUIETLY (no "N tips in one image" MANUAL BET ALERT, no blind $1000
+            # guess). Singles WITH odds still place (incl. the lone no-units 2.5u
+            # fallback). v5.86 review: SCOPED to player-prop legs (raw.player) — a
+            # no-odds TEAM bet (margin 'Adelaide 40+' / total / line / h2h) is NOT
+            # the multi signature and is left to the normal path (the v5.75 margin
+            # placement + the no-units 2.5u fallback), so we never suppress one.
+            # Gated to eddie_afl; other AFL image channels keep prior behaviour.
+            if (tipster == "eddie_afl" and raw.get("player")
+                    and (_img_coerce_float(raw.get("odds")) or 0.0) <= 1.0):
+                log.info(
+                    f"[{channel_name}] Eddie AFL image PLAYER-PROP tip {idx} has NO "
+                    f"odds (multi/SGM-leg signature) -> dropped quietly (no manual "
+                    f"ping): {raw.get('player')} {raw.get('side') or ''} "
+                    f"{raw.get('line') or ''}".rstrip()
+                )
+                continue
             # Over+under of the same line parsed from one image = background-grid
             # over-parse. Can't tell which is the tip -> manual, never auto-place
             # both sides.
@@ -12569,7 +12775,10 @@ async def main():
                 # Only surface text posts that look like a bet/instruction;
                 # drop plain chatter (logged, never lost) to stop flooding
                 # manual with 'thanks'/'good luck'/emoji noise (2026-06-03).
-                if _image_text_is_actionable(text):
+                # Pass img_sport so the BUG B recap guard is SKIPPED for racing
+                # (the racing text path places real money + has its own results
+                # guard) but applied for Eddie AFL (text only pings manual).
+                if _image_text_is_actionable(text, img_sport):
                     if (img_sport or "").lower() == "racing":
                         # v5.21 (Wilson 2026-06-06): Zak/Trial post some real tips
                         # as TEXT, not images ('Adding Lingani for tomorrow').
