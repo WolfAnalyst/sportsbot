@@ -31,6 +31,11 @@ _nba_roster: dict = {}
 _nbl_roster: dict = {}
 _afl_roster: dict = {}
 _mlb_roster: dict = {}
+# MLB same-full-name collisions {name_lower: [teams]} — two different players
+# (e.g. a star and a minor-leaguer) sharing an exact full name on different teams.
+# Populated from roster_mlb.json's "__collisions__" block; consulted by the resolver
+# to refuse a blind team-override/inference (2026-06-25 Pete Alonso/Max Muncy fix).
+_mlb_collisions: dict = {}
 _loaded = False
 
 
@@ -122,23 +127,46 @@ AFL_NICKNAMES = {
     "bont": "Marcus Bontempelli",
 }
 
+# Curated MLB same-full-name collisions that a SINGLE statsapi pull may under-report.
+# Two GENUINELY DIFFERENT MLB players can share an exact full name on different teams
+# (the Dodgers' Max Muncy and a younger Athletics infielder of the same name). If a
+# given /sports/1/players snapshot happens to contain only one of them, within-pull
+# detection would write a confident single mapping; seeding the known pairs keeps the
+# resolver treating them as ambiguous (use a stated team, else manual) regardless of
+# the snapshot. Add a name ONLY when two distinct MLB players really share it -- do
+# NOT add a single player who merely changed clubs (e.g. Pete Alonso, one real player,
+# is correctly resolved to his current team and must keep auto-placing).
+MLB_KNOWN_COLLISIONS = {
+    "Max Muncy": ["Athletics", "Los Angeles Dodgers"],
+}
+
 
 def _load_rosters():
     """Load roster JSON files into memory."""
-    global _nba_roster, _nbl_roster, _afl_roster, _mlb_roster, _loaded
+    global _nba_roster, _nbl_roster, _afl_roster, _mlb_roster, _mlb_collisions, _loaded
     if _loaded:
         return
 
     for path, cache in [(NBA_ROSTER_FILE, "_nba"), (NBL_ROSTER_FILE, "_nbl"),
                         (AFL_ROSTER_FILE, "_afl"), (MLB_ROSTER_FILE, "_mlb")]:
         roster = {}
+        collisions = {}
         if path.exists():
             try:
                 with open(path, encoding="utf-8") as f:
                     data = json.load(f)
                 for name, team in data.items():
+                    # "__collisions__" is a reserved meta key {fullName: [teams]},
+                    # NOT a player — same-full-name MLB collisions (2026-06-25). Load
+                    # it aside so the resolver can refuse a blind override for such a
+                    # name; never let it become a bogus roster entry.
+                    if name == "__collisions__":
+                        if isinstance(team, dict):
+                            collisions = {k.lower(): list(v) for k, v in team.items()}
+                        continue
                     roster[name.lower()] = {"name": name, "team": team}
-                log.info(f"Loaded {len(roster)} players from {path.name}")
+                log.info(f"Loaded {len(roster)} players from {path.name}"
+                         + (f" ({len(collisions)} same-name collisions)" if collisions else ""))
             except Exception as e:
                 log.warning(f"Failed to load {path}: {e}")
 
@@ -150,6 +178,7 @@ def _load_rosters():
             _afl_roster = roster
         else:
             _mlb_roster = roster
+            _mlb_collisions = collisions
 
     _loaded = True
 
@@ -394,6 +423,28 @@ def exact_match_player(query: str, sport: str = "nba", team: str = "") -> dict:
             return {}
         return {"name": info["name"], "team": info["team"], "score": 1.0}
     return {}
+
+
+def is_mlb_name_collision(name: str) -> list:
+    """Return the list of teams an MLB same-full-name collision spans, or [] if the
+    name is unambiguous. Two different players (a star + a minor-leaguer) can share
+    an exact full name on different teams; the roster cannot disambiguate by name
+    alone, so the resolver must NOT apply a blind team-override/inference for such a
+    name (2026-06-25 Pete Alonso $399.99 wrong-game fault / Max Muncy latent). See
+    update_mlb_roster_from_api's "__collisions__" build guard."""
+    if not name:
+        return []
+    _load_rosters()
+    key = name.strip().lower()
+    teams = _mlb_collisions.get(key)
+    if teams:
+        return list(teams)
+    # Belt-and-braces: honour the curated list even if the loaded roster_mlb.json
+    # predates the seed (a stale JSON must NOT silently reopen the wrong-game fault).
+    for _cn, _ct in MLB_KNOWN_COLLISIONS.items():
+        if _cn.strip().lower() == key:
+            return list(_ct)
+    return []
 
 
 def fuzzy_match_player(
@@ -943,17 +994,55 @@ def update_mlb_roster_from_api(season: int = 2026):
             return "".join(c for c in s if not unicodedata.combining(c)).lower()
 
         surname_count: dict = {}
+        fullname_teams: dict = {}  # fullName -> set of distinct teams (collision detector)
         for p in people:
             name = (p.get("fullName") or "").strip()
             tid = (p.get("currentTeam") or {}).get("id")
             team = tmap.get(tid)
             if not (name and team):
                 continue
-            roster[name] = team
+            fullname_teams.setdefault(name, set()).add(team)
             parts = name.split()
             if len(parts) >= 2:
                 key = _surnorm(parts[-1])
                 surname_count[key] = surname_count.get(key, 0) + 1
+
+        # Same-full-name collision guard (2026-06-25; Pete Alonso/Max Muncy fault).
+        # /sports/1/players includes minor-leaguers, so two DIFFERENT players can
+        # share an exact fullName on DIFFERENT teams. The old `roster[name] = team`
+        # was last-writer-wins and silently clobbered the star (the Mets' Pete Alonso
+        # overwritten by a minor-league Orioles Pete Alonso), after which main.py's
+        # unconditional team override placed real money on the WRONG game with no
+        # alert. So: a name on exactly ONE team -> a normal name->team entry; a name
+        # on >1 team -> NO bare name->team mapping (it cannot be disambiguated by name
+        # alone), recorded under "__collisions__" so the resolver routes it to manual.
+        collisions = {n: sorted(ts) for n, ts in fullname_teams.items() if len(ts) > 1}
+        # Merge CURATED known collisions so a single-pull snapshot that contains only
+        # one same-named player (the Mets' Pete Alonso was absent 2026-06-25) cannot
+        # silently write a confident WRONG single mapping. Union the curated clubs
+        # with any within-pull detection and the lone snapshot team.
+        for _cn, _ct in MLB_KNOWN_COLLISIONS.items():
+            _seen = set(collisions.get(_cn, [])) | set(_ct) | set(fullname_teams.get(_cn, set()))
+            collisions[_cn] = sorted(_seen)
+        # Names on exactly ONE team get a normal mapping -- EXCEPT any that are now a
+        # collision (within-pull OR curated): those must carry NO bare name->team key.
+        for name, teams in fullname_teams.items():
+            if len(teams) == 1 and name not in collisions:
+                roster[name] = next(iter(teams))
+        if collisions:
+            # Persist the collision map so the loader + resolver can refuse a blind
+            # override for these names (see _load_rosters / is_mlb_name_collision).
+            roster["__collisions__"] = collisions
+            log.warning(
+                f"MLB same-name collisions dropped from name->team (disambiguate by "
+                f"slate, else manual): {collisions}"
+            )
+
+        # Surnames belonging to a collision fullname must NOT become a bare alias even
+        # when surname_count==1: the colliding partner may carry a different surname,
+        # so e.g. 'Alonso' (count 1 = only the Orioles minor-leaguer in this pull)
+        # would otherwise alias to the WRONG same-name player.
+        _collision_surnames = {_surnorm(n.split()[-1]) for n in collisions if n.split()}
 
         # Second pass: surname-only aliases, ONLY when the surname is unambiguous
         # (exactly one player, accent-insensitive) and not already a full-name
@@ -969,7 +1058,8 @@ def update_mlb_roster_from_api(season: int = 2026):
             parts = name.split()
             if len(parts) >= 2:
                 last = parts[-1]
-                if surname_count.get(_surnorm(last)) == 1 and last not in roster:
+                if (surname_count.get(_surnorm(last)) == 1 and last not in roster
+                        and _surnorm(last) not in _collision_surnames):
                     roster[last] = team
 
         log.info(f"Got {len(people)} MLB players across {len(tmap)} teams")

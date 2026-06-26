@@ -1741,6 +1741,29 @@ def resolve_event(tip: ParsedTip) -> str:
         player = tip.legs[0].player if (tip.legs and tip.legs[0].player) else ""
         if player and len(player.split()) >= 2:
             from roster import exact_match_player as _exact_mlb
+            from roster import is_mlb_name_collision as _mlb_collision
+            # Same-name collision guard (2026-06-25; Pete Alonso $399.99 wrong-game
+            # FAULT, Max Muncy latent). Two different MLB players can share an exact
+            # full name on different teams (a star + a minor-leaguer), so the roster
+            # below cannot be trusted to name the right team — the old unconditional
+            # override placed real money on the WRONG game with no alert. For a known
+            # collision: a tipster-STATED team is the human's explicit intent (not the
+            # clobbered roster) so trust it and let resolve_mlb_event decide; with NO
+            # stated team there is nothing safe to infer -> route to manual.
+            _collision_teams = _mlb_collision(player)
+            if _collision_teams:
+                if team:
+                    log.warning(
+                        f"MLB same-name collision: '{player}' exists on "
+                        f"{_collision_teams}; NOT applying roster override - using "
+                        f"the tipster's stated team '{team}'."
+                    )
+                    return resolve_mlb_event(team) or ""
+                log.warning(
+                    f"MLB same-name collision: '{player}' on {_collision_teams} with "
+                    f"NO stated team - cannot infer safely; routing to manual."
+                )
+                return ""
             _rm = _exact_mlb(player, "mlb")
             # BUG D (Wilson 2026-06-21): exact missed -> GUARDED fuzzy fallback for
             # a TYPO/variant of a full name ('Jung Ho Lee' -> 'Jung Hoo Lee', SF
@@ -6354,6 +6377,22 @@ def _resolve_mlb_player(tip_player: str, selections: list):
         s = "".join(c for c in s if unicodedata.category(c) != "Mn")
         return " ".join(s.lower().split())
 
+    # Generational suffixes ('Jr.'/'III'/...) are noise for surname matching: the
+    # MLB catalog often carries them ('Vladimir Guerrero Jr.') while the tip does
+    # not ('Vlad Guerrero'), which silently defeated the surname anchor below and
+    # sent a clearly-unique player to manual (2026-06-25 Vlad Guerrero $400 miss).
+    # Drop a trailing suffix token from EITHER side before taking the surname. Two
+    # genuinely distinct people (a Jr. AND a Sr. in the SAME game) still both match
+    # the stripped surname -> 2 hits -> the anchor's uniqueness check refuses them
+    # (manual), so this never drifts to a different player.
+    _SUFFIX_TOKENS = {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv", "v"}
+
+    def _surname_token(parts: list) -> str:
+        p = list(parts)
+        while len(p) > 1 and p[-1] in _SUFFIX_TOKENS:
+            p = p[:-1]
+        return p[-1] if p else ""
+
     tip_n = _norm(tip_player)
     if not tip_n:
         return None
@@ -6376,7 +6415,7 @@ def _resolve_mlb_player(tip_player: str, selections: list):
         return cat[tip_n]
     # Guarded fuzzy fallback.
     tip_parts = tip_n.split()
-    tip_surname = tip_parts[-1] if tip_parts else ""
+    tip_surname = _surname_token(tip_parts)
     tip_first = tip_parts[0] if len(tip_parts) >= 2 else ""
     tip_tokens = {t for t in tip_parts if len(t) >= 3}
     scored = []
@@ -6398,7 +6437,7 @@ def _resolve_mlb_player(tip_player: str, selections: list):
         surname_hits = []
         for cn, orig in cat.items():
             cp = cn.split()
-            if not cp or cp[-1] != tip_surname:
+            if not cp or _surname_token(cp) != tip_surname:
                 continue
             cf = cp[0] if len(cp) >= 2 else ""
             first_ok = (

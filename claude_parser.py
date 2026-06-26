@@ -309,6 +309,15 @@ def _websearch_json(system_prompt: str, user_content: str, model=None) -> dict:
         return {}
 
 
+# Per-process memo for the inline AFL player->club web-search. Each web_search
+# round-trip is ~14-22s and runs INLINE on the event loop, and the SAME player can
+# be resolved several times within one tip (the 2026-06-25 McCartin SGM re-resolved
+# the same player 4x across the enrich pass + the sequential _place_sgm_v4 fallback,
+# ~68s). Memoising by lowercased name (incl. the empty "unresolved" answer) collapses
+# those repeats to one search. Bounded staleness: main.py restarts daily.
+_AFL_TEAM_MEMO: dict = {}
+
+
 def resolve_afl_player_team(player: str, model=None) -> str:
     """Resolve an AFL player to their CURRENT club (e.g. a just-listed mid-season
     rookie absent from the stale roster). Returns the full club name or "" if
@@ -316,6 +325,9 @@ def resolve_afl_player_team(player: str, model=None) -> str:
     the bookie's live player-prop catalog before placing."""
     if not (player or "").strip():
         return ""
+    _key = player.strip().lower()
+    if _key in _AFL_TEAM_MEMO:
+        return _AFL_TEAM_MEMO[_key]
     system = (
         "You identify the CURRENT AFL (Australian Football League) club of a named player, "
         "for the live 2026 season. Use web_search to confirm recent listings, mid-season "
@@ -325,12 +337,19 @@ def resolve_afl_player_team(player: str, model=None) -> str:
         "set team to \"\" and confident to false. No other text."
     )
     out = _websearch_json(system, f"Which current AFL club does this player play for in 2026: {player}", model)
+    result = ""
     if out.get("confident") and isinstance(out.get("team"), str):
         team = out["team"].strip()
         if team:
             log.info(f"Claude web-search resolved AFL player '{player}' -> '{team}'")
-            return team
-    return ""
+            result = team
+    # Only memoise a COMPLETED search. _websearch_json returns {} on a transient
+    # failure (network/429/timeout/5xx); caching that empty result would pin a
+    # just-listed player as unresolved for the whole process. A genuine confident
+    # answer (team or "") is a non-empty dict -> safe to cache.
+    if out:
+        _AFL_TEAM_MEMO[_key] = result
+    return result
 
 
 def resolve_sa_track_today(race_num, runner: str, date_str: str, candidate_tracks=None, model=None) -> str:

@@ -173,13 +173,15 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
     url = f"{TELEGRAM_API.format(token=NOTIFY_BOT_TOKEN)}/sendMessage"
     for attempt in (1, 2):
         try:
+            _payload = {"chat_id": target, "text": text}
+            if parse_mode:
+                # Omit parse_mode entirely when falsy ("" / None) so Telegram treats
+                # the text as PLAIN — used by send_long_text for the ASCII daily
+                # review (passing parse_mode="" previously would have been rejected).
+                _payload["parse_mode"] = parse_mode
             resp = requests.post(
                 url,
-                json={
-                    "chat_id": target,
-                    "text": text,
-                    "parse_mode": parse_mode,
-                },
+                json=_payload,
                 # v5.71 (notifier dedup): (connect, read) timeouts. Fail fast on
                 # connect (5s) but give Telegram 20s to respond — the 06-16
                 # Turang double-send was a READ timeout at the old flat 10s
@@ -284,6 +286,43 @@ def _send_success(text: str) -> bool:
 def _send_maintenance(text: str) -> bool:
     """Chat #3: startup, roster refresh, self-check, info."""
     return _send(text, chat_id=NOTIFY_MAINTENANCE_CHAT_ID)
+
+
+def send_long_text(text: str, chat_id: str = "", header: str = "") -> int:
+    """Deliver a long PLAIN-TEXT report as a sequence of Telegram messages, split on
+    LINE boundaries (never mid-line), each well under Telegram's 4096-char hard cap.
+    No parse_mode, so ASCII renders verbatim — the daily review is ASCII-only and the
+    old path delivered only a truncated 1024-char caption, which read as 'cut off'.
+    Each message is prefixed '[i/n]'. Returns the number of chunks successfully sent.
+    """
+    target = chat_id or NOTIFY_MAINTENANCE_CHAT_ID or NOTIFY_CHAT_ID
+    CHUNK = 3500  # < 4096, leaving room for the '[i/n] header' prefix
+    chunks: list[str] = []
+    cur = ""
+    for ln in (text or "").split("\n"):
+        # Hard-wrap any single line longer than a whole chunk.
+        while len(ln) > CHUNK:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(ln[:CHUNK])
+            ln = ln[CHUNK:]
+        if cur and len(cur) + 1 + len(ln) > CHUNK:
+            chunks.append(cur)
+            cur = ln
+        else:
+            cur = (cur + "\n" + ln) if cur else ln
+    if cur:
+        chunks.append(cur)
+    if not chunks:
+        return 0
+    n = len(chunks)
+    sent = 0
+    for i, ch in enumerate(chunks, 1):
+        prefix = f"[{i}/{n}]" + (f" {header}" if header else "") + "\n"
+        if _send(prefix + ch, chat_id=target, parse_mode=""):
+            sent += 1
+    return sent
 
 
 def _send_critical(text: str) -> bool:

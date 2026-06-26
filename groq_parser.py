@@ -483,6 +483,14 @@ def _explicit_leading_sport(text: str) -> str | None:
     return _EXPLICIT_SPORT_TOKENS.get(m.group(0).lower())
 
 
+def _slash_leg_dir(sel: str) -> str:
+    """Classify an over/under selection direction for pseudo-SGM detection. Shared by
+    both demotion sites (the in-parse leg-builder and the '/'-merge) so the two cannot
+    drift (2026-06-25 review)."""
+    s = (sel or "").strip().lower()
+    return "under" if "under" in s else ("over" if "over" in s else s)
+
+
 def _merge_slash_line_into_sgm(tips: list, text: str) -> list:
     """Deterministic "/" = SGM (Wilson 2026-05-31).
 
@@ -561,9 +569,41 @@ def _merge_slash_line_into_sgm(tips: list, text: str) -> list:
             f"'/'=SGM merge: split tips named different bookies {sorted(_bookies)}; "
             f"using tip[0]'s '{base.suggested_bookie}' for the merged SGM"
         )
+    # Pseudo-SGM guard (2026-06-25 Saiyan McCartin): if Groq SPLIT a same-player /
+    # same-stat / same-over-under-direction "alt lines" message (e.g. 'McCartin Under
+    # 19.5 / Under 18.5'), these are NOT a combinable SGM -- re-merging them here would
+    # re-create the very $750 SGM the in-parse demotion avoids. Collapse to a SINGLE on
+    # leg[0] + the rest as alt_lines instead (mirrors the leg-builder demotion).
+    _merge_keys = {((lg.player or "").strip().lower(), (lg.stat or "").strip().lower(),
+                    _slash_leg_dir(lg.selection)) for lg in merged_legs}
+    _merge_all_named = all((lg.player or "").strip() and (lg.stat or "").strip()
+                           for lg in merged_legs)
+    _merge_any_pyo = any(getattr(t, "is_pyo_sgm", False) for t in tips)
+    if (len(merged_legs) >= 2 and len(_merge_keys) == 1 and _merge_all_named
+            and not _merge_any_pyo):
+        base.legs = [merged_legs[0]]
+        base.is_sgm = False
+        base.is_pyo_sgm = False
+        base.alt_lines = [{
+            "stat": lg.stat, "line": lg.line, "selection": lg.selection,
+            "market": lg.market, "is_threshold": bool(getattr(lg, "_is_threshold", False)),
+        } for lg in merged_legs[1:]]
+        base.suggested_odds = 0.0
+        base._is_threshold = False
+        log.info(
+            f"'/'=SGM merge demoted to single+alt (same player/stat/dir, only line "
+            f"differs): {base.legs[0].player} {base.legs[0].stat} {base.legs[0].selection} "
+            f"primary line={base.legs[0].line}, alt lines={[a['line'] for a in base.alt_lines]}"
+        )
+        return [base]
+
     base.legs = merged_legs
     base.is_sgm = True
     base.is_pyo_sgm = any(getattr(t, "is_pyo_sgm", False) for t in tips)
+    # Clear any alt_lines carried over from an already-demoted tips[0]: an SGM ticket
+    # never uses alt_lines (only the singles path reads them), so leftover entries are
+    # dead data. Mirrors the MLB-HRRBI promote-to-SGM reset (main.py:1662). (2026-06-25)
+    base.alt_lines = None
     # Groq split the ticket, so there is no reliable combined SGM price — accept
     # the bookie's computed multi price (no per-leg odds floor to apply).
     base.suggested_odds = 0.0
@@ -1328,6 +1368,39 @@ def parse_with_groq(
                 )
                 legs.append(leg)
 
+            # Pseudo-SGM demotion (2026-06-25 Saiyan McCartin): a "/"-joined tip
+            # whose legs are all the SAME player + SAME stat + SAME over/under
+            # direction, differing ONLY by line, is NOT a combinable SGM -- it is a
+            # primary line + alternative line(s) (Saiyan's "u19.5 bonus, grades at
+            # u18.5"). Groq's universal slash rule flags it is_sgm=true, which then
+            # upsizes to the SGM unit ($750) and routes to the SGM combine path. Demote
+            # it to a SINGLE on leg[0] with the remaining lines as alt_lines, so it
+            # places the primary then spills to the alts -- the proven _merge_batch_alts
+            # behaviour, just triggered from a one-line misflagged SGM. Narrow by design
+            # (same player AND stat AND direction); genuine multi-player / mixed-stat
+            # SGMs are untouched. PYO SGMs are left alone (their own line-pick path).
+            demoted_alt_lines = None
+            if is_sgm and not is_pyo_sgm and len(legs) >= 2:
+                _leg_keys = {((l.player or "").strip().lower(),
+                              (l.stat or "").strip().lower(),
+                              _slash_leg_dir(l.selection)) for l in legs}
+                _all_named = all((l.player or "").strip() and (l.stat or "").strip()
+                                 for l in legs)
+                if len(_leg_keys) == 1 and _all_named:
+                    demoted_alt_lines = [{
+                        "stat": l.stat, "line": l.line, "selection": l.selection,
+                        "market": l.market,
+                        "is_threshold": bool(getattr(l, "_is_threshold", False)),
+                    } for l in legs[1:]]
+                    legs = [legs[0]]
+                    is_sgm = False
+                    log.info(
+                        "Pseudo-SGM demoted to single+alt (same player/stat/dir, only "
+                        f"line differs): {legs[0].player} {legs[0].stat} "
+                        f"{legs[0].selection} primary line={legs[0].line}, "
+                        f"alt lines={[a['line'] for a in demoted_alt_lines]}"
+                    )
+
             # Handle threshold bets - auto-place with threshold market
             is_threshold = td.get("is_threshold", False)
             alert_only = td.get("alert_only", False)
@@ -1378,6 +1451,7 @@ def parse_with_groq(
                 suggested_odds=_safe_float(td.get("odds"), 0.0),
                 is_pyo_sgm=is_pyo_sgm,
                 alt_line=_normalise_alt_dict(td.get("alt_line")),
+                alt_lines=demoted_alt_lines,
                 units_explicit=units_explicit,
             )
 
