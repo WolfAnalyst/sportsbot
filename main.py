@@ -4511,7 +4511,15 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # Manual top-up alert: a hard failure OR any remainder vs the intended unit
     # (v5.20: includes the ladder-down + the bracket headroom no SB account could
     # hold). $1 deadband ignores cent-jitter. Routes the rest to Manual Bets.
-    if failed_results or unfilled > 1.0:
+    # v5.90 (2026-06-27): gate the manual/unfilled alert ONLY on real unfilled
+    # stake, not on "an account failed". The Crisp 06-27 case — Ryan 102506
+    # proxy-403'd but the overs redistribute topped the $120 onto the working
+    # accounts (unfilled -> $0.00) — still fired a ⚠️ BET UNFILLED ("manual")
+    # alert because failed_results was non-empty, even though the unit was FULLY
+    # placed. If unfilled <= $1 there is nothing to place by hand, so suppress it
+    # (the BET PLACED summary already reports the failed/recovered account; the
+    # daily review tracks the per-account failure pattern).
+    if unfilled > 1.0:
         log.warning(
             f"AFL fan-out: ${unfilled:.2f} unfilled "
             f"({len(failed_results)} account(s) failed)"
@@ -4821,7 +4829,10 @@ def _place_etr_nba_fanout(tip: ParsedTip) -> list[BetResult]:
             f"({len(failed_results)} failed, {len(ambiguous_results)} ambiguous)"
         )
 
-    if failed_results or unfilled > 1.0:
+    # v5.90 (2026-06-27): same fix as the AFL fan-out — gate on real unfilled
+    # stake, not on "an account failed", so a failure the ladder/redistribute
+    # fully covered (unfilled -> $0) no longer fires a spurious manual alert.
+    if unfilled > 1.0:
         log.warning(
             f"ETR fan-out: ${unfilled:.2f} unfilled "
             f"({len(failed_results)} account(s) failed)"
@@ -9477,7 +9488,22 @@ def _resolve_leg_for_hyperbot(
                 _before = player
                 player = resolve_player_name(
                     player, sport, team=leg.team_full or "", teams=event_teams)
+                # LATENCY (2026-06-27): resolve_player_name returns the input
+                # UNCHANGED both on a true roster miss AND when the name was
+                # already exactly correct (Saiyan/Eddie send full names like
+                # 'Jack Crisp'/'Elliot Yeo'), so `player == _before` alone CANNOT
+                # tell them apart — it fired the ~14s Claude web-search on EVERY
+                # already-rostered player (06-27: ~14s x N legs, sequential, = the
+                # 76s tip latency). Disambiguate with the player's roster-inferred
+                # team: if leg.team_full already matches one of the fixture's
+                # teams, the player IS rostered AND in this game -> the backstop is
+                # redundant, skip it. A genuinely stale-roster player (team_full
+                # empty or off-fixture) still web-searches, preserving the BUG-A
+                # backstop (the only case that ever NEEDED it).
+                _team_in_fixture = bool(leg.team_full) and any(
+                    _roster_team_matches(leg.team_full, t) for t in event_teams)
                 if player == _before and len(_before.split()) >= 2 \
+                        and not _team_in_fixture \
                         and tip_parser._claude_websearch_enabled():
                     # No roster hit on EITHER event team for a FULL name — the
                     # roster may be stale (just-listed player). Confirm the
