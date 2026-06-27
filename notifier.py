@@ -608,6 +608,23 @@ def notify_image_alert(tipster: str, raw_message: str) -> bool:
     return _send_alert(text)
 
 
+def notify_image_no_tip(tipster: str, caption: str = "") -> bool:
+    """An image was received but the vision parser found NO bettable tip (a
+    recap/results graphic, or a tip the model couldn't read). Distinct from
+    notify_image_alert, whose "Image bet detected" footer falsely implies a bet was
+    found — here NONE was, so say so plainly (2026-06-28: the 23:33 Eddie recap
+    image read as 'Image bet detected', which it was not)."""
+    cap = (f"\n<b>Caption:</b> <pre>{_escape_html(caption[:200])}</pre>"
+           if caption else "")
+    text = (
+        f"<b>IMAGE (no tip parsed)</b>\n"
+        f"<b>Tipster:</b> {_escape_html(tipster)}{cap}\n"
+        f"An image was received but no bettable tip was found — ignore unless you "
+        f"can see a tip in it."
+    )
+    return _send_alert(text)
+
+
 def notify_tip_placed_summary(
     tip, placed_results, intended_stake, unfilled,
     total_elapsed_sec=None,

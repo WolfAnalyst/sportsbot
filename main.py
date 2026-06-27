@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 from datetime import datetime, date as _date, timedelta as _timedelta
@@ -41,6 +42,7 @@ from config import (
     IMAGE_TIPS_TEST_MODE, IMAGE_TIPS_TEST_UNIT_SIZE, IMAGE_TIP_PARSERS,
     IMAGE_RACING_MAX_UNITS, IMAGE_RACING_TEST_MODE,
     SAIYAN_SGM_UNIT_SIZE,
+    IMAGE_TIP_CONCURRENT, IMAGE_TIP_MAX_CONCURRENCY,
 )
 from groq_parser import parse_tip_image
 from models import ParsedTip, ParsedLeg, BetResult
@@ -118,10 +120,18 @@ def _afl_log_event(tip, msg: str, level: str = "info") -> None:
         _afl_log.info(line)
 
 
+# v5.91: serialise audit-file appends. The AFL image fan-out now places multiple
+# tips CONCURRENTLY, and each place_tip writes tip_outcome rows via _log_jsonl;
+# without a lock two worker threads' appends could interleave bytes in audit.jsonl.
+# (bet_ledger.py already serialises its own CSV append with its own Lock.)
+_AUDIT_LOCK = threading.Lock()
+
+
 def _log_jsonl(path: Path, entry: dict):
     entry["timestamp"] = datetime.now().isoformat()
-    with open(path, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    with _AUDIT_LOCK:
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
 
 
 def _audit_log_path():
@@ -4331,6 +4341,11 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # account, rungs are sequential. _execute_bet keeps initial_post_max_attempts
     # =1 so a single rung's transient failure is never re-fired (no double-stake),
     # and the ladder STOPS on an ambiguous/maybe-landed rung (never retries lower).
+    # v5.91 NOTE: under concurrent IMAGE tips (_route_image_afl_tips PASS 2) two
+    # DIFFERENT tips can now fan out to the SAME session_id at once. Each still POSTs
+    # a distinct bet (different selection); HyperBot serialises per-session
+    # server-side. WATCH the first live multi-tip slate for same-session contention;
+    # a per-session_id lock is the belt-and-braces if it ever shows up.
     results: list[BetResult] = []
     log.info(f"AFL fan-out: firing {len(jobs)} concurrent placement(s) (each ladders)")
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
@@ -11274,7 +11289,23 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
             _date_str = msg_time.strftime("%Y-%m-%d") if msg_time else _dt.date.today().isoformat()
             _resolved = None
             if tipster == "zak_racing":
-                _resolved = claude_parser.resolve_sa_track_today(race_num, runner, _date_str)
+                # Zak is SA-only -> pass the SA thoroughbred candidate tracks so the
+                # web-search is a fast CONSTRAINED lookup (not the broad open-web
+                # search that timed out on 06-27 'Pure Bliss'), and RETRY once if the
+                # first call returns empty (one slow turn shouldn't doom a trackless
+                # SA tip). The list is a HINT only (no hard exclusion); a wrong
+                # resolved track still fails the NAME match downstream
+                # (track_claude_resolved disables saddle-only) + the odds floor ->
+                # manual, never a wrong-track bet.
+                _sa_tracks = ["Morphettville", "Morphettville Parks", "Gawler",
+                              "Murray Bridge", "Strathalbyn", "Port Augusta",
+                              "Mount Gambier", "Balaklava", "Oakbank", "Naracoorte",
+                              "Bordertown", "Port Lincoln", "Penola"]
+                _resolved = claude_parser.resolve_sa_track_today(
+                    race_num, runner, _date_str, candidate_tracks=_sa_tracks)
+                if not _resolved:
+                    _resolved = claude_parser.resolve_sa_track_today(
+                        race_num, runner, _date_str, candidate_tracks=_sa_tracks)
             else:  # trial_sniper — general runner-name -> track (+ name-anchored race#)
                 _info = claude_parser.resolve_racing_runner(runner, race_num, _date_str)
                 if _info.get("track"):
@@ -12008,8 +12039,42 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
     no_units_count = sum(
         1 for r in raw_tips if (_img_coerce_float(r.get("units")) or 0) <= 0
     )
+
+    # ── PASS 1 (SEQUENTIAL, main thread): guards + build + dedupe -> jobs ──
+    # v5.91: everything that touches the shared dedup map (_is_duplicate) or is
+    # cheap runs HERE so PASS 2 only parallelises the SLOW place_tip. Batch-dedupe
+    # within the image (_batch_fps) preserves the old check-then-register-
+    # sequentially semantics under concurrency (place_tip never touches
+    # _recent_tips, so the dedup map is only read/written from this main thread).
+    jobs = []          # [(idx, tip, dupe_fp)]
+    _batch_fps = set()
     for idx, raw in enumerate(raw_tips):
         try:
+            # E (2026-06-28): an unschematic / moneyline / multi-parlay selection the
+            # vision parser couldn't fit a market to comes back as market_type
+            # "other" + a plain-English `description`. Route it to MANUAL WITH the
+            # bet text (we never auto-place an Eddie multi) — BEFORE the no-odds drop
+            # below so the parlay is DESCRIBED, not dropped quietly. The 06-27 Eddie
+            # 09:49 moneyline parlay had only pinged the generic "(no bettable tips)"
+            # with no bet detail.
+            _desc = raw.get("description")
+            _desc = _desc.strip() if isinstance(_desc, str) else ""
+            _mt = (raw.get("market_type") or "").strip().lower()
+            # v5.91 review (#3): gate on market_type "other"/empty ONLY. The earlier
+            # "or no player/team" arm over-fired on a real total/team_line/margin tip
+            # that arrived with a stray description + null team, wrongly diverting it
+            # to manual. A real market_type now flows to _build_afl_tip_from_image
+            # (which routes an unplaceable one to manual itself); a multi still can't
+            # auto-place (alert_only backstops in _build + place_tip).
+            if _desc and _mt in ("other", ""):
+                log.info(f"[{channel_name}] AFL image tip {idx} is an unschematic/"
+                         f"multi selection -> manual (not auto-placed): {_desc}")
+                notifier.notify_image_alert(
+                    channel_name,
+                    f"(manual: multi / non-standard bet — review and place by "
+                    f"hand) {_desc}",
+                )
+                continue
             # BUG B (Wilson 2026-06-21): an Eddie AFL PLAYER-PROP image tip with NO
             # odds is a MULTI/SGM leg — Eddie posts SGM combos as a legs-only image
             # with no per-leg price, and the user does NOT take Eddie multis. DROP
@@ -12072,9 +12137,10 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
             _apply_saiyan_sgm_unit(tip)       # Saiyan SGM -> 750/u (250 ea x3); after test-stake
 
             _dupe_fp = f"{tip.tipster}::{_tip_fingerprint(tip)}"  # capture pre-place (v5.49)
-            if _is_duplicate(tip):
+            if _is_duplicate(tip) or _dupe_fp in _batch_fps:
                 log.info(f"[{channel_name}] DUPE image tip skipped: {_tip_fingerprint(tip)}")
                 continue
+            _batch_fps.add(_dupe_fp)
 
             # v5.37: stamp arrival t0 + vision parse so the summary reconciles a
             # true end-to-end. place_tip ADDS resolve_sec; the fan-out price_check_sec.
@@ -12083,25 +12149,79 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                                "parse_sec": round(parse_sec or 0.0, 3)}
 
             _audit_tip(tip, msg_time)
-            results = place_tip(tip)
-            # v5.13: also lock the fingerprint on an ambiguous (maybe-landed)
-            # outcome so a re-post can't double-stake an account that may have
-            # already placed.
-            if any(r.success for r in results) or any(_is_ambiguous_result(r) for r in results):
-                _register_tip_fingerprint(tip, fp=_dupe_fp)
-                for r in results:
-                    if r.success:
-                        log.info(f"[{channel_name}] PLACED image tip: {r.bet_id} on {r.bookie} @ {r.odds}")
-                # v5.43: the no-units FALLBACK flag (tip._units_fallback) is surfaced
-                # in the BET PLACED bet-log summary itself (notifier.notify_tip_placed_summary)
-                # — no separate maintenance ping (Wilson). The flag rides on the tip.
-            else:
-                log.info(f"[{channel_name}] AFL image tip {idx} not placed (routed to manual): {tip.raw_message}")
+            jobs.append((idx, tip, _dupe_fp))
         except Exception as e:
-            log.exception(f"[{channel_name}] AFL image tip {idx} crashed: {e}")
+            log.exception(f"[{channel_name}] AFL image tip {idx} build crashed: {e}")
             try:
                 notifier.notify_image_alert(
                     channel_name, f"(AFL tip {idx} error: {e}) — place manually"
+                )
+            except Exception:
+                pass
+
+    if not jobs:
+        return
+
+    # ── PASS 2: PLACE. Concurrent when >1 job + flag on (the Saiyan/Eddie
+    # multi-tip image: each tip's slow resolve+fan-out runs in PARALLEL instead of
+    # summing — 06-27 Crisp/De Goey/Trezise were 76s SEQUENTIAL). Each place_tip is
+    # independent (a distinct selection); the shared writes it makes are
+    # thread-safe (bet_ledger _lock, _log_jsonl _AUDIT_LOCK) and _recent_tips is
+    # only touched in PASS 1/3 on this main thread. Bounded (IMAGE_TIP_MAX_
+    # CONCURRENCY) so tips x accounts threads don't explode; one tip crashing is
+    # captured and handled in PASS 3 (never kills its siblings). ──
+    def _place_one(job):
+        _i, _t, _f = job
+        try:
+            return (_i, _t, _f, place_tip(_t), None)
+        except Exception as e:  # noqa: BLE001 — isolate one tip's crash
+            return (_i, _t, _f, None, e)
+
+    if IMAGE_TIP_CONCURRENT and len(jobs) > 1:
+        import concurrent.futures
+        _workers = min(len(jobs), max(1, IMAGE_TIP_MAX_CONCURRENCY))
+        log.info(f"[{channel_name}] placing {len(jobs)} image tips CONCURRENTLY "
+                 f"(<= {_workers} at once)")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_workers) as ex:
+            outcomes = list(ex.map(_place_one, jobs))
+    else:
+        outcomes = [_place_one(j) for j in jobs]
+
+    # ── PASS 3 (SEQUENTIAL, main thread): register fingerprint + log per result.
+    # v5.13: lock the fingerprint on success OR an ambiguous (maybe-landed) outcome
+    # so a re-post can't double-stake an account that may have already placed.
+    for _idx, _tip, _fp, results, err in sorted(outcomes, key=lambda o: o[0]):
+        try:
+            if err is not None:
+                # place_tip itself raised in PASS 2 — the bet most likely never
+                # placed, but a mid-flight crash isn't 100% certain, so VERIFY.
+                log.error(f"[{channel_name}] AFL image tip {_idx} placement crashed: {err!r}")
+                notifier.notify_image_alert(
+                    channel_name,
+                    f"(AFL tip {_idx} placement error: {err} — VERIFY before "
+                    f"re-placing) place by hand"
+                )
+                continue
+            if any(r.success for r in results) or any(_is_ambiguous_result(r) for r in results):
+                _register_tip_fingerprint(_tip, fp=_fp)
+                for r in results:
+                    if r.success:
+                        log.info(f"[{channel_name}] PLACED image tip: {r.bet_id} on {r.bookie} @ {r.odds}")
+                # v5.43: the no-units FALLBACK flag (tip._units_fallback) rides on the
+                # tip and is surfaced in the BET PLACED summary itself (no extra ping).
+            else:
+                log.info(f"[{channel_name}] AFL image tip {_idx} not placed (routed to manual): {_tip.raw_message}")
+        except Exception as _e3:
+            # v5.91 review (#5): a crash HERE means PASS 2 already placed the bet(s)
+            # but post-processing (register/log) failed — the dedup fingerprint may
+            # be unregistered. ISOLATE it (don't drop later outcomes) + ping to
+            # VERIFY; NEVER silently re-place (the bet is likely already on).
+            log.error(f"[{channel_name}] AFL image tip {_idx} post-place crashed: {_e3!r}")
+            try:
+                notifier.notify_image_alert(
+                    channel_name,
+                    f"(AFL tip {_idx}: bet likely PLACED but post-processing failed: "
+                    f"{_e3} — VERIFY before any re-place)"
                 )
             except Exception:
                 pass
@@ -12185,10 +12305,12 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
                 log.error(f"[{channel_name}] Claude vision fallback failed: {e}")
         if not raw_tips:
             log.info(f"[{channel_name}] vision parse returned 0 tips")
-            cap = f" — {raw_caption[:120]}" if raw_caption else ""
-            notifier.notify_image_alert(
-                channel_name, f"(image received but no bettable tips parsed){cap}"
-            )
+            # v5.91 (2026-06-28): a no-tip image is NOT a 'bet detected' -> use the
+            # dedicated no-tip notifier (notify_image_alert's footer falsely said
+            # 'Image bet detected. Check and place manually.' — the 23:33 Eddie recap
+            # case). Still PINGS (a real tip the model fumbled must not be silently
+            # dropped — esp. under Claude-primary, where there's no 2nd model).
+            notifier.notify_image_no_tip(channel_name, raw_caption or "")
             return
         # else: Claude recovered tips -> fall through to normal routing below.
 

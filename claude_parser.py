@@ -50,6 +50,13 @@ _MAX_TOKENS = 4000
 # a misbehaving search from spinning. Sonnet (CLAUDE_WEBSEARCH_MODEL) + these caps
 # keep each resolve well under a dollar (the Opus+uncapped path cost ~$2/call).
 _WEBSEARCH_MAX_TURNS = 3
+# v5.91 review (#4): a TOTAL wall-clock budget for the pause-turn loop. timeout=20
+# + max_retries=1 caps ONE create() at ~40s, but the loop can run _WEBSEARCH_MAX_
+# TURNS times (worst ~120s, and the Zak retry-on-empty doubles that) — the budget
+# breaks the loop so a hung search can't run unbounded. The RACING resolvers (Zak
+# SA / Trial) still run inline on the event loop so this caps a freeze there; the
+# AFL player resolver now runs in a PASS-2 worker thread (v5.91 concurrent tips).
+_WEBSEARCH_BUDGET_SEC = 45.0
 _WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 5}
 
 _CLIENT = None
@@ -259,12 +266,18 @@ def parse_racing_text_claude(text, tipster, model=None):
 def _websearch_complete(system_prompt: str, user_content: str, model: str) -> str:
     """Run a web_search agentic loop and return the final text. Handles the
     server-tool `pause_turn` by re-sending until `end_turn` (capped)."""
-    # v5.84: bound each web-search round-trip (the resolvers currently run inline
-    # on the event loop; a tight timeout caps the worst-case block + a hung search
-    # fails to {} -> manual). Full run_in_executor offload is a tracked follow-up.
-    client = _client().with_options(timeout=40.0)
+    # v5.84 + v5.91 review (#4): bound each web-search round-trip. timeout=20 +
+    # max_retries=1 caps ONE create() at ~40s; the SDK default (2 retries x 40s) x
+    # the _WEBSEARCH_MAX_TURNS pause loop is what made the 06-27 Zak 'Pure Bliss'
+    # resolve run ~120s+ and FREEZE the event loop (track=None -> manual). The
+    # _WEBSEARCH_BUDGET_SEC wall-clock cap breaks the pause loop so a hung search
+    # can't run turns x 40s; it fails to {} -> manual. The AFL player resolver now
+    # runs in a PASS-2 worker thread (v5.91); the RACING resolvers still run inline,
+    # so the cap matters most for them. Full executor offload stays a follow-up.
+    client = _client().with_options(timeout=20.0, max_retries=1)
     messages = [{"role": "user", "content": user_content}]
     last = None
+    _deadline = time.monotonic() + _WEBSEARCH_BUDGET_SEC
     for _ in range(_WEBSEARCH_MAX_TURNS):
         last = client.messages.create(
             model=model,
@@ -275,6 +288,10 @@ def _websearch_complete(system_prompt: str, user_content: str, model: str) -> st
             messages=messages,
         )
         if last.stop_reason == "pause_turn":
+            if time.monotonic() >= _deadline:
+                log.warning("websearch: wall-clock budget exhausted mid pause-turn "
+                            "loop -> returning partial ({} -> manual)")
+                break
             # Server hit its tool-loop limit; APPEND the assistant turn and
             # re-send to continue (accumulate across multiple pauses — do NOT
             # rebuild a 2-element list, which drops earlier search context).
