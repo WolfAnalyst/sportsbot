@@ -3802,9 +3802,20 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
             # provably-not-placed gate. (Stake-rejects ladder DOWN below;
             # AMBIGUOUS/maybe-landed already stopped above and is NEVER retried.)
             if AFL_FANOUT_PREPLACEMENT_RETRY and _is_definitely_pre_placement(r.error or ""):
+                _orig_err = r.error or ""
+                _el = _orig_err.lower()
+                # v5.92 (Wilson): short problem label for the bet-log / manual note.
+                # v5.92 review NIT: only call it a proxy-403 when 403 co-occurs with a
+                # proxy/forbidden/client-error marker (a bare "403" substring in an
+                # unrelated error must not be mislabelled a proxy error).
+                _prob = ("403 proxy error"
+                         if ("proxy responded with non 200" in _el
+                             or ("403" in _el and ("proxy" in _el or "forbidden" in _el
+                                                   or "client error" in _el)))
+                         else (_orig_err[:50] or "pre-placement reject"))
                 log.info(
                     f"AFL fan-out: {bk}:{sid} transient pre-placement reject on "
-                    f"${step:.2f} ({(r.error or '')[:60]}) — retrying SAME rung once"
+                    f"${step:.2f} ({_orig_err[:60]}) — retrying SAME rung once"
                 )
                 time.sleep(AFL_FANOUT_RETRY_DELAY_SEC)
                 r = _execute_bet(tip, sess, step, presolved=resolved)
@@ -3813,8 +3824,15 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
                 except Exception:
                     pass
                 if r.success:
+                    # v5.92: recovered on the re-bet — tag so the bets_placed.csv
+                    # `note` column + the BET PLACED summary say "account X hit XX,
+                    # fixed on re-bet" (same stake; a 403 is a clean no-debit reject).
+                    try:
+                        r._recovered_note = f"{bk}:{sid} {_prob} — fixed on re-bet"
+                    except Exception:
+                        pass
                     log.info(f"AFL fan-out: {bk}:{sid} retry PLACED ${step:.2f} "
-                             f"(first attempt was a transient pre-placement reject)")
+                             f"(recovered after a {_prob} on the first attempt)")
                     return r
                 if _is_ambiguous_result(r):
                     return _reconcile_fanout_ambiguous(
@@ -3824,6 +3842,13 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
                     log.info(f"AFL fan-out: {bk}:{sid} retry hit stake-reject "
                              f"${step:.2f}, laddering down")
                     continue
+                # v5.92: FAILED TWICE on the same message (pre-placement both times,
+                # e.g. the proxy 403) — tag so the manual/UNFILLED alert flags it.
+                try:
+                    r._retry_failed_twice = True
+                    r._retry_note = f"{bk}:{sid} {_prob} — FAILED TWICE on this message"
+                except Exception:
+                    pass
                 # retry ALSO a non-stake error -> fall through to abandon.
             log.info(
                 f"AFL fan-out: {bk}:{sid} non-stake error on ${step:.2f} — abandoning "
@@ -11038,7 +11063,17 @@ _IMAGE_RECAP_RE = re.compile(
     r"\b(?:not the best|tough beat|bad beat|rough (?:night|day|one|trot)|"
     r"have (?:taken|copped)|i'?ve taken|taken these|took these|"
     r"already (?:taken|on these)|copped (?:a|some|the)|"
-    r"better odds elsewhere|could be better odds|better elsewhere)\b",
+    r"better odds elsewhere|could be better odds|better elsewhere|"
+    # v5.92 (2026-07-03): weekend P&L wrap-up signatures. The 06-28 "Meh weekend,
+    # some losses involved (-5.8u by my calculations)" + 07-02 "2-2 night with the
+    # late add cooking us" fell through to the units pattern (the -5.8u P&L read as
+    # a stake) -> false manual ping. These phrases never appear in a forward tip.
+    r"meh (?:weekend|round|week)|by my calculation|stunk it up|"
+    # v5.92 review: require a DASH between the score digits (so "2-2 night" matches
+    # but a real "30 night ..." does not) + dropped the "cooking us" alt (it
+    # collided with the forward idiom "cooking us a multi"; "2-2 night" already
+    # catches the 07-02 recap).
+    r"\d\s?[-–]\s?\d\s+night)\b",
     re.IGNORECASE,
 )
 

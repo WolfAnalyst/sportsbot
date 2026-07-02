@@ -788,6 +788,15 @@ def notify_tip_placed_summary(
         total_elapsed_sec, session_timing, concurrent_bookies,
     )
 
+    # v5.92 (Wilson): flag any account that hit a proxy-403 (or other transient
+    # pre-placement reject) on the first attempt but was RECOVERED on the same-stake
+    # re-bet — shown in the bet-log (and persisted to the ledger `note` column).
+    recovery_tag = ""
+    _rec = [getattr(r, "_recovered_note", "") for r in (placed_results or [])
+            if getattr(r, "_recovered_note", "")]
+    if _rec:
+        recovery_tag = "\n<b>⚙️ Recovered on re-bet:</b> " + _escape_html("; ".join(_rec))
+
     text = (
         f"<b>BET PLACED</b>{sgm_tag}{fallback_tag}\n"
         f"<b>Tipster:</b> {_escape_html(tip.tipster)}\n"
@@ -796,6 +805,7 @@ def notify_tip_placed_summary(
         f"<b>Total placed:</b> ${total_placed:.2f} of ${intended_stake:.2f} "
         f"@ avg {weighted_odds:.3f}"
         f"{fill_tag}"
+        f"{recovery_tag}"
         f"{elapsed_tag}\n"
         f"<b>Placements:</b>\n<pre>{_escape_html(placements_str)}</pre>"
         f"{tried_block}"
@@ -954,6 +964,16 @@ def notify_tip_unfilled_with_placements(
         parts.append(
             f"<b>Also tried:</b>\n<pre>"
             f"{_escape_html(chr(10).join(tried_lines))}</pre>"
+        )
+    # v5.92 (Wilson): flag accounts that FAILED TWICE on this message — a
+    # pre-placement reject (e.g. the proxy 403) on BOTH the initial attempt AND the
+    # re-bet — so the manual alert says which account still needs a hand-place.
+    _twice = [getattr(r, "_retry_note", "") for r in (failed_results or [])
+              if getattr(r, "_retry_failed_twice", False) and getattr(r, "_retry_note", "")]
+    if _twice:
+        parts.append(
+            f"<b>🔁 Failed twice (same message):</b>\n<pre>"
+            f"{_escape_html(chr(10).join(_twice))}</pre>"
         )
     parts.extend([
         f"<b>Placed:</b> ${placed_stake:.2f} of ${intended_stake:.2f}",

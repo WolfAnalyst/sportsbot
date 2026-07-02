@@ -42,6 +42,10 @@ COLUMNS = [
     "placed_at", "date", "tipster", "sport", "event", "market", "selection",
     "line", "side", "bookie", "account", "stake", "odds", "potential_return",
     "potential_profit", "bet_id", "correlation_id", "units", "unit_size",
+    # v5.92: free-text note — e.g. "sportsbet:65463 403 proxy error — fixed on
+    # re-bet". Appended column (the ledger is a documented superset; existing rows
+    # leave it blank, a fresh CSV headers it). Blank for the vast majority of bets.
+    "note",
 ]
 _lock = Lock()
 _logged_bet_ids: set = set()
@@ -166,6 +170,7 @@ def log_sports_bet(tip, result, account: str = "") -> None:
             "correlation_id": getattr(result, "correlation_id", "") or "",
             "units": _num(getattr(tip, "units", None)) if getattr(tip, "units", None) is not None else "",
             "unit_size": _num(getattr(tip, "unit_size", None)) if getattr(tip, "unit_size", None) is not None else "",
+            "note": getattr(result, "_recovered_note", "") or "",
         })
     except Exception as e:
         log.error(f"bet_ledger.log_sports_bet failed: {e}")
