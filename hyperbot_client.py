@@ -976,3 +976,48 @@ class HyperBotClient:
         if poll_result.get("success") is False and "statuses" not in poll_result:
             return poll_result
         return self._unwrap_single_status(poll_result)
+
+    def place_betfair_bsp(
+        self, session_id: str, track: str, race_num: int, runner: str,
+        size: float, market: str = "win", bet_direction: str = "back",
+        race_type: str = "(R)", date: str = None,
+    ) -> dict:
+        """Place a Betfair Exchange bet at the STARTING PRICE (BSP) on one runner.
+
+        v5.93 (2026-07-03): HyperBot now takes Betfair back/lay + BSP straight from
+        /v3/place_bet — set bsp=true, no price needed (matches at SP when the race
+        jumps), and pick the runner by track + runner NAME (HB resolves the Betfair
+        market/selection — no IDs to look up). `size` is the STAKE for a back (or the
+        liability for a lay). `market` = 'win' | 'place' (Betfair has separate BSP
+        markets). Erasmus-safe: max_attempts=1 on the initial POST (same as
+        place_racing_bet) — a BSP order can't be double-submitted safely.
+        """
+        if not date:
+            date = datetime.now().strftime("%Y-%m-%d")
+        payload = {
+            "session_id": session_id,
+            "category": "betfair",
+            "bet_direction": bet_direction,
+            "bsp": True,
+            "market": market,
+            "track": track,
+            "race_num": race_num,
+            "race_type": race_type,
+            "runner": runner,
+            "size": size,
+            "date": date,
+        }
+        poll_result = self._post_v3_async("/v3/place_bet", payload)
+        if poll_result.get("success") is False and "statuses" not in poll_result:
+            # Maybe-landed guard: if HB issued a correlation_id the order REACHED the
+            # exchange and MAY have matched at the Starting Price (only the bet_status
+            # polling then died — _post_v3_async attaches the cids on that H23 path).
+            # Mark it AMBIGUOUS so the caller VERIFIES rather than blindly re-backing.
+            # A clean pre-placement reject (403/401/400, or a POST that never got a cid)
+            # carries no correlation_ids and stays a definitive failure. _post_v3_async
+            # already tags a fast POST-timeout ambiguous; this closes the
+            # cid-obtained-then-poll-died gap on the BSP path.
+            if poll_result.get("correlation_ids") and not poll_result.get("ambiguous"):
+                poll_result = {**poll_result, "ambiguous": True}
+            return poll_result
+        return self._unwrap_single_status(poll_result)

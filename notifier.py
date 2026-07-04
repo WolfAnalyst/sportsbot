@@ -591,6 +591,31 @@ def notify_info(message: str) -> bool:
     return _send_maintenance(f"<b>INFO:</b> {_escape_html(message)}")
 
 
+def notify_betfair_bsp_placed(channel_name: str, event_str: str, placements: list) -> bool:
+    """v5.93: Bet Log message for a Betfair BSP placement (Leroy). placements = list
+    of {runner, market, size, units, bet_id} — each matched at the Starting Price."""
+    lines = []
+    total = 0.0
+    for p in (placements or []):
+        total += float(p.get("size", 0) or 0)
+        lines.append(
+            f"  #{p.get('saddle', '?')} {p.get('runner', '?')} "
+            f"{str(p.get('market', 'win')).upper()} @BSP  "
+            f"${float(p.get('size', 0) or 0):.2f} ({float(p.get('units', 0) or 0):g}u)  "
+            f"[{p.get('bet_id') or 'no-id'}]"
+        )
+    body = "\n".join(lines) if lines else "  (none)"
+    text = (
+        f"<b>BET PLACED (Betfair BSP)</b>\n"
+        f"<b>Tipster:</b> {_escape_html(channel_name)}\n"
+        f"<b>Event:</b> {_escape_html(event_str)}\n"
+        f"<b>Total staked:</b> ${total:.2f} at the Starting Price\n"
+        f"<pre>{_escape_html(body)}</pre>\n"
+        f"Backs match at the SP when the race jumps."
+    )
+    return _send_success(text)
+
+
 def notify_critical(message: str) -> bool:
     """Infrastructure failure. Goes to critical chat."""
     return _send_critical(f"<b>🚨 CRITICAL:</b> {_escape_html(message)}")

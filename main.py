@@ -43,6 +43,7 @@ from config import (
     IMAGE_RACING_MAX_UNITS, IMAGE_RACING_TEST_MODE,
     SAIYAN_SGM_UNIT_SIZE,
     IMAGE_TIP_CONCURRENT, IMAGE_TIP_MAX_CONCURRENCY,
+    LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
 )
 from groq_parser import parse_tip_image
 from models import ParsedTip, ParsedLeg, BetResult
@@ -57,6 +58,11 @@ try:
 except ModuleNotFoundError:
     parse_ausbets_message = None
     parse_kev_message = None
+try:
+    # v5.93 Leroy Betfair-BSP racing tipster — tipbot-only (the fork lacks it).
+    from parsers.leroy import parse_leroy_message
+except ModuleNotFoundError:
+    parse_leroy_message = None
 from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
 from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
@@ -1191,6 +1197,14 @@ DUPE_WINDOW_SECS = 600  # 10 minutes
 # racing tip double-placed real money. Fingerprint racing selections here and skip
 # a repeat within DUPE_WINDOW_SECS. Keyed in _route_image_racing_tips.
 _racing_recent_fps: dict = {}  # {racing fingerprint tuple: timestamp}
+# v5.93: the Leroy Betfair-BSP path is a NEW real-money placement path — a telethon
+# reconnect catch-up re-delivery / a tipster re-post would double-back on Betfair.
+# Keyed per (LEROY, track, race, date, saddle, market), registered BEFORE the place.
+# A Leroy race resolves HOURS after the tip, so the 10-min DUPE_WINDOW_SECS is too
+# short (an hour-later re-post must still be caught) — use a day-long TTL. See
+# _leroy_place_race.
+_leroy_recent_fps: dict = {}  # {leroy fingerprint tuple: timestamp}
+LEROY_DEDUP_TTL_SEC = 18 * 3600  # 18h — spans a whole race day; prunes stale keys
 
 
 def _tip_fingerprint(tip: ParsedTip) -> str:
@@ -12467,6 +12481,258 @@ async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
     )
 
 
+async def _process_leroy_betfair_tip(text, cfg, msg_time, channel_name):
+    """v5.93 crash-guard + dispatcher for a Late Mail Leroy post. A create_task'd
+    coroutine's exception is otherwise swallowed by asyncio (logged late, never
+    surfaced) — for a real-money path a crash must ping manual, NEVER silently drop a
+    tip. Parses (MULTI-RACE aware), anchors the date on the post's AEST day (Leroy is
+    DAY-OF ONLY — never roll a date forward), and places each race independently."""
+    try:
+        if parse_leroy_message is None:
+            log.warning(f"[{channel_name}] parsers.leroy missing — Leroy tip -> manual: {text[:80]}")
+            notifier.notify_image_alert(
+                channel_name, f"(Leroy parser unavailable — place manually) {text[:200]}")
+            return
+        parsed = parse_leroy_message(text)
+        if parsed is None:
+            log.info(f"[{channel_name}] Leroy: no racing header (noise) -> dropped: {text[:80]}")
+            return
+        races = parsed.get("races") or []
+        if not races:
+            log.info(f"[{channel_name}] Leroy: no bettable race (noise) -> dropped: {text[:80]}")
+            return
+        # Date = the post's AEST calendar day. event.date is UTC (tz-aware); +10h
+        # anchors to AEST exactly like _img_parse_racing_date — a raw-UTC date on a
+        # morning tip would be the PREVIOUS AEST day -> the wrong day's card -> a
+        # wrong-numbered runner. Leroy is DAY-OF ONLY, so this same-day date is the
+        # bet date; we NEVER probe a next meeting (contrast _next_meeting_date).
+        anchor = msg_time or datetime.now()
+        if getattr(anchor, "tzinfo", None) is not None:
+            anchor = anchor + _timedelta(hours=10)
+        date_str = anchor.strftime("%Y-%m-%d")
+        # Per-race isolation: a crash in one race must NOT skip the others, and its
+        # manual alert must name ONLY that race (an already-PLACED race's legs must not
+        # be re-surfaced for a hand-back — the dedup fp only blocks the automated path).
+        for race in races:
+            if not race.get("legs"):
+                # A "#<digit>" runner line was seen for THIS race but no units parsed
+                # -> a mis-formatted real race must NOT vanish silently ('every post is
+                # a tip' — Wilson). Per-race so a malformed race sharing a post with a
+                # well-formed one still surfaces (the good race still auto-places).
+                log.info(f"[{channel_name}] Leroy: {race.get('track')} "
+                         f"R{race.get('race_num')} parsed 0 bettable legs -> manual")
+                try:
+                    notifier.notify_image_alert(
+                        channel_name,
+                        f"(Leroy — couldn't parse {race.get('track')} "
+                        f"R{race.get('race_num')}, place manually on Betfair BSP)")
+                except Exception:
+                    pass
+                continue
+            try:
+                await _leroy_place_race(race, date_str, channel_name)
+            except Exception as e:
+                log.exception(f"[{channel_name}] Leroy race place crashed: {e}")
+                try:
+                    _legs = ", ".join(
+                        f"#{l['saddle']} {l['win_units']:g}u W/{l['place_units']:g}u P"
+                        for l in race.get("legs", []))
+                    notifier.notify_image_alert(
+                        channel_name,
+                        f"(Leroy race crashed — place manually on Betfair BSP) "
+                        f"{race.get('track')} R{race.get('race_num')}: {_legs} | error: {e}")
+                except Exception:
+                    pass
+    except Exception as e:
+        log.exception(f"[{channel_name}] Leroy Betfair pipeline crashed: {e}")
+        try:
+            notifier.notify_image_alert(
+                channel_name,
+                f"(Leroy tip crashed — place manually on Betfair BSP) {text[:200]} | error: {e}")
+        except Exception:
+            pass
+
+
+async def _leroy_place_race(parsed_race, date_str, channel_name):
+    """Place ONE Leroy race via Betfair BSP (BACK) on LEROY_BETFAIR_SESSION.
+    $LEROY_UNIT_SIZE/unit, FULL stake, NO splitting across accounts, capped at
+    LEROY_MAX_UNITS PER BET. A W/Place line places on BOTH the WIN and PLACE BSP
+    markets. Saddle# -> runner NAME off a price_check_racing card (same-day, exact
+    track+race+date; the card's saddle numbers are correct for THIS race). Money-safety:
+    (1) per-(track,race,date,saddle,market) DEDUP registered BEFORE the place so a
+    reconnect re-delivery / duplicate line can't double-back; (2) an AMBIGUOUS place
+    result (POST/cid timeout — the back MAY have matched at SP) fires a verify-the-
+    account CRITICAL and is NEVER told to 'place manually' (that would double-stake);
+    (3) an unresolvable saddle or a clean failure routes THAT leg to a manual alert."""
+    # Alias-normalise the track (e.g. 'Morphettville Parks' -> 'Morphettville'); an
+    # unknown/vague track passes through and is resolved best-effort by trying the card
+    # across up to 4 bookies below (if ANY recognises it we get the field), else manual.
+    track = _normalise_racing_track(parsed_race["track"]) or parsed_race["track"]
+    race_num = parsed_race["race_num"]
+    rtype = parsed_race["race_type"]
+    sess = str(LEROY_BETFAIR_SESSION)
+    loop = asyncio.get_event_loop()
+    log.info(f"[{channel_name}] Leroy: {track} R{race_num} ({date_str}) — "
+             f"{len(parsed_race['legs'])} runner(s) -> Betfair BSP (session {sess}, "
+             f"${LEROY_UNIT_SIZE:g}/u, cap {LEROY_MAX_UNITS:g}u)")
+
+    # Card fetch for saddle# -> runner NAME (Betfair BSP is placed by NAME; saddle
+    # numbers are identical across bookies for a race). Try the Betfair session first;
+    # if it returns no numbered card (a Betfair session may not serve a fixed-odds
+    # racing card), fall back through the FIRST FEW racing-priority sessions — bounded
+    # so a run of dead sessions can't blow the latency (each price-check is a ~30s cid).
+    def _fetch_runners(_sid):
+        try:
+            c = hb.price_check_racing(_sid, track, race_num, rtype, date_str)
+            return (c or {}).get("runners", []) or []
+        except Exception as e:
+            log.warning(f"[{channel_name}] Leroy card fetch on {_sid} failed: {e}")
+            return []
+
+    def _has_numbers(rs):
+        return any(r.get("number") is not None and (r.get("runner") or "").strip()
+                   for r in rs)
+
+    card_sessions = [sess]
+    try:
+        card_sessions += [s for s in session_priority.get_priority_for("racing")
+                          if s != sess][:3]
+    except Exception:
+        pass
+    runners = []
+    for _sid in card_sessions:
+        runners = await loop.run_in_executor(None, lambda s=_sid: _fetch_runners(s))
+        if _has_numbers(runners):
+            if _sid != sess:
+                log.info(f"[{channel_name}] Leroy: resolved {track} R{race_num} card via "
+                         f"fallback session {_sid} (Betfair {sess} had no numbered card)")
+            break
+
+    def _num_eq(a, b):
+        try:
+            return int(a) == int(b)
+        except (TypeError, ValueError):
+            return str(a).strip() == str(b).strip()
+
+    def _name_for(saddle):
+        for r in runners:
+            if _num_eq(r.get("number"), saddle):
+                return (r.get("runner") or "").strip()
+        return ""
+
+    placed, manual = [], []
+    for leg in parsed_race["legs"]:
+        saddle = leg["saddle"]
+        name = _name_for(saddle)
+        if not name:
+            manual.append(
+                f"#{saddle} ({leg['win_units']:g}u W / {leg['place_units']:g}u P) — "
+                f"couldn't resolve saddle->name on {track} R{race_num}")
+            continue
+        for market, units in (("win", leg["win_units"]), ("place", leg["place_units"])):
+            if units <= 0:
+                continue
+            # DEDUP registered BEFORE the place. A Leroy race resolves HOURS after the
+            # tip, so the 10-min racing window is too short — use a day-long TTL so an
+            # hour-later re-post (or a reconnect catch-up re-delivery) still can't
+            # re-stake. Also collapses any within-post duplicate (saddle,market) that
+            # slipped past the parser.
+            fp = ("LEROY", track.lower(), race_num, date_str, saddle, market)
+            _now = datetime.now()
+            for _k in [k for k, t in _leroy_recent_fps.items()
+                       if (_now - t).total_seconds() > LEROY_DEDUP_TTL_SEC]:
+                del _leroy_recent_fps[_k]
+            if fp in _leroy_recent_fps:
+                log.info(f"[{channel_name}] Leroy DUPLICATE {track} R{race_num} #{saddle} "
+                         f"{market} (already placed/attempted) -> skipped (no double-bet)")
+                continue
+            _leroy_recent_fps[fp] = _now
+
+            capped = min(units, LEROY_MAX_UNITS)   # 4u CAP per bet (Wilson)
+            size = round(capped * LEROY_UNIT_SIZE, 2)
+            _t0 = datetime.now()
+            try:
+                res = await loop.run_in_executor(
+                    None, lambda m=market, s=size: hb.place_betfair_bsp(
+                        sess, track, race_num, name, s, market=m,
+                        race_type=rtype, date=date_str))
+            except Exception as e:
+                res = {"success": False, "error": str(e)}
+            _elapsed = (datetime.now() - _t0).total_seconds()
+            _err = res.get("error") or ""
+            # MAYBE-LANDED = the API flagged it ambiguous OR the reject was SLOW and not
+            # a provably pre-placement reject. A slow non-success CAN have landed
+            # off-ledger (the Erasmus $125 lesson) — mirror the slow-rejection guard
+            # used on every other placement path (STAKE_REJECT_LATENCY_THRESHOLD_SEC /
+            # _is_definitely_pre_placement). A maybe-landed BSP back is NEVER routed to
+            # 'place manually' (a hand re-back would DOUBLE-STAKE at the SP).
+            _maybe_landed = bool(res.get("ambiguous")) or (
+                not res.get("success")
+                and _elapsed >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
+                and not _is_definitely_pre_placement(_err)
+            )
+            if res.get("success"):
+                bet_id = res.get("bet_id") or res.get("betId") or ""
+                if capped < units:
+                    log.info(f"[{channel_name}] Leroy #{saddle} {name} {market}: capped "
+                             f"{units:g}u -> {LEROY_MAX_UNITS:g}u (${size:.2f})")
+                placed.append({"saddle": saddle, "runner": name, "market": market,
+                               "size": size, "units": capped, "bet_id": bet_id})
+                log.info(f"[{channel_name}] Leroy BSP PLACED: #{saddle} {name} {market} "
+                         f"${size:.2f} [{bet_id or 'no-id'}]")
+                try:
+                    import bet_ledger
+                    # Synthesize a stable ledger key when HB returns no bet_id — a BSP
+                    # back is UNMATCHED until the jump, so success-with-no-id is normal;
+                    # bet_ledger._write_row drops a blank-bet_id row, so the placed bet
+                    # would silently miss the ledger + Bet Record feed without this.
+                    _lid = bet_id or f"BSP-{track}-{race_num}-{saddle}-{market}-{date_str}"
+                    bet_ledger.log_racing_bet(
+                        {"track": track, "race_num": race_num, "saddle": saddle,
+                         "runner": name, "market": market, "date": date_str,
+                         "titan": "LEROY", "units": capped},
+                        {"session_id": sess, "bookie": "betfair", "stake": size,
+                         "odds": None, "bet_id": _lid},
+                    )
+                except Exception as _le:
+                    log.error(f"[{channel_name}] Leroy ledger write failed: {_le}")
+            elif _maybe_landed:
+                # The back MAY have matched at the SP (ambiguous flag, or a slow reject
+                # that can land off-ledger). NEVER tell Wilson to 'place manually' (a
+                # hand re-back = DOUBLE STAKE) — fire a verify-the-account CRITICAL,
+                # mirroring racing_placer's ambiguous handling. The dedup fp is already
+                # registered, so a re-post of this leg is also blocked.
+                log.error(f"[{channel_name}] Leroy AMBIGUOUS: #{saddle} {name} {market} "
+                          f"${size:.2f} on {track} R{race_num} (elapsed={_elapsed:.1f}s) "
+                          f"— may have matched at SP")
+                try:
+                    notifier.notify_critical(
+                        f"Leroy Betfair BSP AMBIGUOUS: {track} R{race_num} #{saddle} {name} "
+                        f"{market.upper()} ${size:.2f} — the back MAY have matched at the "
+                        f"Starting Price. VERIFY the Betfair account before ANY manual "
+                        f"placement (do NOT double-back).")
+                except Exception:
+                    pass
+            else:
+                err = _err[:80] or "place failed"
+                log.warning(f"[{channel_name}] Leroy BSP FAILED: #{saddle} {name} "
+                            f"{market} ${size:.2f} — {err}")
+                manual.append(f"#{saddle} {name} {market} {capped:g}u (${size:.2f}) — {err}")
+    if placed:
+        try:
+            notifier.notify_betfair_bsp_placed(channel_name, f"{track} R{race_num}", placed)
+        except Exception:
+            pass
+    if manual:
+        try:
+            notifier.notify_image_alert(
+                channel_name,
+                f"(Leroy — place manually on Betfair BSP) {track} R{race_num}: "
+                + "; ".join(manual))
+        except Exception:
+            pass
+
+
 # ── Roster Freshness ────────────────────────────────────────────────
 
 ROSTER_STALE_DAYS = 1
@@ -12951,6 +13217,23 @@ async def main():
                     f"sender {sender_id} (expected bot_id={expected_bot}). "
                     f"If this is the tipster's new bot, update config.py."
                 )
+            return
+
+        # v5.93: Betfair-BSP CHANNELS (Leroy). A TEXT channel where EVERY post is a
+        # tip; parse (saddle#+units) + place each runner via Betfair BSP (back) on the
+        # configured Betfair session — NOT the fixed-odds racing pipeline. Noise is
+        # dropped by the parser (returns None). LEROY_ENABLED is the kill-switch.
+        if channel_cfg.get("betfair_bsp"):
+            if not LEROY_ENABLED:
+                log.info(f"[{channel_name}] LEROY_ENABLED=false — Betfair BSP tip skipped: {text[:80]}")
+            elif text:
+                asyncio.create_task(
+                    _process_leroy_betfair_tip(text, channel_cfg, msg_time, channel_name)
+                )
+            else:
+                # Leroy is a TEXT tipster; a no-text (image/sticker/empty) post isn't a
+                # tip we can parse. Log so it's visible rather than a silent no-op.
+                log.info(f"[{channel_name}] Betfair BSP post with no text -> ignored")
             return
 
         # Image-tip CHANNELS (Eddie AFL, Zak/Trial racing): the post's image
