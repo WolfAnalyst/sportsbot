@@ -32,7 +32,7 @@ from config import (
     AFL_CONCURRENT_FANOUT, AFL_FANOUT_MIN_STAKE, AFL_FANOUT_WEIGHTED,
     AFL_FANOUT_RATIO_CAP, EDDIE_FANOUT_BIG_UNITS, EDDIE_BIG_LIMITED_STAKE,
     EDDIE_FANOUT_DECAY, AFL_FANOUT_PREPLACEMENT_RETRY, AFL_FANOUT_RETRY_DELAY_SEC,
-    AFL_DISPOSALS_REDISTRIBUTE,
+    AFL_DISPOSALS_REDISTRIBUTE, AFL_REDISTRIBUTE_MAX_PASSES,
     SGM_CONCURRENT_FANOUT,
     ETR_NBA_CONCURRENT_FANOUT, ETR_NBA_SESSION_IDS, ETR_NBA_FIXED_LADDER,
     ETR_NBA_TEST_MODE, ETR_NBA_UNIT_SIZE_TEST,
@@ -3977,48 +3977,105 @@ def _is_afl_disposals_over(tip: ParsedTip) -> bool:
 
 
 def _afl_redistribute_topup(tip, placed_results, unfilled,
-                            sessions_by_sid, resolved_by_sid):
-    """v5.78 (Wilson 2026-06-20): for an AFL DISPOSALS fan-out (Saiyan or Eddie,
-    over or under) that left stake UNFILLED (an account failed — e.g. Alex 65463
-    low balance 06-19 — or laddered down), re-split the WHOLE unfilled remainder
-    EVENLY across the accounts that PLACED and fire a top-up on each, laddering
-    100/90/80/70% of its share and STOPPING on continued reject. ONE reroute round:
-    get the unit down on the bookies that worked rather than to manual.
+                            sessions_by_sid, resolved_by_sid,
+                            exclude_sids=None, max_passes=AFL_REDISTRIBUTE_MAX_PASSES):
+    """v5.94 (Wilson 2026-07-05, from the 07-04 failure review): re-fan an AFL fan-out's
+    UNFILLED remainder onto the accounts PROVEN healthy, in BOUNDED MULTI-PASSES.
 
-    Returns the list of top-up BetResults (the caller classifies + merges them).
-    SAFE: each top-up is capped at its 1/n share so total can never exceed the unit
-    (no over-stake); reuses _fanout_place_account so an ambiguous/maybe-landed top-up
-    STOPS its ladder and is treated as committed (no double-stake); ONE pass only
-    (a top-up's own shortfall is never recursively redistributed)."""
+    v5.78/79 was a SINGLE even-split pass across the base-pass successes: if a top-up leg
+    itself failed (a re-403 on a dead-proxy session — 102506/65463 on 07-04), that slice
+    was abandoned to a manual crumb ($143 lost over Connor Macdonald/Shai Bolton/Cripps),
+    and it never fired at all for under/total/goalscorer markets ($1,267 lost). Now:
+
+      PASS 0 splits the remainder across the base-pass successes; each later PASS re-splits
+      whatever is STILL unfilled across ONLY the accounts whose top-up JUST SUCCEEDED
+      (proven-healthy this second) — so a re-403'd crumb re-shops onto a working sibling
+      instead of dropping. Stop when: remainder < AFL_FANOUT_MIN_STAKE, no healthy target
+      remains, a pass places nothing, or max_passes is hit.
+
+    - `exclude_sids`: sessions that failed the base pass for a NON-CAP reason (403/auth/508)
+      are never targeted — a dead proxy / dry account won't recover mid-tip. A session that
+      re-fails pre-placement DURING a pass is added to the exclusion for the next pass.
+    - If the even share `remainder/n` falls below the bookie $min, CONCENTRATE onto the
+      fewest accounts that each clear the min (so a small remainder actually places in one
+      shot rather than fragmenting into sub-min crumbs that drop).
+
+    Returns all top-up BetResults across passes (caller classifies + merges).
+    SAFE: `remaining` decreases each pass by the COMMITTED stake — clean placed PLUS any
+    maybe-landed/ambiguous top-up (its at-risk rung), treated as committed so a landed-but-
+    uncertain leg is NEVER re-shopped onto a sibling — so base + top-ups can never exceed the
+    unit (no over-stake, no ambiguous double-stake); reuses _fanout_place_account (ambiguous
+    STOPS its ladder); bounded passes."""
     import concurrent.futures
-    placed_sids, seen = [], set()
-    for r in placed_results:
-        sid = str(getattr(r, "session_id", "") or "")
-        if sid and sid not in seen and sid in sessions_by_sid and sid in resolved_by_sid:
-            seen.add(sid)
-            placed_sids.append(sid)
-    n = len(placed_sids)
-    if n == 0 or unfilled <= AFL_FANOUT_MIN_STAKE:
-        return []
-    per = round(unfilled / n, 2)
-    ladder = [round(per * f, 2) for f in (1.0, 0.9, 0.8, 0.7)]
-    ladder = [s for s in ladder if s >= AFL_FANOUT_MIN_STAKE]
-    if not ladder:
-        return []
-    log.info(
-        f"AFL overs redistribute: ${unfilled:.2f} unfilled -> ${per:.2f} top-up "
-        f"across {n} placed account(s) {placed_sids} (ladder {ladder})"
-    )
-    jobs = [(sessions_by_sid[s], list(ladder), resolved_by_sid[s]) for s in placed_sids]
+    excluded = set(str(s) for s in (exclude_sids or []))
+
+    def _healthy(results):
+        sids, seen = [], set()
+        for r in results:
+            sid = str(getattr(r, "session_id", "") or "")
+            if (sid and sid not in seen and sid not in excluded
+                    and sid in sessions_by_sid and sid in resolved_by_sid):
+                seen.add(sid)
+                sids.append(sid)
+        return sids
+
     out: list[BetResult] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
-        futs = {ex.submit(_fanout_place_account, tip, s, l, res): s
-                for (s, l, res) in jobs}
-        for fut in concurrent.futures.as_completed(futs):
-            try:
-                out.append(fut.result())
-            except Exception as e:
-                log.error(f"AFL overs redistribute: top-up raised: {e}")
+    remaining = round(unfilled, 2)
+    targets = _healthy(placed_results)          # PASS 0 targets = base-pass successes
+    for _pass in range(max_passes):
+        if remaining <= AFL_FANOUT_MIN_STAKE or not targets:
+            break
+        n = len(targets)
+        per = round(remaining / n, 2)
+        if per < AFL_FANOUT_MIN_STAKE:
+            # too thin to split n ways -> concentrate on the FEWEST accounts that each
+            # clear the $min, so the remainder lands instead of fragmenting into crumbs.
+            k = max(1, int(remaining // AFL_FANOUT_MIN_STAKE))
+            targets = targets[:k]
+            n = len(targets)
+            per = round(remaining / n, 2)
+        ladder = [round(per * f, 2) for f in (1.0, 0.9, 0.8, 0.7)]
+        ladder = [s for s in ladder if s >= AFL_FANOUT_MIN_STAKE] or [round(per, 2)]
+        log.info(
+            f"AFL redistribute pass {_pass + 1}/{max_passes}: ${remaining:.2f} unfilled -> "
+            f"${per:.2f} top-up across {n} healthy account(s) {targets} (ladder {ladder})"
+        )
+        jobs = [(sessions_by_sid[s], list(ladder), resolved_by_sid[s]) for s in targets]
+        pass_out: list[BetResult] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+            futs = {ex.submit(_fanout_place_account, tip, s, l, res): s
+                    for (s, l, res) in jobs}
+            for fut in concurrent.futures.as_completed(futs):
+                try:
+                    pass_out.append(fut.result())
+                except Exception as e:
+                    log.error(f"AFL redistribute: top-up raised: {e}")
+        out.extend(pass_out)
+        placed_now = round(sum(r.stake or 0 for r in pass_out if r.success), 2)
+        # A maybe-landed (AMBIGUOUS) top-up is treated as COMMITTED (it may have landed at
+        # the bookie): subtract its at-risk stake from `remaining` too, NOT just the clean
+        # successes. Otherwise the next pass re-shops that slice onto a healthy sibling and —
+        # if the ambiguous bet DID land — the tip OVER-STAKES its unit. Mirrors the call-site
+        # ambiguous_total accounting (same _is_ambiguous_result predicate; at-risk = the rung
+        # fired, stashed by _fanout_place_account as _requested_stake). A reconcile-confirmed-
+        # NOT-placed leg is not ambiguous (_is_ambiguous_result False) so it correctly stays
+        # re-placeable in `remaining`. The break stays keyed on REAL successes so a pass that
+        # produced only an ambiguous still stops (never spins).
+        committed_now = round(placed_now + sum(
+            (getattr(r, "_requested_stake", None) or r.stake or 0)
+            for r in pass_out if (not r.success and _is_ambiguous_result(r))), 2)
+        remaining = round(max(0.0, remaining - committed_now), 2)
+        if placed_now <= 0:
+            break  # no REAL fill this pass -> stop (don't spin on dead/ambiguous targets)
+        # a session that re-failed pre-placement (403/auth) this pass is dropped from the
+        # next; the next pass targets ONLY the accounts that JUST succeeded (proven-healthy).
+        for r in pass_out:
+            if not r.success and _is_definitely_pre_placement(getattr(r, "error", "") or ""):
+                excluded.add(str(getattr(r, "session_id", "") or ""))
+        targets = _healthy([r for r in pass_out if r.success])
+    if remaining > AFL_FANOUT_MIN_STAKE:
+        log.info(f"AFL redistribute: ${remaining:.2f} still unfilled after "
+                 f"{max_passes} pass(es) -> manual")
     return out
 
 
@@ -4456,21 +4513,27 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # this unit gap (a failed/short account placed less -> counts in intended-placed).
     unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
 
-    # v5.78 (Wilson 2026-06-20): AFL DISPOSALS redistribute-to-successful top-up.
-    # When the fan-out leaves stake unfilled (an account failed — e.g. Alex 65463
-    # low balance — or laddered down) AND others placed, re-split the WHOLE unfilled
-    # remainder across the accounts that worked and top each up (100/90/80/70%
-    # ladder). AFL disposals OVERS only (any tipster) — ONE reroute round. v5.79:
-    # UNDERS excluded (their per-account cap [124,99,74,50] is far below the OVER cap
-    # [300,250,200,150], so placed accounts have no headroom to absorb a reroute — it
-    # just re-rejects). Each top-up is capped at its 1/n share (no over-stake) and
-    # reuses the ladder (ambiguous -> stop, no double-stake).
-    if (AFL_DISPOSALS_REDISTRIBUTE and unfilled > AFL_FANOUT_MIN_STAKE
-            and placed_results and _is_afl_disposals_over(tip)):
+    # v5.78/79 (Wilson 2026-06-20) → v5.94 (2026-07-05, 07-04 failure review): redistribute
+    # an AFL fan-out's UNFILLED remainder onto proven-healthy accounts in BOUNDED MULTI-
+    # PASSES (see _afl_redistribute_topup — a re-403'd top-up crumb re-shops onto a working
+    # sibling instead of dropping to manual). Fires for the original disposals-OVERS case,
+    # AND now for any single-account NON-CAP failure (403 / auth / 508 low-balance) on ANY
+    # market — under / team-total / goalscorer included: a proxy or funds failure is not a
+    # moved-line risk, so the v5.79 overs-only guard (which existed to avoid piling stake on
+    # a moved disposals line) does not apply. A pure stake-cap (538) miss on a non-overs
+    # market still does NOT redistribute (the whole book is capped -> nowhere with headroom).
+    # Base-pass NON-CAP failures are excluded as top-up targets (a dead proxy / dry account
+    # won't recover mid-tip). SAFE: total placed can never exceed the unit (remainder only
+    # decreases by actual placed stake).
+    _noncap_fail = any(not _is_stake_error(r.error or "") for r in failed_results)
+    if (AFL_DISPOSALS_REDISTRIBUTE and unfilled > AFL_FANOUT_MIN_STAKE and placed_results
+            and (_is_afl_disposals_over(tip) or _noncap_fail)):
         _sess_by_sid = {str(s.get("session_id", "")): s for (s, _l, _r) in jobs}
         _res_by_sid = {str(s.get("session_id", "")): _r for (s, _l, _r) in jobs}
+        _exclude = [str(r.session_id) for r in failed_results
+                    if not _is_stake_error(r.error or "")]
         _topups = _afl_redistribute_topup(
-            tip, placed_results, unfilled, _sess_by_sid, _res_by_sid)
+            tip, placed_results, unfilled, _sess_by_sid, _res_by_sid, exclude_sids=_exclude)
         for _tr in _topups:
             results.append(_tr)
             if _tr.success:
@@ -4484,9 +4547,9 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             ambiguous_total = round(sum(_at_risk_stake(r) for r in ambiguous_results), 2)
             unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
             log.info(
-                f"AFL overs redistribute: topped up "
+                f"AFL redistribute: topped up "
                 f"${sum((r.stake or 0) for r in _topups if r.success):.2f} across "
-                f"{sum(1 for r in _topups if r.success)}/{len(_topups)} account(s); "
+                f"{sum(1 for r in _topups if r.success)}/{len(_topups)} top-up leg(s); "
                 f"unfilled now ${unfilled:.2f}"
             )
 
