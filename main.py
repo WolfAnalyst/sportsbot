@@ -516,9 +516,9 @@ def _tip_has_handicap_leg(tip) -> bool:
 # any half/quarter-qualified handicap to manual, mirroring the image _partial_period
 # guard for the text path. Full-game handicaps (no half/quarter word) are unaffected.
 _SAIYAN_PERIOD_HC_RE = re.compile(
-    r"\b(?:1st|2nd|3rd|4th|first|second|third|fourth)\s*(?:half|quarter|qtr)\b"
+    r"\b(?:1st|2nd|3rd|4th|first|second|third|fourth)[-\s]*(?:half|quarter|qtr)\b"
     r"|\b(?:half|quarter|qtr)[-\s]*(?:time|line)\b"
-    r"|\bhalf\s*time\b|\bq[1-4]\b|\b[1-4]q\b|\b[12]h\b",
+    r"|\bhalf[-\s]*time\b|\bq[1-4]\b|\b[1-4]q\b|\b[12]h\b|\bh[12]\b",
     re.IGNORECASE,
 )
 
