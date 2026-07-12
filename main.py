@@ -53,6 +53,8 @@ from config import (
     SPORTSBET_MAX_STAKE_REBET,
     SELF_BET_MAX_STAKE,
     EDDIE_CAPTION_FALLBACK_ENABLED,
+    AFL_PERIOD_MARKETS_ENABLED,
+    SAIYAN_HC_SGM_ENABLED,
 )
 from groq_parser import parse_tip_image
 from models import ParsedTip, ParsedLeg, BetResult
@@ -388,6 +390,96 @@ def _below_odds_floor(tipped_odds, matched_odds) -> bool:
     return m < t * _ODDS_FLOOR_PCT
 
 
+# ── AFL period / exotic markets (quarter & half handicaps) ──────────────────
+# v5.9x (Wilson 2026-07-12): place AFL quarter (1q-4q) + 1st-half TEAM handicaps
+# via the bookie's EXACT proposition_id, resolved LIVE from price_check_sports.
+# SB-only, gated by AFL_PERIOD_MARKETS_ENABLED (default OFF -> ships DORMANT).
+# EXACT match ONLY (period + team + signed line) — NO fuzzy — so an unmatched
+# niche market routes to MANUAL, never a wrong proposition_id (Wilson's explicit
+# "don't fuck up the prop_id"). tri_bet / winning-margin bands are NOT wired here
+# (more parse-ambiguous) -> they stay manual. HB shapes (probe 2026-07-11):
+#   quarter_line:      {selection: team, period: '1q'..'4q', line, proposition_id, odds}
+#   quarter_time_line: {selection: team, period: 'full_game'|'1h', line, proposition_id}
+
+# Eddie/vision `period` strings -> Sportsbet period codes (supported set only).
+_AFL_PERIOD_CODE_MAP = {
+    "1q": "1q", "q1": "1q", "1st_quarter": "1q", "first_quarter": "1q", "1st quarter": "1q",
+    "2q": "2q", "q2": "2q", "2nd_quarter": "2q", "second_quarter": "2q", "2nd quarter": "2q",
+    "3q": "3q", "q3": "3q", "3rd_quarter": "3q", "third_quarter": "3q", "3rd quarter": "3q",
+    "4q": "4q", "q4": "4q", "4th_quarter": "4q", "fourth_quarter": "4q", "4th quarter": "4q",
+    "1h": "1h", "h1": "1h", "1st_half": "1h", "first_half": "1h", "1st half": "1h",
+    # NOTE (07-12 review #2): a bare "half" is NOT mapped — it's ambiguous (could be
+    # a shortened 2nd-half tip) and would place the WRONG half. Every unmapped /
+    # ambiguous period -> "" -> manual (the no-guess invariant).
+}
+
+
+def _afl_period_code(raw_period) -> str:
+    """Map a vision/parser period string to a SUPPORTED SB period code
+    (1q/2q/3q/4q/1h), or "" if unsupported (e.g. a 2nd-half line -> stays manual)."""
+    p = str(raw_period or "").strip().lower().replace("-", "_")
+    return _AFL_PERIOD_CODE_MAP.get(p, "")
+
+
+def _afl_period_market_for(period_code: str) -> str:
+    """The SB market that carries a given period handicap ("" if none)."""
+    if period_code in ("1q", "2q", "3q", "4q"):
+        return "quarter_line"
+    if period_code == "1h":
+        return "quarter_time_line"
+    return ""
+
+
+def _resolve_afl_period_prop(markets: dict, period_code: str, team: str, line):
+    """EXACT-match an AFL period handicap to its live proposition_id.
+
+    `markets` = price_check_sports(...)['markets']. Returns
+    {proposition_id, odds, selection, market, period, line} on an EXACT
+    (period + team + signed line) match, else None. NO fuzzy — a miss routes to
+    manual, never a wrong niche bet. Team match is case-insensitive on the
+    bookie's exact team spelling (a nickname that doesn't match -> None -> manual)."""
+    mkt_key = _afl_period_market_for(period_code)
+    if not mkt_key or not isinstance(markets, dict):
+        return None
+    m = markets.get(mkt_key)
+    if not isinstance(m, dict):
+        return None
+    sels = m.get("selections") or m.get("outcomes") or []
+    tnorm = (team or "").strip().lower()
+    if not tnorm:
+        return None
+    try:
+        target_line = float(line)
+    except (TypeError, ValueError):
+        return None
+    for s in sels:
+        if not isinstance(s, dict):
+            continue
+        if str(s.get("period") or "").strip().lower() != period_code:
+            continue
+        if str(s.get("selection") or s.get("team") or "").strip().lower() != tnorm:
+            continue
+        s_line = s.get("line")
+        if s_line is None:
+            continue
+        try:
+            if abs(float(s_line) - target_line) > 1e-6:
+                continue
+        except (TypeError, ValueError):
+            continue
+        pid = s.get("proposition_id")
+        if pid:
+            return {
+                "proposition_id": str(pid),
+                "odds": s.get("odds") or s.get("price"),
+                "selection": s.get("selection"),
+                "market": mkt_key,
+                "period": period_code,
+                "line": float(s_line),
+            }
+    return None
+
+
 def _is_handicap_sgm(tip) -> bool:
     """True if `tip` is an SGM containing at least one handicap (line /
     first_half_line) leg. Used to route handicap SGMs to manual."""
@@ -415,6 +507,24 @@ def _tip_has_handicap_leg(tip) -> bool:
                 and not (getattr(l, "stat", "") or "").strip()):
             return True
     return False
+
+
+def _saiyan_hc_placeable(tip) -> bool:
+    """v5.9x (#7, 07-12 review C1): True iff EVERY handicap-ish leg is a clean
+    FULL-GAME 'line' handicap — the ONLY handicap the placement resolvers exact-
+    match (line/pick_own_line). A `first_half_line` (period) leg would otherwise
+    fall back to the FULL-GAME catalog and place the WRONG MARKET; a mangled
+    no-player/no-stat leg, an h2h/margin/team_line leg, has no safe resolver. So
+    when SAIYAN_HC_SGM_ENABLED, ONLY full-game-line handicaps auto-place; every
+    other handicap-ish leg keeps the manual route. Player-prop legs never block."""
+    for l in (getattr(tip, "legs", None) or []):
+        mkt = (getattr(l, "market", "") or "").lower()
+        player = (getattr(l, "player", "") or "").strip()
+        stat = (getattr(l, "stat", "") or "").strip()
+        _is_hcish = (mkt in _HANDICAP_MARKETS) or (not player and not stat)
+        if _is_hcish and mkt != "line":
+            return False
+    return True
 
 # ── Auto alt-line retry config ─────────────────────────────────────
 # When primary line fails to place anywhere, we try tipped_line ±1 for
@@ -1476,7 +1586,11 @@ def _tip_fingerprint(tip: ParsedTip) -> str:
         return f"{tip.sport}::SGM::{tip.event or ''}::{'|'.join(leg_parts)}"
     elif tip.legs:
         leg = tip.legs[0]
-        return f"{tip.sport}::{leg.player}|{leg.team_full}|{leg.stat}|{leg.line}|{leg.selection}"
+        # v5.9x (07-12 review #4): include leg.period so a period handicap (e.g. a
+        # 1st-half line) isn't collapsed as a duplicate of the full-game line at the
+        # same team/line. INERT for normal tips (period=="" for every non-period leg).
+        return (f"{tip.sport}::{leg.player}|{leg.team_full}|{leg.stat}|{leg.line}"
+                f"|{leg.selection}|{getattr(leg, 'period', '')}")
     # Fallback: raw_message[:100] collides when multiple Shook tips share the
     # same context prefix.  For Shook, fingerprint on the trigger text (the
     # part after "CURRENT MESSAGE:\n") so each distinct tip gets its own slot.
@@ -2513,7 +2627,18 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
     # Wilson wants ALL Saiyan handicap/team-line bets placed by hand rather than
     # risk a mis-placed team-line leg. Catches both placement paths below, incl.
     # a handicap leg whose market label was mangled (no player + no stat).
-    if tip.tipster == "saiyan_afl" and _tip_has_handicap_leg(tip):
+    # v5.9x (#7): when SAIYAN_HC_SGM_ENABLED, Saiyan handicap bets are NO LONGER
+    # force-routed to manual — they fall through to the normal placement paths
+    # (single -> AFL fan-out; SGM -> SGM fan-out), where the handicap leg resolves
+    # via the EXACT _match_handicap_in_catalog (line/pick_own_line; a miss -> manual,
+    # never a wrong line) and the max-stake rebet fills at the SB max across all
+    # accounts. Unplaced -> manual. Ships DORMANT (flag default False -> the old
+    # manual routing is unchanged until the 07-12 review + a probe confirm it).
+    if (tip.tipster == "saiyan_afl" and _tip_has_handicap_leg(tip)
+            and not (SAIYAN_HC_SGM_ENABLED and _saiyan_hc_placeable(tip))):
+        # 07-12 review C1: even with the flag on, ONLY a clean full-game 'line'
+        # handicap auto-places; a first_half_line/period, mangled, or ML/margin/
+        # team_line leg stays on the manual route (never a full-game fallback).
         log.info("Saiyan handicap/team-line bet -> routing to manual (Wilson 2026-06-06)")
         if not tip.alert_reason:
             tip.alert_reason = "Saiyan handicap/team-line bet — routed to manual (not auto-placed)"
@@ -2539,7 +2664,12 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
         # Handicap SGMs -> MANUAL (Wilson 2026-05-31): handicap legs inside SGMs
         # (pick_own_line) have been unreliable, so alert rather than risk a
         # mis-placed leg. Toggle via AUTO_MANUAL_HANDICAP_SGM.
-        if AUTO_MANUAL_HANDICAP_SGM and _is_handicap_sgm(tip):
+        # v5.9x (#7): a SAIYAN handicap SGM bypasses this generic manual rule when
+        # SAIYAN_HC_SGM_ENABLED (it places via the SGM fan-out; the handicap leg is
+        # enriched to the exact pick_own_line prop or -> manual). Every OTHER
+        # tipster's handicap SGM still routes to manual here.
+        if (AUTO_MANUAL_HANDICAP_SGM and _is_handicap_sgm(tip)
+                and not (tip.tipster == "saiyan_afl" and SAIYAN_HC_SGM_ENABLED)):
             log.info("Handicap SGM -> routing to manual (AUTO_MANUAL_HANDICAP_SGM)")
             tip.alert_reason = "Handicap SGM — auto-routed to manual (not auto-placed)"
             notifier.notify_manual_alert(tip)
@@ -7198,8 +7328,26 @@ def _match_handicap_in_catalog(team_selection: str, tipped_line, markets: dict):
         return None
 
     def _team_match(cat_sel):
+        # 07-12 review C4: WORD-BOUNDARY containment, not a bare bidirectional
+        # substring. The old `team_l in c or c in team_l` matched 'adelaide'
+        # (Crows) INTO 'port adelaide' (a DIFFERENT club) -> wrong-team handicap.
+        # Accept exact, or the shorter being a whole leading/trailing WORD-run of
+        # the longer (handles both nickname directions: 'adelaide'<->'adelaide
+        # crows', 'giants'<->'gws giants', 'sydney'<->'sydney swans') — then reject
+        # the two known CROSS-CLUB collisions where a distinct club's name is a
+        # trailing word of a DIFFERENT club.
         c = (cat_sel or "").lower().strip()
-        return bool(c) and (team_l in c or c in team_l)
+        if not c:
+            return False
+        if c == team_l:
+            return True
+        a, b = sorted((team_l, c), key=len)  # a = shorter, b = longer
+        if not a or not (b.startswith(a + " ") or b.endswith(" " + a)):
+            return False
+        # (shorter, longer) pairs that are DIFFERENT AFL clubs, not a nickname:
+        _cross_club = {("adelaide", "port adelaide"),
+                       ("sydney", "greater western sydney")}
+        return (a, b) not in _cross_club
 
     # 1. Standard `line` market (selection=team, has `line` field).
     best = None
@@ -7474,8 +7622,28 @@ def _enrich_sgm_legs_with_prop_ids(
         return bool(_leg_is_ou_player_prop(leg) and leg.get("player"))
 
     def _hc_leg(leg):
-        # Team handicap leg — resolved against line / pick_own_line (±0.5).
-        return (leg.get("market") or "") in ("line", "first_half_line")
+        # Team FULL-GAME handicap leg — resolved against line / pick_own_line
+        # (±0.5). 07-12 review C1: first_half_line / period handicaps are NOT
+        # resolved here (they would fall back to the FULL-GAME catalog = wrong
+        # market). Only the full-game 'line' handicap enriches.
+        return (leg.get("market") or "") == "line"
+
+    # 07-12 review C1 safety net: a period/half handicap leg has no safe in-SGM
+    # resolver, so refuse to enrich it -> the caller skips the session -> manual
+    # (never a full-game fallback). Mirrors the #5 single-path invariant. The
+    # Saiyan un-gate already keeps these on manual; this is defence-in-depth for
+    # any other caller.
+    _period_hc = next(
+        (leg for leg in hb_legs
+         if (leg.get("market") or "") in ("first_half_line", "second_half_line",
+                                          "quarter_line", "quarter_time_line")),
+        None)
+    if _period_hc:
+        return (
+            hb_legs,
+            f"period/half handicap leg not supported in an SGM "
+            f"(market='{_period_hc.get('market')}') on session {session_id} — manual",
+        )
 
     needs_catalog = [
         leg for leg in hb_legs
@@ -7496,13 +7664,19 @@ def _enrich_sgm_legs_with_prop_ids(
     # Translate the event to the bookie's form (matches what placement sends).
     event_for_hb = _bookie_event(tip.event, bookie, sport) if bookie else tip.event
 
-    # One catalog fetch covers every player-prop leg for this event+session.
+    # One catalog fetch covers every leg for this event+session.
+    # 07-12 review C2: a handicap ('line') leg resolves against the line /
+    # pick_own_line markets, which the player_props-only filter EXCLUDES (the
+    # singles handicap path fetches with NO filter for this reason). So when any
+    # handicap leg is present, fetch the FULL catalog; a pure player-prop SGM keeps
+    # the cheaper player_props filter.
+    _has_hc = any(_hc_leg(leg) for leg in needs_catalog)
     try:
         price_resp = hb.price_check_sports(
             session_id=str(session_id),
             sport=tip.sport,
             event=event_for_hb,
-            markets_filter=["player_props"],
+            **({} if _has_hc else {"markets_filter": ["player_props"]}),
         )
     except Exception as e:
         return (hb_legs, f"price_check_sports failed: {e}")
@@ -9180,6 +9354,7 @@ def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
     bk = sess.get("bookie", "unknown")
     event_for_hb = _bookie_event(tip.event, bk, tip.sport)
     last: BetResult | None = None
+    _did_sgm_max_rebet = False  # v5.9x: at most one SB max-stake rebet per account
     for i, step in enumerate(ladder):
         _t0 = _t.time()
         resp = hb.place_sgm_bet(
@@ -9304,6 +9479,74 @@ def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
             log.info(f"SGM fan-out: {bk}:{sid} non-stake error on ${step:.2f} — "
                      f"abandoning ladder: {err[:80]}")
             return last
+        # v5.9x (#7 Part A) SGM MAX-STAKE REBET: on a FAST Sportsbet stake-too-high
+        # (538) the bookie returns the allowable max. Rebet ONCE at that max (one
+        # shot/account) instead of laddering down blindly. SB-only, bounded strictly
+        # below `step` (can't over-stake). A SLOW / maybe-landed 538 was already
+        # diverted to the ambiguous branch above (never reaches here), so this is a
+        # clean fast reject. On failure -> the normal ladder-down backstop.
+        # Kill-switch SPORTSBET_MAX_STAKE_REBET. Mirrors the reviewed _execute_bet
+        # singles rebet (the SGM path has no _execute_bet, so it lives here).
+        if not _did_sgm_max_rebet:
+            _mx = _sb_max_stake_target(resp, bk, step)
+            if _mx is not None:
+                _did_sgm_max_rebet = True
+                log.info(f"SGM fan-out: {bk}:{sid} stake-reject ${step:.2f} — SB "
+                         f"stated max ${_mx:.2f}; rebetting ONCE at max")
+                _t0 = _t.time()
+                resp = hb.place_sgm_bet(
+                    session_id=sid, sport=tip.sport, event=event_for_hb,
+                    legs=session_hb_legs, stake=_mx, target_odds=target_odds,
+                )
+                _el = round(_t.time() - _t0, 2)
+                if resp.get("success"):
+                    try:
+                        actual = float(resp.get("stake", _mx))
+                    except (TypeError, ValueError):
+                        actual = _mx
+                    if actual <= 0:
+                        actual = _mx
+                    r = BetResult(
+                        success=True, tip=tip, session_id=sid, bookie=bk,
+                        bet_id=resp.get("bet_id"), odds=resp.get("odds"), stake=actual,
+                        timestamp=datetime.now(), elapsed_sec=_el,
+                        placed_leg_summary=_format_tip_placement_summary(tip))
+                    try:
+                        r._requested_stake = _mx
+                    except Exception:
+                        pass
+                    log.info(f"SGM fan-out: {bk}:{sid} PLACED at SB max ${_mx:.2f}")
+                    return r
+                _err2 = str(resp.get("error", "") or "")
+                if ((_el >= STAKE_REJECT_LATENCY_THRESHOLD_SEC or bool(resp.get("ambiguous")))
+                        and not _is_definitely_pre_placement(_err2)):
+                    r = BetResult(
+                        success=False, tip=tip, session_id=sid, bookie=bk,
+                        error=f"ambiguous (max-stake rebet): {_err2[:120]}",
+                        is_ambiguous=True, stake=_mx, elapsed_sec=_el,
+                        timestamp=datetime.now(),
+                        placed_leg_summary=_format_tip_placement_summary(tip))
+                    try:
+                        r._requested_stake = _mx
+                    except Exception:
+                        pass
+                    return _reconcile_fanout_ambiguous(
+                        tip, sess, r, _mx, f"SGM fan-out {bk}:{sid} (max-stake)")
+                last = BetResult(success=False, tip=tip, session_id=sid, bookie=bk,
+                                 error=_err2, elapsed_sec=_el, timestamp=datetime.now())
+                try:
+                    last._requested_stake = _mx
+                except Exception:
+                    pass
+                # 07-12 review C3: mirror the pre-rebet invariant — a NON-stake
+                # error on the rebet abandons the ladder (a lower rung won't fix a
+                # market/auth/price error); only a stake error ladders down.
+                if not _is_stake_error(_err2):
+                    log.info(f"SGM fan-out: {bk}:{sid} rebet non-stake error — "
+                             f"abandoning ladder: {_err2[:80]}")
+                    return last
+                log.info(f"SGM fan-out: {bk}:{sid} rebet at SB max ${_mx:.2f} still "
+                         f"failed ({_err2[:60]}) — laddering down")
         log.info(f"SGM fan-out: {bk}:{sid} stake-reject ${step:.2f}, laddering down")
     return last if last is not None else BetResult(
         success=False, tip=tip, session_id=sid, bookie=bk,
@@ -10775,36 +11018,99 @@ def _resolve_single_for_placement(
         # routes to manual rather than placing the WRONG SIDE of the spread.
         # Previously this was set only inside the success block, so a failed or
         # throwing price-check left the blind ladders armed on a handicap.
+        # v5.9x (#5): an AFL PERIOD handicap (quarter 1q-4q / 1st-half 1h) carries a
+        # supported period code on the leg. Resolve the EXACT proposition_id from
+        # the live catalog (SB-only) and place THAT; a miss / non-SB / price-check
+        # failure returns a clean MANUAL result and NEVER falls back to the
+        # full-game line (which would be the WRONG market — Wilson: "don't fuck up
+        # the prop_id"). NO fuzzy. Gated by AFL_PERIOD_MARKETS_ENABLED (dormant by
+        # default). Full-game handicaps take the unchanged `else` path below.
+        _pcode = (_afl_period_code(getattr(leg, "period", ""))
+                  if AFL_PERIOD_MARKETS_ENABLED else "")
         tip._hc_catalog_consulted = True
-        try:
-            _event_pc = _bookie_event(tip.event, bookie, tip.sport)
-            price_resp = hb.price_check_sports(
-                session_id=sid, sport=tip.sport, event=_event_pc,
-            )
-            if price_resp.get("success"):
-                _hm = _match_handicap_in_catalog(
-                    selection, line, price_resp.get("markets") or {},
+        if _pcode:
+            # 07-12 review #3: a period handicap with NO tipster odds gives NO
+            # price protection (the ceiling + floor are both inert when
+            # suggested_odds<=1.0), so it could place at any live price. Require a
+            # tipster price > 1.0 -> else manual (mirrors the Dello no-odds rule).
+            if not (tip.suggested_odds and float(tip.suggested_odds) > 1.0):
+                log.info(f"AFL period {_pcode} handicap '{selection}' has no tipster "
+                         f"odds (>1.0) — no price protection -> manual")
+                return (None, BetResult(
+                    success=False, tip=tip, session_id=sid, bookie=bookie,
+                    error=(f"AFL period {_pcode} handicap with no tipster odds "
+                           f"(price-guard-less) — place manually"),
+                    timestamp=datetime.now(),
+                    placed_market=market, placed_player=player, placed_stat=stat,
+                    placed_line=line, placed_selection=selection,
+                    placed_leg_summary=_format_tip_placement_summary(tip),
+                ))
+            _pm = None
+            if "sportsbet" not in str(bookie).lower():
+                log.info(f"AFL period {_pcode} handicap '{selection}' — SB-only; "
+                         f"{bookie} is not Sportsbet -> manual")
+            else:
+                try:
+                    _event_pc = _bookie_event(tip.event, bookie, tip.sport)
+                    price_resp = hb.price_check_sports(
+                        session_id=sid, sport=tip.sport, event=_event_pc)
+                    if price_resp.get("success"):
+                        _pm = _resolve_afl_period_prop(
+                            price_resp.get("markets") or {}, _pcode, selection, line)
+                except Exception as e:
+                    log.debug(f"AFL period catalog match skipped: {e}")
+            if _pm:
+                log.info(
+                    f"AFL period catalog-matched: '{selection}' {_pcode} line={line}"
+                    f" -> market={_pm['market']} prop={_pm['proposition_id']} "
+                    f"odds={_pm['odds']}")
+                market = _pm["market"]
+                line = _pm["line"]
+                _resolved_prop_id = _pm["proposition_id"]
+                _resolved_live_odds = _pm.get("odds")  # ceiling/floor-checked below
+            else:
+                log.info(
+                    f"AFL period {_pcode} handicap '{selection}' line={line} not "
+                    f"carried EXACTLY on {bookie}:{sid} (no fuzzy) -> manual")
+                return (None, BetResult(
+                    success=False, tip=tip, session_id=sid, bookie=bookie,
+                    error=(f"AFL period {_pcode} handicap not carried exactly "
+                           f"('{selection}' {line}) — place manually"),
+                    timestamp=datetime.now(),
+                    placed_market=market, placed_player=player, placed_stat=stat,
+                    placed_line=line, placed_selection=selection,
+                    placed_leg_summary=_format_tip_placement_summary(tip),
+                ))
+        else:
+            try:
+                _event_pc = _bookie_event(tip.event, bookie, tip.sport)
+                price_resp = hb.price_check_sports(
+                    session_id=sid, sport=tip.sport, event=_event_pc,
                 )
-                if _hm:
-                    if _hm["market"] != market or _hm["line"] != line:
-                        log.info(
-                            f"Handicap catalog-matched: '{selection}' line={line} "
-                            f"-> market={_hm['market']} sel='{_hm['selection']}' "
-                            f"line={_hm['line']} odds={_hm['odds']}"
-                        )
-                    market = _hm["market"]
-                    selection = _hm["selection"]
-                    line = _hm["line"]  # None for pick_own_line (in-selection)
-                    _resolved_prop_id = _hm.get("proposition_id")
-                    _resolved_live_odds = _hm.get("odds")  # ceiling-checked below
-                else:
-                    log.info(
-                        f"Handicap '{selection}' line={line} not carried within "
-                        f"±{_HC_LINE_TOLERANCE} on {bookie}:{sid} (line / "
-                        f"pick_own_line) — routing to manual"
+                if price_resp.get("success"):
+                    _hm = _match_handicap_in_catalog(
+                        selection, line, price_resp.get("markets") or {},
                     )
-        except Exception as e:
-            log.debug(f"Handicap catalog match skipped: {e}")
+                    if _hm:
+                        if _hm["market"] != market or _hm["line"] != line:
+                            log.info(
+                                f"Handicap catalog-matched: '{selection}' line={line} "
+                                f"-> market={_hm['market']} sel='{_hm['selection']}' "
+                                f"line={_hm['line']} odds={_hm['odds']}"
+                            )
+                        market = _hm["market"]
+                        selection = _hm["selection"]
+                        line = _hm["line"]  # None for pick_own_line (in-selection)
+                        _resolved_prop_id = _hm.get("proposition_id")
+                        _resolved_live_odds = _hm.get("odds")  # ceiling-checked below
+                    else:
+                        log.info(
+                            f"Handicap '{selection}' line={line} not carried within "
+                            f"±{_HC_LINE_TOLERANCE} on {bookie}:{sid} (line / "
+                            f"pick_own_line) — routing to manual"
+                        )
+            except Exception as e:
+                log.debug(f"Handicap catalog match skipped: {e}")
 
     elif market == "total_points" and line is not None:
         # Match TOTAL against the catalog: total_points main line (±1.0), then
@@ -12613,6 +12919,24 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
         # (or a wrong/absent sign) routes to manual.
         leg = ParsedLeg(market="line", team_full=leg_team, player="",
                         stat="", line=line, selection=leg_team)
+        # v5.9x (#5): a supported PERIOD (quarter 1q-4q / 1st-half) team handicap
+        # carries the SB period code so the placement resolver maps it to
+        # quarter_line / quarter_time_line via the EXACT prop-id (SB-only, gated by
+        # AFL_PERIOD_MARKETS_ENABLED). Full-game handicaps leave period="" and take
+        # the normal line/pick_own_line path. Player-prop periods are NOT set here,
+        # so they still route to manual via the period gate below.
+        if AFL_PERIOD_MARKETS_ENABLED:
+            _pcode_tl = _afl_period_code(_period)
+            # 07-12 review #1: ONLY 1st-half (1h) handicaps auto-place. QUARTER
+            # (1q-4q) handicaps carry an IDENTICAL line + odds across quarters on
+            # Sportsbet — only the vision-parsed quarter digit distinguishes the
+            # proposition_id — so a digit misread would place a WRONG-QUARTER prop
+            # with NO line/odds cross-check to catch it (undetectable wrong-market).
+            # 1st-half lines ARE distinct (probe: 1h ±5.5 vs full_game 2.5), so 1h
+            # is money-safe. Quarters stay manual until an independent quarter signal
+            # exists. (The resolver still supports quarters for that future path.)
+            if _pcode_tl == "1h":
+                leg.period = "1h"
         if not leg_team or not line:
             alert_only = True
             alert_reason = "team line missing team/line — place manually"
@@ -12699,7 +13023,13 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
     # v5.17: a half/quarter period overrides everything -> manual (full-game
     # catalog only). Applies even to player props, since the bot can't place a
     # 2nd-half disposals line either.
-    if _partial_period and not alert_only:
+    # v5.9x (#5): EXCEPTION — a supported PERIOD TEAM HANDICAP carries leg.period
+    # (set ONLY in the team_line branch above, when AFL_PERIOD_MARKETS_ENABLED and
+    # the period maps to 1q-4q/1h). That is now PLACEABLE via the exact-prop-id
+    # resolver (SB-only, unmatched->manual), so it does NOT get force-routed here.
+    # Player-prop periods, unsupported periods (2nd-half etc.), and the flag-off
+    # case never set leg.period, so they still route to manual as before.
+    if _partial_period and not alert_only and not getattr(leg, "period", ""):
         alert_only = True
         alert_reason = (
             f"AFL {_period or 'half/quarter'} market (image tip) — bot places "

@@ -14,6 +14,12 @@ class ParsedLeg:
     line: float = 0.0
     selection: str = ""      # "over"/"under" for props, team name for H2H
     raw_text: str = ""
+    # v5.9x (2026-07-12): AFL period marker for period-handicap placement. ""/
+    # "full_game" = normal full-game market (default; no behaviour change). A
+    # supported period ("1q".."4q", "1h") lets the AFL exotic-market resolver map
+    # the leg to quarter_line / quarter_time_line and place via the EXACT
+    # proposition_id (SB-only, gated). Unsupported / unmatched -> manual.
+    period: str = ""
 
 
 @dataclass
