@@ -225,6 +225,22 @@ def _parse_tip_line(
     if not legs_text:
         return None
 
+    # FIX B (v5.95): capture the tipster odds after '@' (previously DROPPED, leaving
+    # suggested_odds=0.0). Populating it keeps the downstream odds-ceiling/floor +
+    # AFL target_odds 'wrong selection' guards ACTIVE on the regex path (they
+    # disable at odds<=1.0), matching the LLM path, and lets the regex-first gate
+    # validate sane odds. Handles a '$'-prefix and surrounding whitespace.
+    _after_odds = line[at_idx + 1:].strip()
+    _odds_m = re.match(r"\$?\s*(\d+(?:\.\d+)?)", _after_odds)
+    # Reject FRACTIONAL odds ('10/11'): a captured number immediately followed by
+    # '/' is not a decimal price. Leave 0.0 so the AFL target-odds guard + the
+    # regex-first gate treat it as unparseable (-> LLM/manual, safe). A decimal
+    # single price is followed by a space+bookie ('1.91 Betr'), never '/'.
+    if _odds_m and _after_odds[_odds_m.end():_odds_m.end() + 1] == "/":
+        suggested_odds = 0.0
+    else:
+        suggested_odds = float(_odds_m.group(1)) if _odds_m else 0.0
+
     raw_legs = _split_legs(legs_text)
     parsed_legs = [_parse_leg(l) for l in raw_legs]
     parsed_legs = [l for l in parsed_legs if l is not None]
@@ -234,7 +250,7 @@ def _parse_tip_line(
 
     is_sgm = len(parsed_legs) > 1
 
-    return ParsedTip(
+    tip = ParsedTip(
         tipster="saiyan_afl",
         sport="afl",
         is_sgm=is_sgm,
@@ -242,10 +258,18 @@ def _parse_tip_line(
         units=default_units,
         unit_size=unit_size,
         raw_message=line,
+        suggested_odds=suggested_odds,
         # SGMs -> alert only (HyperBot SGM line bug)
         alert_only=is_sgm,
         alert_reason="SGM - place manually" if is_sgm else "",
     )
+    # FIX B (v5.95): mirror the single leg's threshold flag onto the TIP. The AFL
+    # single placement path reads tip._is_threshold (not the leg's), so a regex-
+    # parsed 'N+' single must set it for parity with the LLM path (else it takes
+    # the O/U branch instead of the threshold branch).
+    if len(parsed_legs) == 1:
+        tip._is_threshold = getattr(parsed_legs[0], "_is_threshold", False)
+    return tip
 
 
 # ── Public API ──────────────────────────────────────────────────────

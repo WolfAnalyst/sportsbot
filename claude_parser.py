@@ -395,6 +395,63 @@ def resolve_sa_track_today(race_num, runner: str, date_str: str, candidate_track
         track = out["track"].strip()
         log.info(f"Claude web-search resolved SA track for '{runner}' R{race_num} -> '{track}'")
         return track
+
+    # v5.9x (Wilson 2026-07-12): NON-web-search FALLBACK, fires ONLY on a web-search
+    # TRANSIENT failure (2026-07-11 'Silver Chaos': 2x APITimeout -> _websearch_json
+    # returned {} -> track=None -> every /v3/price 400s -> dead-ended at manual).
+    # `not out` (empty dict) means the search timed out / errored; a NON-empty dict
+    # with confident=false is an INFORMED "unsure" -> we DON'T guess over it (07-12
+    # review #8), leaving "" -> manual. Rather than dead-end on a timeout, make ONE
+    # fast bounded completion (no web_search tool / pause-loop, so it can't freeze
+    # the inline event loop) that picks the single most likely SA track from the
+    # candidate set; only a candidate-list track is accepted (no hallucinated one).
+    # SAFETY: the caller sets track_claude_resolved=True -> the downstream runner-
+    # NAME match (saddle-only Pass-3 disabled) + odds floor gate it, so a wrong
+    # guessed track normally fails the name match -> manual. NOTE this is NOT
+    # byte-identical safety to the web-search path: a blind guess RAISES how often a
+    # wrong track is tried, so the residual Pass-2 substring wrong-horse tail (a
+    # same-race name substring collision on the guessed track) is slightly more
+    # exposed here than on the informed web-search path — a known low-probability
+    # residual (07-12 review #8), acceptable vs the dead-end it replaces.
+    if not out and candidate_tracks and ANTHROPIC_API_KEY:
+        try:
+            fb_system = (
+                "You pick the SINGLE most likely South Australian THOROUGHBRED race "
+                "track for a runner on a given date, choosing ONLY from a fixed candidate "
+                "list, using your knowledge of the SA racing calendar (Morphettville is the "
+                "metropolitan default; country/midweek meetings rotate Gawler, Murray Bridge, "
+                "Strathalbyn, Balaklava, Gawler, etc.). Respond with ONLY JSON: "
+                "{\"track\": \"<exactly one candidate>\"}. Make your best single guess even "
+                "if unsure. No other text."
+            )
+            fb_user = (
+                f"Date {date_str}. Candidate SA tracks: {', '.join(candidate_tracks)}. "
+                f"Which single track most likely runs Race {race_num} with the horse "
+                f"'{runner}'? Return exactly one candidate."
+            )
+            _fb_client = _client().with_options(timeout=15.0, max_retries=1)
+            resp = _fb_client.messages.create(
+                model=model or CLAUDE_WEBSEARCH_MODEL,
+                max_tokens=_MAX_TOKENS,
+                thinking={"type": "disabled"},
+                system=fb_system,
+                messages=[{"role": "user", "content": fb_user}],
+            )
+            raw = (_text_from(resp) or "").replace("```json", "").replace("```", "").strip()
+            obj = groq_parser._parse_json_with_repair(raw)
+            if isinstance(obj, dict) and isinstance(obj.get("track"), str):
+                t = obj["track"].strip()
+                # accept ONLY a candidate-list track (guard against a hallucinated
+                # new track name); the name match downstream is the real safety net.
+                if t and any(t.lower() == c.lower() for c in candidate_tracks):
+                    log.warning(
+                        f"Claude NON-web-search FALLBACK guessed SA track for '{runner}' "
+                        f"R{race_num} -> '{t}' (web-search empty/timed out; runner-NAME "
+                        f"match downstream will validate or route to manual)"
+                    )
+                    return t
+        except Exception as e:
+            log.error(f"SA-track non-web-search fallback failed: {type(e).__name__}: {e}")
     return ""
 
 

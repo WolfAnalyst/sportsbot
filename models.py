@@ -102,6 +102,11 @@ class BetResult:
     # of a bet that may already exist). Accounted for separately in unfilled via
     # the ambiguous_outcomes list. 2026-05-30.
     is_ambiguous: bool = False
+    # v5.9x (2026-07-12): bookie-stated allowable max stake from a stake-too-high
+    # (538) reject — Sportsbet surfaces it (HB v1.7.85, e.g. "max=$86.20" +
+    # top-level max_stake). Read by the max-stake rebet (place at exactly this
+    # instead of laddering down). None when the bookie didn't provide it.
+    max_stake: Optional[float] = None
     # HyperBot v3 correlation_id for the placement attempt. Populated on
     # ambiguous/timeout outcomes so the critical alert and any later
     # /v3/transactions reconciliation can tie back to the server-side request.

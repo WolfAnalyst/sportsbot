@@ -173,14 +173,22 @@ def _team_event_matches(target_norm: str, hteam: str, ateam: str) -> bool:
     # Exact match preferred (either side of fixture)
     if target_norm == h or target_norm == a:
         return True
-    # One-direction substring fallback: target IN team_name, not the reverse
-    if h and target_norm in h:
-        return True
-    if a and target_norm in a:
-        return True
-    # Suffix-strip equality. Only matches when the only difference between
-    # the two strings is a known AFL nickname suffix word. Doesn't widen
-    # the Lachie Ash guard because 'Sydney' is not in _AFL_NICKNAME_SUFFIXES.
+    # Suffix-strip equality: matches ONLY when the sole difference between the
+    # two strings is a known AFL nickname suffix word ('Adelaide' == 'Adelaide
+    # Crows', 'Sydney' == 'Sydney Swans', 'West Coast' == 'West Coast Eagles').
+    #
+    # v5.9x (Wilson 2026-07-12, Milera/Adelaide fix): the previous bare
+    # `target_norm in h/a` one-direction substring fallback ALSO matched
+    # 'adelaide' (Crows) INTO 'port adelaide' (a DIFFERENT club) — so a
+    # "Wayne Milera (ADE)" tip on a day the Crows had no game bound to
+    # "St Kilda v Port Adelaide", then missed the catalog and went to manual as
+    # a WRONG-event guess (2026-07-11). Suffix-strip equality alone covers every
+    # legitimate short/long pairing (all differences are nickname words) AND
+    # rejects the cross-club overlap: strip('adelaide')='adelaide' !=
+    # strip('port adelaide')='port adelaide'. A team with no fixture that day now
+    # returns None -> the tip routes to manual instead of a coincidental bind.
+    # (Still respects the Lachie Ash guard: 'Sydney' is not a nickname suffix, so
+    # 'Greater Western Sydney' never collapses to 'Sydney'.)
     target_stripped = _strip_nickname(target_norm)
     if target_stripped and (target_stripped == _strip_nickname(h) or
                             target_stripped == _strip_nickname(a)):

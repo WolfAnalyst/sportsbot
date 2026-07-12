@@ -25,6 +25,11 @@ NBA_ROSTER_FILE = ROSTER_DIR / "roster_nba.json"
 NBL_ROSTER_FILE = ROSTER_DIR / "roster_nbl.json"
 AFL_ROSTER_FILE = ROSTER_DIR / "roster_afl.json"
 MLB_ROSTER_FILE = ROSTER_DIR / "roster_mlb.json"
+# Curated roster-spelling -> Sportsbet-spelling overrides for AFL player names
+# (see afl_name_overrides.json). Applied at load so the resolved `player` field
+# sent to HyperBot matches what Sportsbet lists in its player-prop markets, even
+# after the daily Draftguru scrape reintroduces a short form ('Brad Hill').
+AFL_NAME_OVERRIDES_FILE = ROSTER_DIR / "afl_name_overrides.json"
 
 # Cached rosters: {full_name_lower: {"name": full_name, "team": team}}
 _nba_roster: dict = {}
@@ -36,6 +41,10 @@ _mlb_roster: dict = {}
 # Populated from roster_mlb.json's "__collisions__" block; consulted by the resolver
 # to refuse a blind team-override/inference (2026-06-25 Pete Alonso/Max Muncy fix).
 _mlb_collisions: dict = {}
+# AFL placement-time alias map {roster_name_lower: [alt_spelling, ...]} from
+# afl_name_overrides.json['aliases'] — alternate Sportsbet spellings tried against
+# the LIVE catalog by main._afl_canonical_catalog_player (see afl_name_aliases()).
+_afl_name_aliases: dict = {}
 _loaded = False
 
 
@@ -180,7 +189,132 @@ def _load_rosters():
             _mlb_roster = roster
             _mlb_collisions = collisions
 
+    _apply_afl_name_overrides()
     _loaded = True
+
+
+def afl_name_aliases() -> dict:
+    """The AFL placement-time alias map {roster_name_lower: [alt_spelling, ...]}
+    from afl_name_overrides.json['aliases']. Consulted by
+    main._afl_canonical_catalog_player to try alternate Sportsbet spellings against
+    the LIVE catalog and use whichever the board actually carries (one lookup, NO
+    extra POST). Empty until a load has run."""
+    _load_rosters()
+    return _afl_name_aliases
+
+
+def _apply_afl_name_overrides() -> None:
+    """Apply the curated afl_name_overrides.json to the loaded AFL roster + alias map.
+
+    Why (2026-07-06, Brad Hill fan-out fault): the roster is scraped daily from
+    Draftguru, which lists common short forms ('Brad Hill') and can mis-assign
+    same-name players (two 'Max King's collide -> last-writer-wins) or keep retired
+    players. Sportsbet's player-prop market lists formal names and HyperBot matches
+    on the `player` field. Every section here is re-applied on each load (and at
+    generation), so a Draftguru refresh can't undo it.
+
+    Sections:
+      overrides       {roster short-form: Sportsbet name} -- CONFIRMED rename; both
+                      spellings resolve to the Sportsbet name (payload player matches).
+      aliases         {roster name: [alt Sportsbet spellings]} -- placement-time
+                      candidates tried against the LIVE catalog (never a rename here).
+      team_overrides  {name: club} -- force a player's club (fixes a same-name scrape
+                      collision); adds the entry if missing.
+      add             {name: club} -- insert a missing player.
+      remove          [name, ...] -- drop a retired/delisted player the scrape lists.
+
+    Money-path safety: an override is skipped if its target spelling is ALREADY a
+    DIFFERENT player on another team (never clobber a real roster entry)."""
+    global _afl_name_aliases
+    _afl_name_aliases = {}
+    if not AFL_NAME_OVERRIDES_FILE.exists():
+        return
+    try:
+        with open(AFL_NAME_OVERRIDES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log.warning(f"Failed to load {AFL_NAME_OVERRIDES_FILE.name}: {e}")
+        return
+    if not isinstance(data, dict):
+        return
+
+    # 1) remove — drop retired/delisted players the daily scrape still lists.
+    removed = 0
+    for name in (data.get("remove") or []):
+        if isinstance(name, str) and _afl_roster.pop(name.strip().lower(), None):
+            removed += 1
+
+    # 2) add — insert a missing player (name -> club). Distinct key; a same-name
+    #    player on another club stays under its own key (event-scoping disambiguates).
+    added = 0
+    add = data.get("add")
+    if isinstance(add, dict):
+        for name, team in add.items():
+            if (isinstance(name, str) and isinstance(team, str)
+                    and name.strip() and team.strip()):
+                _afl_roster[name.strip().lower()] = {"name": name.strip(),
+                                                     "team": team.strip()}
+                added += 1
+
+    # 3) team_overrides — force a player's club (fixes a same-name scrape collision,
+    #    e.g. two 'Max King's). Preserves the existing display name if present.
+    team_fixed = 0
+    tov = data.get("team_overrides")
+    if isinstance(tov, dict):
+        for name, team in tov.items():
+            if not (isinstance(name, str) and isinstance(team, str)
+                    and name.strip() and team.strip()):
+                continue
+            nl = name.strip().lower()
+            keep = _afl_roster.get(nl, {}).get("name") or name.strip()
+            _afl_roster[nl] = {"name": keep, "team": team.strip()}
+            team_fixed += 1
+
+    # 4) overrides — CONFIRMED roster->Sportsbet rename; both spellings resolve to it.
+    applied = 0
+    overrides = data.get("overrides")
+    if isinstance(overrides, dict):
+        for common, sportsbet in overrides.items():
+            if not isinstance(common, str) or not isinstance(sportsbet, str):
+                continue
+            common_l, sb_l = common.strip().lower(), sportsbet.strip().lower()
+            if not common_l or not sb_l:
+                continue
+            entry = _afl_roster.get(common_l) or _afl_roster.get(sb_l)
+            if not entry:
+                continue  # neither spelling on the current roster -> nothing to do
+            team = entry.get("team", "")
+            existing = _afl_roster.get(sb_l)
+            if (existing and existing.get("team") and team
+                    and existing["team"] != team):
+                log.warning(
+                    f"AFL name override skipped: '{common}' -> '{sportsbet}' would "
+                    f"collide with an existing '{sportsbet}' on {existing['team']} "
+                    f"(override target player is on {team})"
+                )
+                continue
+            canonical = {"name": sportsbet, "team": team}
+            _afl_roster[sb_l] = dict(canonical)      # Sportsbet spelling -> itself
+            _afl_roster[common_l] = dict(canonical)  # short form -> the Sportsbet name
+            applied += 1
+
+    # 5) aliases — placement-time candidates tried against the LIVE catalog (no rename).
+    aliases = data.get("aliases")
+    if isinstance(aliases, dict):
+        for name, alts in aliases.items():
+            if not isinstance(name, str) or not isinstance(alts, list):
+                continue
+            key = name.strip().lower()
+            cands = [a.strip() for a in alts if isinstance(a, str) and a.strip()]
+            if key and cands:
+                _afl_name_aliases[key] = cands
+
+    if any((removed, added, team_fixed, applied, _afl_name_aliases)):
+        log.info(
+            f"AFL overrides applied from {AFL_NAME_OVERRIDES_FILE.name}: "
+            f"{applied} rename(s), {len(_afl_name_aliases)} alias-set(s), "
+            f"{team_fixed} team-fix, {added} add, {removed} remove"
+        )
 
 
 def _upgrade_to_full_name(match: dict, sport: str) -> dict:

@@ -42,8 +42,17 @@ from config import (
     IMAGE_TIPS_TEST_MODE, IMAGE_TIPS_TEST_UNIT_SIZE, IMAGE_TIP_PARSERS,
     IMAGE_RACING_MAX_UNITS, IMAGE_RACING_TEST_MODE,
     SAIYAN_SGM_UNIT_SIZE,
+    DELLO_UNIT_SIZE, DELLO_TEST_MODE, DELLO_TEST_UNIT_SIZE,
+    DELLO_BAND_LO, DELLO_BAND_HI, DELLO_SB_WORSE_GATE,
     IMAGE_TIP_CONCURRENT, IMAGE_TIP_MAX_CONCURRENCY,
+    IMAGE_RACING_CONCURRENT, IMAGE_RACING_MAX_CONCURRENCY,
+    REGEX_FIRST_TIPSTERS,
+    TELETHON_WATCHDOG_ENABLED, TELETHON_WATCHDOG_INTERVAL_SEC,
+    TELETHON_WATCHDOG_PROBE_TIMEOUT_SEC, TELETHON_WATCHDOG_FAIL_THRESHOLD,
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
+    SPORTSBET_MAX_STAKE_REBET,
+    SELF_BET_MAX_STAKE,
+    EDDIE_CAPTION_FALLBACK_ENABLED,
 )
 from groq_parser import parse_tip_image
 from models import ParsedTip, ParsedLeg, BetResult
@@ -216,7 +225,7 @@ TIPSTERS_IGNORE_SUGGESTED_BOOKIE: set[str] = {"kev_nba", "ausbets_nba", "saiyan_
 # no unit (we'd otherwise default it) is NOT a confirmed bet for these cappers —
 # route it to manual instead of placing at the default stake (Wilson 2026-06-04:
 # AusBets "Knicks 5.5" had no unit yet attempted a $400 line bet).
-UNITS_REQUIRED_TIPSTERS: set[str] = {"kev_nba", "ausbets_nba"}
+UNITS_REQUIRED_TIPSTERS: set[str] = {"kev_nba", "ausbets_nba", "dello_afl"}
 
 # v5.52 BELT for the gate above: Groq can INVENT a unit value (2026-06-11
 # AusBets "nothin today ... none quite get to my price threshold" parsed as
@@ -248,7 +257,19 @@ _NO_BET_FRAMING_RE = re.compile(
     r"|no\s+bets?\s+today\b"                     # "no bets today"
     r"|no\s+bets?\s+for\s+(?:the\s+|me\s+|us\s+)?(?:today|day)\b"  # "no bets for today/the day/me today"
     r"|none\s+quite"                             # "none quite get to my price threshold"
-    r"|close\s+to\s+(?:a\s+)?bets?\s+but\s+no",  # "close to bets but none ..."
+    r"|close\s+to\s+(?:a\s+)?bets?\s+but\s+no"   # "close to bets but none ..."
+    # Dello (2026-07-12): his no-bet / lean vocabulary. A no-bet cue suppresses
+    # the WHOLE message even when a full in-band SB selection is present ("I love
+    # Salem 25+. Not tipping it ... but I'd have 2U on the o24.5 on SB"). HIGH-
+    # PRECISION phrases only (whole-message suppressor -> one false match kills a
+    # real bet in the same message).
+    r"|not\s+tipping"                            # "not tipping it"
+    r"|won[’']?t\s+tip"                     # "won't tip" (straight or curly ')
+    r"|won[’']?t\s+track|not\s+tracking"    # "won't track" / "not tracking"
+    r"|just\s+(?:a\s+)?leans?\b"                 # "just leans" / "just a lean"
+    r"|worth\s+a\s+mention"                      # "worth a mention"
+    r"|if\s+you\s+wanted\s+a(?:\s+little)?\s+dabble"  # "if you wanted a (little) dabble"
+    r"|chuck\b.*\buntracked",                    # "chuck it in untracked"
     re.IGNORECASE,
 )
 
@@ -281,6 +302,9 @@ TIPSTERS_FORCE_BOOKIE["eddie_afl"] = "sportsbet"
 # ETR NBA (2026-06-07): sportsbet-only (the blind fan-out targets the 4 sportsbet
 # accounts). Guarantees ETR never places on tab/bet365 even if a session list drifts.
 TIPSTERS_FORCE_BOOKIE["etr_nba"] = "sportsbet"
+# Dello AFL (2026-07-12): Sportsbet-only. _place_dello_single price-checks + places
+# on a single SB account; no SB session -> manual (never placed on another bookie).
+TIPSTERS_FORCE_BOOKIE["dello_afl"] = "sportsbet"
 
 # ── Max-odds CEILING (wrong-selection sanity guard) ────────────────
 # Applies to ALL sports tipsters via the global MAX_ODDS_MULT (default 1.25×).
@@ -302,13 +326,16 @@ TIPSTERS_MAX_ODDS_MULT["etr_nba"] = 0.0
 def _afl_target_odds(sport, basis_odds, *, _round: bool = True):
     """Price FLOOR (minimum acceptable odds) sent to HyperBot, floored at 1.01.
 
-    BUG C (Wilson 2026-06-21): AFL widens the tolerance to 15% when the BASIS
-    price is OVER $2.00 (else the standard 10%); non-AFL stays 10%. So a tipped
-    $2.16 (Ryley Sanders u23.5) now floors at 1.84 and accepts a 1.87 market
-    instead of rejecting it at the old 1.94 (10%) floor. Boundary: at exactly
-    $2.00 it stays 10% ($2.00 -> 1.80); $2.01 -> 1.71, $3.00 -> 2.55. This only
-    LOWERS the floor (accepts shorter odds = lower liability) — never raises the
-    bet's risk. Racing keeps its own ODDS_DRIFT floor (racing_placer), untouched.
+    AFL widens the tolerance when the BASIS price is OVER $2.00; non-AFL and
+    AFL <= $2.00 stay at the standard 10%.
+      * v5.9x (Wilson 2026-07-12): AFL > $2.00 reduction is now 20% (mult 0.80),
+        raised from the prior 15% (0.85). Himmelberg 20+ @ 2.25 (07-11) floored
+        at 1.91 (15%) and rejected SB's live 1.87; at 20% it floors 1.80 and
+        accepts. So tipped $2.25 -> 1.80, $2.16 -> 1.73, $2.01 -> 1.61,
+        $3.00 -> 2.40. Boundary: exactly $2.00 stays 10% ($2.00 -> 1.80).
+    This only LOWERS the floor (accepts shorter odds = lower liability) — never
+    raises the bet's risk. Racing keeps its own ODDS_DRIFT floor (racing_placer),
+    untouched.
     """
     try:
         b = float(basis_odds or 0)
@@ -316,7 +343,7 @@ def _afl_target_odds(sport, basis_odds, *, _round: bool = True):
         return None
     if b <= 1.0:
         return None
-    mult = 0.85 if ((sport or "").lower() == "afl" and b > 2.00) else 0.90
+    mult = 0.80 if ((sport or "").lower() == "afl" and b > 2.00) else 0.90
     val = max(1.01, b * mult)
     return round(val, 2) if _round else val
 
@@ -741,6 +768,79 @@ def _is_stake_error(error: str) -> bool:
     return any(pat in err for pat in STAKE_ERROR_PATTERNS)
 
 
+def _extract_max_stake(result):
+    """
+    v5.9x: read the bookie-stated allowable max stake off a stake-too-high (538)
+    reject. Accepts EITHER a raw HyperBot response dict OR a BetResult-like
+    object. Prefers the structured `max_stake` field (HB v1.7.85 surfaces it as a
+    top-level float); falls back to the `max=$X` token in the error string.
+    Returns a float > 0, or None when neither is present / parseable.
+    """
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        ms = result.get("max_stake")
+        err = result.get("error") or ""
+    else:
+        ms = getattr(result, "max_stake", None)
+        err = getattr(result, "error", "") or ""
+    # 1) structured field (preferred)
+    try:
+        if ms is not None and float(ms) > 0:
+            return float(ms)
+    except (TypeError, ValueError):
+        pass
+    # 2) fallback: parse "max=$86.20" (or "max=86.2") out of the error text
+    m = re.search(r"max\s*=\s*\$?([\d,]+(?:\.\d+)?)", err, re.IGNORECASE)
+    if m:
+        try:
+            val = float(m.group(1).replace(",", ""))
+            return val if val > 0 else None
+        except ValueError:
+            return None
+    return None
+
+
+def _sb_max_stake_target(resp, bookie, attempted_stake):
+    """
+    v5.9x max-stake rebet gate. Given a FAILED placement response `resp` (dict),
+    the `bookie` it was placed on, and the stake we just tried, return the stake
+    to rebet at ONCE — or None to fall through to the old blind ladder.
+
+    Fires only when ALL hold:
+      * SPORTSBET_MAX_STAKE_REBET kill-switch on;
+      * the reject is on Sportsbet (the only bookie that surfaces the max);
+      * it is a genuine stake-size error (538 stake-too-high);
+      * the bookie gave us a max >= $1;
+      * that max is STRICTLY below what we just tried (a stake-too-HIGH always
+        is — so the rebet can NEVER over-stake vs the attempted amount).
+    """
+    if not SPORTSBET_MAX_STAKE_REBET:
+        return None
+    if not isinstance(resp, dict) or resp.get("success"):
+        return None
+    # MONEY-SAFETY: never rebet a maybe-landed bet. A stake-too-high (538) is a
+    # clean pre-submission validation reject (nothing hit the exchange), so it is
+    # not ambiguous — but if HyperBot ever tags such a response ambiguous (a fast
+    # POST fail that may have landed), refuse to rebet: that would double-stake.
+    # Symmetric with the racing guard.
+    if resp.get("ambiguous"):
+        return None
+    if "sportsbet" not in str(bookie or "").lower():
+        return None
+    if not _is_stake_error(resp.get("error") or ""):
+        return None
+    mx = _extract_max_stake(resp)
+    if mx is None or mx < 1.0:
+        return None
+    try:
+        if attempted_stake and mx >= float(attempted_stake):
+            return None
+    except (TypeError, ValueError):
+        return None
+    return round(mx, 2)
+
+
 def _is_price_change_error(error: str) -> bool:
     """
     True if HyperBot rejected because price moved between price_check and
@@ -977,7 +1077,136 @@ if parse_kev_message is not None:
 #     2026-06-21 09:00 Saiyan SGM (LDU 24+/Campbell 13+ @1.88) was lost to a Groq
 #     invalid-JSON gibberish failure -> manual, because the v5.80 fallback only
 #     covered Groq-ONLY tipsters and saiyan is a REGEX tipster (Groq+regex both fail).
-CLAUDE_TEXT_FALLBACK_TIPSTERS = {"shook", "saiyan_afl"}
+CLAUDE_TEXT_FALLBACK_TIPSTERS = {"shook", "saiyan_afl", "dello_afl"}
+
+
+# ── FIX B (v5.95): regex-first trust gate ───────────────────────────
+# Per-stat WIDE sane line bounds for the Saiyan regex FAST-PATH. A parsed line
+# outside these -> treat as a mis-parse and defer to the LLM. Bounds only reject
+# absurd values; a borderline-but-real value just falls through to the LLM (safe).
+# Keys mirror config.AFL_STAT_MAP's normalised VALUES (what the parser emits).
+_SAIYAN_LINE_BOUNDS = {
+    "disposals": (5.0, 45.0),
+    "kicks": (2.0, 35.0),
+    "handballs": (2.0, 30.0),
+    "marks": (1.0, 20.0),
+    "tackles": (1.0, 20.0),
+    "clearances": (1.0, 20.0),
+    "hitouts": (1.0, 70.0),
+    "goals": (0.5, 8.0),
+    "behinds": (0.5, 8.0),
+    "fantasy_points": (20.0, 200.0),
+}
+# Live/in-play markers: if ANY appear, defer to the LLM (which sets is_live ->
+# alert_only). The regex parser never sets is_live, so without this a live single
+# would auto-place. WIDE net (a false hit just costs an LLM parse, never a bet).
+_SAIYAN_LIVE_RE = re.compile(
+    r"(?:\blive\b|in.?play|\bIP\b|\bq[1-4]\b"
+    r"|[1-4](?:st|nd|rd|th)?\s*(?:q(?:tr|uarter)?|term)\b"
+    r"|quarter\s*time|half.?time|\bHT\b|\b[12]H\b|3/4\s*time|\U0001F534)",
+    re.IGNORECASE,
+)
+# An explicit unit token the regex parser IGNORES (it hardcodes default_units) ->
+# defer to the LLM which parses per-tip units. Requires a DIGIT before the 'u'
+# so the 'u25.5' under-shorthand and bare 'Under' never match; only '1u'/'1.5u'/
+# '2 units' fire. Over-detection is safe (defer); under-detection would mis-stake.
+_SAIYAN_UNIT_TOKEN_RE = re.compile(r"\b\d+(?:\.\d+)?\s*u(?:nits?)?\b", re.IGNORECASE)
+
+
+def _saiyan_regex_trusted(text: str, tips: list) -> bool:
+    """FIX B high-confidence gate: True ONLY when the deterministic Saiyan regex
+    parse is safe enough to SKIP the LLM. CONSERVATIVE — every non-clean branch
+    returns False so the tip falls through to the LLM (Claude/Groq). A False NEVER
+    drops a tip (the LLM still runs); only True skips the LLM. Restricted to
+    SINGLE-leg player props; SGM / team-line / H2H / live / unit-token defer."""
+    from config import AFL_TEAMS
+    try:
+        from parsers.saiyan_afl import _clean as _saiyan_clean
+    except Exception:
+        return False
+    if not tips:
+        return False
+    cleaned = _saiyan_clean(text)
+
+    # is_live guard: any live marker in the raw OR cleaned text -> LLM.
+    if _SAIYAN_LIVE_RE.search(text) or _SAIYAN_LIVE_RE.search(cleaned):
+        return False
+
+    # An explicit unit token ANYWHERE (even a standalone '2u' line the parser
+    # ignores, not just a bet line) -> the regex can't size it -> defer to the LLM
+    # (v5.95 review, cross-cutting). Safe: Saiyan's decimal odds / bookie lists /
+    # 'u25.5' under-shorthand never produce a digit-then-'u' word-boundary match.
+    if _SAIYAN_UNIT_TOKEN_RE.search(cleaned):
+        return False
+
+    # COMPLETENESS: count EVERY '@'-bearing non-comment line as a bet line and
+    # require exactly one tip per line. NOT gated on a surviving (XX)/[XX] tag: an
+    # all-caps surname whose emoji team-sentinel was stripped in preprocessing
+    # loses its tag, the parser skips the line, and a tag-gated counter would still
+    # match #tips -> a SILENTLY DROPPED leg (v5.95 review fixB #1). Counting all
+    # '@' lines makes count != #tips -> defer, never drop.
+    _bet_lines = 0
+    for _ln in cleaned.split("\n"):
+        _ln = _ln.strip()
+        if not _ln or _ln.startswith("*") or "@" not in _ln:
+            continue
+        # An SGM leg-separator is a '/' in the LEGS portion (BEFORE '@'). A single's
+        # bookie list ('@ 1.91 Betr/1.90 Lads/...') ALSO contains '/', but AFTER the
+        # '@' -> only a pre-'@' '/' means multi-leg. (Checking the whole line would
+        # defer EVERY real Saiyan single on its bookie list = Fix B inert.)
+        if "/" in _ln.split("@", 1)[0]:      # multi-leg SGM line -> LLM
+            return False
+        _bet_lines += 1
+    if _bet_lines == 0 or _bet_lines != len(tips):
+        return False
+
+    # Per-tip field + sanity checks. SINGLE-leg player props ONLY.
+    for _t in tips:
+        if getattr(_t, "is_sgm", False) or getattr(_t, "alert_only", False) \
+                or getattr(_t, "is_live", False):
+            return False
+        if len(_t.legs) != 1:
+            return False
+        _leg = _t.legs[0]
+        if _leg.market != "player_prop":
+            return False
+        if not (getattr(_leg, "player", "") or "").strip():
+            return False
+        if getattr(_leg, "team_abbr", "") not in AFL_TEAMS:   # resolved real club
+            return False
+        _stat = (_leg.stat or "").strip().lower()
+        _bounds = _SAIYAN_LINE_BOUNDS.get(_stat)
+        if _bounds is None:                                    # unknown/unmapped stat
+            return False
+        try:
+            _line = float(_leg.line)
+        except (TypeError, ValueError):
+            return False
+        if not (_bounds[0] <= _line <= _bounds[1]):
+            return False
+        _is_thresh = bool(getattr(_leg, "_is_threshold", False))
+        _sel = (_leg.selection or "").strip().lower()
+        if not _is_thresh and _sel not in ("over", "under"):
+            return False
+        # Sane tipster odds (now populated by the parser) — keeps the downstream
+        # odds-ceiling/floor + AFL target_odds 'wrong selection' guards ACTIVE
+        # (they DISABLE at odds<=1.0, so a 0.0 would silently weaken them).
+        try:
+            _odds = float(getattr(_t, "suggested_odds", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if not (1.01 <= _odds <= 1000.0):
+            return False
+    return True
+
+
+def _regex_first_trusted(tipster: str, text: str, tips: list) -> bool:
+    """Dispatch the FIX B fast-path trust gate by tipster. Returns False for any
+    tipster without a dedicated gate, so adding a tipster to REGEX_FIRST_TIPSTERS
+    without a gate here is a safe no-op (the LLM path runs)."""
+    if tipster == "saiyan_afl":
+        return _saiyan_regex_trusted(text, tips)
+    return False
 
 
 def route_message(
@@ -1003,6 +1232,35 @@ def route_message(
     parser_text = text
     if tipster == "saiyan_afl":
         parser_text = _preprocess_saiyan_emojis(text)
+
+    # FIX B (v5.95) — DETERMINISTIC FAST PATH. For a whitelisted structured-format
+    # tipster with a proven regex parser (saiyan_afl), run the regex parser FIRST
+    # and SKIP the LLM entirely when its output passes the high-confidence gate
+    # (_regex_first_trusted). Reclaims the ~3.5-5.1s Claude parse on the common
+    # single-leg case (the decommissioned llama-4-scout was ~1.2s). ANY doubt --
+    # 0 tips, SGM, partial/under-match, unknown stat, insane line/odds, live,
+    # unit token, unresolved team -- falls THROUGH to the LLM path below UNCHANGED,
+    # so a mis-parse can never escape to placement. A regex cannot hallucinate
+    # (literal-substring extraction or no match), so this does NOT reintroduce the
+    # llama gibberish class; Claude stays the backstop for everything unproven.
+    if tipster in REGEX_FIRST_TIPSTERS:
+        _rf_fn = REGEX_PARSERS.get(tipster)
+        if _rf_fn is not None:
+            _rf_t0 = time.time()
+            try:
+                _rf_tips = _rf_fn(parser_text, default_units=default_units, unit_size=unit_size)
+            except Exception as _rf_e:
+                log.warning(f"regex-first parser crashed for '{tipster}': {_rf_e} -> LLM path")
+                _rf_tips = None
+            if _rf_tips and _regex_first_trusted(tipster, parser_text, _rf_tips):
+                timing["regex_parse"] = round(time.time() - _rf_t0, 3)
+                timing["parser"] = "regex_first"
+                log.info(
+                    f"REGEX-FIRST: {len(_rf_tips)} trusted tip(s) for '{tipster}' in "
+                    f"{timing['regex_parse']:.3f}s -> SKIP LLM parse"
+                )
+                return _rf_tips, timing
+            log.info(f"regex-first not trusted for '{tipster}' -> LLM parse")
 
     # Step 1: parse. v5.83 CLAUDE PRIMARY skips Groq entirely (scout deprecated +
     # gibberish-prone; the Groq-fail-then-fallback round-trip was too slow). The
@@ -1535,6 +1793,11 @@ def _apply_mlb_flat_stake(tip: ParsedTip) -> None:
     MLB_FLAT_STAKE <= 0 (then MLB sizes like any Shook tip). Mutates `tip`."""
     if (tip.sport or "").lower() != "mlb" or MLB_FLAT_STAKE <= 0:
         return
+    # v5.9x (07-12 review #4): a self-bet carries Wilson's EXPLICIT dollar figure;
+    # never clobber it to the Shook-sized MLB_FLAT_STAKE. (MLB self-bets also route
+    # to manual in _process_self_bet, so this is belt-and-braces.)
+    if tip.tipster == "self_bet":
+        return
     flat = round(float(MLB_FLAT_STAKE), 2)
     if abs(tip.stake_dollars - flat) > 0.001:
         log.warning(
@@ -1544,6 +1807,54 @@ def _apply_mlb_flat_stake(tip: ParsedTip) -> None:
         )
     tip.units = 1.0
     tip.unit_size = flat
+
+
+def _apply_dello_flat_stake(tip: ParsedTip) -> None:
+    """Force a Dello tip to a FLAT dollar stake, ignoring Dello's own unit sizing
+    (his 0.05u-2.5u are ignored — Wilson flat-stakes). While DELLO_TEST_MODE the
+    flat stake is DELLO_TEST_UNIT_SIZE ($1) for the gated live test; flip
+    DELLO_TEST_MODE off (+ restart) to place at DELLO_UNIT_SIZE ($400). Like
+    _apply_mlb_flat_stake the clamp lives in the PLACING process so an .env edit
+    needs a restart to change the live stake (the $600 lesson). units=1.0 +
+    unit_size=flat makes stake_dollars == flat exactly; downstream caps only
+    reduce. No-op for non-Dello. Mutates `tip`."""
+    if tip.tipster != "dello_afl":
+        return
+    flat = round(float(DELLO_TEST_UNIT_SIZE if DELLO_TEST_MODE else DELLO_UNIT_SIZE), 2)
+    if flat <= 0:
+        return
+    if abs(tip.stake_dollars - flat) > 0.001:
+        log.warning(
+            f"Dello flat stake: {tip.tipster} {tip.units}u x ${tip.unit_size} "
+            f"= ${tip.stake_dollars} -> forcing flat ${flat} "
+            f"(DELLO_TEST_MODE={DELLO_TEST_MODE}; change DELLO_TEST_MODE/"
+            f"DELLO_UNIT_SIZE + restart for production stake)"
+        )
+    tip.units = 1.0
+    tip.unit_size = flat
+
+
+def _apply_self_bet_flat_stake(tip: ParsedTip) -> None:
+    """v5.9x (Wilson 2026-07-12, 07-12 review #2): force a self-bet tip to a FLAT
+    total stake = the (capped) dollar figure Wilson typed, regardless of any unit
+    token the LLM extracted from the free-text selection. Without this, a stray
+    '2u'/'3u' in the selection would make stake_dollars = units × unit_size and
+    blow past the $SELF_BET_MAX_STAKE hard cap (the accidental-extra-0 guard).
+    Forces units=1.0 and re-clamps unit_size to the cap. No-op for non-self-bet.
+    Mutates `tip`."""
+    if tip.tipster != "self_bet":
+        return
+    capped = min(round(float(tip.unit_size or 0), 2), SELF_BET_MAX_STAKE)
+    if capped <= 0:
+        return
+    if tip.units != 1.0 or abs(float(tip.unit_size or 0) - capped) > 0.001:
+        log.warning(
+            f"self-bet flat stake: {tip.units}u x ${tip.unit_size} "
+            f"= ${tip.stake_dollars} -> forcing 1u x ${capped:.2f} "
+            f"(total-stake cap; ignore any unit token in the selection)"
+        )
+    tip.units = 1.0
+    tip.unit_size = capped
 
 
 def _apply_image_test_stake(tip: ParsedTip) -> None:
@@ -2188,6 +2499,14 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
             f"is_live={tip.is_live} units={tip.units} "
             f"legs={legs_summary}"
         )
+
+    # Dello AFL (2026-07-12): dedicated SINGLES-only Sportsbet placement with the
+    # band + rule-3 gates. Handles single-vs-SGM/multi/exotic internally (anything
+    # not a clean player-prop single -> manual). Sits after event resolution and
+    # BEFORE the generic SGM/single dispatch so Dello never reaches the fan-out /
+    # SGM paths (HyperBot can't auto-place his multis; SGM line bug -> manual).
+    if tip.tipster == "dello_afl":
+        return _place_dello_single(tip)
 
     # Saiyan handicap bets (SGM OR single) -> MANUAL (Wilson 2026-06-06): a
     # mis-parsed "FRE +0.5" handicap leg broke a Saiyan SGM ("over not found").
@@ -3702,6 +4021,11 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
         if leg0 is not None:
             sel = (getattr(leg0, "player", "") or getattr(leg0, "selection", "") or "")
         _el = getattr(r, "elapsed_sec", None) or 0.0
+        # v5.9x (max-stake review, BUG C): reconcile/debit against the ACTUAL stake
+        # attempted on this account (after a max-stake rebet r.stake is the smaller
+        # SB max, not `step`), so pending_bets matches the landed amount and the
+        # debit doesn't over-charge. Falls back to `step` when r carries no stake.
+        _eff_step = float(getattr(r, "stake", None) or step)
         # v5.69 (M3): reconcile against the BOOKIE-aliased event name, the same
         # string placement sent to HyperBot (_execute_bet uses _bookie_event),
         # so /api/pending_bets matches. tip.event is the internal Squiggle name
@@ -3712,7 +4036,7 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
         # (double bet by hand) + lost ledger row.
         _recon_event = _bookie_event(tip.event, sess.get("bookie", ""), tip.sport)
         decision = _recon.decide_ambiguous(
-            hb, sess.get("account_id"), event=_recon_event, stake=step,
+            hb, sess.get("account_id"), event=_recon_event, stake=_eff_step,
             sport=(tip.sport or "afl"), selection=sel,
             submit_ts=_t.time() - _el,
             reconcile_enabled=RECONCILE_AMBIGUOUS, spill_enabled=False,
@@ -3724,9 +4048,9 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
     action = decision.get("action")
     if action == "placed":
         try:
-            actual = float(decision.get("actual_stake", step) or step)
+            actual = float(decision.get("actual_stake", _eff_step) or _eff_step)
         except (TypeError, ValueError):
-            actual = step
+            actual = _eff_step
         # v5.55 (audit, verified-critical): convert to a full SUCCESS — the
         # bet IS on the books (pending_bets confirmed it), so it must flow
         # into placed accounting / the BET PLACED summary / the ledger, NOT
@@ -3869,6 +4193,11 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
                 f"ladder: {(r.error or '')[:80]}"
             )
             return r
+        # v5.9x: the Sportsbet max-stake rebet lives inside _execute_bet (the
+        # shared chokepoint), so by the time a stake-reject bubbles up here the
+        # single max-fill attempt already happened. This just continues the old
+        # blind ladder as the backstop (non-SB bookies, or SB when the field was
+        # absent / the max itself re-rejected).
         log.info(f"AFL fan-out: {bk}:{sid} stake-reject ${step:.2f}, laddering down")
     return last if last is not None else BetResult(
         success=False, tip=tip, session_id=sid, bookie=bk,
@@ -4077,6 +4406,105 @@ def _afl_redistribute_topup(tip, placed_results, unfilled,
         log.info(f"AFL redistribute: ${remaining:.2f} still unfilled after "
                  f"{max_passes} pass(es) -> manual")
     return out
+
+
+# Dello AFL: standard placeable player-prop stats. ANY other stat (e.g. an
+# exotic "most disposals" / "most clearances") -> manual.
+_DELLO_STD_STATS = {
+    "disposals", "goals", "marks", "tackles", "kicks",
+    "handballs", "clearances", "hitouts", "fantasy_points",
+}
+
+
+def _place_dello_single(tip: ParsedTip) -> list[BetResult]:
+    """Dello AFL placement — SINGLES ONLY, Sportsbet ONLY, flat/$1-test stake.
+
+    Wilson's rules (dello_integration_plan.md): auto-place a clean player-prop
+    SINGLE only when the LIVE Sportsbet price is in [DELLO_BAND_LO, DELLO_BAND_HI].
+    A live price above the band (>HI, e.g. >3.00) OR below it (<LO) -> manual. A
+    live SB price >DELLO_SB_WORSE_GATE below Dello's quoted price -> manual (his
+    other-book/multi price was materially better). SGMs / cross-game multis /
+    exotics / team markets -> manual: HyperBot has NO cross-game-multi primitive,
+    and the AFL SGM line bug routes SGMs to manual like Saiyan. Anything
+    unresolved / ambiguous -> manual (real money: default to manual).
+
+    The stake is already flat/$1-clamped by _apply_dello_flat_stake before
+    place_tip; the event is already resolved (tip.event). Places ONE bet on the
+    top-priority Sportsbet account — no fan-out (flat stake, not split)."""
+    def _manual(reason: str) -> list:
+        tip.alert_only = True
+        tip.alert_reason = reason
+        log.info(f"[dello_afl] -> MANUAL: {reason}")
+        notifier.notify_manual_alert(tip)
+        return []
+
+    # 1. SINGLES only. SGM / multi-leg / non-player-prop / non-standard stat -> manual.
+    if getattr(tip, "is_sgm", False) or len(tip.legs) != 1:
+        return _manual("SGM / multi-leg — HyperBot can't auto-place a cross-game multi; place by hand")
+    leg = tip.legs[0]
+    if (leg.market or "").lower() != "player_prop":
+        return _manual(f"non-player-prop market '{leg.market}' (team/exotic) — place by hand")
+    if (leg.stat or "").lower() not in _DELLO_STD_STATS:
+        return _manual(f"non-standard stat '{leg.stat}' (exotic, e.g. 'most X') — place by hand")
+
+    # 2. Sportsbet session (TIPSTERS_FORCE_BOOKIE already restricts to SB); top priority.
+    raw_sessions = _v4_get_active_sessions_unfiltered(tip)
+    sessions = (
+        session_priority.filter_and_order_sessions(raw_sessions, "afl", is_sgm=False)
+        if raw_sessions else []
+    )
+    seen_sids: set[str] = set()
+    ordered: list[dict] = []
+    for s in sessions:
+        _sid = str(s.get("session_id", ""))
+        if not _sid or _sid in seen_sids:
+            continue
+        seen_sids.add(_sid)
+        ordered.append(s)
+    if not ordered:
+        return _manual("no active Sportsbet session for Dello — place by hand")
+    sess = ordered[0]
+
+    # 3. Resolve the exact catalog line + LIVE SB odds. KEEP the wrong-selection
+    #    ceiling (live > 1.25x tipped -> manual); the band below is Dello's own
+    #    floor so apply_floor=False. A catalog miss -> (None, BetResult) -> manual.
+    resolved, manual_br = _resolve_single_for_placement(
+        tip, sess, apply_ceiling=True, apply_floor=False, exact_only=True,
+    )
+    if manual_br is not None:
+        return _manual(f"Sportsbet resolve -> manual: {getattr(manual_br, 'error', '') or 'unresolved line/selection'}")
+    live = resolved.get("live_odds")
+    if live is None:
+        return _manual("Sportsbet has no live price for this exact line/selection — place by hand")
+    live = float(live)
+
+    # 4. Odds band (rules 1 & 2): only [DELLO_BAND_LO, DELLO_BAND_HI] auto-places.
+    if live > DELLO_BAND_HI:
+        return _manual(f"live SB {live} > {DELLO_BAND_HI} (only singles <= {DELLO_BAND_HI} auto-place) — place by hand")
+    if live < DELLO_BAND_LO:
+        return _manual(f"live SB {live} < {DELLO_BAND_LO} floor — place by hand")
+
+    # 5. Rule 4: NO tipster odds in the text -> we can't apply the rule-3 price
+    #    gate, and the resolver's wrong-selection ceiling is disabled when
+    #    tipped<=1.0, so the bet would place on the band alone -> route to manual.
+    ref = float(tip.suggested_odds or 0) or None
+    if ref is None:
+        return _manual("no tipster odds in the text — can't apply the rule-3 price gate; place by hand")
+    # Rule 3: live SB materially worse than Dello's quoted price -> manual.
+    if live < ref * (1.0 - DELLO_SB_WORSE_GATE):
+        return _manual(
+            f"live SB {live} is >{int(DELLO_SB_WORSE_GATE * 100)}% worse than Dello's quoted {ref} "
+            f"(his other-book/multi price is better) — place by hand"
+        )
+
+    # 6. PLACE the single on the one SB account at the flat/$1-test stake.
+    stake = tip.stake_dollars
+    log.info(
+        f"[dello_afl] PLACING single on {sess.get('bookie', 'sportsbet')}:{sess.get('session_id')} "
+        f"— {leg.player} {leg.selection} {leg.line} {leg.stat} @ live {live} "
+        f"(Dello ref {ref}) stake ${stake}"
+    )
+    return [_execute_bet(tip, sess, stake, presolved=resolved)]
 
 
 def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
@@ -4485,12 +4913,16 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                    for (s, _l, resolved) in jobs}
 
     def _at_risk_stake(r: BetResult) -> float:
-        # A failed/ambiguous BetResult carries stake=None (the failure branch of
-        # _execute_bet never sets it). The rung we actually FIRED is stashed as
-        # _requested_stake; fall back to the account's top rung. Without this the
-        # ambiguous alert/audit show $0 and the operator can't size reconciliation.
+        # v5.9x (max-stake review 2026-07-12, BUG C residual): prefer the ACTUAL
+        # stake fired. _execute_bet now sets r.stake on failures too, and after a
+        # max-stake rebet that is the SMALLER SB max — the true maybe-landed
+        # exposure. Using `_requested_stake` (the pre-rebet ladder rung the fan-out
+        # stashes) over-counted the ambiguous bucket by (rung - max), under-routing
+        # that never-submitted gap. Fall back to _requested_stake then the top rung
+        # so the ambiguous alert/audit never show $0. r.stake is always <= the rung,
+        # so this only ever LOWERS at-risk (routes the gap to redistribute/manual).
         return round(
-            (getattr(r, "_requested_stake", None) or r.stake
+            (r.stake or getattr(r, "_requested_stake", None)
              or top_by_sid.get(str(r.session_id), 0.0) or 0.0), 2)
 
     attempted_stake = round(sum(top_by_sid.values()), 2)  # sum of top rungs
@@ -4881,8 +5313,15 @@ def _place_etr_nba_fanout(tip: ParsedTip) -> list[BetResult]:
                   for (s, ladder, _r) in jobs}
 
     def _at_risk_stake(r: BetResult) -> float:
+        # v5.9x (max-stake review 2026-07-12, BUG C residual): prefer the ACTUAL
+        # stake fired (r.stake — set on failures by _execute_bet, = the smaller SB
+        # max after a max-stake rebet) over the pre-rebet rung stashed in
+        # _requested_stake, so the maybe-landed exposure isn't over-counted (which
+        # under-routed the never-submitted gap). Mirrors the AFL fan-out fix.
+        # r.stake <= the rung, so this only ever lowers at-risk. ETR NBA fans out
+        # via _fanout_place_account -> _execute_bet, so it IS rebet-reachable.
         return round(
-            (getattr(r, "_requested_stake", None) or r.stake
+            (r.stake or getattr(r, "_requested_stake", None)
              or top_by_sid.get(str(r.session_id), 0.0) or 0.0), 2)
 
     attempted_stake = round(sum(top_by_sid.values()), 2)
@@ -5365,6 +5804,11 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
             # ladder rung before this check existed.
             _elapsed = result.elapsed_sec or 0.0
             _slow = _elapsed >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
+            # v5.9x (max-stake review, BUG C): after an internal max-stake rebet
+            # result.stake is the smaller SB max actually attempted; reconcile +
+            # debit against THAT, not the original ladder step (else over-debit
+            # `remaining` -> under-fill spillover). No-op when no rebet happened.
+            _eff_stake = float(getattr(result, "stake", None) or step_stake)
             if (
                 not result.success
                 and (
@@ -5388,7 +5832,7 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                     # fan-out), but arms the missed-landed-GWS-bet class if
                     # AFL_CONCURRENT_FANOUT is reverted. Translate the event too.
                     event=_bookie_event(tip.event, chosen_session.get("bookie", ""), tip.sport),
-                    stake=step_stake, sport=tip.sport,
+                    stake=_eff_stake, sport=tip.sport,
                     selection=(result.placed_selection
                                or (tip.legs[0].selection if tip.legs else "")
                                or original_player or ""),
@@ -5409,9 +5853,9 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                 # this sequential path used by NBA/MLB singles.
                 if _recon_b["action"] == "placed":
                     try:
-                        _actual = float(_recon_b.get("actual_stake", step_stake) or step_stake)
+                        _actual = float(_recon_b.get("actual_stake", _eff_stake) or _eff_stake)
                     except (TypeError, ValueError):
-                        _actual = step_stake
+                        _actual = _eff_stake
                     _match = _recon_b.get("match") or {}
                     result.success = True
                     result.is_ambiguous = False
@@ -5434,7 +5878,7 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                     remaining_stake -= _actual
                     success_on_session = True
                     break
-                _debit_b = step_stake
+                _debit_b = _eff_stake
                 # C5/v4.6: label the actual trigger so a fast API-level ambiguous
                 # (elapsed<5s) isn't recorded as a contradictory "slow_rejection".
                 _amb_reason = "slow_rejection" if _slow else "fast_ambiguous"
@@ -6209,6 +6653,7 @@ def _catalog_lookup(markets: dict, market_name: str, player_l: str,
             "market": market_name,
             "line": float(s.get("line")),
             "selection": s.get("selection"),
+            "player": s.get("player"),
             "proposition_id": pid,
             "odds": s.get("odds", s.get("price")),
         }
@@ -6263,6 +6708,7 @@ def _catalog_nearest(markets: dict, market_name: str, player_l: str,
                 "market": market_name,
                 "line": sline,
                 "selection": s.get("selection"),
+                "player": s.get("player"),
                 "proposition_id": s.get("proposition_id"),
                 "odds": s.get("odds", s.get("price")),
             }
@@ -6276,13 +6722,29 @@ def _catalog_nearest(markets: dict, market_name: str, player_l: str,
 # surname sibling whose first name merely shares a prefix must NEVER resolve.
 # Each set is one equivalence group (lowercased). Add pairs as needed.
 _AFL_FIRST_NAME_GROUPS = [
-    {"brad", "bradley"}, {"matt", "matthew"}, {"josh", "joshua"},
-    {"mitch", "mitchell"}, {"nick", "nicholas"}, {"will", "william"},
-    {"ben", "benjamin"}, {"dan", "daniel"}, {"alex", "alexander"},
-    {"zac", "zach", "zachary"}, {"tom", "thomas"}, {"charlie", "charles"},
-    {"nat", "nathan"}, {"ollie", "oliver"}, {"sam", "samuel"},
+    {"brad", "bradley"}, {"matt", "matthew", "matty"}, {"josh", "joshua"},
+    {"mitch", "mitchell"}, {"nick", "nicholas", "nic"}, {"will", "william"},
+    {"ben", "benjamin"}, {"dan", "daniel", "danny"}, {"alex", "alexander"},
+    {"zac", "zach", "zachary", "zak"}, {"tom", "thomas"}, {"charlie", "charles"},
+    {"nat", "nathan", "nate"}, {"ollie", "oliver", "oli"}, {"sam", "samuel"},
     {"gus", "angus"}, {"ed", "edward"}, {"cam", "cameron"},
     {"lachie", "lachlan"}, {"paddy", "patrick"},
+    # 2026-07-06: genuine diminutive<->formal pairs seen across AFL lists vs
+    # Sportsbet's formal spelling. Only fires as a same-surname tiebreak with a
+    # UNIQUE candidate (see _afl_canonical_catalog_player), so a shared first-name
+    # prefix can never resolve to a different same-surname player.
+    #
+    # DELIBERATELY EXCLUDED: {"harry", "harrison"}. Unlike Brad<->Bradley (Bradley
+    # IS Brad's formal name), "Harry" is overwhelmingly a STANDALONE AFL given name
+    # (or short for Harold/Henry), NOT a diminutive of "Harrison" (an independent
+    # name). The uniqueness guard does NOT protect a LONE same-surname candidate
+    # who is a different person, and the first-name group is that path's only
+    # different-person guard — so a tip 'Harry <Surname>' not carried in the live
+    # catalog, with exactly one same-surname 'Harrison <Surname>' carried (e.g. a
+    # real Harrison Jones), would resolve to and BET the WRONG player. Removed after
+    # the v5.96 adversarial review. A confirmed Harry<->Harrison case goes in the
+    # collision-guarded afl_name_overrides.json, never a broad nickname pair.
+    {"jake", "jacob"}, {"joe", "joseph"},
 ]
 _AFL_FIRST_NAME_CANON: dict = {}
 for _grp in _AFL_FIRST_NAME_GROUPS:
@@ -6370,6 +6832,23 @@ def _afl_canonical_catalog_player(markets: dict, market_names: list, player_l: s
               if nrm.split() and _afl_first_name_compatible(q_first, nrm.split()[0])]
     if len(compat) == 1:
         return compat[0]
+    # 3) Curated alias candidates (afl_name_overrides.json 'aliases'): try each
+    # alternate Sportsbet spelling for this player against the LIVE catalog and use
+    # whichever the board actually carries — Jordon<->Jordan, Archie<->Archer, a
+    # Jr/Jnr suffix, Bailey J. Williams<->Bailey Williams, etc. This is the "list
+    # both, let the live board decide" path: a SINGLE catalog lookup, NO extra POST
+    # (so no double-stake retry risk). EXACT accent/case-normalised match only, so a
+    # curated variant resolves to the intended player or nothing — never a different
+    # player. It is SAFE to list an UNconfirmed variant here (the catalog gates it),
+    # unlike a rename in 'overrides' which must be Sportsbet-confirmed.
+    try:
+        from roster import afl_name_aliases as _afl_name_aliases
+        for _alt in _afl_name_aliases().get(q, []):
+            _an = _norm(_alt)
+            if _an in names:
+                return names[_an]
+    except Exception:
+        pass
     return None
 
 
@@ -7057,6 +7536,13 @@ def _enrich_sgm_legs_with_prop_ids(
             new_leg["line"] = match["line"]
             new_leg["selection"] = match["selection"]
             new_leg["proposition_id"] = match["proposition_id"]
+            # v5.96: adopt the catalog's canonical player spelling (roster short-
+            # form 'Brad Hill' -> catalog 'Bradley Hill'), mirroring the MLB leg
+            # below. AFL SGM legs place by proposition_id so a stale `player`
+            # string was masked, but keeping the payload's player field in step
+            # with the matched prop_id/selection removes the latent mismatch.
+            if match.get("player"):
+                new_leg["player"] = match["player"]
             _leg_odds = match.get("odds")
             log.info(
                 f"SGM AFL leg catalog-matched: {leg.get('player')} "
@@ -9611,14 +10097,24 @@ def _resolve_leg_for_hyperbot(
                 # 'Jack Crisp'/'Elliot Yeo'), so `player == _before` alone CANNOT
                 # tell them apart — it fired the ~14s Claude web-search on EVERY
                 # already-rostered player (06-27: ~14s x N legs, sequential, = the
-                # 76s tip latency). Disambiguate with the player's roster-inferred
-                # team: if leg.team_full already matches one of the fixture's
-                # teams, the player IS rostered AND in this game -> the backstop is
-                # redundant, skip it. A genuinely stale-roster player (team_full
-                # empty or off-fixture) still web-searches, preserving the BUG-A
-                # backstop (the only case that ever NEEDED it).
-                _team_in_fixture = bool(leg.team_full) and any(
-                    _roster_team_matches(leg.team_full, t) for t in event_teams)
+                # 76s tip latency). FIX A (2026-07-05): key the skip-guard off the
+                # ROSTER MATCH RESULT, not leg.team_full. Saiyan/Eddie IMAGE tips
+                # arrive with BLANK leg.team_full, so the old `bool(leg.team_full)
+                # and any(_roster_team_matches(...))` was ALWAYS False for them and a
+                # rostered full-name player (e.g. 'Colby McKercher' matched North
+                # Melbourne score=1.0) STILL fired the ~14s web-search. get_player_team
+                # runs the SAME event-scoped fuzzy match as resolve_player_name above
+                # (identical team=/teams= args, same _before input); because
+                # teams=event_teams FORBIDS fuzzy_match_player's cross-game global
+                # fallback (roster.py ~600-621), ANY non-empty team it returns is a
+                # player in THIS fixture -> the backstop is redundant, skip it. A
+                # genuine roster MISS (just-listed/stale player absent from
+                # roster_afl.json) returns "" -> the search still fires, preserving
+                # the BUG-A wrong-game backstop (the only case that ever NEEDED it).
+                # Mirrors the already-correct AFL singles path (~12015-12020).
+                _resolved_team = get_player_team(
+                    _before, sport, team=leg.team_full or "", teams=event_teams)
+                _team_in_fixture = bool(_resolved_team)
                 if player == _before and len(_before.split()) >= 2 \
                         and not _team_in_fixture \
                         and tip_parser._claude_websearch_enabled():
@@ -10035,7 +10531,7 @@ def _format_tip_placement_summary(tip) -> str:
 
 def _resolve_single_for_placement(
     tip: ParsedTip, session: dict, *,
-    apply_ceiling: bool = True, apply_floor: bool = True,
+    apply_ceiling: bool = True, apply_floor: bool = True, exact_only: bool = False,
 ) -> "tuple[dict | None, BetResult | None]":
     """Resolve a single leg to the exact catalog {market, line, selection,
     proposition_id, target_odds} the bookie carries, for one session.
@@ -10101,7 +10597,7 @@ def _resolve_single_for_placement(
 
         if basis_odds and basis_odds > 1.0:
             target_odds = _afl_target_odds(tip.sport, basis_odds)
-            _pct = 85 if ((tip.sport or "").lower() == "afl" and basis_odds > 2.00) else 90
+            _pct = 80 if ((tip.sport or "").lower() == "afl" and basis_odds > 2.00) else 90
             log.info(f"Target odds: {target_odds} ({_pct}% of {basis_label}, floor 1.01)")
     else:
         log.info("Target odds: omitted (price-change retry, accepting current market)")
@@ -10145,7 +10641,7 @@ def _resolve_single_for_placement(
                     "player": player or leg.player,
                     "stat": stat or leg.stat, "line": _tip_line,
                 }
-                _m = _match_afl_player_prop(_leg_dict, _pc.get("markets") or {})
+                _m = _match_afl_player_prop(_leg_dict, _pc.get("markets") or {}, exact_only=exact_only)
                 if _m:
                     _resolved_live_odds = _m.get("odds")  # ceiling-checked below
                     if _m["market"] != market or _m["line"] != line:
@@ -10158,9 +10654,18 @@ def _resolve_single_for_placement(
                     market = _m["market"]
                     line = _m["line"]
                     selection = _m["selection"]
-                    # Mirror the working SGM threshold payload: keep the player
-                    # name + stat alongside the bare-name selection.
-                    player = player or leg.player
+                    # v5.96 (2026-07-06): adopt the catalog's CANONICAL player
+                    # spelling for the payload's `player` field. HyperBot matches
+                    # AFL player props on `player`, so sending the roster short-
+                    # form ('Brad Hill') while `selection` already carried the
+                    # catalog name ('Bradley Hill') was rejected on EVERY account
+                    # ("player='Brad Hill' did not match ... Bradley Hill",
+                    # 2026-07-05 eddie disposals fan-out — the catalog match had
+                    # resolved the name but only `selection` was updated). The
+                    # matcher already ran _afl_canonical_catalog_player, so
+                    # _m["player"] is the exact live-catalog spelling; fall back
+                    # to the tip/roster name only when the catalog omits it.
+                    player = _m.get("player") or player or leg.player
                     stat = stat or leg.stat
                     _afl_pp_resolved = True
         except Exception as e:
@@ -10528,6 +11033,67 @@ def _execute_bet(
     )
     _elapsed = round(_time_mod.time() - _t_place_start, 2)
 
+    # v5.9x MAX-STAKE REBET (shared chokepoint for every sports-singles caller:
+    # AFL fan-out, singles_v4, spillover, name-variants). On a Sportsbet
+    # stake-too-high (538) reject the bookie now tells us the allowable max
+    # (HB v1.7.85). Instead of returning a failure that ladders DOWN blindly
+    # upstream, rebet ONCE right here at exactly that max and continue with THAT
+    # response. Bounded strictly below the rejected `stake` (a too-HIGH reject
+    # always is) so it can NEVER over-stake; ONE shot (no re-entry — we call the
+    # placement primitive directly). Kill-switch SPORTSBET_MAX_STAKE_REBET.
+    # BUG A (max-stake review 2026-07-12): ONLY rebet when the ORIGINAL reject
+    # was FAST. A SLOW "stake too high" can be the Erasmus class (2026-05-03: a
+    # 33s stake-too-high that ACTUALLY LANDED on Sportsbet) — HyperBot does NOT
+    # tag such a completed-cid reject `ambiguous`; its ambiguity is derived
+    # DOWNSTREAM by the elapsed>=threshold slow-rejection guard. If we rebet on a
+    # slow 538 we (a) risk double-staking a bet that already landed and (b)
+    # overwrite `_elapsed`/`resp`, defeating that downstream guard for the
+    # original. So on a slow reject we SKIP the rebet and let the original slow
+    # failure flow to the maybe-landed handling. Symmetric with the racing gate.
+    _mx_target = _sb_max_stake_target(resp, bookie, stake)
+    if _mx_target is not None and _elapsed >= STAKE_REJECT_LATENCY_THRESHOLD_SEC:
+        log.warning(
+            f"MAX-STAKE REBET SKIPPED: {bookie}:{sid} stake-too-high on ${stake:.2f} "
+            f"came back SLOW ({_elapsed:.1f}s >= {STAKE_REJECT_LATENCY_THRESHOLD_SEC}s) "
+            f"— treating as maybe-landed (Erasmus guard), NOT rebetting"
+        )
+        _mx_target = None
+    if _mx_target is not None:
+        log.info(
+            f"MAX-STAKE REBET: {bookie}:{sid} stake-too-high on ${stake:.2f} "
+            f"(SB max ${_mx_target:.2f}) — rebetting ONCE at max"
+        )
+        _afl_log_event(
+            tip,
+            f"MAXSTAKE-REBET bookie={bookie} sid={sid} "
+            f"from=${stake:.2f} to=${_mx_target:.2f}",
+        )
+        _t_place_start = _time_mod.time()
+        resp = hb.place_single_sports_bet(
+            session_id=sid,
+            sport=tip.sport,
+            event=event_for_hb,
+            market=market,
+            selection=selection,
+            stake=_mx_target,
+            player=player,
+            stat=stat,
+            line=line,
+            target_odds=target_odds,
+            proposition_id=_resolved_prop_id,
+        )
+        _elapsed = round(_time_mod.time() - _t_place_start, 2)
+        # Reassign `stake` so the auto-cap check + BetResult reflect the true
+        # (max) amount we requested — not a spurious "auto-cap" vs the original.
+        stake = _mx_target
+        if resp.get("success"):
+            log.info(f"MAX-STAKE REBET PLACED ${_mx_target:.2f} on {bookie}:{sid}")
+        else:
+            log.info(
+                f"MAX-STAKE REBET at ${_mx_target:.2f} still failed on "
+                f"{bookie}:{sid}: {(resp.get('error') or '')[:80]}"
+            )
+
     if resp.get("success"):
         # AUTO-CAP detection: bookies (Neds/Ladbrokes esp.) silently
         # auto-cap to account liability limits without rejecting. Read
@@ -10574,6 +11140,13 @@ def _execute_bet(
         return BetResult(
             success=False, tip=tip, session_id=sid, bookie=bookie,
             error=resp.get("error", "Unknown error"), timestamp=datetime.now(),
+            # v5.9x (max-stake review 2026-07-12, BUG C): carry the ACTUAL stake
+            # attempted. After a max-stake rebet `stake` was reassigned to the
+            # (smaller) SB max, so an ambiguous/maybe-landed reject debits the
+            # amount truly at risk — not the original ladder stake — which would
+            # otherwise over-debit `remaining` and under-fill the spillover.
+            # Honest value on every failure (== the amount we tried on this leg).
+            stake=stake,
             placed_leg_summary=_format_tip_placement_summary(tip),
             placed_market=market, placed_player=player, placed_stat=stat,
             placed_line=line, placed_selection=selection,
@@ -10584,6 +11157,10 @@ def _execute_bet(
             # dropped — a fast ambiguous that the >=5s elapsed guard would miss).
             # The slow-rejection handlers also trigger on result.is_ambiguous.
             is_ambiguous=bool(resp.get("ambiguous", False)),
+            # v5.9x: bookie-stated allowable max stake on a stake-too-high (538)
+            # reject (Sportsbet, HB v1.7.85). Read by the max-stake rebet so a
+            # capped account fills at exactly this instead of laddering blindly.
+            max_stake=resp.get("max_stake"),
             # Carried so ambiguous-outcome alerts include the server-side cid
             # for manual reconciliation / future /v3/transactions lookup.
             correlation_id=resp.get("correlation_id"),
@@ -10805,8 +11382,12 @@ def _shook_should_process(text: str) -> bool:
 
 async def _process_tip(text: str, tipster: str, sport: str,
                        unit_size: float, default_units: float,
-                       msg_time, channel_name: str):
-    """Process a single tip message through full pipeline with timing."""
+                       msg_time, channel_name: str, skip_dedup: bool = False):
+    """Process a single tip message through full pipeline with timing.
+
+    skip_dedup (v5.9x, self-bet channel): bypass the 10-min duplicate guard so
+    Wilson can intentionally re-bet the same selection from his own bet channel
+    as many times as he likes. Default False (every real tipster keeps dedup)."""
     pipeline_start = time.time()
 
     try:
@@ -10818,11 +11399,11 @@ async def _process_tip(text: str, tipster: str, sport: str,
             "message": text, "error": str(e),
         })
         notifier.notify_parse_error(channel_name, text, str(e))
-        return
+        return 0
 
     if not tips:
         log.debug("No tips found in message")
-        return
+        return 0
 
     log.info(
         f"Parsed {len(tips)} tip(s) from {channel_name} via {timing.get('parser', '?')} "
@@ -10865,6 +11446,24 @@ async def _process_tip(text: str, tipster: str, sport: str,
         for _t in tips:
             _t.suggested_bookie = _forced_bookie
 
+    # v5.9x (self-bet single-ticket guard, 07-12 review #2/#3): a self-bet message
+    # is exactly ONE ticket. If the parser split it into >1 tip (a compound
+    # "X and Y" selection, or an SGM the LLM broke into separate singles), placing
+    # N bets each at the full capped stake would blow past the $1500 total cap ->
+    # route to manual instead. Wilson re-sends a clean single-line self-bet.
+    if tipster == "self_bet" and len(tips) > 1:
+        log.warning(
+            f"[self-bet] parsed into {len(tips)} tips -> manual (one message = one "
+            f"ticket; would exceed the ${SELF_BET_MAX_STAKE:.0f} total cap): {text[:160]}")
+        try:
+            notifier.notify_image_alert(
+                channel_name,
+                f"SELF-BET parsed into {len(tips)} bets (expected 1) -> place "
+                f"manually: {text[:200]}")
+        except Exception:
+            pass
+        return 0
+
     for tip in tips:
         tip.timestamp = msg_time
 
@@ -10892,6 +11491,10 @@ async def _process_tip(text: str, tipster: str, sport: str,
         # MLB flat stake (ignore the recommended unit; $1 while gated, prod $).
         _apply_mlb_flat_stake(tip)
         _apply_saiyan_sgm_unit(tip)   # Saiyan SGM -> 750/u (250 ea x3); no-op otherwise
+        _apply_dello_flat_stake(tip)  # Dello -> flat $ (test $1 / prod DELLO_UNIT_SIZE); no-op otherwise
+        # v5.9x (07-12 review #2): self-bet -> flat 1u x (capped) $ so a stray unit
+        # token in the free-text selection can't multiply the total past the cap.
+        _apply_self_bet_flat_stake(tip)
 
         # Image-tip channels: pin to $1/unit while IMAGE_TIPS_TEST_MODE is on.
         # No-op for every non-image tipster; a safety belt in case an image
@@ -10904,9 +11507,11 @@ async def _process_tip(text: str, tipster: str, sport: str,
         # rewrites a leg selection), so a post-place fp wouldn't match a re-send's
         # pre-place fp and the dedup would be defeated (v5.49 James Wood HRRBI).
         _dupe_fp = f"{tip.tipster}::{_tip_fingerprint(tip)}"
-        if _is_duplicate(tip):
+        if not skip_dedup and _is_duplicate(tip):
             log.info(f"DUPE detected, skipping: {tip.tipster} {_tip_fingerprint(tip)}")
             continue
+        if skip_dedup:
+            log.info(f"[{tip.tipster}] self-bet: dedup bypassed (intentional re-bet allowed)")
 
         # No-unit gate: aus/kev tips MUST carry an explicit unit to be a bet.
         # Without one we'd default the stake and place a bet the capper never
@@ -10987,6 +11592,11 @@ async def _process_tip(text: str, tipster: str, sport: str,
                 "message": tip.raw_message, "error": str(e),
             })
             notifier.notify_parse_error(tip.tipster, tip.raw_message, str(e))
+
+    # v5.9x: number of tips this message produced (0 on parse-fail/empty). The
+    # Eddie caption fallback reads this to decide whether the caption was handled
+    # or should still ping manual (07-12 review #5 — no silent drop).
+    return len(tips)
 
 
 # ── Image-tip processing (vision-parsed channels) ───────────────────
@@ -11485,7 +12095,12 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
     if pipeline_start is not None:
         _phase_timing = {"t0": pipeline_start, "parse_sec": round(parse_sec or 0.0, 3)}
 
-    placed_any = False
+    # ── PASS 1 (SEQUENTIAL, on the event loop): guards + forward-fill + dedup ──
+    # FIX C (2026-07-05): the forward-fill (last_race_num) and the _racing_recent_fps
+    # check-then-register are ORDER-DEPENDENT and have NO await between the check and
+    # the write, so they MUST stay single-threaded here. Only the slow placement
+    # (PASS 2) is parallelised. Mirrors _route_image_afl_tips (v5.91).
+    jobs = []  # [(idx, parsed, intended_stake)]
     last_race_num = None  # forward-fill across selections grouped under a race
     for idx, raw in enumerate(raw_tips):
         try:
@@ -11532,7 +12147,10 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
             # Fingerprint the selection; skip a repeat within DUPE_WINDOW_SECS.
             # Registered BEFORE placing so a rapid re-delivery during the ~seconds of
             # placement is also caught (a failed tip won't auto-retry within the
-            # window — acceptable, it routes to manual anyway).
+            # window — acceptable, it routes to manual anyway). FIX C: this
+            # check-then-register runs on the event loop with NO await between the
+            # scan and the write, so two identical selections in ONE post cannot
+            # both build a job even though PASS 2 places concurrently.
             _rfp = (tipster, (parsed.get("track") or "").lower(), parsed.get("race_num"),
                     (parsed.get("runner") or "").lower(), parsed.get("saddle"),
                     parsed.get("market"), parsed.get("date"))
@@ -11560,22 +12178,55 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
             else:
                 intended_stake = round(units_capped * float(unit_size), 2)
 
-            await process_image_racing_tip(
-                parsed, intended_stake, hb, notifier,
-                source=channel_name, test_mode=IMAGE_RACING_TEST_MODE,
-                phase_timing=_phase_timing,
-            )
-            placed_any = True
+            jobs.append((idx, parsed, intended_stake))
         except Exception as e:
-            log.exception(f"[{channel_name}] racing image tip {idx} crashed: {e}")
+            log.exception(f"[{channel_name}] racing image tip {idx} build crashed: {e}")
             try:
                 notifier.notify_image_alert(
                     channel_name, f"(racing tip {idx} error: {e}) — place manually"
                 )
             except Exception:
                 pass
-    if not placed_any:
+
+    if not jobs:
         log.info(f"[{channel_name}] no placeable racing tips after guards")
+        return
+
+    # ── PASS 2: PLACE. Concurrent when >1 job + flag on. Each job is a DISTINCT
+    # selection; all downstream shared placement state is thread/async-safe:
+    #   * racing_placer._pace_* keyed per session_id (SAME-account bets still
+    #     stagger 5-10s; DIFFERENT accounts overlap) — _pace_lock;
+    #   * circuit-breaker _cb_* — _cb_lock; tiptitans _claim_bet — _fps_lock;
+    #   * place_racing_tip's used_session_ids is a LOCAL set per call.
+    # Bounded by IMAGE_RACING_MAX_CONCURRENCY; one tip crashing never kills siblings.
+    # IMAGE_RACING_CONCURRENT=false reverts to the serial loop (kill-switch).
+    sem = asyncio.Semaphore(max(1, IMAGE_RACING_MAX_CONCURRENCY))
+
+    async def _place_racing_job(job):
+        _idx, _parsed, _stake = job
+        async with sem:
+            try:
+                await process_image_racing_tip(
+                    _parsed, _stake, hb, notifier,
+                    source=channel_name, test_mode=IMAGE_RACING_TEST_MODE,
+                    phase_timing=_phase_timing,
+                )
+            except Exception as e:
+                log.exception(f"[{channel_name}] racing image tip {_idx} crashed: {e}")
+                try:
+                    notifier.notify_image_alert(
+                        channel_name, f"(racing tip {_idx} error: {e}) — place manually"
+                    )
+                except Exception:
+                    pass
+
+    if IMAGE_RACING_CONCURRENT and len(jobs) > 1:
+        log.info(f"[{channel_name}] placing {len(jobs)} racing image tips CONCURRENTLY "
+                 f"(<= {max(1, IMAGE_RACING_MAX_CONCURRENCY)} at once)")
+        await asyncio.gather(*(_place_racing_job(j) for j in jobs))
+    else:
+        for j in jobs:
+            await _place_racing_job(j)
 
 
 def _afl_disambiguate_surname_by_odds(scoped: list, game_labels: list, token: str,
@@ -12417,6 +13068,44 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
                 log.error(f"[{channel_name}] Claude vision fallback failed: {e}")
         if not raw_tips:
             log.info(f"[{channel_name}] vision parse returned 0 tips")
+            # v5.9x (Wilson 2026-07-12): CAPTION FALLBACK. Some AFL image tips put
+            # the reasoning IN the image and the actual BET in the Telegram caption
+            # (e.g. "Crows -19.5 hc"). When vision yields 0 tips, optionally parse
+            # the caption through the AFL TEXT pipeline. Ships DORMANT
+            # (EDDIE_CAPTION_FALLBACK_ENABLED default False) — the 07-12 review found
+            # a recap/scratch/no-bet caption could auto-place a LIVE bet. STRICT gate:
+            # AFL image only, caption must carry a real selection pattern AND must NOT
+            # be an urgent/scratch instruction, a recap, a summary, or no-bet framing
+            # — those route to the manual ping, never to placement. If the caption
+            # parses to 0 tips we still ping manual (never silently drop). On any
+            # error -> manual ping. Only fires on the vision-empty path, so it can
+            # never double-place a vision tip.
+            _cap_fallback_ok = (
+                EDDIE_CAPTION_FALLBACK_ENABLED
+                and sport_l == "afl" and bool(raw_caption)
+                and _image_text_selection_pattern(_cap_l)
+                and not _IMAGE_URGENT_INSTRUCTION_RE.search(_cap_l)
+                and not _IMAGE_RECAP_RE.search(_cap_l)
+                and not _IMAGE_SUMMARY_RE.search(_cap_l)
+                and not _is_no_bet_framing(raw_caption)
+            )
+            if _cap_fallback_ok:
+                log.warning(
+                    f"[{channel_name}] CAPTION FALLBACK: vision 0 tips + actionable "
+                    f"non-recap caption -> AFL text pipeline: {raw_caption[:100]}"
+                )
+                try:
+                    _n_handled = await _process_tip(
+                        raw_caption, tipster, "afl", unit_size, default_units,
+                        msg_time, channel_name)
+                    if _n_handled:
+                        return  # caption produced >=1 tip (placed or its own manual)
+                    log.info(f"[{channel_name}] caption fallback parsed 0 tips -> manual ping")
+                except Exception as e:
+                    log.error(
+                        f"[{channel_name}] caption-fallback text parse failed: {e} "
+                        f"— falling back to manual ping"
+                    )
             # v5.91 (2026-06-28): a no-tip image is NOT a 'bet detected' -> use the
             # dedicated no-tip notifier (notify_image_alert's footer falsely said
             # 'Image bet detected. Check and place manually.' — the 23:33 Eddie recap
@@ -12457,6 +13146,114 @@ def _text_looks_like_result(text: str) -> bool:
     Keeps a results post off the auto-place text racing path (it can carry a race
     code + runner + price and would otherwise place on an already-run race)."""
     return bool(_RESULT_MARKERS_RE.search(text or ""))
+
+
+async def _process_self_bet(text: str, msg_time, channel_name: str):
+    """v5.9x (Wilson 2026-07-12): Wilson's OWN bet channel.
+
+    6-field pipe format: `sport / teams-or-event / single|sgm / selection / stake / odds`
+      e.g. `afl / St Kilda v Port Adelaide / single / Nasiah Wanganeen-Milera under 24.5 disposals / 400 / 1.82`
+           `nba / Celtics v Knicks / sgm / Tatum 25+ pts and Brown 20+ pts / 300 / 3.5`
+
+    AFL/NBA route through the normal per-sport pipeline (`_process_tip`), which
+    fuzzy-matches the fixture + selection, fans out across ALL that sport's accounts,
+    ladders on a limit and rebets at the Sportsbet max. RACING and MLB -> manual
+    alert (an explicit-dollar racing self-bet doesn't fit the image-racing test/cap
+    path; MLB's flat-stake/HRRBI machinery can't honour an arbitrary dollar). HARD
+    $SELF_BET_MAX_STAKE cap enforced BOTH here and via _apply_self_bet_flat_stake
+    (units forced to 1 so a stray unit token can't multiply the total). Requires
+    valid odds > 1.0 (so the price guards apply). NO content dedup — Wilson re-bets
+    the same selection on purpose (skip_dedup=True). A message that parses into >1
+    tip, is malformed, has an unknown sport, or lacks odds -> manual (never a
+    mis-placed or mis-staked bet)."""
+    parts = [p.strip() for p in (text or "").split("/")]
+    if len(parts) < 6 or not parts[0]:
+        notifier.notify_image_alert(
+            channel_name,
+            "SELF-BET format (6 fields):\n"
+            "sport / teams-or-event / single|sgm / selection / stake / odds\n"
+            f"got {len(parts)} field(s) -> place manually: {text[:200]}")
+        return
+    # v5.9x (07-12 review #10): pin the fixed fields from BOTH ends so a "/" inside
+    # the selection over-splits gracefully — sport/event/type from the left,
+    # stake/odds from the right, selection = everything in between rejoined.
+    sport_raw, event_raw, bet_type = parts[0], parts[1], parts[2]
+    stake_raw, odds_raw = parts[-2], parts[-1]
+    selection = "/".join(parts[3:-2]).strip()
+    sport = (sport_raw or "").strip().lower()
+    stake = _img_coerce_float(stake_raw) or 0.0
+    odds = _img_coerce_float(odds_raw) or 0.0
+    is_sgm = "sgm" in (bet_type or "").lower()
+
+    if stake <= 0 or not selection.strip() or not event_raw.strip():
+        notifier.notify_image_alert(
+            channel_name,
+            f"SELF-BET: missing/invalid event, selection or stake -> place manually: {text[:200]}")
+        return
+
+    # HARD cap — accidental extra-0 guard (Wilson: "$1500 max in case I add a 0").
+    if stake > SELF_BET_MAX_STAKE:
+        log.warning(
+            f"[self-bet] stake ${stake:.2f} exceeds the ${SELF_BET_MAX_STAKE:.0f} cap "
+            f"-> capping to ${SELF_BET_MAX_STAKE:.0f} (accidental extra-0 guard)")
+        try:
+            notifier.notify_info(
+                f"⚠️ SELF-BET stake ${stake:.0f} exceeds the "
+                f"${SELF_BET_MAX_STAKE:.0f} cap -> capped to ${SELF_BET_MAX_STAKE:.0f}")
+        except Exception:
+            pass
+        stake = SELF_BET_MAX_STAKE
+
+    _sport_map = {"afl": "afl", "nba": "nba", "nbl": "nbl", "mlb": "mlb",
+                  "racing": "racing", "horse": "racing", "horses": "racing",
+                  "gallops": "racing", "thoroughbred": "racing"}
+    sport_key = _sport_map.get(sport)
+    if sport_key is None:
+        notifier.notify_image_alert(
+            channel_name,
+            f"SELF-BET: unknown sport '{sport_raw}' (use afl / nba / mlb / racing) "
+            f"-> place manually: {text[:200]}")
+        return
+
+    if sport_key in ("racing", "mlb"):
+        # RACING: an explicit-dollar racing self-bet doesn't fit the image-racing
+        # test-mode / unit-cap / dedup pipeline. MLB (07-12 review #4): the MLB
+        # flat-stake + HRRBI-reshape machinery is hardcoded to Shook sizing and
+        # can't honour an arbitrary dollar figure. Surface BOTH for a hand-place so
+        # we never mis-stake them. (Direct wiring for each is a follow-up.)
+        _lbl = "RACING" if sport_key == "racing" else "MLB"
+        notifier.notify_image_alert(
+            channel_name,
+            f"SELF-BET {_lbl} (place manually): {event_raw} / {selection} / "
+            f"${stake:.0f} @ {odds or '?'}")
+        log.info(f"[self-bet] {sport_key} -> manual: {event_raw} / {selection} / ${stake:.0f}")
+        return
+
+    # v5.9x (07-12 review #7): AFL/NBA require valid odds (>1.0). A blank/omitted
+    # odds field would leave suggested_odds=0, which disables BOTH the odds ceiling
+    # AND the floor and lets a ±1.0 nearest-line snap place a wrong line at any
+    # price. Missing odds -> manual (mirrors the Dello no-odds rule).
+    if odds <= 1.0:
+        notifier.notify_image_alert(
+            channel_name,
+            f"SELF-BET: missing/invalid odds '{odds_raw}' (need > 1.0 so the price "
+            f"guards apply) -> place manually: {text[:200]}")
+        log.info(f"[self-bet] {sport_key} no valid odds -> manual: {text[:160]}")
+        return
+
+    # AFL / NBA: reconstruct a natural-language tip and route through the normal
+    # per-sport pipeline. Stake is carried as unit_size; _apply_self_bet_flat_stake
+    # forces units=1 so the placed total is EXACTLY the capped dollar figure even
+    # if the LLM reads a stray unit token. skip_dedup=True (Wilson re-bets).
+    recon = f"{event_raw}: {selection}"
+    if is_sgm and "sgm" not in recon.lower():
+        recon += " (SGM)"
+    recon += f" @ {odds}"
+    log.info(
+        f"[self-bet] {sport_key} {'SGM' if is_sgm else 'single'} ${stake:.2f} "
+        f"(cap ${SELF_BET_MAX_STAKE:.0f}) -> routing as text: {recon[:160]}")
+    await _process_tip(recon, "self_bet", sport_key, stake, 1.0,
+                       msg_time, channel_name, skip_dedup=True)
 
 
 async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
@@ -13239,6 +14036,83 @@ def _code_fingerprint() -> str:
 CODE_FINGERPRINT = _code_fingerprint()
 
 
+# ── Telethon connection-liveness watchdog (incident 2026-07-06) ─────
+# Wall-clock (time.time()) of the last update RECEIVED on any monitored chat,
+# stamped in the NewMessage handler (even for ignored senders). Read by the
+# watchdog ONLY as an asymmetric veto (proof the socket is alive) — a passive
+# stamp must never TRIGGER a reconnect (a quiet night != a dead socket).
+_last_telethon_update_ts: float = 0.0
+
+
+async def _telethon_probe(client):
+    """Single ACTIVE liveness probe over the MTProto socket -> (healthy, reason).
+    A half-open socket makes get_me() HANG -> asyncio timeout -> unhealthy.
+    get_me() returns None (does NOT raise) on a revoked/invalidated session, so a
+    falsy result is treated unhealthy (2026-07-06 review blind-spot fix)."""
+    try:
+        if not client.is_connected():
+            return False, "is_connected() is False"
+        me = await asyncio.wait_for(client.get_me(), timeout=TELETHON_WATCHDOG_PROBE_TIMEOUT_SEC)
+        if not me:
+            return False, "get_me() returned None (unauthorized/revoked session)"
+        return True, ""
+    except asyncio.TimeoutError:
+        return False, f"get_me() timed out (>{TELETHON_WATCHDOG_PROBE_TIMEOUT_SEC}s)"
+    except Exception as e:
+        return False, f"probe error: {type(e).__name__}: {e}"
+
+
+def _telethon_socket_recently_alive(now: float = None) -> bool:
+    """True if ANY update arrived within the last probe INTERVAL -> socket provably
+    alive. ASYMMETRIC VETO: a probe failure while updates still flow (e.g. a sync
+    place_tip fan-out briefly blocked the event loop, tripping the get_me timeout)
+    is a FALSE positive and must NOT force a reconnect. Staleness alone NEVER
+    triggers a reconnect; it only vetoes a false one."""
+    now = time.time() if now is None else now
+    return _last_telethon_update_ts > 0 and (now - _last_telethon_update_ts) < TELETHON_WATCHDOG_INTERVAL_SEC
+
+
+async def _telethon_liveness_watchdog(client, reconnect_event):
+    """Force a fast reconnect when the telethon socket goes DEAD/half-open.
+
+    Incident 2026-07-06: main.py stayed alive but the socket went half-open
+    ~01:15-10:53 (~9.5h), received ZERO updates, and telethon's own ping/reconnect
+    did not notice -> every morning tip missed. This probes every INTERVAL sec; on
+    FAIL_THRESHOLD consecutive genuinely-unhealthy probes it sets reconnect_event +
+    client.disconnect() -> run_until_disconnected() returns -> main() raises
+    ConnectionError -> __main__ restarts main() with a fresh client and RESUMES LIVE.
+    NOTE: the client runs catch_up=False, so the dead-window tips are DROPPED (not
+    replayed onto already-run races) — money-safe; the win is ~9.5h deaf -> ~2-4 min."""
+    consecutive = 0
+    while True:
+        await asyncio.sleep(TELETHON_WATCHDOG_INTERVAL_SEC)
+        healthy, reason = await _telethon_probe(client)
+        if not healthy and _telethon_socket_recently_alive():
+            log.info(f"telethon watchdog: probe unhealthy ({reason}) but an update arrived "
+                     f"<{TELETHON_WATCHDOG_INTERVAL_SEC}s ago -> socket alive, vetoing reconnect")
+            healthy = True
+        if healthy:
+            consecutive = 0
+            continue
+        consecutive += 1
+        log.warning(f"telethon watchdog: UNHEALTHY probe {consecutive}/{TELETHON_WATCHDOG_FAIL_THRESHOLD} ({reason})")
+        if consecutive >= TELETHON_WATCHDOG_FAIL_THRESHOLD:
+            log.error(f"telethon watchdog: dead socket ({reason}) -> forcing listener reconnect "
+                      f"(dropping the gap, resuming live)")
+            try:
+                notifier.notify_critical(
+                    f"Telethon socket dead ({reason}) - forcing listener reconnect. "
+                    f"Was silent-deaf; gap dropped, resuming live.")
+            except Exception:
+                pass
+            reconnect_event.set()
+            try:
+                await client.disconnect()
+            except Exception as e:
+                log.error(f"telethon watchdog: disconnect() failed: {e}")
+            return
+
+
 async def main():
     log.info("Starting TipBot...")
     # Banner: version NUMBER + fingerprint only (v5.39, Wilson) — the full
@@ -13256,6 +14130,11 @@ async def main():
 
     @client.on(events.NewMessage(chats=monitored_chats))
     async def handler(event):
+        # v5.9x: stamp EVERY received update (even ones ignored for a wrong sender)
+        # BEFORE the sender filter — any inbound update proves the MTProto socket is
+        # alive; read by the liveness watchdog as an asymmetric veto (never a trigger).
+        global _last_telethon_update_ts
+        _last_telethon_update_ts = time.time()
         text = event.raw_text or ""
         chat_id = event.chat_id
         sender_id = event.sender_id or 0
@@ -13297,6 +14176,16 @@ async def main():
                 # Leroy is a TEXT tipster; a no-text (image/sticker/empty) post isn't a
                 # tip we can parse. Log so it's visible rather than a silent no-op.
                 log.info(f"[{channel_name}] Betfair BSP post with no text -> ignored")
+            return
+
+        # v5.9x (Wilson 2026-07-12): Wilson's OWN bet channel. 6-field structured
+        # text; route AFL/NBA/MLB through the normal per-sport fan-out (split-stake
+        # + max-stake rebet, NO dedup, $1500 cap), racing + MLB -> manual alert.
+        if channel_cfg.get("self_bet"):
+            if text:
+                asyncio.create_task(_process_self_bet(text, msg_time, channel_name))
+            else:
+                log.info(f"[{channel_name}] self-bet post with no text -> ignored")
             return
 
         # Image-tip CHANNELS (Eddie AFL, Zak/Trial racing): the post's image
@@ -13536,6 +14425,18 @@ async def main():
     asyncio.create_task(_session_watchdog())
     log.info(f"Session watchdog started (poll every {WATCHDOG_INTERVAL_SEC}s)")
 
+    # v5.9x: telethon connection-liveness watchdog (2026-07-06 incident: the socket
+    # went half-open ~9.5h, silent-deaf, no auto-reconnect). Gated by a kill-switch.
+    _telethon_reconnect_event = asyncio.Event()
+    if TELETHON_WATCHDOG_ENABLED:
+        asyncio.create_task(_telethon_liveness_watchdog(client, _telethon_reconnect_event))
+        log.info(
+            f"Telethon liveness watchdog started (probe every {TELETHON_WATCHDOG_INTERVAL_SEC}s, "
+            f"timeout {TELETHON_WATCHDOG_PROBE_TIMEOUT_SEC}s, threshold {TELETHON_WATCHDOG_FAIL_THRESHOLD})"
+        )
+    else:
+        log.info("Telethon liveness watchdog DISABLED (TELETHON_WATCHDOG_ENABLED=false)")
+
     # Start Tip Titans poller (optional - only if credentials set)
     if os.getenv("TIPTITANS_EMAIL") and os.getenv("TIPTITANS_PASSWORD"):
         try:
@@ -13553,6 +14454,12 @@ async def main():
 
     log.info("Listening for tips... (Ctrl+C to stop)")
     await client.run_until_disconnected()
+
+    # v5.9x: if the liveness watchdog forced this disconnect (dead/half-open socket),
+    # route into the __main__ reconnect loop (fresh client, resume live) instead of a
+    # clean process exit. A genuine clean shutdown leaves the event unset -> normal exit.
+    if _telethon_reconnect_event.is_set():
+        raise ConnectionError("telethon liveness watchdog forced reconnect (dead/half-open socket)")
 
 
 if __name__ == "__main__":
