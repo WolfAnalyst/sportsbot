@@ -509,6 +509,20 @@ def _tip_has_handicap_leg(tip) -> bool:
     return False
 
 
+# 07-13 re-verify: TEXT handicap tips carry NO period field (leg.period is set on
+# the IMAGE path only), and the text parser has no 2nd-half/quarter market — so a
+# Saiyan "St Kilda 2nd Half -5.5" / "Q3" handicap is labelled market='line' and
+# would place FULL-GAME (wrong market). This deterministic raw-text backstop forces
+# any half/quarter-qualified handicap to manual, mirroring the image _partial_period
+# guard for the text path. Full-game handicaps (no half/quarter word) are unaffected.
+_SAIYAN_PERIOD_HC_RE = re.compile(
+    r"\b(?:1st|2nd|3rd|4th|first|second|third|fourth)\s*(?:half|quarter|qtr)\b"
+    r"|\b(?:half|quarter|qtr)[-\s]*(?:time|line)\b"
+    r"|\bhalf\s*time\b|\bq[1-4]\b|\b[1-4]q\b|\b[12]h\b",
+    re.IGNORECASE,
+)
+
+
 def _saiyan_hc_placeable(tip) -> bool:
     """v5.9x (#7, 07-12 review C1): True iff EVERY handicap-ish leg is a clean
     FULL-GAME 'line' handicap — the ONLY handicap the placement resolvers exact-
@@ -517,6 +531,10 @@ def _saiyan_hc_placeable(tip) -> bool:
     no-player/no-stat leg, an h2h/margin/team_line leg, has no safe resolver. So
     when SAIYAN_HC_SGM_ENABLED, ONLY full-game-line handicaps auto-place; every
     other handicap-ish leg keeps the manual route. Player-prop legs never block."""
+    # 07-13 re-verify: text tips have no leg.period, so catch a half/quarter
+    # qualifier in the raw message and keep it on manual (never a full-game bet).
+    if _SAIYAN_PERIOD_HC_RE.search(getattr(tip, "raw_message", "") or ""):
+        return False
     for l in (getattr(tip, "legs", None) or []):
         mkt = (getattr(l, "market", "") or "").lower()
         player = (getattr(l, "player", "") or "").strip()
@@ -7344,9 +7362,15 @@ def _match_handicap_in_catalog(team_selection: str, tipped_line, markets: dict):
         a, b = sorted((team_l, c), key=len)  # a = shorter, b = longer
         if not a or not (b.startswith(a + " ") or b.endswith(" " + a)):
             return False
-        # (shorter, longer) pairs that are DIFFERENT AFL clubs, not a nickname:
+        # (shorter, longer) pairs where the shorter is a distinct AFL CLUB that is a
+        # trailing word of a DIFFERENT club (NOT a nickname) — reject the word-match.
+        # These are the only such collisions in the AFL: Adelaide/Port Adelaide,
+        # Sydney/Greater Western Sydney, Melbourne/North Melbourne. (07-13 re-verify:
+        # Melbourne/North Melbourne was missing -> 'Melbourne' handicap could bind
+        # to 'North Melbourne' = wrong team.)
         _cross_club = {("adelaide", "port adelaide"),
-                       ("sydney", "greater western sydney")}
+                       ("sydney", "greater western sydney"),
+                       ("melbourne", "north melbourne")}
         return (a, b) not in _cross_club
 
     # 1. Standard `line` market (selection=team, has `line` field).
@@ -12856,7 +12880,11 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
     _partial_period = (
         (_period not in ("", "full", "match", "fulltime", "full time", "game", "full game")
          and any(w in _period for w in ("half", "quarter", "1st", "2nd", "3rd", "4th",
-                                        "1h", "2h", "q1", "q2", "q3", "q4", "h1", "h2")))
+                                        "1h", "2h", "q1", "q2", "q3", "q4", "h1", "h2",
+                                        # 07-13 re-verify: digit-first codes the
+                                        # period map accepts (1q..4q) were missed,
+                                        # so a period leg could slip to full-game.
+                                        "1q", "2q", "3q", "4q")))
         or "half" in _label or "quarter" in _label
     )
     stat = _normalise_afl_image_stat(raw.get("stat"))
