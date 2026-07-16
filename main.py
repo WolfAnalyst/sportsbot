@@ -408,10 +408,25 @@ _AFL_PERIOD_CODE_MAP = {
     "3q": "3q", "q3": "3q", "3rd_quarter": "3q", "third_quarter": "3q", "3rd quarter": "3q",
     "4q": "4q", "q4": "4q", "4th_quarter": "4q", "fourth_quarter": "4q", "4th quarter": "4q",
     "1h": "1h", "h1": "1h", "1st_half": "1h", "first_half": "1h", "1st half": "1h",
+    # v6.00 (Wilson 2026-07-17): 2nd-half recognised. NOTE: Sportsbet offers NO 2h
+    # LINE market (only first_half_total/second_half_total totals + quarter_time_line
+    # full_game/1h) — so a 2h HANDICAP resolves to no market -> exact-or-manual =
+    # manual; a 2h TOTAL maps to second_half_total (placeable). See _afl_period_*.
+    "2h": "2h", "h2": "2h", "2nd_half": "2h", "second_half": "2h", "2nd half": "2h",
     # NOTE (07-12 review #2): a bare "half" is NOT mapped — it's ambiguous (could be
     # a shortened 2nd-half tip) and would place the WRONG half. Every unmapped /
     # ambiguous period -> "" -> manual (the no-guess invariant).
 }
+
+# v6.00 (Wilson 2026-07-17): NO-ODDS Eddie player-prop safety band. A lone no-odds
+# prop auto-places EXACT-line-only (no ±1 snap) but carries NO tipster-odds price
+# ceiling/floor, so the fan-out enforces this band off the LIVE catalog price:
+#   - the live price must be ABOVE EDDIE_NOODDS_MIN_ODDS (else the whole tip -> manual;
+#     no short-priced blind bets), and
+#   - the total stake is capped so potential winnings (to-win) can't exceed
+#     EDDIE_NOODDS_MAX_TOWIN. Odds-bearing tips keep the normal ceiling/floor.
+EDDIE_NOODDS_MIN_ODDS = float(os.getenv("EDDIE_NOODDS_MIN_ODDS", "1.75"))
+EDDIE_NOODDS_MAX_TOWIN = float(os.getenv("EDDIE_NOODDS_MAX_TOWIN", "1500"))
 
 
 def _afl_period_code(raw_period) -> str:
@@ -458,6 +473,67 @@ def _resolve_afl_period_prop(markets: dict, period_code: str, team: str, line):
         if str(s.get("period") or "").strip().lower() != period_code:
             continue
         if str(s.get("selection") or s.get("team") or "").strip().lower() != tnorm:
+            continue
+        s_line = s.get("line")
+        if s_line is None:
+            continue
+        try:
+            if abs(float(s_line) - target_line) > 1e-6:
+                continue
+        except (TypeError, ValueError):
+            continue
+        pid = s.get("proposition_id")
+        if pid:
+            return {
+                "proposition_id": str(pid),
+                "odds": s.get("odds") or s.get("price"),
+                "selection": s.get("selection"),
+                "market": mkt_key,
+                "period": period_code,
+                "line": float(s_line),
+            }
+    return None
+
+
+def _afl_period_total_market_for(period_code: str) -> str:
+    """The SB market that carries a given period TOTAL ("" if none). v6.00
+    (07-17 live probe): 1h->first_half_total, 2h->second_half_total,
+    1q-4q->quarter_total. Full-game totals use total_points (not here)."""
+    if period_code == "1h":
+        return "first_half_total"
+    if period_code == "2h":
+        return "second_half_total"
+    if period_code in ("1q", "2q", "3q", "4q"):
+        return "quarter_total"
+    return ""
+
+
+def _resolve_afl_period_total(markets: dict, period_code: str, side, line):
+    """EXACT-match an AFL period TOTAL (Over/Under + line) to its live
+    proposition_id (D, v6.00). Mirrors _resolve_afl_period_prop but matches
+    selection=Over/Under instead of a team. Returns {proposition_id, odds,
+    selection, market, period, line} on an EXACT (period + side + line) match,
+    else None (miss -> manual, NO fuzzy)."""
+    mkt_key = _afl_period_total_market_for(period_code)
+    if not mkt_key or not isinstance(markets, dict):
+        return None
+    m = markets.get(mkt_key)
+    if not isinstance(m, dict):
+        return None
+    sels = m.get("selections") or m.get("outcomes") or []
+    snorm = (side or "").strip().lower()
+    if snorm not in ("over", "under"):
+        return None
+    try:
+        target_line = float(line)
+    except (TypeError, ValueError):
+        return None
+    for s in sels:
+        if not isinstance(s, dict):
+            continue
+        if str(s.get("period") or "").strip().lower() != period_code:
+            continue
+        if str(s.get("selection") or "").strip().lower() != snorm:
             continue
         s_line = s.get("line")
         if s_line is None:
@@ -4871,8 +4947,16 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         bk = (sess.get("bookie", "") or "").lower()
         if bk in resolved_by_bookie:
             continue
+        # v6.00 (review A-HIGH fix): a tip with NO tipster odds (the lone no-odds
+        # Eddie player-prop fall-through) has an INERT odds ceiling/floor, so force
+        # EXACT-line matching (NO +/-1.0 nearest-line snap). A wrong-line snap on a
+        # blind-price bet is the exact money risk the review flagged (e.g. tip 22.5,
+        # catalog 23.5 -> snap to 23.5 at any price). Odds-bearing tips keep the ±1
+        # snap (their ceiling catches a bad snap). A no-odds miss -> manual.
+        _no_tipster_odds = not (tip.suggested_odds and float(tip.suggested_odds) > 1.0)
         _resolved, _manual = _resolve_single_for_placement(
             tip, sess, apply_ceiling=True, apply_floor=False,
+            exact_only=_no_tipster_odds,
         )
         resolved_by_bookie[bk] = _resolved  # None when routed to manual
         if _manual is not None:
@@ -4883,6 +4967,54 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     _tm = getattr(tip, "_timing", None)
     if isinstance(_tm, dict):
         _tm["price_check_sec"] = round(_time_mod.time() - _pc_t0, 3)
+
+    # v6.00 (review A-HIGH + Wilson's band): a NO-tipster-odds bet (the lone no-odds
+    # Eddie player-prop fall-through) has an inert odds ceiling/floor, so enforce
+    # Wilson's explicit band off the LIVE catalog price: (1) the live price must be
+    # ABOVE EDDIE_NOODDS_MIN_ODDS (1.75) else the whole tip -> manual (no short-priced
+    # blind bets); (2) cap the total stake so potential winnings (to-win) <=
+    # EDDIE_NOODDS_MAX_TOWIN ($1500) at the live price (the `allocated` running total
+    # below enforces the reduced intended). Odds-bearing tips are untouched.
+    if not (tip.suggested_odds and float(tip.suggested_odds) > 1.0):
+        _band_lo = next((r.get("live_odds") for r in resolved_by_bookie.values()
+                         if r and r.get("live_odds")), None)
+        try:
+            _band_lo = float(_band_lo) if _band_lo is not None else None
+        except (TypeError, ValueError):
+            _band_lo = None
+        _has_resolved = any(r for r in resolved_by_bookie.values() if r)
+        if _band_lo is None and _has_resolved:
+            # v6.00 (verify residual #1): a no-tipster-odds bet with NO live price
+            # can't be bounded by the band -> route to manual (never place a truly
+            # price-less blind bet). Unrealistic on a live SB catalog, defensive.
+            log.info("AFL fan-out: no-odds bet has NO live price -> whole tip to MANUAL")
+            for _bk in list(resolved_by_bookie):
+                manual_by_bookie.setdefault(_bk, BetResult(
+                    success=False, tip=tip, bookie=_bk,
+                    error="no-odds prop with no live price — place manually",
+                    timestamp=datetime.now()))
+                resolved_by_bookie[_bk] = None
+        elif _band_lo is not None and _band_lo <= EDDIE_NOODDS_MIN_ODDS:
+            log.info(
+                f"AFL fan-out: no-odds bet live price {_band_lo} <= floor "
+                f"{EDDIE_NOODDS_MIN_ODDS} -> whole tip to MANUAL"
+            )
+            for _bk in list(resolved_by_bookie):
+                manual_by_bookie.setdefault(_bk, BetResult(
+                    success=False, tip=tip, bookie=_bk,
+                    error=(f"no-odds prop live odds {_band_lo} <= "
+                           f"{EDDIE_NOODDS_MIN_ODDS} floor — place manually"),
+                    timestamp=datetime.now()))
+                resolved_by_bookie[_bk] = None
+        elif _band_lo is not None:
+            _max_total = EDDIE_NOODDS_MAX_TOWIN / (_band_lo - 1.0)
+            if intended_stake > _max_total:
+                log.info(
+                    f"AFL fan-out: no-odds to-win cap ${EDDIE_NOODDS_MAX_TOWIN:.0f} "
+                    f"@ {_band_lo} -> intended ${intended_stake:.2f} capped to "
+                    f"${_max_total:.2f}"
+                )
+                intended_stake = round(_max_total, 2)
 
     if not any(resolved_by_bookie.values()):
         log.info(
@@ -11137,40 +11269,98 @@ def _resolve_single_for_placement(
                 log.debug(f"Handicap catalog match skipped: {e}")
 
     elif market == "total_points" and line is not None:
-        # Match TOTAL against the catalog: total_points main line (±1.0), then
-        # pick_own_total alt lines (±0.5; line baked into the selection ->
-        # proposition_id). Mirrors the line/pick_own_line handicap path so an
-        # off-main total (e.g. Eddie's 172.5 vs a 166.5 main line) places at the
-        # EXACT alt line instead of snapping to the wrong line / dying. A catalog
-        # miss leaves the leg as-is -> placement fails -> manual. 2026-06-03.
-        try:
-            price_resp = hb.price_check_sports(
-                session_id=sid, sport=tip.sport, event=tip.event,
-            )
-            if price_resp.get("success"):
-                _tm = _match_total_in_catalog(
-                    selection, line, price_resp.get("markets") or {},
+        # v6.00 (#D): an AFL PERIOD total (1h/2h/1q-4q) carries a period code on the
+        # leg -> resolve the EXACT proposition_id (first_half_total /
+        # second_half_total / quarter_total) and place THAT; a miss / non-SB /
+        # price-check fail -> MANUAL, never a full-game total fallback. Gated by
+        # AFL_PERIOD_MARKETS_ENABLED. Requires a tipster price >1.0 (no price
+        # protection otherwise — mirrors the period handicap rule at 07-12 review #3).
+        _pcode_to = (_afl_period_code(getattr(leg, "period", ""))
+                     if AFL_PERIOD_MARKETS_ENABLED else "")
+        if _pcode_to:
+            if not (tip.suggested_odds and float(tip.suggested_odds) > 1.0):
+                log.info(f"AFL period {_pcode_to} total '{selection}' has no tipster "
+                         f"odds (>1.0) — no price protection -> manual")
+                return (None, BetResult(
+                    success=False, tip=tip, session_id=sid, bookie=bookie,
+                    error=(f"AFL period {_pcode_to} total with no tipster odds "
+                           f"(price-guard-less) — place manually"),
+                    timestamp=datetime.now(),
+                    placed_market=market, placed_player=player, placed_stat=stat,
+                    placed_line=line, placed_selection=selection,
+                    placed_leg_summary=_format_tip_placement_summary(tip),
+                ))
+            _ptm = None
+            if "sportsbet" not in str(bookie).lower():
+                log.info(f"AFL period {_pcode_to} total '{selection}' — SB-only; "
+                         f"{bookie} is not Sportsbet -> manual")
+            else:
+                try:
+                    _event_pc = _bookie_event(tip.event, bookie, tip.sport)
+                    price_resp = hb.price_check_sports(
+                        session_id=sid, sport=tip.sport, event=_event_pc)
+                    if price_resp.get("success"):
+                        _ptm = _resolve_afl_period_total(
+                            price_resp.get("markets") or {}, _pcode_to, selection, line)
+                except Exception as e:
+                    log.debug(f"AFL period total catalog match skipped: {e}")
+            if _ptm:
+                log.info(
+                    f"AFL period TOTAL catalog-matched: '{selection}' {_pcode_to} "
+                    f"line={line} -> market={_ptm['market']} "
+                    f"prop={_ptm['proposition_id']} odds={_ptm['odds']}")
+                market = _ptm["market"]
+                line = _ptm["line"]
+                _resolved_prop_id = _ptm["proposition_id"]
+                _resolved_live_odds = _ptm.get("odds")  # ceiling/floor-checked below
+            else:
+                log.info(
+                    f"AFL period {_pcode_to} total '{selection}' line={line} not "
+                    f"carried EXACTLY on {bookie}:{sid} (no fuzzy) -> manual")
+                return (None, BetResult(
+                    success=False, tip=tip, session_id=sid, bookie=bookie,
+                    error=(f"AFL period {_pcode_to} total not carried exactly "
+                           f"('{selection}' {line}) — place manually"),
+                    timestamp=datetime.now(),
+                    placed_market=market, placed_player=player, placed_stat=stat,
+                    placed_line=line, placed_selection=selection,
+                    placed_leg_summary=_format_tip_placement_summary(tip),
+                ))
+        else:
+            # Match TOTAL against the catalog: total_points main line (±1.0), then
+            # pick_own_total alt lines (±0.5; line baked into the selection ->
+            # proposition_id). Mirrors the line/pick_own_line handicap path so an
+            # off-main total (e.g. Eddie's 172.5 vs a 166.5 main line) places at the
+            # EXACT alt line instead of snapping to the wrong line / dying. A catalog
+            # miss leaves the leg as-is -> placement fails -> manual. 2026-06-03.
+            try:
+                price_resp = hb.price_check_sports(
+                    session_id=sid, sport=tip.sport, event=tip.event,
                 )
-                if _tm:
-                    if _tm["market"] != market or _tm["line"] != line:
-                        log.info(
-                            f"Total catalog-matched: '{selection}' line={line} "
-                            f"-> market={_tm['market']} sel='{_tm['selection']}' "
-                            f"line={_tm['line']} odds={_tm['odds']}"
-                        )
-                    market = _tm["market"]
-                    selection = _tm["selection"]
-                    line = _tm["line"]  # None for pick_own_total (in-selection)
-                    _resolved_prop_id = _tm.get("proposition_id")
-                    _resolved_live_odds = _tm.get("odds")  # ceiling-checked below
-                else:
-                    log.info(
-                        f"Total '{selection}' line={line} not carried "
-                        f"(total_points ±1.0 / pick_own_total ±0.5) on "
-                        f"{bookie}:{sid} — routing to manual"
+                if price_resp.get("success"):
+                    _tm = _match_total_in_catalog(
+                        selection, line, price_resp.get("markets") or {},
                     )
-        except Exception as e:
-            log.debug(f"Total catalog match skipped: {e}")
+                    if _tm:
+                        if _tm["market"] != market or _tm["line"] != line:
+                            log.info(
+                                f"Total catalog-matched: '{selection}' line={line} "
+                                f"-> market={_tm['market']} sel='{_tm['selection']}' "
+                                f"line={_tm['line']} odds={_tm['odds']}"
+                            )
+                        market = _tm["market"]
+                        selection = _tm["selection"]
+                        line = _tm["line"]  # None for pick_own_total (in-selection)
+                        _resolved_prop_id = _tm.get("proposition_id")
+                        _resolved_live_odds = _tm.get("odds")  # ceiling-checked below
+                    else:
+                        log.info(
+                            f"Total '{selection}' line={line} not carried "
+                            f"(total_points ±1.0 / pick_own_total ±0.5) on "
+                            f"{bookie}:{sid} — routing to manual"
+                        )
+            except Exception as e:
+                log.debug(f"Total catalog match skipped: {e}")
 
     # ── Max-odds CEILING sanity check (all sports tipsters) ─────────
     # If the live (catalog/price-check) odds for the resolved selection are far
@@ -12937,6 +13127,15 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
         # $1-gated like all image tips; a catalog miss routes to manual.
         leg = ParsedLeg(market="total_points", team_full=leg_team, player="",
                         stat="", line=line, selection=side)
+        # v6.00 (#D): a supported PERIOD total (1h/2h/1q-4q) carries the SB period
+        # code so the placement resolver maps it to first_half_total /
+        # second_half_total / quarter_total via the EXACT prop-id (SB-only, gated by
+        # AFL_PERIOD_MARKETS_ENABLED). Full-game totals leave period="" and take the
+        # normal total_points / pick_own_total path. A period miss -> manual.
+        if AFL_PERIOD_MARKETS_ENABLED:
+            _pcode_to = _afl_period_code(_period)
+            if _pcode_to:
+                leg.period = _pcode_to
         if not leg_team or side not in ("over", "under") or not line:
             alert_only = True
             alert_reason = "total market missing team/side/line — place manually"
@@ -12955,16 +13154,18 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
         # so they still route to manual via the period gate below.
         if AFL_PERIOD_MARKETS_ENABLED:
             _pcode_tl = _afl_period_code(_period)
-            # 07-12 review #1: ONLY 1st-half (1h) handicaps auto-place. QUARTER
-            # (1q-4q) handicaps carry an IDENTICAL line + odds across quarters on
-            # Sportsbet — only the vision-parsed quarter digit distinguishes the
-            # proposition_id — so a digit misread would place a WRONG-QUARTER prop
-            # with NO line/odds cross-check to catch it (undetectable wrong-market).
-            # 1st-half lines ARE distinct (probe: 1h ±5.5 vs full_game 2.5), so 1h
-            # is money-safe. Quarters stay manual until an independent quarter signal
-            # exists. (The resolver still supports quarters for that future path.)
-            if _pcode_tl == "1h":
-                leg.period = "1h"
+            # v6.00 (Wilson 2026-07-17): UN-GATE quarters (1q-4q) + 2nd-half (2h) —
+            # was 1st-half only. The resolver targets the EXACT per-period
+            # proposition_id from the LIVE catalog (07-17 probe confirmed:
+            # quarter_line carries period=1q..4q with distinct prop_ids;
+            # quarter_time_line carries 1h; there is NO SB 2h-LINE market so a 2h
+            # handicap -> exact-or-manual = MANUAL). Wilson ACCEPTS the quarter
+            # wrong-digit risk (identical line+odds across quarters, only the vision
+            # digit distinguishes) — a placed-quarter confirmation is logged at
+            # placement. Any period miss / non-SB / price-check fail -> manual;
+            # NEVER a full-game or wrong-period fallback ("don't fuck up the prop_id").
+            if _pcode_tl:
+                leg.period = _pcode_tl
         if not leg_team or not line:
             alert_only = True
             alert_reason = "team line missing team/line — place manually"
@@ -13160,6 +13361,18 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
     no_units_count = sum(
         1 for r in raw_tips if (_img_coerce_float(r.get("units")) or 0) <= 0
     )
+    # v6.00 (Wilson 2026-07-17): count no-odds PLAYER-PROP legs in THIS image.
+    # A LONE one (==1) is a standalone single -> auto-place at market (fan-out,
+    # exactly like an odds-bearing disposals prop). >=2 no-odds player legs in ONE
+    # image = Eddie's legs-only SGM combo signature -> ONE MANUAL alert (never a
+    # silent drop, never split into separate singles). Fixes the 07-16 Marshall
+    # o22.5 / Wanganeen-Milera under drop (each arrived alone in its own image).
+    n_player_noodds = sum(
+        1 for r in raw_tips
+        if tipster == "eddie_afl" and r.get("player")
+        and (_img_coerce_float(r.get("odds")) or 0.0) <= 1.0
+    )
+    _noodds_multi_alerted = False
 
     # ── PASS 1 (SEQUENTIAL, main thread): guards + build + dedupe -> jobs ──
     # v5.91: everything that touches the shared dedup map (_is_duplicate) or is
@@ -13208,13 +13421,41 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
             # Gated to eddie_afl; other AFL image channels keep prior behaviour.
             if (tipster == "eddie_afl" and raw.get("player")
                     and (_img_coerce_float(raw.get("odds")) or 0.0) <= 1.0):
+                if n_player_noodds >= 2:
+                    # v6.00: >=2 no-odds player legs in ONE image = SGM combo (Eddie
+                    # posts legs-only, no per-leg price) -> ONE MANUAL alert, never a
+                    # silent drop and never auto-split into singles. Alert once per
+                    # image (listing all legs), then skip each leg.
+                    if not _noodds_multi_alerted:
+                        _noodds_multi_alerted = True
+                        _legs = "; ".join(
+                            f"{r.get('player')} {r.get('side') or ''} "
+                            f"{r.get('line') or ''}".strip()
+                            for r in raw_tips
+                            if r.get("player")
+                            and (_img_coerce_float(r.get("odds")) or 0.0) <= 1.0
+                        )
+                        log.info(
+                            f"[{channel_name}] Eddie AFL image: {n_player_noodds} "
+                            f"no-odds player legs (SGM combo signature) -> MANUAL "
+                            f"alert (not auto-placed): {_legs}"
+                        )
+                        notifier.notify_image_alert(
+                            channel_name,
+                            f"(manual: {n_player_noodds}-leg SGM / multi — no per-leg "
+                            f"odds, place by hand) {_legs}",
+                        )
+                    continue
+                # v6.00: a LONE no-odds player prop (==1 in this image) is a standalone
+                # single -> DO NOT drop; fall through to build + auto-place at market
+                # via the fan-out (odds-less like every Eddie disposals prop; the
+                # fan-out sizes off the live catalog + liability caps, not tipster
+                # odds). Was a silent drop pre-v6.00 (the 07-16 Marshall/Nasiah miss).
                 log.info(
-                    f"[{channel_name}] Eddie AFL image PLAYER-PROP tip {idx} has NO "
-                    f"odds (multi/SGM-leg signature) -> dropped quietly (no manual "
-                    f"ping): {raw.get('player')} {raw.get('side') or ''} "
-                    f"{raw.get('line') or ''}".rstrip()
+                    f"[{channel_name}] Eddie AFL image LONE no-odds player prop "
+                    f"-> auto-place as single at market: {raw.get('player')} "
+                    f"{raw.get('side') or ''} {raw.get('line') or ''}".rstrip()
                 )
-                continue
             # Over+under of the same line parsed from one image = background-grid
             # over-parse. Can't tell which is the tip -> manual, never auto-place
             # both sides.
