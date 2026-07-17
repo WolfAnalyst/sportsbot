@@ -231,6 +231,22 @@ Tips on DIFFERENT lines (each its own line/emoji) = SEPARATE tips, not SGM.
    - If SGM odds < 1.90 AND any leg is a threshold (X+ format), it's likely Pick-Your-Own-Line
    - Set is_pyo_sgm=true for these (we'll use pick_own_line market)
 
+1b. DELLO AFL (Telegram): Posts AFL player-prop DISPOSALS bets — SINGLES and
+   2-player SAME-GAME SGMs. Uses the SAME AFL teams / stats / O-U + threshold
+   formats as Saiyan above.
+   - SINGLE: one player disposals over/under or N+ (e.g. "Bailey Smith over 29.5
+     disposals", "Max Holmes 24+ disposals") -> ONE tip, is_sgm=false.
+   - SAME-GAME SGM: TWO players from the SAME match combined into ONE bet — the
+     two legs may be joined by "/", "+", "&", the word "SGM", or simply listed as
+     one grouped selection (e.g. "Bailey Smith 29+ disp + Darcy Wilson 24+ disp",
+     "Max Holmes 24+ / Lawson Humphries 19+"). Output ONE tip with is_sgm=true and
+     BOTH legs in raw_legs — NEVER split a 2-player same-game combo into two
+     separate singles. Both players are in the SAME game; disposals is the usual
+     stat; carry the previous leg's player if a leg omits the name.
+   - Dello often posts NO odds and NO explicit units on a leg — that is FINE:
+     leave odds 0/null and units null (the bot sizes + gates it). Do NOT invent an
+     odds or drop a leg just because it lacks a price.
+
 2. AUSBETS NBA: Posts NBA player props, spreads, totals
    - Format: "Aus NBA:1U - Player Over/Under X.5 STAT (bookie: $odds) @everyone"
    - Threshold: "1U - Player 20+ P (SB: $1.93)"
@@ -993,9 +1009,18 @@ IMAGE_PROMPT_AFL = (
     "directly followed by 'N+' — e.g. 'Adelaide 40+', 'Geelong 30+', usually "
     "at longer odds ($3-$15) — is a WINNING-MARGIN bet (that team to win by N "
     "or more points). Set market_type=\"margin\", `team`=the team, `line`=N "
-    "(the whole margin number, e.g. 40 for '40+'), `side`=\"over\". A bare TEAM "
+    "(the whole margin number, e.g. 40 for '40+'), `side`=\"over\", and ALSO set "
+    "`description`=\"<team> <N>+\" (e.g. \"Adelaide 40+\"). A bare TEAM "
     "'40+' is ALWAYS a margin, NEVER 'over 0.5 goals' / a player prop — only a "
-    "PLAYER name carries a goals/disposals/etc prop. Anything else \"other\". "
+    "PLAYER name carries a goals/disposals/etc prop. "
+    "WINNING-MARGIN RANGE BAND: a TEAM followed by a RANGE of two numbers — e.g. "
+    "'St Kilda 1-39', 'Geelong 20-39', 'Adelaide 40-59', 'Carlton 1-39 points' — "
+    "is a DIFFERENT bet from 'N+' (that team to win by a margin INSIDE the range, "
+    "a tri-bet / winning-margin band). Set market_type=\"margin\", `team`=the "
+    "team, `side`=\"over\", `line`=null (do NOT collapse the range to a single "
+    "number), and `description`=the EXACT range as printed WITH the team, e.g. "
+    "\"St Kilda 1-39\". NEVER turn a range band into a single margin number or a "
+    "handicap line. Anything else \"other\". "
     "PERIOD: capture any half/quarter qualifier on the "
     "bet — '1st/2nd Half', a 'Half Line'/'Half Total', or a quarter ('1st "
     "Quarter' etc.) -> set `period` to e.g. \"2nd_half\" / \"1st_quarter\"; a "

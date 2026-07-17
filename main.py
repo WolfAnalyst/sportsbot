@@ -49,6 +49,8 @@ from config import (
     REGEX_FIRST_TIPSTERS,
     TELETHON_WATCHDOG_ENABLED, TELETHON_WATCHDOG_INTERVAL_SEC,
     TELETHON_WATCHDOG_PROBE_TIMEOUT_SEC, TELETHON_WATCHDOG_FAIL_THRESHOLD,
+    LOOP_FREEZE_WATCHDOG_ENABLED, LOOP_FREEZE_TICK_SEC,
+    LOOP_FREEZE_CHECK_SEC, LOOP_FREEZE_MAX_SILENCE_SEC,
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
     SPORTSBET_MAX_STAKE_REBET,
     SELF_BET_MAX_STAKE,
@@ -429,6 +431,32 @@ EDDIE_NOODDS_MIN_ODDS = float(os.getenv("EDDIE_NOODDS_MIN_ODDS", "1.75"))
 EDDIE_NOODDS_MAX_TOWIN = float(os.getenv("EDDIE_NOODDS_MAX_TOWIN", "1500"))
 
 
+def _afl_team_word_match(team, cat_sel) -> bool:
+    """WORD-BOUNDARY AFL team match (v6.00 B-MEDIUM: extracted from
+    _match_handicap_in_catalog's nested _team_match so the PERIOD resolvers share
+    the SAME fuzzy match the full-game handicap path uses — otherwise a nickname
+    tip ('Sydney') never matched SB's full club name ('Sydney Swans') and every
+    such quarter/1h handicap fell to manual). Accepts exact, or the shorter name
+    being a whole leading/trailing WORD-run of the longer ('adelaide'<->'adelaide
+    crows', 'gws'<->'gws giants', 'sydney'<->'sydney swans'), then REJECTS the 3
+    cross-club collisions where a distinct club is a trailing word of a DIFFERENT
+    club (Adelaide/Port Adelaide, Sydney/Greater Western Sydney,
+    Melbourne/North Melbourne). Word-boundary, never a bare substring."""
+    t = (team or "").lower().strip()
+    c = (cat_sel or "").lower().strip()
+    if not t or not c:
+        return False
+    if c == t:
+        return True
+    a, b = sorted((t, c), key=len)  # a = shorter, b = longer
+    if not a or not (b.startswith(a + " ") or b.endswith(" " + a)):
+        return False
+    _cross_club = {("adelaide", "port adelaide"),
+                   ("sydney", "greater western sydney"),
+                   ("melbourne", "north melbourne")}
+    return (a, b) not in _cross_club
+
+
 def _afl_period_code(raw_period) -> str:
     """Map a vision/parser period string to a SUPPORTED SB period code
     (1q/2q/3q/4q/1h), or "" if unsupported (e.g. a 2nd-half line -> stays manual)."""
@@ -472,7 +500,7 @@ def _resolve_afl_period_prop(markets: dict, period_code: str, team: str, line):
             continue
         if str(s.get("period") or "").strip().lower() != period_code:
             continue
-        if str(s.get("selection") or s.get("team") or "").strip().lower() != tnorm:
+        if not _afl_team_word_match(team, s.get("selection") or s.get("team")):
             continue
         s_line = s.get("line")
         if s_line is None:
@@ -4662,9 +4690,31 @@ def _place_dello_single(tip: ParsedTip) -> list[BetResult]:
         notifier.notify_manual_alert(tip)
         return []
 
-    # 1. SINGLES only. SGM / multi-leg / non-player-prop / non-standard stat -> manual.
-    if getattr(tip, "is_sgm", False) or len(tip.legs) != 1:
-        return _manual("SGM / multi-leg — HyperBot can't auto-place a cross-game multi; place by hand")
+    # 1. SGM handling (v6.00): a SAME-GAME player-prop SGM (Dello's 2-player disposals
+    #    combos, e.g. the 07-15 Geelong v St Kilda SGMs) now AUTO-PLACES via the SGM
+    #    fan-out (like Saiyan) instead of manual — a same-game SGM is a real HyperBot
+    #    ticket. _place_sgm_fanout scopes EVERY leg to the event's two teams and forbids
+    #    the cross-game global-roster fallback, so a genuinely CROSS-game leg fails to
+    #    resolve -> the SGM routes to manual/unfilled (never a wrong cross-game bet).
+    #    Dello stays $1-test (stake already clamped by _apply_dello_flat_stake) and
+    #    places on the AFL SGM priority (Daniel). Non-player-prop / non-standard-stat
+    #    legs stay manual. A non-SGM multi stays manual. A single flows to step 2.
+    if getattr(tip, "is_sgm", False):
+        _sgm_legs = tip.legs or []
+        _all_std_pp = len(_sgm_legs) >= 2 and all(
+            (l.market or "").lower() == "player_prop"
+            and (l.stat or "").lower() in _DELLO_STD_STATS
+            for l in _sgm_legs
+        )
+        if _all_std_pp:
+            log.info(
+                f"[dello_afl] SAME-GAME player-prop SGM ({len(_sgm_legs)} legs) -> SGM "
+                f"fan-out (Dello $1-test, ${tip.stake_dollars}): {tip.event}"
+            )
+            return _place_sgm_fanout(tip)
+        return _manual("SGM with a non-player-prop / non-standard-stat leg — place by hand")
+    if len(tip.legs) != 1:
+        return _manual("multi-leg (non-SGM) — place by hand")
     leg = tip.legs[0]
     if (leg.market or "").lower() != "player_prop":
         return _manual(f"non-player-prop market '{leg.market}' (team/exotic) — place by hand")
@@ -7478,32 +7528,9 @@ def _match_handicap_in_catalog(team_selection: str, tipped_line, markets: dict):
         return None
 
     def _team_match(cat_sel):
-        # 07-12 review C4: WORD-BOUNDARY containment, not a bare bidirectional
-        # substring. The old `team_l in c or c in team_l` matched 'adelaide'
-        # (Crows) INTO 'port adelaide' (a DIFFERENT club) -> wrong-team handicap.
-        # Accept exact, or the shorter being a whole leading/trailing WORD-run of
-        # the longer (handles both nickname directions: 'adelaide'<->'adelaide
-        # crows', 'giants'<->'gws giants', 'sydney'<->'sydney swans') — then reject
-        # the two known CROSS-CLUB collisions where a distinct club's name is a
-        # trailing word of a DIFFERENT club.
-        c = (cat_sel or "").lower().strip()
-        if not c:
-            return False
-        if c == team_l:
-            return True
-        a, b = sorted((team_l, c), key=len)  # a = shorter, b = longer
-        if not a or not (b.startswith(a + " ") or b.endswith(" " + a)):
-            return False
-        # (shorter, longer) pairs where the shorter is a distinct AFL CLUB that is a
-        # trailing word of a DIFFERENT club (NOT a nickname) — reject the word-match.
-        # These are the only such collisions in the AFL: Adelaide/Port Adelaide,
-        # Sydney/Greater Western Sydney, Melbourne/North Melbourne. (07-13 re-verify:
-        # Melbourne/North Melbourne was missing -> 'Melbourne' handicap could bind
-        # to 'North Melbourne' = wrong team.)
-        _cross_club = {("adelaide", "port adelaide"),
-                       ("sydney", "greater western sydney"),
-                       ("melbourne", "north melbourne")}
-        return (a, b) not in _cross_club
+        # v6.00 (B-MEDIUM): delegate to the shared module-level word-boundary match
+        # (extracted so the period resolvers use the SAME logic + cross-club blocklist).
+        return _afl_team_word_match(team_l, cat_sel)
 
     # 1. Standard `line` market (selection=team, has `line` field).
     best = None
@@ -13170,26 +13197,47 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
             alert_only = True
             alert_reason = "team line missing team/line — place manually"
     elif market_type == "margin":
-        # Winning margin "Team N+" (e.g. 'Adelaide 40+') == that team on the
-        # -(N-0.5) LINE handicap (Wilson 2026-06-18: "40+ winning = -39.5 alt
-        # line / handicap"). Convert to a placeable line bet so the bet is
-        # ATTEMPTED rather than misparsed to a goals prop or dropped to manual.
-        # The handicap matcher (_match_handicap_in_catalog, ±0.5) places the alt
-        # line only if the bookie carries it; a miss routes to manual (never a
-        # blind/wrong line). `line` from the vision parse is the whole margin N.
-        margin_n = abs(line)
-        hc_line = -(margin_n - 0.5) if margin_n else 0.0
-        leg = ParsedLeg(market="line", team_full=leg_team, player="",
-                        stat="", line=hc_line, selection=leg_team)
-        if not leg_team or not margin_n:
+        # v6.00 (E safety guard, Wilson's "St Kilda 1-39 must NOT become -38.5 HC"):
+        # a winning-margin RANGE BAND ("Team 1-39" / "20-39" / "40-59") is NOT a
+        # handicap and must NEVER be converted to a -(N-0.5) LINE (which pick_own_line
+        # could carry -> a WRONG bet). Detect a lo-hi range in any parsed text field
+        # and route to MANUAL. SB carries these as the `winning_margin_spread` band
+        # market (matched by EXACT selection text); auto-placing them needs a confirmed
+        # real Eddie tri-bet parse first (deferred), so a band -> manual for now,
+        # NEVER a wrong handicap. A bare "N+" (open-ended, no range) keeps the
+        # placeable -(N-0.5) alt-line conversion below (unchanged, v5.75).
+        _margin_txt = " ".join(str(raw.get(k) or "") for k in
+                               ("selection", "description", "market_detail", "title", "line"))
+        if re.search(r"\b\d{1,3}\s*-\s*\d{1,3}\b", _margin_txt):
             alert_only = True
-            alert_reason = "winning-margin tip missing team/number — place manually"
+            alert_reason = (
+                "winning-margin BAND (range e.g. '1-39') — SB carries this as "
+                "winning_margin_spread (exact band); auto-place pending a confirmed "
+                "Eddie tri-bet parse — place by hand (NOT converted to a handicap)"
+            )
+            leg = ParsedLeg(market="other", team_full=leg_team, player="",
+                            stat="", line=line, selection=side)
         else:
-            raw_msg = (
-                f"[Eddie image] {leg_team} {margin_n:g}+ winning margin "
-                f"({hc_line:g} line) @ {odds or '?'} "
-                f"{('(' + bookie + ')') if bookie else ''}"
-            ).strip()
+            # Winning margin "Team N+" (e.g. 'Adelaide 40+') == that team on the
+            # -(N-0.5) LINE handicap (Wilson 2026-06-18: "40+ winning = -39.5 alt
+            # line / handicap"). Convert to a placeable line bet so the bet is
+            # ATTEMPTED rather than misparsed to a goals prop or dropped to manual.
+            # The handicap matcher (_match_handicap_in_catalog, ±0.5) places the alt
+            # line only if the bookie carries it; a miss routes to manual (never a
+            # blind/wrong line). `line` from the vision parse is the whole margin N.
+            margin_n = abs(line)
+            hc_line = -(margin_n - 0.5) if margin_n else 0.0
+            leg = ParsedLeg(market="line", team_full=leg_team, player="",
+                            stat="", line=hc_line, selection=leg_team)
+            if not leg_team or not margin_n:
+                alert_only = True
+                alert_reason = "winning-margin tip missing team/number — place manually"
+            else:
+                raw_msg = (
+                    f"[Eddie image] {leg_team} {margin_n:g}+ winning margin "
+                    f"({hc_line:g} line) @ {odds or '?'} "
+                    f"{('(' + bookie + ')') if bookie else ''}"
+                ).strip()
     elif market_type and market_type != "player_prop":
         # Other (non-margin, non-total, non-line): no clean catalog mapping -> manual.
         alert_only = True
@@ -14712,7 +14760,117 @@ async def _telethon_liveness_watchdog(client, reconnect_event):
             return
 
 
+# ── Event-loop FREEZE watchdog (incident 2026-07-17) ───────────────────
+# Wall-clock stamp proving the asyncio EVENT LOOP is still spinning, updated by
+# _loop_liveness_ticker every LOOP_FREEZE_TICK_SEC and read by the OUT-OF-LOOP
+# _loop_freeze_watchdog_thread. 0.0 == DISARMED (loop intentionally not running:
+# process startup / reconnect backoff) so the thread never false-fires while the
+# loop is legitimately down. This is a SEPARATE mechanism from the telethon socket
+# watchdog above: that one catches a dead SOCKET (loop alive); this one catches a
+# frozen LOOP (a hung synchronous call blocking the single loop thread), which the
+# in-loop telethon prober cannot catch because it freezes too. See config.py.
+_loop_heartbeat_ts: float = 0.0
+
+
+async def _loop_liveness_ticker():
+    """Stamp _loop_heartbeat_ts every LOOP_FREEZE_TICK_SEC to prove the asyncio event
+    loop is still spinning. Runs regardless of tip traffic (unlike the PASSIVE
+    _last_telethon_update_ts stamp), so a quiet night still looks alive. If a
+    synchronous call blocks the loop, this coroutine cannot resume -> the stamp goes
+    stale -> the out-of-loop freeze watchdog thread restarts the process."""
+    global _loop_heartbeat_ts
+    while True:
+        _loop_heartbeat_ts = time.time()
+        await asyncio.sleep(LOOP_FREEZE_TICK_SEC)
+
+
+def _loop_is_frozen(ts: float, now: float) -> bool:
+    """Pure decision fn (testable): True iff the loop-liveness stamp is ARMED (>0)
+    and older than LOOP_FREEZE_MAX_SILENCE_SEC. A disarmed (0.0) stamp is never
+    'frozen' — the loop is intentionally down (startup / reconnect gap)."""
+    return ts > 0 and (now - ts) > LOOP_FREEZE_MAX_SILENCE_SEC
+
+
+def _sync_freeze_alert(msg: str) -> None:
+    """Best-effort SYNCHRONOUS Telegram alert from the watchdog thread. The async
+    notifier is on the FROZEN loop and unusable, so this posts directly via requests
+    (a plain blocking HTTP call, fine on this thread). Hard 10s timeout so it can
+    NEVER delay the restart; every failure is swallowed."""
+    try:
+        from config import NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID
+        token = NOTIFY_BOT_TOKEN
+        chat = os.getenv("NOTIFY_CRITICAL_CHAT_ID", "") or NOTIFY_CHAT_ID
+        if not token or not chat:
+            return
+        import requests
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": f"[FREEZE-WATCHDOG] {msg}"},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _loop_freeze_tick(now: float) -> bool:
+    """ONE freeze-check iteration (split from the thread loop for testability). If the
+    loop-liveness stamp is frozen (armed AND older than MAX_SILENCE) fire a bounded
+    synchronous alert then os._exit(1). os._exit skips atexit/buffer-flush and
+    terminates immediately -> tipbot.bat's :start loop relaunches clean. Returns False
+    when the loop looks alive; returns True only in tests that patch os._exit (in
+    production os._exit terminates before the return)."""
+    ts = _loop_heartbeat_ts
+    if not _loop_is_frozen(ts, now):
+        return False
+    age = now - ts
+    msg = (f"TipBot event loop FROZEN for {age:.0f}s "
+           f"(>{LOOP_FREEZE_MAX_SILENCE_SEC}s no tick) - force-restarting the "
+           f"process; tipbot.bat will relaunch. (incident-2026-07-17 self-recovery)")
+    try:
+        log.critical(msg)
+    except Exception:
+        pass
+    # Run the alert in a worker thread with a BOUNDED join so a hung alert (e.g. a DNS
+    # stall that requests' connect/read timeout does not cover) can NEVER delay the
+    # guaranteed restart — the whole point of this watchdog. If it hasn't returned in
+    # 12s we abandon it (daemon; killed by os._exit below) and exit anyway.
+    try:
+        _t = threading.Thread(target=_sync_freeze_alert, args=(msg,),
+                              name="freeze-alert", daemon=True)
+        _t.start()
+        _t.join(timeout=12)
+    except Exception:
+        pass
+    os._exit(1)
+    return True  # unreachable in production (os._exit terminated); test-only
+
+
+def _loop_freeze_watchdog_thread():
+    """OS-THREAD (NOT asyncio) hard-freeze watchdog. Incident 2026-07-17: the whole
+    event loop froze ~6.5h on a hung synchronous HyperBot call, taking every in-loop
+    watchdog down with it (no probe, no heartbeat, no auto-recovery). This thread
+    lives OUTSIDE the loop — a blocking network call releases the GIL, so it keeps
+    running while the loop is wedged. It polls the loop-liveness stamp; on a frozen
+    stamp _loop_freeze_tick force-restarts the process. Idle while the stamp is 0.0
+    (disarmed). Wrapped so a freak error can NEVER kill the watchdog itself."""
+    while True:
+        time.sleep(LOOP_FREEZE_CHECK_SEC)
+        try:
+            _loop_freeze_tick(time.time())
+        except Exception:
+            try:
+                log.exception("loop-freeze watchdog: unexpected error in check (continuing)")
+            except Exception:
+                pass
+
+
 async def main():
+    global _loop_heartbeat_ts
+    _loop_heartbeat_ts = time.time()  # ARM the freeze watchdog (loop is now live)
+    if LOOP_FREEZE_WATCHDOG_ENABLED:
+        # Ticker keeps the stamp fresh; created FIRST so a hang anywhere in startup
+        # (below) is also covered by the out-of-loop thread.
+        asyncio.create_task(_loop_liveness_ticker())
     log.info("Starting TipBot...")
     # Banner: version NUMBER + fingerprint only (v5.39, Wilson) — the full
     # TIPBOT_VERSION is a multi-KB accumulated changelog; it stays in config.py +
@@ -15036,6 +15194,17 @@ async def main():
     else:
         log.info("Telethon liveness watchdog DISABLED (TELETHON_WATCHDOG_ENABLED=false)")
 
+    # v6.02: event-loop FREEZE watchdog (2026-07-17 incident: the whole asyncio loop
+    # froze ~6.5h on a hung sync HB call; every in-loop watchdog froze with it). The
+    # ticker was created at main() top; the OS-thread half is started in __main__.
+    if LOOP_FREEZE_WATCHDOG_ENABLED:
+        log.info(
+            f"Loop-freeze watchdog active (tick {LOOP_FREEZE_TICK_SEC}s, check "
+            f"{LOOP_FREEZE_CHECK_SEC}s, force-restart after {LOOP_FREEZE_MAX_SILENCE_SEC}s frozen)"
+        )
+    else:
+        log.info("Loop-freeze watchdog DISABLED (LOOP_FREEZE_WATCHDOG_ENABLED=false)")
+
     # Start Tip Titans poller (optional - only if credentials set)
     if os.getenv("TIPTITANS_EMAIL") and os.getenv("TIPTITANS_PASSWORD"):
         try:
@@ -15077,6 +15246,19 @@ if __name__ == "__main__":
     _BACKOFF_MAX_SEC = 300
     _STABLE_UPTIME_SEC = 300
 
+    # v6.02: OS-thread half of the event-loop FREEZE watchdog. Started ONCE here
+    # (outside asyncio) so it SURVIVES a reconnect (which tears down & rebuilds the
+    # loop). It reads _loop_heartbeat_ts, which the in-loop ticker keeps fresh while
+    # a loop is running and which we DISARM (=0.0) during the reconnect backoff below
+    # so it never false-fires while the loop is intentionally down. daemon=True so it
+    # can't block interpreter shutdown. See _loop_freeze_watchdog_thread.
+    if LOOP_FREEZE_WATCHDOG_ENABLED:
+        threading.Thread(
+            target=_loop_freeze_watchdog_thread,
+            name="loop-freeze-watchdog",
+            daemon=True,
+        ).start()
+
     _backoff = _BACKOFF_INITIAL_SEC
     while True:
         _run_started = time.time()
@@ -15097,6 +15279,7 @@ if __name__ == "__main__":
                 f"Connection lost after {_uptime:.0f}s uptime: {e}. "
                 f"Restarting in {_backoff}s"
             )
+            _loop_heartbeat_ts = 0.0  # DISARM freeze watchdog (loop down for backoff)
             time.sleep(_backoff)
             _backoff = min(_backoff * 2, _BACKOFF_MAX_SEC)
         except Exception:
@@ -15110,5 +15293,6 @@ if __name__ == "__main__":
                 f"Unhandled exception after {_uptime:.0f}s uptime, "
                 f"restarting in {_backoff}s"
             )
+            _loop_heartbeat_ts = 0.0  # DISARM freeze watchdog (loop down for backoff)
             time.sleep(_backoff)
             _backoff = min(_backoff * 2, _BACKOFF_MAX_SEC)
