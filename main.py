@@ -51,6 +51,8 @@ from config import (
     TELETHON_WATCHDOG_PROBE_TIMEOUT_SEC, TELETHON_WATCHDOG_FAIL_THRESHOLD,
     LOOP_FREEZE_WATCHDOG_ENABLED, LOOP_FREEZE_TICK_SEC,
     LOOP_FREEZE_CHECK_SEC, LOOP_FREEZE_MAX_SILENCE_SEC,
+    PLACEMENT_OFFLOAD_ENABLED, PLACEMENT_EXECUTOR_WORKERS,
+    STARTUP_PENDING_RECONCILE_ENABLED, STARTUP_PENDING_RECONCILE_LOOKBACK_SEC,
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
     SPORTSBET_MAX_STAKE_REBET,
     SELF_BET_MAX_STAKE,
@@ -144,6 +146,26 @@ def _afl_log_event(tip, msg: str, level: str = "info") -> None:
 # without a lock two worker threads' appends could interleave bytes in audit.jsonl.
 # (bet_ledger.py already serialises its own CSV append with its own Lock.)
 _AUDIT_LOCK = threading.Lock()
+
+# v6.03 (incident 2026-07-17): DEDICATED bounded pool for offloaded placement
+# (place_tip) off the asyncio loop. A dedicated pool (not the default None
+# executor) gives a predictable thread ceiling AND isolates placement from the
+# default pool that racing/Leroy/vision-parse use, so a burst of hung placements
+# can't starve them. Each placement STILL fans out internally over its accounts
+# in its own ThreadPoolExecutor; this pool only caps how many TIPS place at once.
+# Gated by PLACEMENT_OFFLOAD_ENABLED; see _run_in_placement_executor. HARD
+# PREREQUISITE: the v3 poll hard ceiling bounds each worker (else a hung
+# placement pins a worker with no freeze-watchdog recovery).
+import concurrent.futures as _cf
+_PLACEMENT_EXECUTOR = _cf.ThreadPoolExecutor(
+    max_workers=max(1, PLACEMENT_EXECUTOR_WORKERS), thread_name_prefix="place"
+)
+
+
+async def _run_in_placement_executor(fn, *args):
+    """Await a synchronous placement fn on the dedicated placement pool so it does
+    NOT block the event loop. Mirrors the racing/Leroy run_in_executor offload."""
+    return await asyncio.get_running_loop().run_in_executor(_PLACEMENT_EXECUTOR, fn, *args)
 
 
 def _log_jsonl(path: Path, entry: dict):
@@ -1683,6 +1705,14 @@ hb = HyperBotClient()
 # ── Duplicate Detection ────────────────────────────────────────────
 _recent_tips: dict = {}  # {fingerprint: timestamp}
 DUPE_WINDOW_SECS = 600  # 10 minutes
+# v6.03: fingerprints whose placement is CURRENTLY IN FLIGHT (offloaded place_tip
+# running on a worker). Added at claim-before-place, discarded on completion. This
+# is NEVER time-purged, so a placement that outlives DUPE_WINDOW_SECS (a slow-HB
+# price-poll + place-poll can stack to ~2x the 420s ceiling > 600s) cannot have its
+# dedup claim evicted mid-flight -> an identical re-send in that window is still
+# caught (else it would fan out a SECOND time onto accounts where attempt #1 may
+# have landed = double stake). All access is on the loop thread (like _recent_tips).
+_inflight_fps: set = set()
 # v5.22: the racing path (image AND text) had NO dedup — a reposted / re-delivered
 # racing tip double-placed real money. Fingerprint racing selections here and skip
 # a repeat within DUPE_WINDOW_SECS. Keyed in _route_image_racing_tips.
@@ -1740,7 +1770,9 @@ def _is_duplicate(tip: ParsedTip) -> bool:
     for k in expired:
         del _recent_tips[k]
 
-    return fp in _recent_tips
+    # v6.03: a fingerprint whose placement is IN FLIGHT is a duplicate even if its
+    # _recent_tips claim was time-purged during a >600s slow-HB placement.
+    return fp in _recent_tips or fp in _inflight_fps
 
 
 def _register_tip_fingerprint(tip: ParsedTip, fp: str = None) -> None:
@@ -4267,6 +4299,11 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
     re-bet is Tier-2 spill, deliberately OFF for sports."""
     import time as _t
     import reconcile as _recon
+    # Guard B (v6.03): did this ambiguous come from the #2 HARD poll deadline? If so
+    # HB never confirmed the cid resolved AT ALL, so a pending_bets 'not found' is far
+    # less trustworthy than in the normal fast/slow-reject case (the bet can still land
+    # after the ~30s reconcile window). See the not_placed branch below.
+    _hard_deadline = "hard poll deadline" in str(getattr(r, "error", "") or "").lower()
     try:
         leg0 = tip.legs[0] if getattr(tip, "legs", None) else None
         sel = ""
@@ -4330,6 +4367,17 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
                     f"actual stake")
         return r
     if action == "not_placed":
+        # Guard B (v6.03): NEVER downgrade a HARD-poll-deadline ambiguous to a clean
+        # not-placed. decide_ambiguous returns not_placed when /api/pending_bets is
+        # reachable but the bet isn't visible YET — fine for a fast/slow reject, but a
+        # hard-deadline means the cid NEVER resolved, so it can still land after the
+        # poll window. Converting to UNFILLED would prompt a manual re-place -> a LATE
+        # land = DOUBLE STAKE. Stay conservative (debit-as-placed + ambiguous CRITICAL).
+        if _hard_deadline:
+            log.warning(f"{label}: reconcile says not-placed BUT this was a HARD poll "
+                        f"deadline (cid never resolved) — staying CONSERVATIVE "
+                        f"(debit-as-placed), NOT converting to unfilled (Guard B)")
+            return r
         r.is_ambiguous = False
         r.stake = 0
         try:
@@ -10205,7 +10253,13 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
                     results.append(r)
                     remaining = round(remaining - _actual, 2)
                     break
-                if _action == "not_placed":
+                # v6.03 Guard B (also on the MLB single path): a HARD poll-deadline
+                # ambiguous is NEVER treated as a clean not-placed here — HB never
+                # confirmed the cid resolved, so a pending_bets 'not found' can still
+                # land after the poll window. not_placed -> leftover -> manual re-place
+                # -> LATE land = DOUBLE STAKE. Fall through to conservative
+                # (debit-as-placed), mirroring _reconcile_fanout_ambiguous's Guard B.
+                if _action == "not_placed" and "hard poll deadline" not in (err or "").lower():
                     # v5.55: pending_bets POSITIVELY confirmed nothing landed —
                     # no debit, no ambiguous critical; the stake stays in the
                     # orchestrator's leftover -> manual alert. Still STOP this
@@ -12102,17 +12156,41 @@ async def _process_tip(text: str, tipster: str, sport: str,
         _audit_tip(tip, msg_time)
 
         try:
-            results = place_tip(tip)
+            # v6.03: CLAIM the dedup fingerprint BEFORE we yield to the executor.
+            # Dedup lives on the loop thread only; offloading place_tip introduces a
+            # real await (yield) between the _is_duplicate check above and here, so
+            # two rapid identical re-sends could BOTH pass the check before either
+            # registered -> double fan-out. Claiming now (no await between the check
+            # and this point) closes that race. This is EXACTLY equivalent to the old
+            # register-on-landed: we RELEASE below if nothing landed. Mirrors the
+            # racing image path's claim-before (_route_image_racing_tips) + tiptitans
+            # _claim_bet. self-bet (skip_dedup) never claims (Wilson re-bets on
+            # purpose). A CancelledError during the await is BaseException (NOT caught
+            # by `except Exception` below), so the claim is deliberately RETAINED on
+            # cancellation: the offloaded place_tip may still land, and retaining
+            # blocks a double-stake re-send.
+            if not skip_dedup:
+                _register_tip_fingerprint(tip, fp=_dupe_fp)
+                _inflight_fps.add(_dupe_fp)  # v6.03: block re-send for the WHOLE flight
+            if PLACEMENT_OFFLOAD_ENABLED:
+                results = await _run_in_placement_executor(place_tip, tip)
+            else:
+                results = place_tip(tip)
+            if not skip_dedup:
+                # placement finished -> no longer in-flight; the _recent_tips claim
+                # (retained/popped below) now governs the post-completion 10-min window.
+                _inflight_fps.discard(_dupe_fp)
             resolve_time = time.time() - resolve_start
 
             any_success = any(r.success for r in results)
-            # Register the fingerprint after a successful OR AMBIGUOUS (maybe-
-            # landed) placement: a re-post of the same tip must NOT fan out a
-            # second time onto an account where the first attempt may have
-            # already landed (double-stake). A clean total failure stays
-            # unregistered so genuine re-tips aren't locked out for 10 min. v5.13.
-            if any_success or any(_is_ambiguous_result(r) for r in results):
-                _register_tip_fingerprint(tip, fp=_dupe_fp)
+            # RELEASE the claim iff NOTHING landed (no success, no ambiguous), so a
+            # clean total failure stays re-sendable (preserves v5.13 semantics).
+            # Retained on success/ambiguous so a re-post can't fan out a second time
+            # onto an account where the first attempt may already have landed.
+            if not skip_dedup and not (
+                any_success or any(_is_ambiguous_result(r) for r in results)
+            ):
+                _recent_tips.pop(_dupe_fp, None)
 
             for r in results:
                 if r.success:
@@ -12133,6 +12211,15 @@ async def _process_tip(text: str, tipster: str, sport: str,
                 else:
                     log.warning(f"FAILED: {r.error}")
         except Exception as e:
+            # v6.03: non-cancellation crash -> RELEASE the claim to preserve today's
+            # "re-send allowed after a clean crash" behaviour (a place_tip exception
+            # is almost always a pre-placement resolve/parse crash, nothing fired;
+            # per-account errors inside the fan-out come back as failed BetResults,
+            # not exceptions). A CancelledError is NOT caught here, so a cancelled
+            # placement keeps BOTH claims (see the claim-before comment above).
+            if not skip_dedup:
+                _inflight_fps.discard(_dupe_fp)
+                _recent_tips.pop(_dupe_fp, None)
             log.exception(f"Bet placement error: {e}")
             _log_jsonl(ERROR_LOG, {
                 "type": "placement_exception", "tipster": tip.tipster,
@@ -13390,7 +13477,7 @@ def _image_afl_conflicting_indices(raw_tips: list) -> set:
     return conflicted
 
 
-def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
+async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                           default_units: float, msg_time, channel_name: str,
                           pipeline_start: float = None, parse_sec: float = None) -> None:
     """Route vision-extracted AFL tips through the sports pipeline (place_tip,
@@ -13560,6 +13647,14 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
 
             _audit_tip(tip, msg_time)
             jobs.append((idx, tip, _dupe_fp))
+            # v6.03: CLAIM the cross-message dedup fp only AFTER the tip is committed
+            # as a job (a build/_audit_tip crash ABOVE must NOT leak a claim -> that
+            # would block a legit re-send for ~10 min). Before PASS 2 is offloaded/
+            # awaited, so a second identical image during the await is still caught.
+            # _recent_tips = post-completion window; _inflight_fps = whole flight (never
+            # time-purged). Released in PASS 3 if this tip doesn't land.
+            _register_tip_fingerprint(tip, fp=_dupe_fp)
+            _inflight_fps.add(_dupe_fp)
         except Exception as e:
             log.exception(f"[{channel_name}] AFL image tip {idx} build crashed: {e}")
             try:
@@ -13587,15 +13682,26 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
         except Exception as e:  # noqa: BLE001 — isolate one tip's crash
             return (_i, _t, _f, None, e)
 
-    if IMAGE_TIP_CONCURRENT and len(jobs) > 1:
-        import concurrent.futures
-        _workers = min(len(jobs), max(1, IMAGE_TIP_MAX_CONCURRENCY))
-        log.info(f"[{channel_name}] placing {len(jobs)} image tips CONCURRENTLY "
-                 f"(<= {_workers} at once)")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_workers) as ex:
-            outcomes = list(ex.map(_place_one, jobs))
+    def _place_all_jobs():
+        if IMAGE_TIP_CONCURRENT and len(jobs) > 1:
+            import concurrent.futures
+            _workers = min(len(jobs), max(1, IMAGE_TIP_MAX_CONCURRENCY))
+            log.info(f"[{channel_name}] placing {len(jobs)} image tips CONCURRENTLY "
+                     f"(<= {_workers} at once)")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=_workers) as ex:
+                return list(ex.map(_place_one, jobs))
+        return [_place_one(j) for j in jobs]
+
+    # v6.03: offload the whole blocking PASS 2 (place_tip fan-outs) OFF the event
+    # loop so an image slate can't freeze telethon / the freeze-watchdog ticker.
+    # PASS 1 (claim) + PASS 3 (register/release) stay on the loop thread so
+    # _recent_tips is NEVER mutated from a worker (that would race the watchdog
+    # cleanup). The inner ThreadPoolExecutor still gives per-tip concurrency inside
+    # the single offloaded worker; each place_tip is bounded by #2's poll ceiling.
+    if PLACEMENT_OFFLOAD_ENABLED:
+        outcomes = await _run_in_placement_executor(_place_all_jobs)
     else:
-        outcomes = [_place_one(j) for j in jobs]
+        outcomes = _place_all_jobs()
 
     # ── PASS 3 (SEQUENTIAL, main thread): register fingerprint + log per result.
     # v5.13: lock the fingerprint on success OR an ambiguous (maybe-landed) outcome
@@ -13605,6 +13711,10 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
             if err is not None:
                 # place_tip itself raised in PASS 2 — the bet most likely never
                 # placed, but a mid-flight crash isn't 100% certain, so VERIFY.
+                # v6.03: RELEASE the PASS-1 claim so a re-send is allowed (preserves
+                # the prior "not registered on a PASS-2 crash" behaviour).
+                _inflight_fps.discard(_fp)
+                _recent_tips.pop(_fp, None)
                 log.error(f"[{channel_name}] AFL image tip {_idx} placement crashed: {err!r}")
                 notifier.notify_image_alert(
                     channel_name,
@@ -13613,19 +13723,29 @@ def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                 )
                 continue
             if any(r.success for r in results) or any(_is_ambiguous_result(r) for r in results):
+                # landed / maybe-landed: KEEP the PASS-1 claim (refresh its timestamp)
+                # so a re-post can't double-stake; placement is done -> clear in-flight.
                 _register_tip_fingerprint(_tip, fp=_fp)
+                _inflight_fps.discard(_fp)
                 for r in results:
                     if r.success:
                         log.info(f"[{channel_name}] PLACED image tip: {r.bet_id} on {r.bookie} @ {r.odds}")
                 # v5.43: the no-units FALLBACK flag (tip._units_fallback) rides on the
                 # tip and is surfaced in the BET PLACED summary itself (no extra ping).
             else:
+                # clean total failure: RELEASE the PASS-1 claim (re-sendable), matching
+                # the old net "register only on landed" behaviour.
+                _inflight_fps.discard(_fp)
+                _recent_tips.pop(_fp, None)
                 log.info(f"[{channel_name}] AFL image tip {_idx} not placed (routed to manual): {_tip.raw_message}")
         except Exception as _e3:
             # v5.91 review (#5): a crash HERE means PASS 2 already placed the bet(s)
             # but post-processing (register/log) failed — the dedup fingerprint may
             # be unregistered. ISOLATE it (don't drop later outcomes) + ping to
             # VERIFY; NEVER silently re-place (the bet is likely already on).
+            # v6.03: placement is done -> clear in-flight, but KEEP the _recent_tips
+            # claim (PASS-1 registered it) so a re-send is blocked (bet likely on).
+            _inflight_fps.discard(_fp)
             log.error(f"[{channel_name}] AFL image tip {_idx} post-place crashed: {_e3!r}")
             try:
                 notifier.notify_image_alert(
@@ -13773,7 +13893,7 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
             pipeline_start=_t0, parse_sec=round(elapsed, 3),
         )
     else:
-        _route_image_afl_tips(
+        await _route_image_afl_tips(
             raw_tips, tipster, unit_size, default_units, msg_time, channel_name,
             pipeline_start=_t0, parse_sec=round(elapsed, 3),
         )
@@ -14864,6 +14984,99 @@ def _loop_freeze_watchdog_thread():
                 pass
 
 
+# ── Startup pending-bets reconciliation (incident 2026-07-17, v6.03 bug #2) ──
+# ALERT-ONLY sweep: on restart, surface pending bets that were in-flight when the
+# process died and aren't in the ledger. NEVER places (an in-flight bet may have
+# landed; re-placing = double stake). Gated by STARTUP_PENDING_RECONCILE_ENABLED
+# (default OFF). See reconcile.find_orphan_pending.
+_STARTUP_RECONCILE_STATE_PATH = os.getenv(
+    "STARTUP_RECONCILE_STATE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "pending_reconcile_seen.json"),
+)
+
+
+def _read_ledger_rows_for_reconcile():
+    """Read bets_placed.csv DIRECTLY into light rows for the orphan sweep:
+    [{bet_id, correlation_id, event, selection, stake, placed_at(epoch|None)}].
+    Best-effort; missing/garbage ledger -> []. Does NOT rely on bet_ledger's
+    lazily-seeded in-memory set."""
+    import csv as _csv
+    import bet_ledger as _bl
+    rows = []
+    path = getattr(_bl, "_LEDGER_PATH", None)
+    if not path or not os.path.exists(path):
+        return rows
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            for r in _csv.DictReader(f):
+                pa_epoch = None
+                pa = r.get("placed_at")
+                if pa:
+                    try:
+                        pa_epoch = datetime.fromisoformat(str(pa)).timestamp()
+                    except (ValueError, TypeError):
+                        pa_epoch = None
+                rows.append({
+                    "bet_id": r.get("bet_id"), "correlation_id": r.get("correlation_id"),
+                    "event": r.get("event"), "selection": r.get("selection"),
+                    "stake": r.get("stake"), "placed_at": pa_epoch,
+                })
+    except Exception as e:
+        log.warning(f"startup-reconcile: could not read ledger {path}: {e}")
+    return rows
+
+
+def _startup_pending_reconcile_blocking(owned_sessions):
+    """BLOCKING (worker thread): read ledger + seen-state, query /api/pending_bets
+    for owned sessions, return (orphans, seen_ids). Reads + alerts only; NEVER places."""
+    import reconcile as _recon
+    seen = _recon.load_seen_orphans(_STARTUP_RECONCILE_STATE_PATH)
+    ledger_rows = _read_ledger_rows_for_reconcile()
+    orphans = _recon.find_orphan_pending(
+        hb, owned_sessions, ledger_rows=ledger_rows, seen_ids=seen,
+        lookback_sec=STARTUP_PENDING_RECONCILE_LOOKBACK_SEC,
+    )
+    return orphans, seen
+
+
+async def _startup_pending_reconcile(owned_sessions):
+    """ALERT-ONLY startup reconcile. Surfaces pending bets in-flight at the last
+    shutdown that aren't in the ledger. Runs the blocking HB/CSV I/O OFF the loop so
+    startup / the freeze ticker are never blocked. NEVER re-places (an in-flight bet
+    MAY have landed -> re-placing would double-stake): Wilson verifies + records."""
+    import reconcile as _recon
+    try:
+        orphans, seen = await asyncio.get_running_loop().run_in_executor(
+            None, _startup_pending_reconcile_blocking, owned_sessions
+        )
+    except Exception as e:
+        log.exception(f"startup-reconcile failed (non-fatal): {e}")
+        return
+    if not orphans:
+        log.info("startup-reconcile: no orphaned pending bets found")
+        return
+    lines = [
+        f"- {o.get('bookie','?')} (s{o.get('session_id')}): {o.get('event','?')} - "
+        f"{o.get('bet','?')} ${o.get('stake')} @ {o.get('odds')} [{o.get('dt')}] "
+        f"bookie_bet_id={o.get('bookie_bet_id')}"
+        for o in orphans
+    ]
+    try:
+        notifier.notify_critical(
+            f"STARTUP RECONCILE: {len(orphans)} pending bet(s) were on the account at "
+            f"restart and are NOT in the ledger. They MAY have LANDED - VERIFY on the "
+            f"bookie and record manually. TipBot will NOT re-place them.\n" + "\n".join(lines)
+        )
+    except Exception as e:
+        log.error(f"startup-reconcile: alert send failed: {e}")
+    # Persist so a flapping restart doesn't re-alert the same orphans every cycle.
+    try:
+        seen = set(seen) | {str(o.get("id")) for o in orphans if o.get("id") is not None}
+        _recon.save_seen_orphans(_STARTUP_RECONCILE_STATE_PATH, seen)
+    except Exception as e:
+        log.warning(f"startup-reconcile: persist seen failed: {e}")
+
+
 async def main():
     global _loop_heartbeat_ts
     _loop_heartbeat_ts = time.time()  # ARM the freeze watchdog (loop is now live)
@@ -15174,6 +15387,17 @@ async def main():
             f"TipBot {_ver_short} (fingerprint {CODE_FINGERPRINT}) "
             f"started but NO owned HyperBot sessions are active!"
         )
+
+    # v6.03 bug #2: STARTUP pending-bets reconcile (ALERT-ONLY, gated OFF by default).
+    # On a restart (freeze-watchdog os._exit / crash) a bet that was in-flight at death
+    # is invisible to the ledger; this sweeps /api/pending_bets for owned accounts and
+    # ALERTS Wilson to verify+record. NEVER re-places. Background task off the loop so
+    # it can't block the listener / freeze ticker.
+    if STARTUP_PENDING_RECONCILE_ENABLED:
+        asyncio.create_task(_startup_pending_reconcile(owned_sessions))
+        log.info("Startup pending-bets reconcile scheduled (alert-only, background)")
+    else:
+        log.info("Startup pending-bets reconcile DISABLED (STARTUP_PENDING_RECONCILE_ENABLED=false)")
 
     # Refresh roster if stale (background, non-blocking)
     _check_and_refresh_roster()

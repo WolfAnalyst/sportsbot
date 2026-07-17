@@ -31,7 +31,9 @@ window there is only one candidate — we don't need odds to disambiguate
 ml-vs-line, and odds can drift between attempt and fill).
 """
 
+import json
 import logging
+import os
 import time
 from datetime import datetime
 
@@ -62,6 +64,15 @@ def _parse_iso_utc(dt_str):
 def _norm(s):
     """Lowercase alphanumerics only — for fuzzy event/text comparison."""
     return "".join(c.lower() for c in (s or "") if c.isalnum())
+
+
+def _toks(s):
+    """Significant (>=3 alnum char) lowercased tokens of s (split on non-alnum,
+    exact-token equality). Shared by pending_bet_matches and the startup orphan
+    sweep for fuzzy selection comparison."""
+    return {t for t in "".join(
+        c.lower() if c.isalnum() else " " for c in (s or "")
+    ).split() if len(t) >= 3}
 
 
 def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=None,
@@ -128,10 +139,6 @@ def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=Non
         # window + stake gate remain the discriminators there; requiring ALL
         # tokens would flip the risk to false-REJECTS (-> racing spill ->
         # double-bet), the worse direction.
-        def _toks(s):
-            return {t for t in "".join(
-                c.lower() if c.isalnum() else " " for c in (s or "")
-            ).split() if len(t) >= 3}
         sel_toks = _toks(selection_text)
         bet_toks = _toks(pending.get("bet"))
         if bet_toks and sel_toks and not (sel_toks & bet_toks):
@@ -269,6 +276,135 @@ def decide_ambiguous(hb, account_id, *, event, stake, sport, selection,
     # unfilled=$0 and the shortfall never reached manual.
     return {'action': 'not_placed',
             'reason': 'confirmed not-placed, spill off (Tier 1)'}
+
+
+# ── Startup ORPHAN sweep (incident 2026-07-17, v6.03) ───────────────────────
+# On process restart (freeze-watchdog os._exit / crash / reconnect) a bet that was
+# IN FLIGHT when the process died is never reconciled -> invisible to the ledger +
+# Wilson. find_orphan_pending queries /api/pending_bets for OWNED sessions and
+# returns pending bets (within a recent window) that are NOT accounted-for in the
+# ledger. It is ALERT-ONLY: it reads pending_bets + the ledger and NEVER places
+# anything (an in-flight bet MAY have landed; re-placing = double stake). The
+# caller alerts Wilson to verify + record manually. See main._startup_pending_reconcile.
+DEFAULT_STARTUP_LOOKBACK_SEC = 1800  # 30 min
+
+
+def _ledger_row_matches(pending, ledger_rows, *, pdt, lookback_sec,
+                        dt_grace_sec=DEFAULT_DT_GRACE_SEC, stake_tol=DEFAULT_STAKE_TOL):
+    """True if some ledger row plausibly IS this pending bet (=> accounted-for, NOT
+    an orphan). Mirrors pending_bet_matches' gates: event normalized-substring,
+    stake within tol, selection-token overlap, and (best-effort) placed_at within
+    the window of the pending dt. A row with an unparseable placed_at skips only the
+    time gate (still matched on event+stake+selection)."""
+    pe = _norm(pending.get("event"))
+    try:
+        pstake = float(pending.get("stake"))
+    except (TypeError, ValueError):
+        pstake = None
+    pbet_toks = _toks(pending.get("bet"))
+    for r in ledger_rows:
+        pa = r.get("placed_at")
+        if pa is not None and abs(pa - pdt) > lookback_sec + dt_grace_sec:
+            continue
+        re_ = _norm(r.get("event"))
+        if pe and re_ and not (pe in re_ or re_ in pe):
+            continue
+        if pstake is not None:
+            try:
+                rstake = float(r.get("stake"))
+            except (TypeError, ValueError):
+                rstake = None
+            if rstake is not None and abs(pstake - rstake) > stake_tol:
+                continue
+        rsel_toks = _toks(r.get("selection"))
+        if pbet_toks and rsel_toks and not (pbet_toks & rsel_toks):
+            continue
+        return True
+    return False
+
+
+def find_orphan_pending(hb, owned_sessions, *, ledger_rows, seen_ids,
+                        lookback_sec=DEFAULT_STARTUP_LOOKBACK_SEC, now_ts=None,
+                        dt_grace_sec=DEFAULT_DT_GRACE_SEC):
+    """Return ORPHAN pending-bet dicts: PENDING bets on an owned account within the
+    lookback window that are NOT accounted-for in the ledger (likely in-flight when
+    the process died, never recorded). ALERT-ONLY — reads pending_bets + the ledger,
+    NEVER places. Accounted-for = the pending id/bookie_bet_id is a known ledger
+    bet_id/correlation_id, OR _ledger_row_matches. seen_ids suppresses re-alerting the
+    same orphan across restarts. A per-session API failure is logged and SKIPPED
+    (never emitted as an orphan — an API failure is not proof of an orphan)."""
+    now_ts = now_ts if now_ts is not None else time.time()
+    ledger_ids = {str(r.get("bet_id")).strip() for r in (ledger_rows or []) if r.get("bet_id")}
+    ledger_ids |= {str(r.get("correlation_id")).strip() for r in (ledger_rows or []) if r.get("correlation_id")}
+    seen = set(str(x) for x in (seen_ids or ()))
+    orphans = []
+    for s in (owned_sessions or []):
+        acct = s.get("account_id")
+        if not acct:
+            log.info(f"startup-reconcile: session {s.get('session_id')} has no account_id "
+                     f"— skipping pending-bets check")
+            continue
+        try:
+            resp = hb.get_pending_bets(acct)
+        except Exception as e:
+            log.warning(f"startup-reconcile: get_pending_bets raised for acct {acct}: {e} "
+                        f"— skipping (API fail != orphan)")
+            continue
+        if not resp or resp.get("success") is False:
+            log.warning(f"startup-reconcile: get_pending_bets failed for acct {acct} "
+                        f"({(resp or {}).get('error')}) — skipping (API fail != orphan)")
+            continue
+        for b in resp.get("bets", []):
+            if b.get("result") is not None:
+                continue  # settled, not pending
+            pdt = _parse_iso_utc(b.get("dt"))
+            if pdt is None:
+                continue
+            if pdt < now_ts - lookback_sec - dt_grace_sec:
+                continue  # older than the in-flight-at-crash window — ignore
+            bid = str(b.get("id") or "").strip()
+            if bid and bid in seen:
+                continue  # already alerted on a previous restart
+            bbid = str(b.get("bookie_bet_id") or "").strip()
+            if (bid and bid in ledger_ids) or (bbid and bbid in ledger_ids):
+                continue  # exact id join -> accounted-for
+            if _ledger_row_matches(b, ledger_rows or [], pdt=pdt, lookback_sec=lookback_sec,
+                                   dt_grace_sec=dt_grace_sec):
+                continue  # fuzzy ledger match -> accounted-for
+            orphans.append({
+                "account_id": acct,
+                "session_id": s.get("session_id"),
+                "bookie": s.get("bookie", ""),
+                "event": b.get("event", ""),
+                "bet": b.get("bet", ""),
+                "stake": b.get("stake"),
+                "odds": b.get("odds"),
+                "dt": b.get("dt"),
+                "id": b.get("id"),
+                "bookie_bet_id": b.get("bookie_bet_id"),
+            })
+    return orphans
+
+
+def load_seen_orphans(path):
+    """Load the persisted set of already-alerted orphan pending-bet ids (str).
+    Missing/unreadable/garbage -> empty set (fail open: at worst we re-alert once)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return set(str(x) for x in json.load(f))
+    except Exception:
+        return set()
+
+
+def save_seen_orphans(path, ids):
+    """Persist the set of alerted orphan ids (JSON list) atomically. Best-effort."""
+    try:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(str(x) for x in ids), f)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning(f"startup-reconcile: could not persist seen-orphans to {path}: {e}")
 
 
 # ── Self-test against the live 2026-05-30 sample ────────────────────────────

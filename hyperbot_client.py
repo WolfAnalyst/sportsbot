@@ -15,13 +15,89 @@ v4.1 (2026-05-15): /v3/price_check + /v3/place_bet + /v3/start_session
 + /v3/restart_session migration. See tipbot_v4_1_spec.md for context.
 """
 
+import json
+import os
+import threading
 import time
 import requests
 import logging
 from datetime import datetime
-from config import HYPERBOT_API_KEY, HYPERBOT_BASE_URL
+from config import (
+    HYPERBOT_API_KEY, HYPERBOT_BASE_URL, V3_POLL_HARD_CEILING_SEC,
+    GLOBAL_MAX_STAKE, GLOBAL_DAILY_PLACEMENT_CAP,
+)
 
 log = logging.getLogger(__name__)
+
+# ── SAFE-MODE placement governor (Wilson 2026-07-17) ───────────────────
+# Hard money bounds applied to REAL PLACEMENTS ONLY (place_* methods). Price checks
+# and all other endpoints are NOT governed. See config.py. GLOBAL_MAX_STAKE clamps
+# each placement's stake; GLOBAL_DAILY_PLACEMENT_CAP caps placement ATTEMPTS/day
+# (atomic reserve under a lock so the concurrent fan-out can't overshoot; persisted
+# so it survives a restart). Both 0 => disabled (fork default).
+_GOV_LOCK = threading.Lock()
+_GOV_STATE_PATH = os.getenv(
+    "PLACEMENT_GOVERNOR_STATE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "placement_governor_count.json"),
+)
+
+
+def _gov_load() -> dict:
+    try:
+        with open(_GOV_STATE_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return {"date": str(d.get("date", "")), "count": int(d.get("count", 0))}
+    except Exception:
+        return {"date": "", "count": 0}
+
+
+def _gov_save(state: dict) -> None:
+    try:
+        tmp = _GOV_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"date": state.get("date", ""), "count": int(state.get("count", 0))}, f)
+        os.replace(tmp, _GOV_STATE_PATH)
+    except Exception as e:
+        log.error(f"placement governor: could not persist count to {_GOV_STATE_PATH}: {e}")
+
+
+def _placement_governor(amount):
+    """SAFE-MODE money guard for EVERY real placement (place_* only). Returns
+    (allowed: bool, clamped_amount: float, reason: str). (1) Clamps the stake to
+    GLOBAL_MAX_STAKE. (2) Atomically reserves one slot against
+    GLOBAL_DAILY_PLACEMENT_CAP for the current calendar day; if the day's cap is
+    already spent it returns allowed=False (the caller must NOT place). Both bounds
+    disabled when their config value is <= 0. Never raises."""
+    try:
+        amt = float(amount)
+    except (TypeError, ValueError):
+        return (True, amount, "")  # non-numeric stake: leave it to the caller
+
+    if GLOBAL_MAX_STAKE and GLOBAL_MAX_STAKE > 0 and amt > GLOBAL_MAX_STAKE:
+        log.warning(f"placement governor: stake ${amt} > GLOBAL_MAX_STAKE ${GLOBAL_MAX_STAKE} "
+                    f"-> CLAMPED to ${GLOBAL_MAX_STAKE}")
+        amt = float(GLOBAL_MAX_STAKE)
+
+    if GLOBAL_DAILY_PLACEMENT_CAP and GLOBAL_DAILY_PLACEMENT_CAP > 0:
+        with _GOV_LOCK:
+            today = datetime.now().strftime("%Y-%m-%d")
+            state = _gov_load()
+            if state.get("date") != today:
+                state = {"date": today, "count": 0}
+            if state["count"] >= GLOBAL_DAILY_PLACEMENT_CAP:
+                log.error(
+                    f"placement governor: DAILY PLACEMENT CAP reached "
+                    f"({state['count']}/{GLOBAL_DAILY_PLACEMENT_CAP} today) -> REFUSING this "
+                    f"placement. Raise GLOBAL_DAILY_PLACEMENT_CAP (explicit permission) to allow more."
+                )
+                return (False, amt,
+                        f"daily placement cap reached ({GLOBAL_DAILY_PLACEMENT_CAP}/day) - refused; "
+                        f"raise GLOBAL_DAILY_PLACEMENT_CAP for explicit permission")
+            state["count"] += 1
+            _gov_save(state)
+            log.info(f"placement governor: placement attempt {state['count']}/"
+                     f"{GLOBAL_DAILY_PLACEMENT_CAP} today (stake ${amt})")
+    return (True, amt, "")
 
 # Retry config for transient upstream failures (5xx gateway errors, read timeout,
 # connection errors). HyperBot occasionally drops ~60-120s before recovering;
@@ -48,6 +124,11 @@ _V3_POLL_GRACE_SEC = 5.0
 # Fallback budget if the server doesn't return submitted_at/timeout_at on
 # the initial response. Should never fire in practice.
 _V3_POLL_FALLBACK_BUDGET_SEC = 60.0
+# v6.03 (incident 2026-07-17): HARD wall-clock ceiling for the ENTIRE bet_status
+# poll loop, independent of the server-supplied budget (which had no upper bound
+# -> a runaway budget made the loop poll for ~6.5h; per-request timeouts didn't
+# help because the LOOP, not any single request, hung). See config.py.
+_V3_POLL_HARD_CEILING_SEC = V3_POLL_HARD_CEILING_SEC
 
 
 class HyperBotClient:
@@ -206,7 +287,14 @@ class HyperBotClient:
         start = time.time()
         last_poll: dict = {}
         poll_count = 0
-        while time.time() - start < budget_sec + _V3_POLL_GRACE_SEC:
+        terminal = False
+        # v6.03 (incident 2026-07-17): clamp the poll window with a HARD wall-clock
+        # ceiling. budget_sec comes from the server (timeout_at - submitted_at) and
+        # had no upper bound -> a runaway value made this loop poll for hours. min()
+        # NEVER shortens a legitimate budget (a normal ~300s cid settles well under
+        # the ceiling); it only bites when budget_sec is pathologically huge.
+        effective_ceiling = min(budget_sec + _V3_POLL_GRACE_SEC, _V3_POLL_HARD_CEILING_SEC)
+        while time.time() - start < effective_ceiling:
             interval = _V3_POLL_SCHEDULE[min(poll_count, len(_V3_POLL_SCHEDULE) - 1)]
             time.sleep(interval)
             poll_count += 1
@@ -218,7 +306,32 @@ class HyperBotClient:
             )
             statuses = last_poll.get("statuses") or []
             if statuses and all(s.get("status") != "pending" for s in statuses):
+                terminal = True
                 break
+
+        # v6.03: the poll loop hit its HARD ceiling without a terminal status. For a
+        # PLACEMENT this is money-critical: the bet MAY have landed at the bookie (HB
+        # never confirmed the cid resolved), so return the SAME ambiguous envelope
+        # shape as the H22 pending / H24 timeout paths -> main.py's ambiguous handling
+        # debits-as-placed + blocklists + STOPS the ladder + fires a CRITICAL alert,
+        # and NEVER retries/spills (no double stake). The error string carries no
+        # PRE_PLACEMENT_REJECT token so it is not misread as a clean pre-placement
+        # reject. Non-placement (price) paths fall through to `return last_poll` (a
+        # plain pending -> transient failure, no placement so zero money risk).
+        if not terminal and "/place_bet" in path:
+            _cid0 = cids[0] if cids else None
+            log.warning(
+                f"_post_v3_async HARD DEADLINE: {path} cids={cids} unresolved after "
+                f"{time.time() - start:.0f}s (ceiling={effective_ceiling:.0f}s) - treating "
+                f"AMBIGUOUS (bet may have landed; no retry/spill)"
+            )
+            return {
+                "success": False,
+                "error": f"cid pending - hard poll deadline exhausted, bet status unknown (cid={_cid0})",
+                "ambiguous": True,
+                "correlation_id": _cid0,
+                "correlation_ids": cids,
+            }
 
         # H23: if the loop exited due to a failed last poll (not a clean
         # terminal status), attach the cids so the critical alert has them
@@ -279,8 +392,10 @@ class HyperBotClient:
             tim = datetime.fromisoformat(timeout_at)
             delta = (tim - sub).total_seconds()
             # Floor at 10s to give some breathing room even if server
-            # returns a nonsense small delta.
-            return max(delta, 10.0)
+            # returns a nonsense small delta. v6.03: also CEILING at the hard
+            # poll cap so a runaway server timeout_at can't inflate the budget at
+            # the source (defence-in-depth; the poll loop clamps too).
+            return min(max(delta, 10.0), _V3_POLL_HARD_CEILING_SEC)
         except (ValueError, TypeError):
             return None
 
@@ -813,6 +928,9 @@ class HyperBotClient:
         place_racing_bet docstring for the Erasmus regression that
         forced this. Same retry-unsafe class applies to sports.
         """
+        _ok, stake, _gov = _placement_governor(stake)  # SAFE-MODE cap (place-only)
+        if not _ok:
+            return {"success": False, "error": _gov}
         payload = {
             "session_id": session_id,
             "category": "sports",
@@ -860,6 +978,9 @@ class HyperBotClient:
         2026-05-03: max_attempts=1 to prevent retry-driven overstaking.
         See place_racing_bet docstring.
         """
+        _ok, stake, _gov = _placement_governor(stake)  # SAFE-MODE cap (place-only)
+        if not _ok:
+            return {"success": False, "error": _gov}
         payload = {
             "session_id": session_id,
             "category": "sports",
@@ -957,6 +1078,9 @@ class HyperBotClient:
         """
         if not date:
             date = datetime.now().strftime("%Y-%m-%d")
+        _ok, stake, _gov = _placement_governor(stake)  # SAFE-MODE cap (place-only)
+        if not _ok:
+            return {"success": False, "error": _gov}
         payload = {
             "session_id": session_id,
             "category": "racing",
@@ -994,6 +1118,9 @@ class HyperBotClient:
         """
         if not date:
             date = datetime.now().strftime("%Y-%m-%d")
+        _ok, size, _gov = _placement_governor(size)  # SAFE-MODE cap (place-only)
+        if not _ok:
+            return {"success": False, "error": _gov}
         payload = {
             "session_id": session_id,
             "category": "betfair",
