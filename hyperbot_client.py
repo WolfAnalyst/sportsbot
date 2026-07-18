@@ -68,6 +68,12 @@ def _placement_governor(amount):
     GLOBAL_DAILY_PLACEMENT_CAP for the current calendar day; if the day's cap is
     already spent it returns allowed=False (the caller must NOT place). Both bounds
     disabled when their config value is <= 0. Never raises."""
+    # Fully INERT under TIPBOT_TESTING (the test harness sets it): tests must not be
+    # stake-clamped, must not consume/refuse against the daily cap, and must never
+    # touch the persisted PROD counter file. The governor applies in PRODUCTION only
+    # (prod never sets TIPBOT_TESTING — same convention bet_ledger uses to isolate).
+    if os.getenv("TIPBOT_TESTING"):
+        return (True, amount, "")
     try:
         amt = float(amount)
     except (TypeError, ValueError):

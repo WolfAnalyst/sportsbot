@@ -12178,19 +12178,24 @@ async def _process_tip(text: str, tipster: str, sport: str,
                 results = place_tip(tip)
             if not skip_dedup:
                 # placement finished -> no longer in-flight; the _recent_tips claim
-                # (retained/popped below) now governs the post-completion 10-min window.
+                # (refreshed/popped below) now governs the post-completion 10-min window.
                 _inflight_fps.discard(_dupe_fp)
             resolve_time = time.time() - resolve_start
 
             any_success = any(r.success for r in results)
-            # RELEASE the claim iff NOTHING landed (no success, no ambiguous), so a
-            # clean total failure stays re-sendable (preserves v5.13 semantics).
-            # Retained on success/ambiguous so a re-post can't fan out a second time
-            # onto an account where the first attempt may already have landed.
-            if not skip_dedup and not (
-                any_success or any(_is_ambiguous_result(r) for r in results)
-            ):
-                _recent_tips.pop(_dupe_fp, None)
+            if not skip_dedup:
+                if any_success or any(_is_ambiguous_result(r) for r in results):
+                    # landed/ambiguous: REFRESH the claim to COMPLETION time (mirrors the
+                    # image PASS-3 refresh). A >600s flight (the HB-meltdown this bundle
+                    # targets) could have aged the claim-time stamp past DUPE_WINDOW_SECS;
+                    # without this refresh a re-send arriving JUST after completion would be
+                    # in neither _inflight_fps (discarded above) nor _recent_tips (purged)
+                    # -> double fan-out onto accounts where attempt #1 may have landed.
+                    _register_tip_fingerprint(tip, fp=_dupe_fp)
+                else:
+                    # clean total failure: RELEASE the claim (re-sendable), preserves the
+                    # v5.13 "re-send after a clean fail" semantics.
+                    _recent_tips.pop(_dupe_fp, None)
 
             for r in results:
                 if r.success:
