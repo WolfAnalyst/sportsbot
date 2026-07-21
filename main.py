@@ -13038,6 +13038,52 @@ EDDIE_IMAGE_NO_UNITS_MAX_STAKE = 1000.0
 # ($1000 to-win), o=3 -> $500, o<=2 -> the $1000 stake cap binds first.
 EDDIE_IMAGE_NO_UNITS_MAX_LIABILITY = 1000.0
 
+# v6.05 (Wilson 2026-07-21): Eddie often posts a betslip PHOTO with the units in
+# the photo's CAPTION (same Telegram message) rather than on the slip — the vision
+# parse then reads "NO unit sizing" and the 2.5u fallback fired instead of his real
+# size. Extract "Xu" / "X units" from the caption and use it (treated as a REAL
+# size, like an in-image units read). Sanity-capped so a caption misparse can't
+# stake an absurd size; a value outside (0, MAX] is ignored -> the 2.5u fallback
+# still applies. Scoped at the CALL SITE to a LONE no-units tip (single betslip),
+# so a multi-tip image can never get N x the caption units.
+EDDIE_CAPTION_UNITS_MAX = 5.0
+_CAPTION_UNITS_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:u\b|units?\b)", re.IGNORECASE)
+# v6.05 audit hardening: a RESULTS / BRAG / commentary caption ('won 3u yesterday',
+# 'up 4 units this month', 'on a 4-unit heater') carries a units token that is NOT
+# THIS slip's stake. If any of these markers appear, refuse to read units from the
+# caption (-> the normal 2.5u fallback applies instead of a misparsed size).
+_CAPTION_NONBET_RE = re.compile(
+    r"\b(won|banked|bankroll|profit|lost|losses|winner|heater|yesterday|"
+    r"last\s+week|this\s+(?:week|month|round|season)|so\s+far|on\s+the\s+year|"
+    r"record|streak|up\s+\d|down\s+\d)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_units_from_caption(caption: str):
+    """Return the units float from an Eddie photo caption ('2.5u', '3 units'),
+    or None if the caption is absent, reads like a RESULTS/brag caption, is
+    AMBIGUOUS (zero or >1 units tokens — e.g. 'won 4u, play 2u'), or the value is
+    out of the sane (0, EDDIE_CAPTION_UNITS_MAX] range. v6.05 audit: this is a
+    HEURISTIC read (lower confidence than an on-slip units read), so the caller
+    still applies the no-units $1000 stake/liability caps to whatever this returns.
+    The negative-lookbehind + digit-anchor means 'under'/'disposals' never match
+    (only a NUMBER immediately followed by u/units)."""
+    if not caption:
+        return None
+    if _CAPTION_NONBET_RE.search(caption):
+        return None  # brag/results caption — a units token here is not this bet's size
+    matches = _CAPTION_UNITS_RE.findall(caption)
+    if len(matches) != 1:
+        return None  # 0 tokens (no size) or >1 (ambiguous which is the stake) -> fallback
+    try:
+        u = float(matches[0])
+    except (TypeError, ValueError):
+        return None
+    if u <= 0 or u > EDDIE_CAPTION_UNITS_MAX:
+        return None
+    return u
+
 
 def _resolve_eddie_surname_to_player(token: str, msg_time, stat: str = None,
                                      line=None, side: str = None, tip_odds=None):
@@ -13210,7 +13256,13 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
         # units * unit_size <= the cap. Only fires when units are unreadable — a
         # correctly-read 1u / 3u tip places its real size.
         no_units_fallback = True
-        fb_units = EDDIE_IMAGE_NO_UNITS_FALLBACK_UNITS
+        # v6.05: a photo CAPTION units hint (_caption_units) is used as the sizing
+        # BASE instead of the 2.5u default — but it STILL flows through the $1000
+        # stake + $1000 liability caps below (audit: a caption read is a heuristic,
+        # lower confidence than an on-slip read, so it must NOT bypass the caps).
+        _cap_hint = _img_coerce_float(raw.get("_caption_units"))
+        _units_src = "caption" if (_cap_hint and _cap_hint > 0) else "fallback-2.5u"
+        fb_units = _cap_hint if (_cap_hint and _cap_hint > 0) else EDDIE_IMAGE_NO_UNITS_FALLBACK_UNITS
         if unit_size and unit_size > 0:
             # cap 1: total STAKE <= $1000
             fb_units = min(fb_units, EDDIE_IMAGE_NO_UNITS_MAX_STAKE / unit_size)
@@ -13224,7 +13276,7 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
                 )
         units = fb_units
         log.info(
-            f"[{tipster}] image tip has NO unit sizing -> fallback {units:.3f}u "
+            f"[{tipster}] image tip NO on-slip units (source={_units_src}) -> {units:.3f}u "
             f"x ${unit_size:.0f} = ${round(units * unit_size, 2)} stake "
             f"(odds={odds or '?'}; caps: stake<=${EDDIE_IMAGE_NO_UNITS_MAX_STAKE:.0f}, "
             f"liability<=${EDDIE_IMAGE_NO_UNITS_MAX_LIABILITY:.0f})"
@@ -13300,7 +13352,24 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
         # placeable -(N-0.5) alt-line conversion below (unchanged, v5.75).
         _margin_txt = " ".join(str(raw.get(k) or "") for k in
                                ("selection", "description", "market_detail", "title", "line"))
-        if re.search(r"\b\d{1,3}\s*-\s*\d{1,3}\b", _margin_txt):
+        # v6.05 (Wilson 2026-07-21): EITHER-TEAM / TRIBET band — a margin band with
+        # NO team ('TriBet', 'Either Team 1-24': the match margin regardless of
+        # winner). It is NEVER a one-team handicap, so it must NEVER reach the
+        # -(N-0.5) conversion below. Route to manual up front (defensive net beyond
+        # the range regex). SB carries these as winning_margin_spread; auto-placement
+        # is a gated follow-up (needs a live-catalog probe to map the exact band
+        # selection/prop_id — see WEEKEND notes). This DESCRIBES the tri-bet cleanly
+        # instead of the old generic "unschematic/multi" alert.
+        if not leg_team:
+            alert_only = True
+            alert_reason = (
+                "EITHER-TEAM / TRIBET winning-margin band (e.g. 'Either Team 1-24') "
+                "— no single team, so NOT a handicap. SB carries this as "
+                "winning_margin_spread; auto-place pending a catalog probe — place by hand"
+            )
+            leg = ParsedLeg(market="other", team_full="", player="",
+                            stat="", line=line, selection=side)
+        elif re.search(r"\b\d{1,3}\s*-\s*\d{1,3}\b", _margin_txt):
             alert_only = True
             alert_reason = (
                 "winning-margin BAND (range e.g. '1-39') — SB carries this as "
@@ -13484,7 +13553,8 @@ def _image_afl_conflicting_indices(raw_tips: list) -> set:
 
 async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                           default_units: float, msg_time, channel_name: str,
-                          pipeline_start: float = None, parse_sec: float = None) -> None:
+                          pipeline_start: float = None, parse_sec: float = None,
+                          raw_caption: str = "") -> None:
     """Route vision-extracted AFL tips through the sports pipeline (place_tip,
     Sportsbet-locked via TIPSTERS_FORCE_BOOKIE). Mirrors the per-tip steps of
     _process_tip (cap units, flat/test-stake clamp, dupe-check, place_tip).
@@ -13501,6 +13571,26 @@ async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
     no_units_count = sum(
         1 for r in raw_tips if (_img_coerce_float(r.get("units")) or 0) <= 0
     )
+    # v6.05 (Wilson 2026-07-21): CAPTION UNITS. Eddie posts a betslip PHOTO with the
+    # units in the photo's CAPTION ("3u") rather than on the slip; the vision parse
+    # reads "NO unit sizing" and the 2.5u fallback fired instead of his real size.
+    # Attach the caption units as a HINT (_caption_units) on the tip; the builder
+    # uses it as the fallback BASE but STILL applies the no-units $1000 stake/liability
+    # caps (audit: a caption read is a heuristic, not an on-slip read, so it must not
+    # bypass the safety caps). SCOPED to a SINGLE-tip image (len==1) with no units:
+    #   - len==1 => the caption units can never be mis-attributed across a multi-slip
+    #     image, and a multi/over-parsed image never gets N x the caption units.
+    #   - _extract_units_from_caption already refuses brag/results + ambiguous captions.
+    # eddie_afl only.
+    if tipster == "eddie_afl" and len(raw_tips) == 1 and no_units_count == 1 and raw_caption:
+        _cap_units = _extract_units_from_caption(raw_caption)
+        if _cap_units is not None:
+            raw_tips[0]["_caption_units"] = _cap_units
+            log.info(
+                f"[{channel_name}] CAPTION UNITS: '{_cap_units:g}u' read from the photo "
+                f"caption for the lone no-units betslip (caption={raw_caption[:60]!r}) "
+                f"— used as the sizing base, STILL $1000 stake/liability-capped"
+            )
     # v6.00 (Wilson 2026-07-17): count no-odds PLAYER-PROP legs in THIS image.
     # A LONE one (==1) is a standalone single -> auto-place at market (fan-out,
     # exactly like an odds-bearing disposals prop). >=2 no-odds player legs in ONE
@@ -13901,6 +13991,7 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
         await _route_image_afl_tips(
             raw_tips, tipster, unit_size, default_units, msg_time, channel_name,
             pipeline_start=_t0, parse_sec=round(elapsed, 3),
+            raw_caption=raw_caption,
         )
 
 
