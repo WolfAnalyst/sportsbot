@@ -420,7 +420,7 @@ def resolve_sa_track_today(race_num, runner: str, date_str: str, candidate_track
                 "track for a runner on a given date, choosing ONLY from a fixed candidate "
                 "list, using your knowledge of the SA racing calendar (Morphettville is the "
                 "metropolitan default; country/midweek meetings rotate Gawler, Murray Bridge, "
-                "Strathalbyn, Balaklava, Gawler, etc.). Respond with ONLY JSON: "
+                "Strathalbyn, Balaklava, Naracoorte, Mount Gambier, etc.). Respond with ONLY JSON: "
                 "{\"track\": \"<exactly one candidate>\"}. Make your best single guess even "
                 "if unsure. No other text."
             )

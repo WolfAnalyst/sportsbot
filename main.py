@@ -57,6 +57,8 @@ from config import (
     SPORTSBET_MAX_STAKE_REBET,
     SELF_BET_MAX_STAKE,
     EDDIE_CAPTION_FALLBACK_ENABLED,
+    EDDIE_TEXT_PLACE_ENABLED,
+    SA_THOROUGHBRED_TRACKS,
     AFL_PERIOD_MARKETS_ENABLED,
     SAIYAN_HC_SGM_ENABLED,
 )
@@ -251,7 +253,7 @@ TIPSTERS_IGNORE_SUGGESTED_BOOKIE: set[str] = {"kev_nba", "ausbets_nba", "saiyan_
 # no unit (we'd otherwise default it) is NOT a confirmed bet for these cappers —
 # route it to manual instead of placing at the default stake (Wilson 2026-06-04:
 # AusBets "Knicks 5.5" had no unit yet attempted a $400 line bet).
-UNITS_REQUIRED_TIPSTERS: set[str] = {"kev_nba", "ausbets_nba", "dello_afl"}
+UNITS_REQUIRED_TIPSTERS: set[str] = {"kev_nba", "ausbets_nba", "dello_afl", "eddie_afl"}
 
 # v5.52 BELT for the gate above: Groq can INVENT a unit value (2026-06-11
 # AusBets "nothin today ... none quite get to my price threshold" parsed as
@@ -642,9 +644,13 @@ def _tip_has_handicap_leg(tip) -> bool:
 # any half/quarter-qualified handicap to manual, mirroring the image _partial_period
 # guard for the text path. Full-game handicaps (no half/quarter word) are unaffected.
 _SAIYAN_PERIOD_HC_RE = re.compile(
-    r"\b(?:1st|2nd|3rd|4th|first|second|third|fourth)[-\s]*(?:half|quarter|qtr)\b"
+    r"\b(?:1st|2nd|3rd|4th|first|second|third|fourth)[-\s]*(?:half|quarter|qtr|q)\b"
     r"|\b(?:half|quarter|qtr)[-\s]*(?:time|line)\b"
-    r"|\bhalf[-\s]*time\b|\bq[1-4]\b|\b[1-4]q\b|\b[12]h\b|\bh[12]\b",
+    r"|\bhalf[-\s]*time\b|\bht\b"
+    # v6.06 re-verify: also catch 'Q 3' / 'Qtr 3' / 'Quarter 3' / '3Q' / '3 Qtr'
+    # (the base q[1-4]/[1-4]q only caught the no-space form).
+    r"|\bq(?:tr|uarter)?\s*[1-4]\b|\b[1-4]\s*q(?:tr|uarter)?\b"
+    r"|\b[12]h\b|\bh[12]\b",
     re.IGNORECASE,
 )
 
@@ -12658,10 +12664,9 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
                 # resolved track still fails the NAME match downstream
                 # (track_claude_resolved disables saddle-only) + the odds floor ->
                 # manual, never a wrong-track bet.
-                _sa_tracks = ["Morphettville", "Morphettville Parks", "Gawler",
-                              "Murray Bridge", "Strathalbyn", "Port Augusta",
-                              "Mount Gambier", "Balaklava", "Oakbank", "Naracoorte",
-                              "Bordertown", "Port Lincoln", "Penola"]
+                # v6.06: shared SA candidate list (config) so the upstream resolver and
+                # the racing_placer live-catalog probe (STAGE 1B) stay in sync.
+                _sa_tracks = SA_THOROUGHBRED_TRACKS
                 _resolved = claude_parser.resolve_sa_track_today(
                     race_num, runner, _date_str, candidate_tracks=_sa_tracks)
                 if not _resolved:
@@ -12678,9 +12683,11 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
                 track_inferred = True
                 track_claude_resolved = True  # forces NAME-or-manual in racing_placer (no saddle-only)
                 log.warning(
-                    f"[{tipster}] track=None -> CLAUDE WEB-SEARCH resolved track "
-                    f"'{track}' R{race_num} for {runner}. NAME match REQUIRED downstream "
-                    f"(saddle-only disabled) + odds floor -> wrong track = manual."
+                    f"[{tipster}] track=None -> resolved track '{track}' R{race_num} for "
+                    f"{runner} (web-search OR SA-calendar fallback; see claude_parser log "
+                    f"for which). NAME match REQUIRED downstream (saddle-only disabled); a "
+                    f"Zak SA miss is re-probed against the LIVE catalog in racing_placer "
+                    f"(STAGE 1B) -> wrong track = manual, never a wrong-track bet."
                 )
         except Exception as e:
             log.error(f"Claude track resolve failed for {tipster}: {e}")
@@ -15333,6 +15340,41 @@ async def main():
                                 img_default_units, msg_time, channel_name,
                             )
                         )
+                    elif (img_sport or "").lower() == "afl" and EDDIE_TEXT_PLACE_ENABLED:
+                        # v6.06 (Wilson 2026-07-25): Eddie posts some COMPLETE, placeable
+                        # bets as TEXT follow-ups, not betslip images (e.g. "2.5u -
+                        # Richmond +41.5 $1.91 - 365", "Ross over 22.5 at $1.87"). Parse +
+                        # place them through the SAME AFL text pipeline Saiyan uses
+                        # (_process_tip -> Claude AFL parse -> place_tip fan-out,
+                        # Sportsbet-locked via TIPSTERS_FORCE_BOOKIE, EXACT-OR-MANUAL): a
+                        # clean single places; a matchup/parlay/unresolvable market fails
+                        # to resolve in place_tip -> manual (never a wrong bet); CHATTER
+                        # ("Adding one more") parses to 0 tips -> dropped, no ping. units
+                        # REQUIRED (eddie_afl in UNITS_REQUIRED_TIPSTERS) so a no-stake
+                        # text -> manual. dedup + caps applied by _process_tip. Gated by
+                        # EDDIE_TEXT_PLACE_ENABLED (ships OFF). AFL image betslip path
+                        # unchanged.
+                        # AUDIT FIX (HIGH): a HALF/QUARTER PERIOD handicap posted as TEXT
+                        # ("Hawthorn -5.5 2nd Half") loses its period in the text parser
+                        # and would place FULL-GAME (wrong market) — the period-placement
+                        # path only runs for the IMAGE schema. Route any period-qualified
+                        # text to MANUAL up front (belt), mirroring the image
+                        # _partial_period + Saiyan _SAIYAN_PERIOD_HC_RE guards; the odds
+                        # floor/ceiling is the suspenders for anything that slips.
+                        if _SAIYAN_PERIOD_HC_RE.search(text or ""):
+                            log.info(
+                                f"[{channel_name}] Eddie AFL text has a HALF/QUARTER period "
+                                f"marker -> manual (text path places full-game only, wrong "
+                                f"market otherwise): {text[:120]}")
+                            notifier.notify_image_alert(channel_name, text)
+                        else:
+                            log.info(f"[{channel_name}] actionable AFL TEXT post -> parsing for placement")
+                            asyncio.create_task(
+                                _process_tip(
+                                    text, img_tipster, img_sport,
+                                    img_unit_size, img_default_units, msg_time, channel_name,
+                                )
+                            )
                     else:
                         log.info(f"[{channel_name}] text-only post on image channel (actionable) -> manual alert: {text[:120]}")
                         notifier.notify_image_alert(channel_name, text)
