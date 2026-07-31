@@ -188,6 +188,83 @@ def parse_image(image_bytes, tipster, sport, max_retries=4):
     return groq_parser.parse_tip_image(image_bytes, tipster, sport, max_retries=max_retries)
 
 
+def _resolve_afl_bare_surname(token: str):
+    """Resolve a BARE AFL SURNAME to a unique (full_name, team), else None.
+
+    v6.07 (sweep HIGH #11). Eddie posts last-name-only player props ("Reid 15+
+    disposals"), and since v6.06 his TEXT tips auto-place. This builder used to
+    hand every name, including a lone surname, to ``get_player_team`` — a FUZZY
+    matcher. Two ways that produced a wrong-player bet:
+
+    * a different surname within the fuzzy threshold: 'Reid' matched
+      **Liam Reidy** (ratio 0.888) -> team Carlton. If Carlton played Essendon
+      that round, the downstream catalog search for "Reid" inside the *Carlton*
+      event then found **Zach Reid** and staked Eddie's unit on him, when the
+      tip meant Harley Reid (West Coast).
+    * an arbitrary pick among several real same-surname players with no
+      collision check: 'Smith' -> Henry Smith, 'Hill' -> Bobby Hill.
+
+    So: EXACT surname candidates only (``afl_surname_candidates`` — which also
+    refuses to match FIRST names, so 'Daniel' means Caleb Daniel, never Daniel
+    Rioli), and resolve ONLY when the surname is unique across the league.
+
+    We also return the CANONICAL FULL NAME so the leg (and therefore the bookie
+    payload) carries "Charlie Curnow" rather than the bare "Curnow" — the v5.96
+    lesson that the payload `player` must be the bookie's exact spelling.
+
+    Uniqueness here is league-wide rather than game-scoped. main.py's IMAGE path
+    (``_resolve_eddie_surname_to_player``) narrows to the teams playing now and
+    can therefore also resolve a surname that is ambiguous league-wide but
+    unique in that game, with a catalog-odds tie-break. That needs the live
+    Squiggle fixture + Sportsbet catalog, which this parser must not block on,
+    so the shared builder takes the strictly conservative subset: unique in the
+    league -> resolve, anything else -> manual."""
+    tok = (token or "").strip()
+    if not tok or len(tok.split()) != 1:
+        return None
+    try:
+        from roster import afl_surname_candidates
+        cands = afl_surname_candidates(tok)
+    except Exception as e:
+        log.warning(f"afl_surname_candidates failed for {tok!r}: {e}")
+        return None
+    by_name = {}
+    for c in cands or []:
+        name = (c.get("name") or "").strip()
+        team = (c.get("team") or "").strip()
+        if name:
+            by_name[name] = team
+    if len(by_name) != 1:
+        return None
+    name, team = next(iter(by_name.items()))
+    if not team:
+        return None  # roster row without a club can't resolve an event
+    # v6.07 audit (2026-07-31): the surname must not also be a DIFFERENT player's FIRST
+    # name. afl_surname_candidates ignores first names on purpose, so a lone token is
+    # read as a surname — right as a default, but for 19 real tokens both readings exist
+    # and neither is obviously intended: 'Bailey' -> Zac Bailey while nine players are
+    # named Bailey (Bailey Smith is a far more likely disposals tip, at another club);
+    # 'Scott' -> Bailey Scott while 'Scott' is Scott Pendlebury; 'Luke' -> Ryda Luke
+    # against thirteen players first-named Luke. Before this diff those tokens did not
+    # resolve here at all, so silently binding one reading is a NEW wrong-player path.
+    # Standing rule: unsure -> MANUAL, never guess. The caller turns None into a clean
+    # alert_only, so this costs a (rare) auto-place, never a wrong bet. Measured: no
+    # colliding bare token has EVER appeared in audit.jsonl, so nothing regresses today.
+    try:
+        from roster import afl_first_name_owners
+        others = {c.get("name") for c in (afl_first_name_owners(tok) or [])} - {name}
+    except Exception as e:
+        log.warning(f"afl_first_name_owners failed for {tok!r}: {e}")
+        others = set()
+    if others:
+        log.warning(
+            f"AFL bare token '{tok}' is BOTH the surname of {name} and the first name "
+            f"of {sorted(others)[:4]} - AMBIGUOUS, refusing to guess (-> manual)"
+        )
+        return None
+    return name, team
+
+
 # ── Shared post-processing: model JSON -> list[ParsedTip] ────────────
 def build_tips_from_parsed(parsed, text, tipster, sport, unit_size, default_units):
     """Turn a provider's parsed-JSON dict (``{"tips": [...]}``) into a list of
@@ -251,6 +328,65 @@ def build_tips_from_parsed(parsed, text, tipster, sport, unit_size, default_unit
             )
             legs.append(leg)
 
+        # v6.07 (sweep HIGH #7/#14): PSEUDO-SGM DEMOTION. groq_parser's in-parse
+        # leg-builder has this, but THIS shared builder — the one the LIVE
+        # Claude-primary parser uses — did not, so the guard was effectively dead in
+        # production (drifted duplicate logic). A "/"-joined tip whose legs are all the
+        # SAME player + SAME stat + SAME over/under direction, differing ONLY by line,
+        # is NOT a combinable SGM: it is a primary line + alternative line(s) (Saiyan's
+        # "u19.5 bonus, grades at u18.5", the 2026-06-25 McCartin case). Left as an SGM
+        # it upsizes to the Saiyan SGM unit ($750/u) and routes to the SGM combine path.
+        # Demote to a SINGLE on leg[0] with the rest as alt_lines. Narrow by design
+        # (same player AND stat AND direction); genuine multi-player / mixed-stat SGMs
+        # are untouched, and PYO SGMs are left alone (their own line-pick path).
+        # Reuses groq_parser._slash_leg_dir so the two sites cannot drift again.
+        demoted_alt_lines = None
+        _raw_legs = td.get("raw_legs") or []
+        if is_sgm and not is_pyo_sgm and len(legs) >= 2 and len(_raw_legs) == len(legs):
+            try:
+                from groq_parser import _slash_leg_dir as _sld
+            except Exception:
+                _sld = lambda s: (s or "").strip().lower()
+            # Key off the RAW leg dicts, not the built ParsedLegs: in this builder's SGM
+            # path the stat lands in leg.market and leg.selection/leg.stat are EMPTY, so
+            # keying off the objects made the "all named" check always fail and the
+            # demotion never fired (that is precisely why this guard was dead here).
+            # raw_legs carry player/market/line/type consistently for both providers.
+            # v6.07 AUDIT (2026-07-31): `stat` FIRST, `market` only as a fallback.
+            # The order used to be `market or stat`, and the live parsers emit the
+            # GENERIC market 'player_prop' on every player leg (133 of 153 SGM legs in
+            # logs/audit.jsonl), so `market` MASKED the stat: a genuine same-player
+            # MIXED-STAT SGM ("Sam Darcy o14.5 disposals / o1.5 goals @ 2.90") collapsed
+            # to ONE key and was demoted to a SINGLE on the disposals leg, keeping the
+            # COMBINED 2.90 SGM price. That is a wrong bet at a wrong price, and it is
+            # the shape the docstring above promises is "untouched". The groq_parser twin
+            # keys on `stat` alone and was never affected, which is how the two drifted.
+            # Keep `market` as the fallback for any provider shape that puts the stat
+            # there and leaves `stat` empty, so real pseudo-SGMs still demote.
+            def _rk(rl):
+                return ((rl.get("player") or "").strip().lower(),
+                        (rl.get("stat") or rl.get("market") or "").strip().lower(),
+                        _sld(rl.get("type") or rl.get("selection") or ""))
+            _leg_keys = {_rk(rl) for rl in _raw_legs}
+            _all_named = all(k[0] and k[1] and k[2] for k in _leg_keys)
+            _lines = [_safe_float(rl.get("line"), None) for rl in _raw_legs]
+            if (len(_leg_keys) == 1 and _all_named
+                    and all(l is not None for l in _lines) and len(set(_lines)) > 1):
+                demoted_alt_lines = [{
+                    "stat": l.stat or (_raw_legs[i].get("market") or ""),
+                    "line": l.line, "selection": l.selection or _sld(_raw_legs[i].get("type") or ""),
+                    "market": l.market,
+                    "is_threshold": bool(getattr(l, "_is_threshold", False)),
+                } for i, l in enumerate(legs) if i >= 1]
+                legs = [legs[0]]
+                is_sgm = False
+                log.info(
+                    "Pseudo-SGM demoted to single+alt (shared builder; same "
+                    f"player/stat/dir, only line differs): {legs[0].player} "
+                    f"{legs[0].market} primary line={legs[0].line}, "
+                    f"alt lines={[a['line'] for a in demoted_alt_lines]}"
+                )
+
         is_threshold = td.get("is_threshold", False)
         alert_only = td.get("alert_only", False)
         alert_reason = td.get("alert_reason", "")
@@ -290,6 +426,10 @@ def build_tips_from_parsed(parsed, text, tipster, sport, unit_size, default_unit
             suggested_odds=_safe_float(td.get("odds"), 0.0),
             is_pyo_sgm=is_pyo_sgm,
             alt_line=_normalise_alt_dict(td.get("alt_line")),
+            # v6.07 (sweep HIGH #7/#14): carry the pseudo-SGM demotion's alternative
+            # lines so the demoted single spills to them (the proven _merge_batch_alts
+            # behaviour) instead of the $750/u SGM it used to become.
+            alt_lines=demoted_alt_lines,
             units_explicit=units_explicit,
         )
 
@@ -299,6 +439,40 @@ def build_tips_from_parsed(parsed, text, tipster, sport, unit_size, default_unit
                 from roster import get_player_team
                 for leg in tip.legs:
                     if not leg.team_full and leg.player:
+                        # v6.07 (sweep HIGH #11): a BARE SURNAME must never go
+                        # through get_player_team's fuzzy match. See
+                        # _resolve_afl_bare_surname — unique-or-manual.
+                        if len(leg.player.split()) == 1:
+                            hit = _resolve_afl_bare_surname(leg.player)
+                            if hit:
+                                _was = leg.player
+                                leg.player, leg.team_full = hit
+                                log.info(
+                                    f"AFL bare surname '{_was}' -> '{leg.player}' "
+                                    f"({leg.team_full}) [unique surname in roster]"
+                                )
+                            else:
+                                # Ambiguous/unknown surname. A blank team is NOT
+                                # safe on its own: the downstream player resolve
+                                # re-fuzzes LEAGUE-WIDE when team_full is empty,
+                                # so refusing here would just move the wrong-player
+                                # guess one step later. Force a clean manual.
+                                _r = (
+                                    f"'{leg.player}' is a bare surname with no unique "
+                                    f"AFL roster match (ambiguous or unknown), "
+                                    f"place manually"
+                                )
+                                # Don't clobber a reason the tip already carried
+                                # (e.g. "parlay - place manually"); both matter.
+                                tip.alert_reason = (
+                                    f"{tip.alert_reason}; {_r}" if tip.alert_only and tip.alert_reason else _r
+                                )
+                                tip.alert_only = True
+                                log.warning(
+                                    f"AFL bare surname '{leg.player}' not uniquely "
+                                    f"resolvable -> MANUAL (never guess the player)"
+                                )
+                            continue
                         inferred = get_player_team(leg.player, "afl")
                         if inferred:
                             leg.team_full = inferred

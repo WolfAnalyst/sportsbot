@@ -278,7 +278,18 @@ class HyperBotClient:
                     )
                 )
                 if not _definitive_reject:
-                    return {**initial, "ambiguous": True}
+                    # v6.07 (Batch A audit): this is the FOURTH maybe-landed
+                    # placement envelope and the MOST unresolved of all — the POST
+                    # itself timed out / 5xx'd, so we never even received a
+                    # correlation id and HyperBot may be mid-placement server-side
+                    # with its own multi-minute bookie budget. There is no cid to
+                    # reconcile against later, so a pending_bets miss proves nothing.
+                    # It must be treated exactly like the cid-unresolved envelopes:
+                    # never downgraded to a clean not-placed, never spilled, never
+                    # re-staked or hand-re-placed. (Its error text — "Read timed
+                    # out", "502 Server Error" — matches none of the text markers,
+                    # so the structural flag is the only thing that catches it.)
+                    return {**initial, "ambiguous": True, "cid_unresolved": True}
             return initial
 
         cids, budget_sec = self._extract_cids_and_budget(initial)
@@ -335,6 +346,7 @@ class HyperBotClient:
                 "success": False,
                 "error": f"cid pending - hard poll deadline exhausted, bet status unknown (cid={_cid0})",
                 "ambiguous": True,
+                "cid_unresolved": True,  # v6.07: see _unwrap_single_status timeout branch
                 "correlation_id": _cid0,
                 "correlation_ids": cids,
             }
@@ -585,6 +597,14 @@ class HyperBotClient:
                 "success": False,
                 "error": f"cid timeout - bet status unknown (cid={cid})",
                 "ambiguous": True,
+                # v6.07 (sweep HIGH #1/#5): STRUCTURAL marker for "the cid NEVER
+                # resolved, so the bet can still land AFTER our poll window". Guard B
+                # used to string-match only "hard poll deadline", so this timeout
+                # envelope was downgraded to a clean not-placed and re-staked on a
+                # sibling account / hand-placed -> DOUBLE STAKE (seen 2026-07-16 AFL
+                # s65465 $120, 2026-06-19 racing tip 62247 neds:76345). Never key
+                # money safety on error text again.
+                "cid_unresolved": True,
                 "correlation_id": cid,
             }
 
@@ -600,6 +620,7 @@ class HyperBotClient:
                 "success": False,
                 "error": f"cid pending - poll budget exhausted, bet status unknown (cid={cid})",
                 "ambiguous": True,
+                "cid_unresolved": True,  # v6.07: see the timeout branch above
                 "correlation_id": cid,
             }
 
@@ -921,6 +942,7 @@ class HyperBotClient:
         player: str = None, stat: str = None,
         line: float = None, target_odds: float = None,
         proposition_id: str = None,
+        direction: str = None, max_odds: float = None,
     ) -> dict:
         """Place a single sports bet (NBA, AFL, etc).
 
@@ -966,6 +988,22 @@ class HyperBotClient:
         # singles (which match on market+selection+line) are unchanged.
         if proposition_id:
             payload["proposition_id"] = proposition_id
+        # v6.07 (HB API doc 1.7.10x): `direction` is a SEPARATE top-level over/under
+        # field — per the docs the side is NOT parsed out of `selection`. Empirically
+        # HB already honours our side today (763/763 production bets had the correct
+        # side at the bookie, via `selection` + `proposition_id`), so this is DEFENSIVE
+        # alignment with the documented contract: if HB ever tightens to the public
+        # schema, our payloads keep the side instead of silently losing it.
+        if direction:
+            payload["direction"] = direction
+        # v6.07: `max_odds` is a BOOKIE-SIDE ceiling — HB auto-rejects if the matched
+        # price is ABOVE it. The docs state it "guards against wrong-line matching".
+        # This is strictly stronger than our client-side _exceeds_odds_ceiling check,
+        # which can only judge the catalog price we saw BEFORE placing: max_odds also
+        # covers drift between price-check and placement. It can only ever PREVENT a
+        # bet, never place a bigger/extra one. Must be >= target_odds (caller enforces).
+        if max_odds:
+            payload["max_odds"] = max_odds
         poll_result = self._post_v3_async("/v3/place_bet", payload)
         if poll_result.get("success") is False and "statuses" not in poll_result:
             return poll_result

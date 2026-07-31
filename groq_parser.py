@@ -33,12 +33,65 @@ GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "").strip() or GROQ_MODEL
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "").strip() or GROQ_MODEL
 
 
+def _flag_repair_damaged_tips(parsed):
+    """v6.07 (sweep HIGH #8): after a REPAIR, a tip can come back missing a field
+    that decides which SIDE of a market we bet. The mid-key salvage drops the broken
+    field entirely, so a truncated `"selection":"under"` silently disappears and the
+    downstream matcher defaults to OVER — i.e. an UNDER tip placed as an OVER (a
+    wrong bet, not a failed one). Reproduced: a 2-tip payload truncated inside tip 2
+    returns tip 2 with selection=None.
+
+    So any repaired tip that lost a side/identity-critical field is marked
+    alert_only -> it routes to a MANUAL alert with the bet text instead of being
+    placed on a guessed side. Mirrors the existing 1-leg-SGM alert_only guard.
+    Applied at this single choke point so BOTH the Groq and the Claude-primary paths
+    (both call this function) are covered.
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    tips = parsed.get("tips")
+    if not isinstance(tips, list):
+        return parsed
+    for td in tips:
+        if not isinstance(td, dict):
+            continue
+        if td.get("alert_only"):
+            continue
+        # SGMs carry their sides per-leg in raw_legs; only judge non-SGM singles.
+        if td.get("is_sgm") or td.get("raw_legs"):
+            continue
+        _missing = []
+        _sel = td.get("selection")
+        _sel_empty = not str(_sel).strip() if _sel is not None else True
+        # A two-sided market is unbettable without the side. Thresholds ("N+")
+        # legitimately carry no selection (integer line + is_threshold, side implicit).
+        if _sel_empty and not td.get("is_threshold"):
+            _missing.append("selection")
+        if td.get("player") and td.get("line") in (None, ""):
+            _missing.append("line")
+        if _missing:
+            td["alert_only"] = True
+            td["alert_reason"] = (
+                f"JSON repair dropped {'/'.join(_missing)}: side/line unknown, "
+                f"place manually (never bet a guessed side)"
+            )
+            log.warning(
+                f"JSON repair damaged a tip (missing {_missing}) -> alert_only: "
+                f"{str(td)[:160]}"
+            )
+    return parsed
+
+
 def _parse_json_with_repair(content: str) -> Optional[dict]:
     """
     Parse Groq's JSON response, with repair for common truncation failures.
     Groq can truncate mid-response when hitting max_tokens, leaving unclosed
     braces/brackets. On 2026-04-23 a KAT tip arrived with JSON ending at
     '"alt_line": null}]' — missing the outer closing '}'.
+
+    v6.07: every REPAIR path routes its result through _flag_repair_damaged_tips so
+    a tip that lost its `selection` (side) can never be placed on a guessed side.
+    The clean fast path below is untouched.
     """
     # Fast path: clean JSON
     try:
@@ -129,6 +182,12 @@ def _validate_sgm_legs_after_repair(parsed: dict) -> dict:
                 f"H30: SGM tip has only {len(legs)} leg(s) after JSON repair — "
                 f"marking alert_only (manual review required)"
             )
+    # v6.07 (sweep HIGH #8): H30 only guards SGM LEG loss. A repaired SINGLE can also
+    # lose its `selection` (the over/under SIDE), which silently defaults to OVER —
+    # an UNDER tip placed as an OVER. Chain the side/line check here so every repair
+    # return path (both suffix-append and mid-key salvage, on the Groq AND
+    # Claude-primary parsers) is covered by one call.
+    parsed = _flag_repair_damaged_tips(parsed)
     return parsed
 
 

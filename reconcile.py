@@ -75,9 +75,79 @@ def _toks(s):
     ).split() if len(t) >= 3}
 
 
+def _market_contradicts(pending, market) -> bool:
+    """v6.07 (sweep HIGH #6): True when the pending record is provably the OTHER
+    racing market (win vs place) than the one we attempted.
+
+    Without this, an ambiguous PLACE attempt could "confirm" against the WIN bet
+    already sitting on the same account for the SAME runner: same event, same window,
+    same selection tokens, and a place stake is usually <= the win stake so the stake
+    gate passes too. That returns a false PLACED (the place bet is recorded as landed
+    when it never did) and, on the racing path, suppresses the spill that would have
+    filled it. Same-account win+place pairs on one runner are routine (38 such pairs
+    in logs/bets_placed.csv).
+
+    STRUCTURED FIELD ONLY, deliberately. The asymmetry matters:
+      - gate does NOT fire when it should  -> the pre-existing behaviour (a place
+        attempt may falsely 'confirm' against the win bet -> recorded placed ->
+        under-fill). Bad, bounded, and the status quo.
+      - gate fires when it should NOT (false-reject of a bet that DID land) ->
+        landed=False -> racing Tier-2 SPILL re-shops the same stake onto the next
+        bookie -> DOUBLE BET. Strictly worse.
+    So we only reject on an UNAMBIGUOUS structured market field. An earlier version
+    also inferred the market from a '(win)'/'(place)' token in the bet text, but a
+    log sweep found 10 '(win)' occurrences and ZERO '(place)' ones, and no bet_type
+    value anywhere — i.e. there is NO captured evidence that HyperBot labels PLACE
+    pending records with a '(place)' token. If it instead labels them with the win
+    convention (or omits the market), that text arm would false-reject a landed place
+    bet and spill it. Absent a real place-market sample, the text arm is not safe, so
+    it is gone: when the market is unknown we simply do not gate (unchanged behaviour,
+    no new risk). Revisit if a real PLACE pending_bets sample is ever captured.
+
+    ★ v6.07 AUDIT (2026-07-31) — SCHEMA NOW CAPTURED LIVE, AND THIS GATE IS INERT.
+    I read /api/pending_bets across all 37 active accounts (83 real racing records).
+    The record shape is:
+        [account_id, bet, bet_type, bookie_bet_id, dt, event, id, odds, result,
+         session_id, sport, stake, verified]
+    and the two fields this gate reads are BOTH unusable:
+      * `bet_type` is the PROMO field — it was "non_promo" on 83 of 83 records, never
+        win/place.
+      * there is NO `market` key at all (0 of 83 records have one).
+    The win/place label exists ONLY inside the `bet` TEXT ("Jarrito (win)").
+    So `bt` is always "non_promo" here and this function ALWAYS returns False in
+    production: the gate can never fire, which is money-SAFE (it cannot false-reject,
+    so it cannot cause the Tier-2 spill/double-bet above) but it is also DEAD as a
+    safety feature — the same phantom-field trap as the v6.06 #21 period guard.
+    DO NOT "fix" it by reading the bet text without new evidence: all 83 records were
+    "(win)", and the ledger confirms ZERO place bets were placed on the day those
+    records were created (2026-07-29), so their uniformity is fully explained by there
+    being no place bets to see — it is NOT evidence that HB labels places as "(win)",
+    but it is not evidence against it either. The hazard Wilson identified stands
+    unresolved. To resurrect this gate, capture a pending_bets record for a KNOWN place
+    bet first (place one deliberately, then read the endpoint while it is unsettled),
+    and only then key off whatever field that sample proves carries the market.
+    Pinned by test_reconcile_market_gate_is_inert_against_the_real_schema.
+    """
+    m = _norm(market)
+    if m not in ("win", "place"):
+        return False
+    # v6.07 audit: consult EVERY candidate field and take the first that actually
+    # carries a win/place label. The old `bet_type or market` chain short-circuited on
+    # the FIRST TRUTHY value, and bet_type is always the truthy promo string
+    # ("non_promo"), so the `market` fallback was unreachable -- meaning that even if
+    # HyperBot later starts emitting a real market field (the documented way to
+    # resurrect this gate) it would still never be read. No behaviour change today:
+    # with bet_type="non_promo" and no market key, this stays inert exactly as before.
+    for _field in ("bet_type", "market", "bet_market", "market_type"):
+        bt = _norm(pending.get(_field) or "")
+        if bt in ("win", "place"):
+            return bt != m
+    return False
+
+
 def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=None,
                         after_ts, now_ts=None, dt_grace_sec=DEFAULT_DT_GRACE_SEC,
-                        stake_tol=DEFAULT_STAKE_TOL):
+                        stake_tol=DEFAULT_STAKE_TOL, market=None):
     """True if a /api/pending_bets record is the bet we just attempted.
 
     Gates (all must pass):
@@ -123,6 +193,18 @@ def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=Non
         if ps and _norm(sport) and ps != _norm(sport):
             return False
 
+    # v6.07 (sweep HIGH #6): HARD win/place gate. A racing PLACE attempt must never
+    # confirm against the WIN bet on the same runner/account (or vice-versa) — every
+    # other gate (event, window, selection tokens, stake) passes for that pair.
+    if market and _market_contradicts(pending, market):
+        log.info(
+            f"reconcile: dt/event/stake matched but the pending bet is the "
+            f"OTHER market (attempted '{market}', pending "
+            f"bet_type={pending.get('bet_type') or pending.get('market')!r} "
+            f"bet={str(pending.get('bet'))[:60]!r}): rejecting (not our bet)"
+        )
+        return False
+
     if selection_text:
         # v5.57 (soundness check on v5.56): compare TOKEN SETS, not
         # substring-in-blob. The v5.56 version normalised the pending bet text
@@ -163,7 +245,8 @@ def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=Non
 def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
                       selection_text=None, after_ts,
                       max_wait_sec=DEFAULT_MAX_WAIT_SEC,
-                      poll_interval_sec=DEFAULT_POLL_INTERVAL_SEC):
+                      poll_interval_sec=DEFAULT_POLL_INTERVAL_SEC,
+                      market=None):
     """Poll /api/pending_bets until a matching bet appears or max_wait elapses.
 
     Returns:
@@ -188,7 +271,8 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
             api_ok_once = True
             for b in resp.get("bets", []):
                 if pending_bet_matches(b, event=event, stake=stake, sport=sport,
-                                       selection_text=selection_text, after_ts=after_ts):
+                                       selection_text=selection_text, after_ts=after_ts,
+                                       market=market):
                     log.info(
                         f"reconcile: LANDED — matched pending bet id={b.get('id')} "
                         f"bookie_bet_id={b.get('bookie_bet_id')} stake=${b.get('stake')} "
@@ -210,7 +294,7 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
 
 
 def decide_ambiguous(hb, account_id, *, event, stake, sport, selection,
-                     submit_ts, reconcile_enabled, spill_enabled):
+                     submit_ts, reconcile_enabled, spill_enabled, market=None):
     """Shared SLOW-REJECTION reconciliation decision used by BOTH main.py sports
     placement and racing_placer.py (lives here, not main.py, to avoid a circular
     import). Encodes Wilson's 2026-05-31 decisions on top of verify_bet_landed.
@@ -245,6 +329,9 @@ def decide_ambiguous(hb, account_id, *, event, stake, sport, selection,
         v = verify_bet_landed(
             hb, account_id, event=event, stake=stake, sport=sport,
             selection_text=selection, after_ts=submit_ts,
+            # v6.07 (sweep HIGH #6): racing win/place discriminator so a PLACE
+            # attempt can't confirm against the WIN bet on the same runner.
+            market=market,
         )
     except Exception as e:
         log.error(f"reconcile: verify_bet_landed raised: {e}")

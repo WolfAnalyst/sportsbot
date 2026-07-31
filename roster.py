@@ -177,9 +177,25 @@ def _load_rosters():
                 log.info(f"Loaded {len(roster)} players from {path.name}"
                          + (f" ({len(collisions)} same-name collisions)" if collisions else ""))
             except Exception as e:
-                log.warning(f"Failed to load {path}: {e}")
+                # v6.07 (sweep #28-adjacent): ERROR, not warning. A failed parse leaves
+                # `roster` EMPTY, and because `_loaded` is set True below and never
+                # reset, that empty cache stands for the WHOLE process lifetime: every
+                # player lookup for that sport fails and every tip silently routes to
+                # manual, behind what used to be a single log.warning. The writes are
+                # now atomic (tmp+replace) so a torn read should no longer be possible,
+                # but this must be loud if it ever happens again.
+                log.error(f"Failed to load {path}: {e} -- {path.name} will be EMPTY "
+                          f"for this process; every lookup for that sport will MISS "
+                          f"and route to manual until restart")
 
-        if cache == "_nba":
+        _prev = {"_nba": _nba_roster, "_nbl": _nbl_roster,
+                 "_afl": _afl_roster, "_mlb": _mlb_roster}[cache]
+        if not roster and _prev:
+            # Never swap a POPULATED cache for an empty one (only reachable on a
+            # re-load; harmless but correct).
+            log.error(f"{path.name} loaded 0 players: KEEPING the previous "
+                      f"{len(_prev)} in-memory entries")
+        elif cache == "_nba":
             _nba_roster = roster
         elif cache == "_nbl":
             _nbl_roster = roster
@@ -461,7 +477,49 @@ def _team_matches(roster_team: str, query_team: str) -> bool:
 
     r = roster_team.strip().lower()
     q = q_expanded.strip().lower()
-    return r == q or r in q or q in r
+    # v6.07 (sweep HIGH #13): the old `r in q or q in r` bidirectional SUBSTRING test
+    # leaked across DIFFERENT clubs, because AFL club names nest:
+    #   'Melbourne' in 'North Melbourne'  -> True
+    #   'Sydney'    in 'Greater Western Sydney' -> True
+    # Verified consequence: fuzzy_match_player('Xerri','afl',team='Melbourne',
+    # teams=['Melbourne','Carlton']) returned NORTH Melbourne's Tristan Xerri — a
+    # player on NEITHER event team — so a team-scoped lookup could still yield a
+    # wrong-club player and (with the event resolved from the other team) a bet on the
+    # wrong player entirely.
+    # Fix: exact match after stripping a trailing NICKNAME suffix, which is the same
+    # rule resolver._team_event_matches already uses correctly. That still accepts the
+    # legitimate short/long pairs ('Adelaide' == 'Adelaide Crows', 'Sydney' ==
+    # 'Sydney Swans') while rejecting the cross-club nests above ('north melbourne'
+    # has no strippable nickname, so it can never equal 'melbourne').
+    if r == q:
+        return True
+    return _strip_team_nickname(r) == _strip_team_nickname(q)
+
+
+# v6.07: nickname suffixes kept in step with resolver._AFL_NICKNAME_SUFFIXES. Only a
+# NICKNAME is strippable — 'Western Bulldogs'/'North Melbourne'/'Greater Western
+# Sydney' keep their distinguishing words, which is what stops the cross-club leak.
+_TEAM_NICKNAME_SUFFIXES = (
+    " swans", " crows", " lions", " cats", " suns", " eagles",
+    " hawks", " demons", " tigers", " magpies", " dockers",
+    " saints", " bombers", " blues", " power", " kangaroos",
+    " giants", " bulldogs",
+)
+
+
+def _strip_team_nickname(name_lower: str) -> str:
+    """Drop ONE trailing AFL nickname suffix so 'adelaide crows' == 'adelaide'.
+    'western bulldogs' -> unchanged ('Bulldogs' is the club, not a suffix to drop:
+    stripping it would leave 'western', which matches nothing). Same for
+    'greater western sydney' / 'north melbourne' — no nickname suffix present."""
+    n = (name_lower or "").strip()
+    for suf in _TEAM_NICKNAME_SUFFIXES:
+        if n.endswith(suf) and len(n) > len(suf):
+            base = n[: -len(suf)].strip()
+            # never strip down to a fragment that is itself only a direction word
+            if base and base not in ("western", "north", "south", "east", "west", "greater"):
+                return base
+    return n
 
 
 def _scope_roster_to_team(roster: dict, team: str) -> dict:
@@ -474,6 +532,53 @@ def _scope_roster_to_team(roster: dict, team: str) -> dict:
     return {k: v for k, v in roster.items() if _team_matches(v["team"], team)}
 
 
+# Generational suffixes are NOT surnames. They must be dropped before the surname
+# comparison in _passes_token_overlap_gate: 'Jr' (2 chars) is removed by the >=3-char
+# filter but the roster's 'Jr.' (3 chars) is not, so the query's surname token was
+# compared against the candidate's 'jr.' -> the RIGHT player was gated out and a wrong
+# same-surname one let through. See that function's v6.07 AUDIT note.
+_GEN_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v", "vi"}
+
+
+def _lone_token_drifts(query_parts: list, matched_name: str) -> bool:
+    """True when a SINGLE-token query only reaches `matched_name` via surname DRIFT.
+
+    v6.07 (sweep #27, self-caught regression) — and v6.07 AUDIT (2026-07-31): this rule
+    lived INLINE in fuzzy_match_player and was never applied to fuzzy_match_all, so the
+    drift class it exists to stop was still fully live there. Factored out so the two
+    call sites cannot drift apart again (the same lesson as reusing
+    groq_parser._slash_leg_dir for the pseudo-SGM key).
+
+    _passes_token_overlap_gate tolerates a 0.85 surname ratio so a typo'd FULL name still
+    resolves ("Nic Naitanui"), which is right for a multi-token query and catastrophic for
+    a bare one: once per-candidate gating stopped a rejected first-name shadow from
+    killing the whole list, that tolerance began surfacing a DIFFERENT surname. Measured
+    on the live rosters via fuzzy_match_all, where the WRONG player also sorted FIRST:
+    'Slawson'->A.J. Lawson (before Jalen Slawson), 'Swanson'->Matt Svanson (before Dansby
+    Swanson), 'Weissert'->Brandon Eisert, 'Greeves'->Ned Reeves, 'Eder'->Bryce Elder,
+    'Collins'->Ryan Rollins, 'Gardener'->Myron Gardner. main.py's NBA Stage B REWRITES
+    tip.legs[0].player from these candidates and etr_nba places a BLIND $400/unit
+    fan-out with no price check, so a wrong leader is a wrong-player bet.
+
+    Drift stays available for multi-token queries and via the explicit
+    afl_fuzzy_surname_candidates path (Eddie vision typos)."""
+    if len(query_parts) != 1:
+        return False
+    _toks = [t for t in (matched_name or "").strip().lower().split() if t]
+    return query_parts[0] not in _toks
+
+
+def _name_tokens_for_gate(name: str) -> list:
+    """Lowercased >=3-char name tokens with generational suffixes removed.
+
+    Falls back to the un-stripped tokens if stripping would empty the list, so a
+    degenerate query that is ONLY a suffix still behaves as before rather than
+    silently passing every candidate."""
+    toks = [t for t in (name or "").lower().split() if len(t) >= 3]
+    core = [t for t in toks if t.strip(".,").rstrip(".") not in _GEN_SUFFIXES]
+    return core or toks
+
+
 def _passes_token_overlap_gate(query: str, matched: str) -> bool:
     """Reject fuzzy matches that share no >=3-char tokens with the query.
 
@@ -484,12 +589,89 @@ def _passes_token_overlap_gate(query: str, matched: str) -> bool:
     Lifted from the singles-path gate in main.py so SGM leg resolution
     gets the same protection. Skips when the query is too short for the
     >=3-char filter to leave any tokens behind.
+
+    v6.07 (sweep HIGH #12): ANY shared token used to pass, so a shared FIRST name was
+    enough. Verified: 'Tyrese Haliburton' -> 'Tyrese Martin' and 'Jalen Green' ->
+    'Jalen Brunson' both passed. With a stale roster (a player missing) the fuzzy
+    matcher could drift to a DIFFERENT player on a DIFFERENT team and still clear this
+    gate, i.e. a wrong-player bet. First names are common; surnames identify. So the
+    gate now requires the SURNAME (last token) to correspond, with fuzzy tolerance so
+    genuine spelling/format drift still passes ('Brad Hill' vs 'Bradley Hill' share
+    the surname; 'Davies-Uniacke' and 'Wanganeen-Milera' are single surname tokens).
+    A first-name-only overlap no longer qualifies. Failing this gate routes to
+    manual/no-match, which is the safe direction.
+
+    v6.07 AUDIT (2026-07-31): GENERATIONAL SUFFIXES must be stripped before picking the
+    surname token, or this gate rejects the CORRECT player and lets a wrong same-surname
+    one through. 'Jr' is 2 chars so the >=3-char filter dropped it from the QUERY
+    ('Jaren Jackson Jr' -> surname 'jackson'), but the roster spells it 'Jr.' which IS 3
+    chars, so the CANDIDATE's last token became 'jr.'. ratio('jackson','jr.') is far
+    below 0.85, so 'Jaren Jackson Jr.' was gated OUT while 'Quenton Jackson' (last token
+    really is the surname) passed. Measured against v6.06: 4 WRONG-PLAYER swaps
+    ('Jaren Jackson Jr'->Quenton Jackson, 'Derrick Jones Jr'->Herbert Jones,
+    'Jabari Smith Jr'->Malachi Smith) and 7 outright losses ('Jimmy Butler',
+    'Kelly Oubre', 'Bobby Portis', 'Michael Porter Jr', 'Wendell Carter Jr',
+    'Tim Hardaway Jr', 'Gary Trent Jr'). All of those query shapes appear verbatim in
+    logs/tipbot.log, and NBA props run through this gate on a live $400/unit blind
+    fan-out, so it is a real wrong-bet path, not a theoretical one.
     """
-    orig_tokens = {t for t in query.lower().split() if len(t) >= 3}
+    orig_tokens = _name_tokens_for_gate(query)
     if not orig_tokens:
         return True
-    matched_tokens = set(matched.lower().split())
-    return bool(orig_tokens & matched_tokens)
+    matched_tokens = _name_tokens_for_gate(matched)
+    if not matched_tokens:
+        return False
+    q_sur, m_sur = orig_tokens[-1], matched_tokens[-1]
+    if q_sur == m_sur:
+        return True
+    # v6.07 AUDIT (2026-07-31): compare ACCENT-FOLDED too. Tipsters type ASCII, the roster
+    # is scraped WITH diacritics, and the fold makes an identical surname compare equal
+    # instead of scoring 0.714 ('vucevic' vs 'vučević') and being gated out. Real case:
+    # 'Nikola Vucevic' is in logs/tipbot.log and v6.06 resolved it correctly. This can
+    # only ever make genuinely-equal names match - it never brings a DIFFERENT surname
+    # closer ('vukcevic' folds to itself and still needs first-name corroboration below).
+    if _fold_accents(q_sur) == _fold_accents(m_sur):
+        return True
+    # spelling drift on the surname itself (e.g. 'mccartin' vs 'mcartin').
+    # v6.07 AUDIT (2026-07-31): a MULTI-token query must ALSO have a corresponding FIRST
+    # name. A real typo drifts ONE token, not both; surname drift ALONE admitted a
+    # DIFFERENT SAME-CLUB player whenever the tipped player was absent from the roster
+    # (a stale weekly refresh, a scrape hiccup, or a bad afl_name_overrides "remove" --
+    # the same threat model the #12 note above cites). Leave-one-out over the live AFL
+    # roster with the PRODUCTION call shape (team=own club + teams=fixture, which every
+    # AFL placement caller passes) found exactly 3 such pairs, and because the club is
+    # RIGHT every team/fixture guard waves them straight through to the HyperBot
+    # `player` field:
+    #     'Toby Greene' -> Tom Green      (both GWS,          ratio 0.909)
+    #     'Ned Reeves'  -> Ollie Greeves  (both Hawthorn,            0.923)
+    #     'Jeremy Howe' -> Noah Howes     (both Collingwood,         0.889)
+    # v6.06 returned {} for all three, so the Claude web-search club backstop ran and the
+    # bet placed with the tipster's own CORRECT spelling -- i.e. this diff turned three
+    # correct bets into wrong-player bets. Requiring the first name to correspond keeps
+    # the genuine typo corrections, because those drift the SURNAME while the first name
+    # is exact ('Will Aschroft'->Will Ashcroft, 'Moussa Diabate'->Moussa Diabate-accented).
+    # A LONE-token query never reaches production through this branch alone: both callers
+    # additionally apply _lone_token_drifts, the stricter exact-token rule.
+    # NOTE the candidate must have a first name to corroborate with: the NBA/MLB rosters
+    # carry ~1,300 bare-surname ALIAS entries whose `name` IS a single token, and letting
+    # those skip the first-name check reopened the whole hole via _upgrade_to_full_name --
+    # the ASCII query 'Nikola Vucevic' hit the alias `{'name': 'Vukcevic'}` on surname
+    # drift alone (ratio 0.933) and upgraded to **Tristan Vukcevic** (Washington), while
+    # the CORRECT 'Nikola Vučević' was rejected because the accents drop its ratio to
+    # 0.714. That is a real production query (it appears in logs/tipbot.log) and v6.06
+    # resolved it correctly, so a single-token candidate must NOT be an escape hatch.
+    if SequenceMatcher(None, q_sur, m_sur).ratio() >= 0.85:
+        if len(orig_tokens) == 1:
+            return True   # lone-token query: _lone_token_drifts is the stricter rule
+        if (len(matched_tokens) > 1
+                and SequenceMatcher(None, orig_tokens[0], matched_tokens[0]).ratio() >= 0.85):
+            return True
+    # A SINGLE-token query is a surname in this domain (Eddie posts bare surnames),
+    # so also accept it matching ANY token of the match — but only when the query is
+    # NOT the match's first name, which is exactly the hole above.
+    if len(orig_tokens) == 1 and q_sur in matched_tokens and q_sur != matched_tokens[0]:
+        return True
+    return False
 
 
 def _fold_accents(s: str) -> str:
@@ -645,8 +827,9 @@ def fuzzy_match_player(
         (post threshold + token-overlap gate) as a result dict, or {} if none.
         Extracted so we can try the team-scoped roster first and, on a miss,
         a guarded global fallback (Wilson 2026-05-31)."""
-        best_match = None
-        best_score = 0
+        # v6.07 (sweep #27): collect EVERY candidate above the threshold instead of
+        # keeping a running best. See the resolution block below for why.
+        scored = []  # [(score, roster_key, info)]
 
         for key, info in roster_subset.items():
             name_parts = key.split()
@@ -688,31 +871,115 @@ def fuzzy_match_player(
                 ).ratio()
                 score = max(score, last_score * 0.9)
 
-            if score > best_score:
-                best_score = score
-                best_match = info
+            if score >= threshold:
+                scored.append((score, key, info))
 
-        if best_match and best_score >= threshold:
-            # Token-overlap sanity gate: reject matches that share no
-            # meaningful tokens with the query. Catches "O'Sullivan" ->
-            # "Sullivan Robey" (apostrophe splits "o'sullivan" from
-            # "sullivan") and "Davis" -> "Hugh Davies" (different strings).
-            # Previously only enforced on the singles path in main.py;
-            # promoted here so SGM leg resolution gets the same protection.
-            # This gate is ALSO what makes the global fallback below safe.
-            if not _passes_token_overlap_gate(query_lower, best_match["name"]):
-                log.warning(
-                    f"Discarding suspicious fuzzy match: '{query}' -> "
-                    f"'{best_match['name']}' (score={best_score:.3f}) — "
-                    f"no shared name tokens"
+        if not scored:
+            return {}
+        scored.sort(key=lambda t: -t[0])
+
+        # Token-overlap sanity gate: reject matches that share no meaningful tokens
+        # with the query. Catches "O'Sullivan" -> "Sullivan Robey" (the apostrophe
+        # splits "o'sullivan" from "sullivan") and "Davis" -> "Hugh Davies".
+        #
+        # v6.07 (sweep #27): gate EVERY candidate in score order, not just the winner.
+        # Gating only the best match meant a rejected first-name shadow took a
+        # legitimate lower-scoring SURNAME match down with it: 'bailey' returned
+        # NOTHING even though Zac Bailey is the roster's only Bailey (shadowed by the
+        # several players whose FIRST name is Bailey), same for 'saad' -> Adam Saad and
+        # 'jackson' -> Luke Jackson. This mirrors what fuzzy_match_all already does.
+        survivors = []
+        for score, key, info in scored:
+            if not _passes_token_overlap_gate(query_lower, info["name"]):
+                log.debug(
+                    f"fuzzy: discarding '{info['name']}' for '{query}' "
+                    f"(score={score:.3f}) - no surname correspondence"
                 )
-                return {}
-            return _upgrade_to_full_name({
-                "name": best_match["name"],
-                "team": best_match["team"],
-                "score": round(best_score, 3),
-            }, sport)
-        return {}
+                continue
+            # v6.07 (sweep #27, self-caught regression): for a LONE token the surname
+            # must match EXACTLY - no drift. See _lone_token_drifts (shared with
+            # fuzzy_match_all, which the v6.07 audit found had NEVER had this guard).
+            if _lone_token_drifts(query_parts, info["name"]):
+                log.debug(
+                    f"fuzzy: discarding '{info['name']}' for lone token "
+                    f"'{query}' (surname drift, not an exact token)"
+                )
+                continue
+            survivors.append((score, key, _upgrade_to_full_name({
+                "name": info["name"],
+                "team": info["team"],
+                "score": round(score, 3),
+            }, sport)))
+        if not survivors:
+            # v6.07 (post-audit, Wilson 2026-07-31): LONE UNIQUE FIRST NAME, non-AFL only.
+            #
+            # #12/#27 make a lone token match a SURNAME, never a first name, because AFL
+            # tipsters post bare surnames and a first-name hit is the documented
+            # wrong-player hazard ('Daniel' -> Daniel Rioli instead of Caleb Daniel).
+            # But NBA tipsters post distinctive bare FIRST names, so that same rule broke
+            # them: 'Chet' (x12 in tipbot.log), 'Deni', 'Rudy', 'Daniss', 'Jaylin' all
+            # resolved to NOTHING even though each is the unique first name of exactly one
+            # player and is nobody's surname.
+            #
+            # Resolve ONLY when it is unambiguous: the token is not ANY player's surname,
+            # and exactly ONE player carries it as a first name. A shared first name (65 in
+            # the NBA roster: aaron/alex/anthony/...) or a token that is also a surname
+            # (21 of them) still refuses -> manual, same as before.
+            #
+            # SPORT-GATED to non-AFL so #27's AFL behaviour is untouched, and placed HERE,
+            # after `not survivors`, so it is PURELY ADDITIVE: every path that resolves
+            # today is unaffected because this only runs where the answer was already {}.
+            if len(query_parts) == 1 and (sport or "").lower() != "afl":
+                _tok = query_parts[0]
+                _as_first, _as_last = set(), False
+                for _k, _i in roster_subset.items():
+                    _p = _k.split()
+                    if len(_p) < 2:
+                        continue
+                    if _p[-1] == _tok:
+                        _as_last = True
+                        break
+                    if _p[0] == _tok:
+                        _as_first.add(_i["name"])
+                if not _as_last and len(_as_first) == 1:
+                    _nm = next(iter(_as_first))
+                    _hit = next(i for k, i in roster_subset.items() if i["name"] == _nm)
+                    log.info(f"fuzzy: lone token '{query}' is the UNIQUE first name of "
+                             f"'{_nm}' ({_hit['team']}) and nobody's surname -> resolved")
+                    return _upgrade_to_full_name(
+                        {"name": _nm, "team": _hit["team"], "score": 0.85}, sport)
+            return {}
+
+        # A TIE must NEVER be broken by roster-FILE ORDER. The surname branches above
+        # hard-code 0.85 (and 1.0 on an identical first+last), so same-surname players
+        # tie EXACTLY and the old `score > best_score` silently kept whichever row the
+        # JSON happened to list first. Measured on the live roster: 'daicos' ->
+        # Josh, not Nick; 'reid'/West Coast -> Harley, not Archer; 'jones' scoped to
+        # [Adelaide, Essendon] -> Chayce, but REVERSED to [Essendon, Adelaide] ->
+        # Harrison, so home/away ordering alone decided who the bet landed on. The
+        # weekly roster refresh could flip any of them. Dedupe on the UPGRADED name
+        # because surname-alias keys legitimately point at one player.
+        top = survivors[0][0]
+        tied = [s for s in survivors if s[0] == top]
+        if len({s[2]["name"] for s in tied}) > 1:
+            # Tier 1: an EXACT roster-key hit wins its own tie. This is a real bug fix,
+            # not just a tie-break: 'Bailey J. Williams' is an exact key (West Coast)
+            # yet lost to 'Bailey Williams' (Western Bulldogs) at score 1.0 = wrong
+            # player AND wrong club. Likewise NBA 'Trey Murphy III' -> 'Trey Jemison
+            # III' (both end in the 'iii' token, so the gate passed on the suffix).
+            # Tier 2: prefer a candidate whose SURNAME is the query's last token - the
+            # same preference main.py's NBA event-path disambiguator already applies.
+            for pref in ([s for s in tied if s[1] == query_lower],
+                         [s for s in tied if s[1].split()[-1] == query_parts[-1]]):
+                if len({s[2]["name"] for s in pref}) == 1:
+                    return pref[0][2]
+            log.warning(
+                f"AMBIGUOUS roster match for '{query}': "
+                f"{[(s[2]['name'], s[2]['team']) for s in tied]} all score "
+                f"{top:.3f} - refusing to guess (-> manual)"
+            )
+            return {}
+        return survivors[0][2]
 
     # Team filter: scope to that team's players only. If team is given but
     # the filter yields nothing (unrecognised team name), warn and match
@@ -863,6 +1130,19 @@ def fuzzy_match_all(
                     f"'{query}' (score={score:.3f}) — no shared name tokens"
                 )
                 continue
+            # v6.07 AUDIT (2026-07-31): the SAME lone-token no-drift rule as
+            # fuzzy_match_player. It was added there by sweep #27 but never here, so the
+            # wrong-player drift class stayed fully live on this path -- and worse, the
+            # drifted candidate often sorted FIRST ('Slawson' -> [A.J. Lawson, Jalen
+            # Slawson], 'Swanson' -> [Matt Svanson, Dansby Swanson]). main.py's NBA
+            # Stage B rewrites tip.legs[0].player from this list and etr_nba places a
+            # BLIND $400/unit fan-out with no price check, so the leader IS the bet.
+            if _lone_token_drifts(query_parts, info["name"]):
+                log.debug(
+                    f"fuzzy_match_all: discarding '{info['name']}' for lone token "
+                    f"'{query}' (surname drift, not an exact token)"
+                )
+                continue
             candidates.append({
                 "name": info["name"],
                 "team": info["team"],
@@ -997,6 +1277,38 @@ def afl_surname_candidates(token: str) -> list:
     return out
 
 
+def afl_first_name_owners(token: str) -> list:
+    """All AFL roster players whose FIRST name matches `token` (normalised).
+
+    v6.07 audit (2026-07-31). The complement of afl_surname_candidates, used ONLY to
+    detect that a bare token is AMBIGUOUS between two readings, never to resolve one.
+
+    afl_surname_candidates deliberately ignores first names so a lone token is read as
+    a SURNAME. That is the right default, but 19 real tokens are a surname for one
+    player AND the first name of a DIFFERENT one, and the surname reading is not
+    obviously the intended one:
+        'Bailey' -> Zac Bailey, yet 9 players are named Bailey (incl. Bailey Smith,
+                    a heavily-tipped disposals target at another club)
+        'Scott'  -> Bailey Scott, yet 'Scott' is Scott Pendlebury
+        'Luke'   -> Ryda Luke, yet 13 players' first name is Luke
+    Binding either reading is a GUESS, and by the standing rule (unsure -> MANUAL,
+    never guess a bet) the caller must refuse. Returns
+    [{"name": full_name, "team": team}, ...] — possibly empty."""
+    _load_rosters()
+    tok = _afl_token_norm(token)
+    if not tok:
+        return []
+    out = []
+    for _, info in _afl_roster.items():
+        name = info.get("name", "")
+        parts = name.split()
+        if len(parts) < 2:
+            continue
+        if tok == _afl_token_norm(parts[0]):
+            out.append({"name": name, "team": info.get("team", "")})
+    return out
+
+
 def afl_fuzzy_surname_candidates(token: str, threshold: float = 0.85) -> list:
     """v5.77: like afl_surname_candidates but FUZZY — AFL players whose surname is
     within `threshold` (difflib SequenceMatcher ratio) of the normalised `token`.
@@ -1085,8 +1397,12 @@ def update_roster_from_api():
             roster[p["full_name"]] = ""
 
     if roster:
-        with open(NBA_ROSTER_FILE, "w", encoding="utf-8") as f:
+        # v6.07: ATOMIC write (tmp+replace) so a concurrent _load_rosters can never
+        # read a TRUNCATED roster and cache it empty for the process lifetime.
+        _tmp = NBA_ROSTER_FILE.with_suffix(".json.tmp")
+        with open(_tmp, "w", encoding="utf-8") as f:
             json.dump(roster, f, indent=2, ensure_ascii=False)
+        os.replace(_tmp, NBA_ROSTER_FILE)
         log.info(f"Saved {len(roster)} entries to {NBA_ROSTER_FILE}")
 
     return roster
@@ -1202,8 +1518,12 @@ def update_mlb_roster_from_api(season: int = 2026):
         return {}
 
     if roster:
-        with open(MLB_ROSTER_FILE, "w", encoding="utf-8") as f:
+        # v6.07: ATOMIC write (tmp+replace) so a concurrent _load_rosters can never
+        # read a TRUNCATED roster and cache it empty for the process lifetime.
+        _tmp = MLB_ROSTER_FILE.with_suffix(".json.tmp")
+        with open(_tmp, "w", encoding="utf-8") as f:
             json.dump(roster, f, indent=2, ensure_ascii=False)
+        os.replace(_tmp, MLB_ROSTER_FILE)
         log.info(f"Saved {len(roster)} entries to {MLB_ROSTER_FILE}")
 
     return roster

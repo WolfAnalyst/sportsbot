@@ -15,6 +15,7 @@ Design guarantees:
 """
 import csv
 import os
+import re
 import logging
 from datetime import datetime
 from threading import Lock
@@ -83,6 +84,23 @@ def _num(v):
         return None
 
 
+def _direction_of(*candidates) -> str:
+    """First candidate yielding a whitelisted over/under direction, else "".
+
+    v6.07 (sweep #31). TOKEN-based on purpose: the old `"over" in selection.lower()`
+    substring test would label a horse named "Overlord" or a player "Overton" as an
+    OVER bet. Only a standalone over/under token counts, and anything else (a horse
+    name on a racing win row, a team on a handicap) correctly yields "" rather than a
+    made-up direction."""
+    for c in candidates:
+        toks = re.split(r"[^a-z]+", str(c or "").strip().lower())
+        if "over" in toks:
+            return "over"
+        if "under" in toks:
+            return "under"
+    return ""
+
+
 def _round2(v):
     n = _num(v)
     return round(n, 2) if n is not None else ""
@@ -142,12 +160,18 @@ def log_sports_bet(tip, result, account: str = "") -> None:
                     if getattr(result, "placed_line", None) is not None
                     else (legs[0].line if legs else ""))
             line = "" if line is None else line
-        side = ""
-        sel_low = str(selection).lower()
-        if "over" in sel_low:
-            side = "over"
-        elif "under" in sel_low:
-            side = "under"
+        # v6.07 (sweep #31): side used to be sniffed ONLY from the display selection,
+        # so it was filled when placed_selection happened to embed the word ("Colby
+        # McKercher Under") and BLANK when it was just the player name ("Lachie
+        # Neale") - 521 of 1,095 player_disposals rows blank, inconsistent within the
+        # SAME market. Prefer the STRUCTURED leg direction, which is set either way.
+        # Token-based, not substring: "over" in "Overlord"/"Overton" used to read as
+        # an OVER bet on a racing win row.
+        side = _direction_of(
+            (legs[0].selection if legs and not (is_sgm and len(legs) > 1) else ""),
+            getattr(result, "placed_selection", None),
+            selection,
+        )
         stake = _num(getattr(result, "stake", None))
         odds = _num(getattr(result, "odds", None))
         _write_row({

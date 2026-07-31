@@ -51,10 +51,13 @@ from config import (
     TELETHON_WATCHDOG_PROBE_TIMEOUT_SEC, TELETHON_WATCHDOG_FAIL_THRESHOLD,
     LOOP_FREEZE_WATCHDOG_ENABLED, LOOP_FREEZE_TICK_SEC,
     LOOP_FREEZE_CHECK_SEC, LOOP_FREEZE_MAX_SILENCE_SEC,
+    WORK_STALL_MAX_SILENCE_SEC,
     PLACEMENT_OFFLOAD_ENABLED, PLACEMENT_EXECUTOR_WORKERS,
     STARTUP_PENDING_RECONCILE_ENABLED, STARTUP_PENDING_RECONCILE_LOOKBACK_SEC,
+    STARTUP_DEAD_SESSION_ALERT, STARTUP_DEAD_SESSION_GRACE_SEC, STARTUP_DEAD_SESSION_MAX,
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
     SPORTSBET_MAX_STAKE_REBET,
+    HB_SEND_MAX_ODDS, HB_SEND_DIRECTION,
     SELF_BET_MAX_STAKE,
     EDDIE_CAPTION_FALLBACK_ENABLED,
     EDDIE_TEXT_PLACE_ENABLED,
@@ -96,15 +99,38 @@ import tip_parser  # v5.80: per-call Claude recovery layer (fallback + resolvers
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 
+# v6.07 (2026-07-29) ROOT CAUSE of the recurring "alive but SILENT" outages
+# (07-06 ~9.5h, 07-08 ~6h, 07-29 14.5h): this StreamHandler wrote every log line to
+# the launcher's CONSOLE. On Windows a console with QuickEdit Mode (default ON) BLOCKS
+# ALL WRITES while text is selected, so one stray click in that window blocks every
+# thread that logs - forever. Symptoms match exactly: process alive with near-zero
+# CPU; the asyncio liveness ticker keeps stamping (it does not log) so the freeze
+# watchdog correctly saw a healthy loop and never fired; telethon + the Tip Titans
+# poller both stopped because both log; and NOTHING was recorded about it (no
+# exception, no traceback) because logging itself was blocked.
+# Fix: only attach a console handler when stdout is a REAL TTY. Under the scheduled
+# task / tipbot.bat (which now redirects to logs\stdout.log) there is no TTY, so the
+# bot writes to FILES only - a file write cannot be paused by a mouse selection.
+# Set TIPBOT_FORCE_CONSOLE_LOG=1 to force it back on for interactive debugging.
+_log_handlers = [logging.FileHandler(LOG_DIR / "tipbot.log", encoding="utf-8")]
+try:
+    _want_console = bool(os.getenv("TIPBOT_FORCE_CONSOLE_LOG")) or (
+        sys.stdout is not None and sys.stdout.isatty()
+    )
+except Exception:
+    _want_console = False
+if _want_console:
+    try:
+        _log_handlers.insert(0, logging.StreamHandler(
+            open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)
+        ))
+    except Exception:
+        pass  # no usable stdout (pythonw / detached) -> file logging only
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(
-            open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)
-        ),
-        logging.FileHandler(LOG_DIR / "tipbot.log", encoding="utf-8"),
-    ],
+    handlers=_log_handlers,
 )
 log = logging.getLogger("tipbot")
 
@@ -171,10 +197,30 @@ async def _run_in_placement_executor(fn, *args):
 
 
 def _log_jsonl(path: Path, entry: dict):
-    entry["timestamp"] = datetime.now().isoformat()
-    with _AUDIT_LOCK:
-        with open(path, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+    """Append one audit/error record. NEVER raises.
+
+    v6.07 (sweep #15): this used to be bare, and it is the only file I/O on the
+    text-tip router's per-tip path (`_audit_tip`, called at the top of the loop
+    OUTSIDE any try). A locked `logs/audit.jsonl` (a rotation or the daily-review job
+    holding it -> PermissionError WinError 32) or a full disk therefore escaped
+    `_process_tip` -- which every caller launches fire-and-forget via
+    `asyncio.create_task` with no exception handler -- so the remaining tips in a
+    multi-tip message were never routed, never placed and never alerted, leaving only
+    asyncio's own "Task exception was never retrieved" in the log. It is also called
+    from inside the placement `except` handler, where a raise would mask the real
+    error. Audit logging must never be able to cost a bet: log the failure and carry
+    on. All 15 call sites are fire-and-forget; none depends on this raising."""
+    try:
+        entry["timestamp"] = datetime.now().isoformat()
+        with _AUDIT_LOCK:
+            with open(path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        try:
+            log.warning(f"audit write to {getattr(path, 'name', path)} FAILED "
+                        f"(tip processing continues): {e}")
+        except Exception:
+            pass
 
 
 def _audit_log_path():
@@ -394,6 +440,43 @@ def _exceeds_odds_ceiling(tipster: str, tipped_odds, matched_odds) -> bool:
     if t <= 1.0 or m <= 0:
         return False
     return m > t * mult
+
+
+def _bookie_max_odds(tipster: str, tipped_odds, target_odds=None):
+    """v6.07 (HB API doc 1.7.10x): the SAME ceiling policy as
+    _exceeds_odds_ceiling, expressed as the `max_odds` field HyperBot now accepts
+    on /v3/place_bet — the bookie auto-rejects a fill priced ABOVE it ("guards
+    against wrong-line matching" per the docs).
+
+    Why send it when we already check client-side: our check judges the CATALOG
+    price we saw before placing, so it cannot catch drift between the price-check
+    and the actual fill, nor a bookie matching a different rung at placement time.
+    max_odds closes that window at the bookie. It can only ever PREVENT a bet, never
+    place a larger or extra one.
+
+    Returns None (field omitted, unchanged behaviour) when the tipster has no
+    ceiling, the tipped odds are unusable, or the computed ceiling would be below
+    target_odds (the API requires max_odds >= target_odds).
+    Kill-switch: HB_SEND_MAX_ODDS.
+    """
+    if not HB_SEND_MAX_ODDS:
+        return None
+    mult = TIPSTERS_MAX_ODDS_MULT.get(tipster, MAX_ODDS_MULT)
+    if not mult or mult <= 1.0:
+        return None
+    try:
+        t = float(tipped_odds or 0)
+    except (TypeError, ValueError):
+        return None
+    if t <= 1.0:
+        return None
+    ceiling = round(t * mult, 2)
+    try:
+        if target_odds and ceiling < float(target_odds):
+            return None  # API requires max_odds >= target_odds
+    except (TypeError, ValueError):
+        pass
+    return ceiling
 
 
 # Min-odds FLOOR (price-moved / wrong-selection guard), symmetric to the
@@ -817,6 +900,27 @@ AMBIGUOUS_OUTCOME_PATTERNS = [
 #     slip was ever submitted (Bet365 empty-scrape, Redcliffe 2026-05-29).
 #   - "disabled at one or more hierarchy": Sportsbet refused to build the SGM
 #     slip at validation, nothing submitted (NBA SGM, 2026-05-29).
+# v6.07 (sweep HIGH #1/#5): the error-text signatures of HyperBot's THREE
+# "correlation id never resolved" envelopes (hyperbot_client _unwrap_single_status
+# timeout + H22 pending, and _post_v3_async's hard poll deadline). Such a bet CAN
+# still land after our poll window, so it must never be downgraded to a clean
+# not-placed and re-staked/hand-placed (DOUBLE STAKE). Prefer the structural
+# BetResult.cid_unresolved flag; this text match is the belt for any envelope that
+# predates it. Keep in sync with hyperbot_client.
+_CID_UNRESOLVED_MARKERS = (
+    "hard poll deadline",
+    "cid timeout",
+    "poll budget exhausted",
+    "bet status unknown",
+)
+
+
+def _err_is_cid_unresolved(err) -> bool:
+    """True if an error string is one of HyperBot's unresolved-cid envelopes."""
+    e = str(err or "").lower()
+    return any(m in e for m in _CID_UNRESOLVED_MARKERS)
+
+
 # Mirrors racing_placer.PRE_PLACEMENT_REJECT_PATTERNS - keep the two in sync.
 PRE_PLACEMENT_REJECT_PATTERNS = [
     "no_runners",
@@ -3148,7 +3252,14 @@ def _try_place_with_name_variants(
         and not getattr(tip, "_hc_catalog_consulted", False)
     ):
         leg0 = tip.legs[0]
-        if leg0.market in ("line", "first_half_line") and leg0.line is not None:
+        # v6.07 (sweep HIGH #2): FULL-GAME "line" ONLY. This blind sign-flip used to
+        # arm for `first_half_line` too, but the disarm flag (_hc_catalog_consulted)
+        # is only ever set in _execute_bet's `market == "line"` branch, so a PERIOD
+        # handicap never disarmed it — and the flipped retry resolves against the
+        # FULL-GAME catalog. An AusBets NBA "1u - Lakers 1st Half -5.5" could
+        # therefore place a FULL-GAME -5.5/+5.5 (wrong market, at $400/unit). A period
+        # handicap must stay EXACT-OR-MANUAL: no blind flip, no alt-line walk.
+        if leg0.market == "line" and leg0.line is not None:
             saved_line = leg0.line
             try:
                 flipped = -float(saved_line)
@@ -3195,7 +3306,10 @@ def _try_place_with_name_variants(
         and not getattr(tip, "_hc_catalog_consulted", False)
     ):
         leg0 = tip.legs[0]
-        if leg0.market in ("line", "first_half_line") and leg0.line is not None:
+        # v6.07 (sweep HIGH #2): FULL-GAME "line" ONLY — same reasoning as Path A
+        # above. Walking ±0.5/±1.0 off a PERIOD handicap resolves against the
+        # full-game catalog, i.e. a wrong-market bet. Period -> exact-or-manual.
+        if leg0.market == "line" and leg0.line is not None:
             try:
                 base_line = float(leg0.line)
             except (TypeError, ValueError):
@@ -4305,11 +4419,21 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
     re-bet is Tier-2 spill, deliberately OFF for sports."""
     import time as _t
     import reconcile as _recon
-    # Guard B (v6.03): did this ambiguous come from the #2 HARD poll deadline? If so
-    # HB never confirmed the cid resolved AT ALL, so a pending_bets 'not found' is far
-    # less trustworthy than in the normal fast/slow-reject case (the bet can still land
-    # after the ~30s reconcile window). See the not_placed branch below.
-    _hard_deadline = "hard poll deadline" in str(getattr(r, "error", "") or "").lower()
+    # Guard B (v6.03, BROADENED v6.07): did this ambiguous come from an UNRESOLVED
+    # CORRELATION ID? If so HB never confirmed the cid resolved AT ALL, so a
+    # pending_bets 'not found' is far less trustworthy than in the normal
+    # fast/slow-reject case (the bet can still land after the ~30s reconcile window).
+    # See the not_placed branch below.
+    # v6.07 (sweep HIGH #1/#5): this used to string-match ONLY "hard poll deadline",
+    # but hyperbot_client emits THREE unresolved-cid envelopes (cid timeout / poll
+    # budget exhausted / hard poll deadline). The other two were downgraded to a clean
+    # not-placed and then re-staked on sibling accounts AND hand-placed -> DOUBLE STAKE
+    # (2026-07-16 AFL s65465 $120; 2026-06-19 racing tip 62247). Now read the
+    # STRUCTURAL cid_unresolved flag, with the text match kept as a belt for any
+    # envelope that predates the flag.
+    _hard_deadline = bool(getattr(r, "cid_unresolved", False)) or _err_is_cid_unresolved(
+        getattr(r, "error", "")
+    )
     try:
         leg0 = tip.legs[0] if getattr(tip, "legs", None) else None
         sel = ""
@@ -9638,6 +9762,11 @@ def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
                 error=f"ambiguous ({'slow_rejection' if _slow else 'fast_ambiguous'}): "
                       f"{err[:120]}",
                 is_ambiguous=True, stake=step, elapsed_sec=_el,
+                # v6.07 (Batch A audit): set the STRUCTURAL flag on the SGM fan-out
+                # too. Guard B must not depend on the cid markers surviving inside
+                # this composed/truncated error string (err[:120]) — one HB rewording
+                # or a tighter slice would silently re-open the double-stake hole.
+                cid_unresolved=bool(resp.get("cid_unresolved", False)),
                 timestamp=datetime.now(),
                 placed_leg_summary=_format_tip_placement_summary(tip))
             try:
@@ -9694,6 +9823,8 @@ def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
                     r = BetResult(
                         success=False, tip=tip, session_id=sid, bookie=bk,
                         error=f"ambiguous (retry): {err[:120]}", is_ambiguous=True,
+                        # v6.07 (Batch A audit): structural flag, not text-dependent
+                        cid_unresolved=bool(resp.get("cid_unresolved", False)),
                         stake=step, elapsed_sec=_el, timestamp=datetime.now(),
                         placed_leg_summary=_format_tip_placement_summary(tip))
                     try:
@@ -9761,6 +9892,8 @@ def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
                         success=False, tip=tip, session_id=sid, bookie=bk,
                         error=f"ambiguous (max-stake rebet): {_err2[:120]}",
                         is_ambiguous=True, stake=_mx, elapsed_sec=_el,
+                        # v6.07 (Batch A audit): structural flag, not text-dependent
+                        cid_unresolved=bool(resp.get("cid_unresolved", False)),
                         timestamp=datetime.now(),
                         placed_leg_summary=_format_tip_placement_summary(tip))
                     try:
@@ -10265,7 +10398,15 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
                 # land after the poll window. not_placed -> leftover -> manual re-place
                 # -> LATE land = DOUBLE STAKE. Fall through to conservative
                 # (debit-as-placed), mirroring _reconcile_fanout_ambiguous's Guard B.
-                if _action == "not_placed" and "hard poll deadline" not in (err or "").lower():
+                # v6.07 (sweep HIGH #1/#5): broadened from the single "hard poll
+                # deadline" literal to EVERY unresolved-cid envelope (cid timeout /
+                # poll budget exhausted / hard deadline) — those bets can still land
+                # after the reconcile window, so they must stay ambiguous, never be
+                # downgraded to a clean not-placed. Mirrors _reconcile_fanout_ambiguous.
+                if _action == "not_placed" and not (
+                    bool(resp.get("cid_unresolved", False))
+                    or _err_is_cid_unresolved(err)
+                ):
                     # v5.55: pending_bets POSITIVELY confirmed nothing landed —
                     # no debit, no ambiguous critical; the stake stays in the
                     # orchestrator's leftover -> manual alert. Still STOP this
@@ -10288,6 +10429,8 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
                 r = BetResult(
                     success=False, tip=tip, session_id=sid, bookie=bookie,
                     error=f"ambiguous ({_reason}): {err[:120]}", is_ambiguous=True,
+                    # v6.07 (Batch A audit): structural flag, not text-dependent
+                    cid_unresolved=bool(resp.get("cid_unresolved", False)),
                     stake=_debit, elapsed_sec=_el, timestamp=datetime.now(),
                     placed_leg_summary=_format_tip_placement_summary(tip),
                 )
@@ -11625,6 +11768,16 @@ def _execute_bet(
     # Wraps only the HyperBot round-trip — local prep above is fast.
     import time as _time_mod
     _t_place_start = _time_mod.time()
+    # v6.07 (HB API doc 1.7.10x): send the documented over/under `direction` and the
+    # bookie-side `max_odds` ceiling. `direction` is defensive (HB already honours our
+    # side via selection+proposition_id — 763/763 correct in production); `max_odds`
+    # is a genuine new guard: the BOOKIE rejects a fill above our ceiling, which also
+    # covers price drift between the price-check and the fill (our client-side
+    # _exceeds_odds_ceiling can only judge the pre-placement catalog price). Both are
+    # omitted when unavailable, so behaviour is unchanged in that case.
+    _dir = (getattr(tip.legs[0], "selection", "") or "").strip().lower() if tip.legs else ""
+    _direction = _dir if (HB_SEND_DIRECTION and _dir in ("over", "under")) else None
+    _max_odds = _bookie_max_odds(tip.tipster, tip.suggested_odds, target_odds)
     resp = hb.place_single_sports_bet(
         session_id=sid,
         sport=tip.sport,
@@ -11637,6 +11790,8 @@ def _execute_bet(
         line=line,
         target_odds=target_odds,
         proposition_id=_resolved_prop_id,
+        direction=_direction,
+        max_odds=_max_odds,
     )
     _elapsed = round(_time_mod.time() - _t_place_start, 2)
 
@@ -11764,6 +11919,9 @@ def _execute_bet(
             # dropped — a fast ambiguous that the >=5s elapsed guard would miss).
             # The slow-rejection handlers also trigger on result.is_ambiguous.
             is_ambiguous=bool(resp.get("ambiguous", False)),
+            # v6.07 (sweep HIGH #1/#5): carry the STRUCTURAL unresolved-cid marker so
+            # Guard B never downgrades a maybe-landed bet to a clean not-placed.
+            cid_unresolved=bool(resp.get("cid_unresolved", False)),
             # v5.9x: bookie-stated allowable max stake on a stake-too-high (538)
             # reject (Sportsbet, HB v1.7.85). Read by the max-stake rebet so a
             # capped account fills at exactly this instead of laddering blindly.
@@ -12161,6 +12319,10 @@ async def _process_tip(text: str, tipster: str, sport: str,
         resolve_start = time.time()
         _audit_tip(tip, msg_time)
 
+        # v6.07 (sweep #15): False until place_tip is about to run, so the except
+        # handler can tell a pre-placement crash (safe to re-open for a re-send) from a
+        # post-placement one (bets may be ON -> keep the claim, never double-stake).
+        _place_attempted = False
         try:
             # v6.03: CLAIM the dedup fingerprint BEFORE we yield to the executor.
             # Dedup lives on the loop thread only; offloading place_tip introduces a
@@ -12178,6 +12340,9 @@ async def _process_tip(text: str, tipster: str, sport: str,
             if not skip_dedup:
                 _register_tip_fingerprint(tip, fp=_dupe_fp)
                 _inflight_fps.add(_dupe_fp)  # v6.03: block re-send for the WHOLE flight
+            # v6.07 (sweep #15): from here on a crash may follow a LANDED bet, so the
+            # except below must NOT release the re-send claim. See it for the detail.
+            _place_attempted = True
             if PLACEMENT_OFFLOAD_ENABLED:
                 results = await _run_in_placement_executor(place_tip, tip)
             else:
@@ -12228,9 +12393,24 @@ async def _process_tip(text: str, tipster: str, sport: str,
             # per-account errors inside the fan-out come back as failed BetResults,
             # not exceptions). A CancelledError is NOT caught here, so a cancelled
             # placement keeps BOTH claims (see the claim-before comment above).
+            #
+            # v6.07 (sweep #15): that "nothing fired" rationale holds only for a crash
+            # BEFORE place_tip. This try also spans the POST-placement bookkeeping
+            # (ledger write, notifier calls, jsonl), so a disk-full / locked-file /
+            # notifier raise AFTER the bets are on used to release the claim too, and a
+            # re-send inside DUPE_WINDOW_SECS would then re-fan-out onto accounts that
+            # already hold the bet = DOUBLE STAKE. _place_attempted splits the two: a
+            # provably pre-placement crash still re-opens the tip; a post-placement one
+            # KEEPS the claim (mirroring the image PASS-3 rule).
             if not skip_dedup:
                 _inflight_fps.discard(_dupe_fp)
-                _recent_tips.pop(_dupe_fp, None)
+                if not _place_attempted:
+                    _recent_tips.pop(_dupe_fp, None)
+                else:
+                    log.warning(
+                        "Crash occurred AFTER placement was attempted: KEEPING the "
+                        "dedup claim so a re-send cannot double-stake a landed bet"
+                    )
             log.exception(f"Bet placement error: {e}")
             _log_jsonl(ERROR_LOG, {
                 "type": "placement_exception", "tipster": tip.tipster,
@@ -12467,6 +12647,37 @@ for _mi, _mn in enumerate(
     _IMG_MONTHS[_mn[:3]] = _mi
 
 
+def _au_east_day(dt) -> "_date":
+    """The post's AUSTRALIAN-EASTERN calendar date, DST-correct.
+
+    v6.07 (sweep #25). Telethon's `event.date` is tz-aware UTC, so the local calendar
+    day must be derived before it can be used to pick a race MEETING. Three sites did
+    this by hand and one of them didn't do it at all:
+      * `_img_parse_racing_date` and the Leroy path added a hardcoded `+10h`
+      * the trackless Zak/Trial meeting resolver used the RAW UTC date, so a tip posted
+        00:00-10:00 AEST (= 14:00-24:00 UTC the previous day) asked the resolver about
+        YESTERDAY's meetings -> wrong or empty track. That is a 10-hour window every
+        day, and it covers exactly the morning slot these tipsters post in.
+    The `+10h` hardcode is also wrong under AEDT (UTC+11, roughly Oct-Apr), which
+    mis-dates the 00:00-00:59 local hour for about half the year.
+
+    A NAIVE datetime is already server-local, so it is returned as-is. Falls back to
+    the old +10h behaviour if the tz database is unavailable (Windows needs `tzdata`),
+    so this can never be worse than what it replaces."""
+    if dt is None:
+        return _date.today()
+    try:
+        if getattr(dt, "tzinfo", None) is None:
+            return dt.date()
+        try:
+            from zoneinfo import ZoneInfo
+            return dt.astimezone(ZoneInfo("Australia/Sydney")).date()
+        except Exception:
+            return (dt + _timedelta(hours=10)).date()
+    except Exception:
+        return _date.today()
+
+
 def _img_parse_racing_date(raw_date, msg_time) -> "str|None":
     """Convert a vision-extracted race date/day to ISO YYYY-MM-DD, anchored on
     the post time. Returns None when absent/unparseable — the caller's
@@ -12481,15 +12692,10 @@ def _img_parse_racing_date(raw_date, msg_time) -> "str|None":
     s = (raw_date or "").strip().lower()
     if not s:
         return None
-    # Anchor on the post's AEST calendar date (event.date is UTC; +10h, June=no
-    # DST). A naive msg_time (datetime.now fallback) is already local.
-    try:
-        anchor = msg_time
-        if getattr(anchor, "tzinfo", None) is not None:
-            anchor = anchor + _timedelta(hours=10)
-        base = anchor.date() if hasattr(anchor, "date") else _date.today()
-    except Exception:
-        base = _date.today()
+    # Anchor on the post's Australian-Eastern calendar date (event.date is UTC).
+    # v6.07: via _au_east_day, which is DST-correct (the old hardcoded +10h mis-dated
+    # the 00:00-00:59 local hour throughout AEDT).
+    base = _au_east_day(msg_time)
     m = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", s)
     if m:
         try:
@@ -12653,7 +12859,11 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
         try:
             import claude_parser
             import datetime as _dt
-            _date_str = msg_time.strftime("%Y-%m-%d") if msg_time else _dt.date.today().isoformat()
+            # v6.07 (sweep #25A): was msg_time.strftime(...) on the RAW UTC datetime, so
+            # a tip posted 00:00-10:00 AEST asked the resolver about YESTERDAY's
+            # meetings -> wrong/empty track -> a recoverable tip lost to manual (worst
+            # for trial_sniper, which has no Zak-style STAGE-1B catalog re-probe).
+            _date_str = _au_east_day(msg_time).isoformat()
             _resolved = None
             if tipster == "zak_racing":
                 # Zak is SA-only -> pass the SA thoroughbred candidate tracks so the
@@ -12785,6 +12995,25 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
                     channel_name,
                     f"(manual: missing race number) {parsed['title']} @ "
                     f"{parsed['tipster_odds'] or '?'} {parsed['track'] or ''}".strip(),
+                )
+                continue
+
+            # Guard 2b (v6.07, sweep #22): the row has NO runner NAME. Guard 1 only
+            # skips a row with no saddle AND no runner AND no odds, so a cropped horse
+            # name on an otherwise-complete row ({"saddle":7,"runner":null,"odds":4.2})
+            # sailed through to racing_placer as runner="" and BOUND A HORSE ANYWAY:
+            # Pass 2's substring test matches every runner ("" in rn is always True)
+            # and Pass 3 binds saddle #N with no name cross-check. The TEXT racing
+            # parsers strip these rows; the IMAGE parsers do not. racing_placer now
+            # refuses to price a nameless tip as well (defence in depth) — this arm
+            # makes it a LOUD manual instead of a silent no-price.
+            if not runner:
+                log.warning(f"[{channel_name}] racing tip {idx} has NO runner name -> manual")
+                notifier.notify_image_alert(
+                    channel_name,
+                    f"(manual: no runner NAME read) #{parsed.get('saddle') or '?'} "
+                    f"{parsed['track'] or '?'} R{parsed['race_num']} @ "
+                    f"{parsed['tipster_odds'] or '?'}".strip(),
                 )
                 continue
 
@@ -13237,8 +13466,17 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
     # field, or a 'half'/'quarter' marker left in any text field) and force the
     # tip to MANUAL. Wilson 2026-06-05 (the Hawthorn -5.5 2nd-half misparse).
     _period = (raw.get("period") or "").strip().lower()
-    _label = " ".join(str(raw.get(k) or "") for k in
-                      ("period", "market", "market_detail", "title", "selection")).lower()
+    # v6.07 (sweep #21): this free-text arm was 100% DEAD. IMAGE_PROMPT_AFL emits
+    # exactly player/team/stat/side/line/odds/bookie/units/period/market_type/
+    # description, so `market`, `market_detail`, `title` and `selection` are PHANTOM
+    # keys here (`market_detail` has ZERO assignments repo-wide; `market`/`selection`
+    # belong to the TEXT prompt, `title` to racing). _label therefore collapsed to the
+    # `period` string that arm 1 already checks, contributing no coverage at all.
+    # The ONE free-text field that can carry a dropped qualifier is `description`, so
+    # a vision read that puts the period ONLY there ("Hawthorn -5.5 2nd Half Line",
+    # period=null) used to place a FULL-GAME -5.5 (measured: alert_only=False,
+    # market='line', leg.period=''). Same phantom-field class as the v6.01 margin fix.
+    _label = " ".join(str(raw.get(k) or "") for k in ("period", "description")).lower()
     _partial_period = (
         (_period not in ("", "full", "match", "fulltime", "full time", "game", "full game")
          and any(w in _period for w in ("half", "quarter", "1st", "2nd", "3rd", "4th",
@@ -13523,8 +13761,22 @@ def _image_afl_conflicting_indices(raw_tips: list) -> set:
         mkt = (raw.get("market_type") or "").strip().lower()
         ln = _img_coerce_float(raw.get("line"))
         side = (raw.get("side") or "").strip().lower()
-        if ln is None or side not in ("over", "under"):
+        if ln is None:
             continue
+        if side not in ("over", "under"):
+            # v6.07 (sweep #16): a HANDICAP's two sides are the SIGN of the line on the
+            # two competing teams ("West Coast -7.5" / "Port Adelaide +7.5"), NEVER
+            # over/under. IMAGE_PROMPT_AFL only defines `side` for over/under markets
+            # and mandates the signed form for handicaps, so EVERY signed team_line row
+            # was dropped right here and the pair escaped the detector -> both sides of
+            # ONE fixture auto-placed at up to $1000 each, a guaranteed loss of the
+            # overround on a bet the tipster never made. (Measured: a -7.5/+7.5 pair
+            # returned set(); the totals over/under control correctly returned {0,1}.)
+            # An over/under-LABELLED team_line row keeps its explicit side, so the
+            # 2026-06-03 grid-over-read shape stays caught.
+            if mkt != "team_line" or ln == 0:
+                continue
+            side = "over" if ln > 0 else "under"
         period = _norm_period(raw.get("period"))
         if mkt == "player_prop":
             # v5.69 (m11): include stat + period so two DISTINCT props on the
@@ -13541,6 +13793,19 @@ def _image_afl_conflicting_indices(raw_tips: list) -> set:
             # sides escape the guard and auto-place. Resolving both team labels
             # to the event collapses them to one key. Falls back to the raw team
             # string if resolution fails.
+            team_raw = (raw.get("team") or raw.get("player") or "").strip()
+            try:
+                key_event = (resolve_afl_event(team_raw) or team_raw).lower()
+            except Exception:
+                key_event = team_raw.lower()
+            key = (mkt, key_event, period, round(abs(ln), 1))
+        elif mkt == "team_line":
+            # v6.07 (sweep #16): same event-resolution trick as totals above. The model
+            # writes the FAVOURITE on one row and the UNDERDOG on the other, so both
+            # team labels must resolve to the fixture to collapse into one key.
+            # round(abs(ln),1) is already sign-free, so -7.5 and +7.5 hash together.
+            # A resolve failure falls back to the raw team string = fail-OPEN (exactly
+            # today's behaviour), so this can never invent a false manual.
             team_raw = (raw.get("team") or raw.get("player") or "").strip()
             try:
                 key_event = (resolve_afl_event(team_raw) or team_raw).lower()
@@ -14236,10 +14501,8 @@ async def _process_leroy_betfair_tip(text, cfg, msg_time, channel_name):
         # morning tip would be the PREVIOUS AEST day -> the wrong day's card -> a
         # wrong-numbered runner. Leroy is DAY-OF ONLY, so this same-day date is the
         # bet date; we NEVER probe a next meeting (contrast _next_meeting_date).
-        anchor = msg_time or datetime.now()
-        if getattr(anchor, "tzinfo", None) is not None:
-            anchor = anchor + _timedelta(hours=10)
-        date_str = anchor.strftime("%Y-%m-%d")
+        # v6.07: _au_east_day is DST-correct (was a hardcoded +10h).
+        date_str = _au_east_day(msg_time or datetime.now()).strftime("%Y-%m-%d")
         # Per-race isolation: a crash in one race must NOT skip the others, and its
         # manual alert must name ONLY that race (an already-PLACED race's legs must not
         # be re-surfaced for a hand-back — the dedup fp only blocks the automated path).
@@ -14553,6 +14816,62 @@ _initial_session_state: dict = {}
 #     "alerted_critical": bool,  # 15-min Critical fired? prevents re-alert
 #   }
 _pending_drops: dict = {}
+
+
+def _dead_at_startup_sids(sessions: list) -> list:
+    """PURE (v6.07, sweep #29): priority-listed AND yaml-owned session ids that are NOT
+    active in `sessions`.
+
+    Excludes any id missing from sessions.yaml, via _is_owned_session -- measured on the
+    live config there are 23 priority-listed ids but only 22 in the yaml, the odd one
+    being the yaml-commented 100004. Without that filter it would page forever about an
+    account that is deliberately disabled.
+
+    Returns [] for an empty/failed poll: absence of data is NOT proof a session is down.
+    """
+    if not sessions:
+        return []
+    active = {str(s.get("session_id", "")) for s in sessions if s.get("active")}
+    try:
+        listed = session_priority.all_priority_session_ids()
+    except Exception as e:
+        log.warning(f"dead-at-startup: could not read the priority lists: {e}")
+        return []
+    return sorted(sid for sid in listed
+                  if str(sid) not in active and _is_owned_session(str(sid)))
+
+
+async def _startup_dead_session_check():
+    """v6.07 (sweep #29): after a grace window (HyperBot may still be logging sessions in
+    while tipbot boots), re-poll and hand any still-dead priority session to the
+    watchdog's pending-drop set, so the existing Step 2/3 logic emits the recovery INFO
+    or the 15-min Critical with the usual placeable-vs-inert severity split.
+
+    Alert-only. Nothing is started, placed or re-placed."""
+    try:
+        await asyncio.sleep(max(0, STARTUP_DEAD_SESSION_GRACE_SEC))
+        cur = await asyncio.to_thread(hb.get_sessions_or_none)
+        if cur is None:
+            log.info("Startup dead-session check: HB API unavailable, skipping")
+            return
+        dead = _dead_at_startup_sids(cur)[:max(0, STARTUP_DEAD_SESSION_MAX)]
+        if not dead:
+            log.info("Startup dead-session check: all priority sessions are active")
+            return
+        now = datetime.now()
+        for sid in dead:
+            _pending_drops.setdefault(str(sid), {
+                "first_seen_down": now,
+                "info": {"session_id": sid},
+                "alerted_critical": False,
+            })
+        log.warning(
+            f"Startup dead-session check: {len(dead)} priority session(s) were DEAD at "
+            f"startup {dead} - handed to the watchdog (Critical in "
+            f"{WATCHDOG_CRITICAL_AFTER_SEC // 60}m if still down)"
+        )
+    except Exception as e:
+        log.warning(f"Startup dead-session check failed: {e}")
 
 
 def _drop_label(sid: str, info: dict) -> str:
@@ -15014,6 +15333,28 @@ def _loop_is_frozen(ts: float, now: float) -> bool:
     return ts > 0 and (now - ts) > LOOP_FREEZE_MAX_SILENCE_SEC
 
 
+def _work_is_stalled(ts: float, now: float) -> bool:
+    """v6.07 (incident 2026-07-29): pure decision fn — True iff the WORK-liveness
+    stamp is ARMED (>0) and older than WORK_STALL_MAX_SILENCE_SEC.
+
+    WHY THIS EXISTS (the gap that cost 14.5h of tips on 2026-07-29):
+    _loop_is_frozen only answers "is the asyncio loop spinning?". On 07-29 the loop
+    WAS spinning — the process was alive (23 threads), the ticker kept stamping, so
+    the freeze watchdog correctly stayed quiet — but every unit of WORK had stopped:
+    the Tip Titans poller's last login was 01:36, its next (04:06) never happened, no
+    telethon updates after 01:43, and nothing was ingested or placed until a manual
+    restart at 16:19. A loop-liveness probe can never catch that.
+
+    So this checks PROGRESS instead of aliveness: tiptitans_processor.LAST_POLL_TS is
+    refreshed every ~10s by the poll loop REGARDLESS of whether any tips exist, so a
+    stale stamp means the poller task is dead/stalled. Disarmed (0.0) until the first
+    successful poll, so a fork with no Tip Titans credentials never false-fires.
+    Threshold is deliberately generous (default 30 min vs a 10s poll) so a slow
+    fetch, a 60s auth backoff, or a burst of concurrent placements can never trip it,
+    while still turning a 14.5h blackout into ~30 min."""
+    return ts > 0 and (now - ts) > WORK_STALL_MAX_SILENCE_SEC
+
+
 def _sync_freeze_alert(msg: str) -> None:
     """Best-effort SYNCHRONOUS Telegram alert from the watchdog thread. The async
     notifier is on the FROZEN loop and unusable, so this posts directly via requests
@@ -15043,22 +15384,51 @@ def _loop_freeze_tick(now: float) -> bool:
     when the loop looks alive; returns True only in tests that patch os._exit (in
     production os._exit terminates before the return)."""
     ts = _loop_heartbeat_ts
-    if not _loop_is_frozen(ts, now):
+    _frozen = _loop_is_frozen(ts, now)
+    # v6.07 (incident 2026-07-29): ALSO restart on a WORK stall. The loop can be
+    # perfectly alive while every unit of work has died — that is exactly what
+    # happened on 07-29 (14.5h with no ingestion or placement, watchdog correctly
+    # quiet because the loop was spinning). Read the poller's progress stamp lazily so
+    # a fork without Tip Titans (stamp stays 0.0 = disarmed) never false-fires.
+    _work_ts = 0.0
+    _stalled = False
+    if WORK_STALL_MAX_SILENCE_SEC and WORK_STALL_MAX_SILENCE_SEC > 0:
+        try:
+            import tiptitans_processor as _ttp
+            _work_ts = float(getattr(_ttp, "LAST_POLL_TS", 0.0) or 0.0)
+            _stalled = _work_is_stalled(_work_ts, now)
+        except Exception:
+            _stalled = False
+    if not _frozen and not _stalled:
         return False
-    age = now - ts
-    msg = (f"TipBot event loop FROZEN for {age:.0f}s "
-           f"(>{LOOP_FREEZE_MAX_SILENCE_SEC}s no tick) - force-restarting the "
-           f"process; tipbot.bat will relaunch. (incident-2026-07-17 self-recovery)")
+    if _frozen:
+        age = now - ts
+        msg = (f"TipBot event loop FROZEN for {age:.0f}s "
+               f"(>{LOOP_FREEZE_MAX_SILENCE_SEC}s no tick) - force-restarting the "
+               f"process; tipbot.bat will relaunch. (incident-2026-07-17 self-recovery)")
+    else:
+        age = now - _work_ts
+        msg = (f"TipBot WORK STALLED: no Tip Titans poll for {age:.0f}s "
+               f"(>{WORK_STALL_MAX_SILENCE_SEC}s) while the event loop was still "
+               f"alive - force-restarting the process; tipbot.bat will relaunch. "
+               f"(incident-2026-07-29: 14.5h of tips lost to exactly this)")
+    # v6.07: logging and the Telegram alert BOTH run in a bounded worker thread.
+    # log.critical() used to be called inline here, which is unsafe for the exact
+    # failure this watchdog must survive: if the process is blocked on a CONSOLE write
+    # (Windows QuickEdit text-selection - the root cause of the 07-06/07-08/07-29
+    # silent outages) then log.critical BLOCKS rather than raises, so the try/except
+    # does not help and os._exit is never reached. A blocked logger must never be able
+    # to stop the restart. If the worker hasn't finished in 12s we abandon it (daemon;
+    # killed by os._exit) and exit anyway.
+    def _notify_then_ignore():
+        try:
+            log.critical(msg)
+        except Exception:
+            pass
+        _sync_freeze_alert(msg)
+
     try:
-        log.critical(msg)
-    except Exception:
-        pass
-    # Run the alert in a worker thread with a BOUNDED join so a hung alert (e.g. a DNS
-    # stall that requests' connect/read timeout does not cover) can NEVER delay the
-    # guaranteed restart — the whole point of this watchdog. If it hasn't returned in
-    # 12s we abandon it (daemon; killed by os._exit below) and exit anyway.
-    try:
-        _t = threading.Thread(target=_sync_freeze_alert, args=(msg,),
+        _t = threading.Thread(target=_notify_then_ignore,
                               name="freeze-alert", daemon=True)
         _t.start()
         _t.join(timeout=12)
@@ -15543,6 +15913,16 @@ async def main():
     # Start session watchdog
     asyncio.create_task(_session_watchdog())
     log.info(f"Session watchdog started (poll every {WATCHDOG_INTERVAL_SEC}s)")
+
+    # v6.07 (sweep #29): report priority sessions that were DEAD at startup. The
+    # watchdog above can only see TRANSITIONS out of the already-active set, so a
+    # session logged out before we booted is invisible to it. Alert-only, grace-delayed.
+    if STARTUP_DEAD_SESSION_ALERT:
+        asyncio.create_task(_startup_dead_session_check())
+        log.info(f"Startup dead-session check scheduled "
+                 f"(in {STARTUP_DEAD_SESSION_GRACE_SEC}s, alert-only)")
+    else:
+        log.info("Startup dead-session check DISABLED (STARTUP_DEAD_SESSION_ALERT=false)")
 
     # v5.9x: telethon connection-liveness watchdog (2026-07-06 incident: the socket
     # went half-open ~9.5h, silent-deaf, no auto-reconnect). Gated by a kill-switch.

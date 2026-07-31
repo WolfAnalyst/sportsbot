@@ -108,6 +108,15 @@ class BetResult:
     # of a bet that may already exist). Accounted for separately in unfilled via
     # the ambiguous_outcomes list. 2026-05-30.
     is_ambiguous: bool = False
+    # v6.07 (sweep HIGH #1/#5): True when HyperBot NEVER resolved the correlation id
+    # (cid timeout / poll budget exhausted / hard poll deadline). The bet can still
+    # land AFTER our poll window closes, so this outcome must NEVER be downgraded to a
+    # clean "confirmed not-placed" and re-staked elsewhere (sibling redistribute,
+    # racing spill) or hand-placed — that is a DOUBLE STAKE. Guard B reads this FLAG
+    # instead of string-matching the error text, which previously matched only
+    # "hard poll deadline" and let the other two envelopes through (2026-07-16 AFL
+    # s65465 $120; 2026-06-19 racing tip 62247 neds:76345).
+    cid_unresolved: bool = False
     # v5.9x (2026-07-12): bookie-stated allowable max stake from a stake-too-high
     # (538) reject — Sportsbet surfaces it (HB v1.7.85, e.g. "max=$86.20" +
     # top-level max_stake). Read by the max-stake rebet (place at exactly this
