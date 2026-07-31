@@ -112,7 +112,18 @@ LOG_DIR.mkdir(exist_ok=True)
 # task / tipbot.bat (which now redirects to logs\stdout.log) there is no TTY, so the
 # bot writes to FILES only - a file write cannot be paused by a mouse selection.
 # Set TIPBOT_FORCE_CONSOLE_LOG=1 to force it back on for interactive debugging.
-_log_handlers = [logging.FileHandler(LOG_DIR / "tipbot.log", encoding="utf-8")]
+# v6.07 (2026-07-31): the unit suite must NOT write into the PRODUCTION log. Importing
+# main.py under pytest attached a FileHandler to logs/tipbot.log, so test runs injected
+# their own lines (`chat=-100`, `net down (test)`, `403 Cloudflare`, `401 Unauthorized
+# (simulated persistent outage)`) into the file used to diagnose real incidents. Today
+# that put 1,299 fake "persistent outage" lines and thousands of fake auth errors in the
+# middle of a genuine Tip Titans outage and actively slowed the diagnosis - the same class
+# of contamination `_audit_log_path()` was written to stop for audit.jsonl. Mirror it here.
+_LOG_FILE = LOG_DIR / "tipbot.log"
+if os.getenv("TIPBOT_TESTING"):
+    import tempfile as _tempfile
+    _LOG_FILE = Path(_tempfile.gettempdir()) / "tipbot_test_run.log"
+_log_handlers = [logging.FileHandler(_LOG_FILE, encoding="utf-8")]
 try:
     _want_console = bool(os.getenv("TIPBOT_FORCE_CONSOLE_LOG")) or (
         sys.stdout is not None and sys.stdout.isatty()
