@@ -428,7 +428,7 @@ def all_priority_session_ids() -> set[str]:
     """Union of every per-sport priority list — the session ids tipbot can
     actually auto-place on. Computed from the LIVE module-state priority
     config at call time (NOT a startup snapshot), so racing-only accounts
-    appended to RACING_SESSION_PRIORITY (100000/100001/99996/100002) are
+    appended to RACING_SESSION_PRIORITY (100000/99996/100002) are
     included the moment the config is (re)loaded. Single source of truth
     shared by log_startup_summary's "no priority assignment" diagnostic and
     the FIX 4 inert-crash severity partition (main.py watchdog +
