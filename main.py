@@ -2360,23 +2360,48 @@ def _disposals_selection_id(row: dict) -> str:
     return f"{_t(row.get('evt'))}~{_t(row.get('pid'))}~{line}~{_t(row.get('side'))}"
 
 
-def _disposals_priority_sessions() -> set:
-    """Session ids to sweep for outside exposure: every Sportsbet session that carries
-    an afl.player_disposals liability cap.
+def _disposals_sweep_sessions() -> list:
+    """The SESSION DICTS to sweep for outside exposure: every OWNED Sportsbet session
+    carrying an afl.player_disposals liability cap. Returns [] when the scope cannot be
+    determined, which every caller must treat as UNKNOWN rather than "no exposure".
+
+    ONE helper for both callers (the claim-time check and the hourly export). They each
+    used to fetch and filter separately, and only one of them used the fail-closed
+    get_sessions_or_none — a test caught the divergence.
 
     DERIVED from sessions.yaml rather than hardcoding the seven contract ids, so adding
     or retiring an account cannot leave this list silently stale — the orphan-id class
     sessions.yaml's own header calls 'the 100004 mistake'."""
-    out = set()
+    out = []
+    for sid, s in _disposals_priority_sessions().items():
+        out.append(s)
+    return out
+
+
+def _disposals_priority_sessions() -> dict:
+    """{session_id: session_dict} for the sweep scope. See _disposals_sweep_sessions."""
+    out = {}
     try:
-        for s in (hb.get_sessions() or []):
+        # get_sessions_or_none, NOT get_sessions: the latter collapses an API failure to
+        # [] , and an empty sweep set reads as "no exposure" which is the dangerous
+        # direction (2026-05-01: that same collapse made the watchdog fire 9 criticals).
+        rows = hb.get_sessions_or_none()
+        if rows is None:
+            log.warning("[disposals_model] session list unavailable (API failure) — "
+                        "sweep scope UNKNOWN, not empty")
+            return out
+        for s in rows:
             if str(s.get("bookie", "")).lower() != "sportsbet":
                 continue
             sid = str(s.get("session_id") or "")
-            if not sid:
+            # _is_owned_session keeps out other PCs sharing the HyperBot key; the cap
+            # lookup then narrows to accounts that actually carry a disposals ladder.
+            # Both are DERIVED from sessions.yaml, so retiring an account cannot leave
+            # this stale (the "100004 mistake" class).
+            if not sid or not _is_owned_session(sid):
                 continue
             if session_priority.lookup_liability_cap(sid, "afl", "player_disposals") is not None:
-                out.add(sid)
+                out[sid] = s
     except Exception as e:
         log.error(f"[disposals_model] could not resolve sweep sessions: {e}")
     return out
@@ -2429,11 +2454,8 @@ def _disposals_outside_exposure(row: dict):
     if not DISPOSALS_MODEL_RECONCILE_ENABLED:
         return 0.0, [], "disabled"
     try:
-        sessions = [
-            s for s in (hb.get_sessions() or [])
-            if str(s.get("bookie", "")).lower() == "sportsbet"
-            and str(s.get("session_id")) in _disposals_priority_sessions()
-        ]
+        import reconcile  # imported locally, as every other reconcile caller here does
+        sessions = _disposals_sweep_sessions()
         if not sessions:
             return 0.0, [], "unknown"
         exposure, errors = reconcile.collect_prop_exposure(hb, sessions, stat="disposals")
@@ -2665,6 +2687,125 @@ def _disposals_write_fill(row: dict, *, requested: float, placed: float,
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         log.error(f"[disposals_model] failed to append fill record: {e}")
+
+
+def _disposals_book_to_canonical(book_name: str):
+    """Best-effort AFL canonical spelling for a Sportsbet player name, or None.
+
+    DETERMINISTIC, not fuzzy: takes the surname, asks the roster for every player with
+    that surname, and returns a canonical name ONLY when exactly one candidate survives
+    a first-initial check. Anything ambiguous returns None, and None is emitted to the
+    model as an explicit null rather than a plausible guess — a plausible guess is
+    precisely what a fuzzy matcher produces on the day it is wrong, and this feeds a
+    double-stake guard. roster.fuzzy_match_player is deliberately NOT used (four
+    wrong-player regressions in v6.07)."""
+    toks = " ".join(str(book_name or "").split()).split()
+    if len(toks) < 2:
+        return None
+    try:
+        cands = afl_surname_candidates(toks[-1]) or []
+    except Exception:
+        return None
+    if not cands:
+        return None
+    init = toks[0][:1].casefold()
+    hits = [c for c in cands
+            if str(c.get("name", "")).strip()[:1].casefold() == init]
+    if len(hits) != 1:
+        return None
+    return str(hits[0].get("name") or "").strip() or None
+
+
+def _disposals_emit_reconciliation() -> tuple:
+    """Sweep the book and append one `type: "reconciliation"` SNAPSHOT record per
+    disposals selection carrying money, for the MODEL to read.
+
+    Returns (n_selections, total_dollars, status).
+
+    SNAPSHOT, never a delta: each record is the complete current picture for that
+    selection, so a later record REPLACES the earlier one on the model's side. Summing
+    successive sweeps would inflate exposure on every poll and progressively suppress
+    real bets. Agreed explicitly with the model side.
+
+    These records carry NO `key` — a bet placed outside tipbot never had a message — so
+    they are joined on (player, line, side, event). The model's loader accepts both
+    shapes; it originally filtered on `key` and would have discarded every one of these
+    silently, which is why the shape is spelled out here.
+
+    Deliberately gated on DISPOSALS_MODEL_RECONCILE_ENABLED and NOT on
+    DISPOSALS_MODEL_ENABLED: the tipster ships dormant, but the model has live tranches
+    and hand-placed money to reconcile RIGHT NOW, so the export must flow while the
+    placement side is still switched off."""
+    if not DISPOSALS_MODEL_RECONCILE_ENABLED:
+        return 0, 0.0, "disabled"
+    try:
+        import reconcile  # imported locally, as every other reconcile caller here does
+        sessions = _disposals_sweep_sessions()
+        if not sessions:
+            log.warning("[disposals_model] reconciliation sweep: no eligible sessions "
+                        "(treated as UNKNOWN, not as zero exposure)")
+            return 0, 0.0, "unknown"
+        exposure, errors = reconcile.collect_prop_exposure(hb, sessions, stat="disposals")
+    except Exception as e:
+        log.error(f"[disposals_model] reconciliation sweep crashed: {e}")
+        return 0, 0.0, "unknown"
+
+    status = "unknown" if errors else "ok"
+    if errors:
+        log.warning(f"[disposals_model] reconciliation sweep: {len(errors)} error(s) "
+                    f"{errors[:3]} — records marked status=unknown (NOT zero)")
+    observed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    total = 0.0
+    for (_pl, line, side), v in sorted(exposure.items(), key=lambda kv: -kv[1]["total"]):
+        book_player = v.get("player", "")
+        rec = {
+            "type": "reconciliation",
+            "source": "pending_bets",
+            "status": status,
+            "semantics": "snapshot",   # explicit: REPLACES any earlier record, never sums
+            "player_book": book_player,
+            "player": _disposals_book_to_canonical(book_player),  # null when ambiguous
+            "line": line,
+            "side": side,
+            "market": "player_disposals",
+            "events": v.get("events", []),
+            "stake_total": round(float(v["total"]), 2),
+            "accounts": v.get("accounts", []),
+            "observed_at": observed_at,
+        }
+        total = round(total + rec["stake_total"], 2)
+        try:
+            path = DISPOSALS_MODEL_FILLS_PATH
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            log.error(f"[disposals_model] failed to append reconciliation record: {e}")
+    log.info(
+        f"[disposals_model] reconciliation snapshot: {len(exposure)} disposals "
+        f"selection(s), ${total:,.2f} on the book, status={status}"
+    )
+    return len(exposure), total, status
+
+
+async def _disposals_reconciliation_loop():
+    """Hourly book-reconciliation sweep + export. Skips the 23:00-07:00 blackout, where
+    every session is intentionally down and a sweep would only produce status=unknown
+    noise. Exception-proof: this must never be able to take down the loop."""
+    if not DISPOSALS_MODEL_RECONCILE_ENABLED:
+        log.info("[disposals_model] reconciliation loop disabled")
+        return
+    log.info("[disposals_model] reconciliation loop started (hourly, skips the "
+             f"{DISPOSALS_MODEL_QUIET_START_HOUR}:00-{DISPOSALS_MODEL_QUIET_END_HOUR}:00 blackout)")
+    while True:
+        try:
+            if _disposals_in_quiet_window():
+                log.debug("[disposals_model] reconciliation: inside the blackout, skipping")
+            else:
+                await _run_in_placement_executor(_disposals_emit_reconciliation)
+        except Exception as e:
+            log.error(f"[disposals_model] reconciliation loop error: {e}")
+        await asyncio.sleep(3600)
 
 
 def _apply_disposals_model_stake(tip: ParsedTip) -> None:
@@ -16898,6 +17039,14 @@ async def main():
     # Start session watchdog
     asyncio.create_task(_session_watchdog())
     log.info(f"Session watchdog started (poll every {WATCHDOG_INTERVAL_SEC}s)")
+
+    # v6.08b: hourly book-reconciliation sweep + export for the disposals model.
+    # Gated on DISPOSALS_MODEL_RECONCILE_ENABLED and deliberately NOT on
+    # DISPOSALS_MODEL_ENABLED — the tipster ships dormant, but the model has live
+    # tranches and hand-placed money to reconcile now, so the export must flow while
+    # the placement side is still switched off.
+    if DISPOSALS_MODEL_RECONCILE_ENABLED:
+        asyncio.create_task(_disposals_reconciliation_loop())
 
     # v6.07 (sweep #29): report priority sessions that were DEAD at startup. The
     # watchdog above can only see TRANSITIONS out of the already-active set, so a
