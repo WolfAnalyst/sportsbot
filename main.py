@@ -15024,6 +15024,15 @@ async def _place_one_disposals_row(row: dict, msg_time, channel_name: str):
     start_utc = _disposals_parse_start_utc(row["start"])
     if start_utc is None:
         log.warning(f"[{channel_name}] {key}: unparseable start {row['start']!r} -> refused")
+        # Every PROCESSED message writes exactly one fill record, including the ones
+        # that place nothing. The model needs "a record exists saying nothing was
+        # placed" to be distinguishable from "no record at all / the file is broken":
+        # absence of feedback must mean "assume it is on", so a silent gap here would
+        # freeze that tranche forever.
+        _disposals_write_fill(row, requested=float(row["stake"]), placed=0.0,
+                              ambiguous=0.0, manual=False,
+                              committed=_disposals_committed(row),
+                              accounts=[], outcome="refused")
         notifier.notify_critical(
             f"⚠️ DisposalsModel: unparseable start time <code>{row['start']}</code> "
             f"for {row['player']} — refused, nothing placed.")
@@ -15033,6 +15042,10 @@ async def _place_one_disposals_row(row: dict, msg_time, channel_name: str):
         log.warning(
             f"[{channel_name}] {key}: start {start_utc.isoformat()} already passed "
             f"(now {now_utc.isoformat()}) -> REFUSED (never place in-play)")
+        _disposals_write_fill(row, requested=float(row["stake"]), placed=0.0,
+                              ambiguous=0.0, manual=False,
+                              committed=_disposals_committed(row),
+                              accounts=[], outcome="refused")
         notifier.notify_image_alert(
             channel_name,
             f"DisposalsModel: {row['player']} UNDER {row['line']} — bounce time has "
