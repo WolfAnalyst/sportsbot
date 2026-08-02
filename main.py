@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import unicodedata
-from datetime import datetime, date as _date, timedelta as _timedelta
+from datetime import datetime, date as _date, timedelta as _timedelta, timezone as _dt_timezone
 from pathlib import Path
 
 from telethon import TelegramClient, events
@@ -64,6 +64,21 @@ from config import (
     SA_THOROUGHBRED_TRACKS,
     AFL_PERIOD_MARKETS_ENABLED,
     SAIYAN_HC_SGM_ENABLED,
+    # v6.08 DisposalsModel (AFL player-disposals UNDER machine feed)
+    DISPOSALS_MODEL_ENABLED,
+    DISPOSALS_MODEL_MAX_STAKE,
+    DISPOSALS_MODEL_MAX_SELECTION_STAKE,
+    DISPOSALS_MODEL_TEST_MODE,
+    DISPOSALS_MODEL_TEST_STAKE,
+    DISPOSALS_MODEL_MIN_ODDS,
+    DISPOSALS_MODEL_WORSE_GATE,
+    DISPOSALS_MODEL_START_SLACK_SEC,
+    DISPOSALS_MODEL_MAX_PLAYERS_PER_EVENT,
+    DISPOSALS_MODEL_RETRY_ENABLED,
+    DISPOSALS_MODEL_QUIET_START_HOUR,
+    DISPOSALS_MODEL_QUIET_END_HOUR,
+    DISPOSALS_MODEL_STATE_PATH,
+    DISPOSALS_MODEL_FILLS_PATH,
 )
 from groq_parser import parse_tip_image
 from models import ParsedTip, ParsedLeg, BetResult
@@ -83,6 +98,17 @@ try:
     from parsers.leroy import parse_leroy_message
 except ModuleNotFoundError:
     parse_leroy_message = None
+try:
+    # v6.08 DisposalsModel machine feed — tipbot-only (the fork lacks it, and its
+    # SPORTSBOT_MODE filter drops the channel anyway). Tolerated absence keeps the
+    # fork booting; the name staying None makes the handler branch unreachable.
+    # NOTE the except clause: `from parsers import <name>` raises a PLAIN ImportError
+    # ("cannot import name ..."), NOT ModuleNotFoundError, when the submodule is
+    # absent — ModuleNotFoundError is a SUBCLASS, so catching only it would let the
+    # error through and crash the fork at import. Verified, not assumed.
+    from parsers import disposals_model as disposals_model_parser
+except ImportError:
+    disposals_model_parser = None
 from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
 from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
@@ -390,6 +416,12 @@ TIPSTERS_FORCE_BOOKIE["etr_nba"] = "sportsbet"
 # Dello AFL (2026-07-12): Sportsbet-only. _place_dello_single price-checks + places
 # on a single SB account; no SB session -> manual (never placed on another bookie).
 TIPSTERS_FORCE_BOOKIE["dello_afl"] = "sportsbet"
+# DisposalsModel (v6.08): Sportsbet-only, and this one is a STRATEGY constraint, not
+# just an availability one — the measured +18.35% ROI was on SPORTSBET's posted lines.
+# Another book's line at the same number is a different (untested) bet, so a missing
+# SB session must route to manual rather than shop elsewhere.
+DISPOSALS_MODEL_TIPSTER = "disposals_model"
+TIPSTERS_FORCE_BOOKIE[DISPOSALS_MODEL_TIPSTER] = "sportsbet"
 
 # ── Max-odds CEILING (wrong-selection sanity guard) ────────────────
 # Applies to ALL sports tipsters via the global MAX_ODDS_MULT (default 1.25×).
@@ -2223,6 +2255,339 @@ def _apply_dello_flat_stake(tip: ParsedTip) -> None:
     tip.unit_size = flat
 
 
+# ── DisposalsModel: persisted per-selection exposure ledger (v6.08) ──
+# WHY THIS EXISTS. The feed re-offers a tranche with a NEW `key` each tick, so every
+# in-memory dedup layer in this file lets it through BY DESIGN (they fingerprint
+# content in a 600s window; the retry arrives hours later with different content).
+# The upstream contract assumed Sportsbet's own liability limit would throttle the
+# repeat. It does not: at $500/7 = $71.43 a share against a floor(124/0.80) = $155
+# per-account stake ceiling there is 2.2x headroom, so a re-offer FILLS AGAIN and the
+# selection ends up at ~2x its intended size, every placement reporting clean success.
+#
+# So tipbot tracks it. Keyed on the SELECTION (evt, pid, line, side) rather than the
+# message key, because the whole point is to cap what accumulates ACROSS keys:
+#   committed  = dollars we believe are on (placed + ambiguous)
+#   target     = the largest tranche target seen for this selection
+#   keys       = every message key already processed (permanent, restart-surviving)
+# A repeat key is an upstream bug -> refuse + critical alert, never a second bet.
+_DISPOSALS_STATE_LOCK = threading.Lock()
+
+
+def _disposals_state_path() -> str:
+    """Resolved state path.
+
+    Read from the module global on EVERY call (never cached) so a test can
+    monkeypatch DISPOSALS_MODEL_STATE_PATH and be certain it is not writing to the
+    live ledger. There is no automatic TIPBOT_TESTING redirect here — tests must set
+    the path explicitly, which test_disposals_model.py's `state` fixture does."""
+    return DISPOSALS_MODEL_STATE_PATH
+
+
+def _disposals_load_state() -> dict:
+    """Load the exposure ledger. A MISSING file is a clean first run; a CORRUPT one
+    is NOT — returning {} there would silently reset every cap and re-admit every
+    key, so it is surfaced as corrupt and the caller refuses to place."""
+    path = _disposals_state_path()
+    if not os.path.exists(path):
+        return {"selections": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get("selections"), dict):
+            raise ValueError("unexpected shape")
+        return data
+    except Exception as e:
+        log.error(f"[disposals_model] state file unreadable ({e}) — FAILING CLOSED")
+        return {"selections": {}, "state_corrupt": True}
+
+
+def _disposals_save_state(state: dict) -> bool:
+    """Atomic tmp+replace so a kill mid-write cannot leave truncated JSON (which
+    would read back as corrupt and, before the fail-closed above, reset the caps).
+
+    Returns True on success. The CALLER MUST CHECK: a swallowed write failure at
+    claim time means the key + reservation were never persisted, so the very next
+    offer would be admitted again and double-stake. Fails CLOSED there."""
+    path = _disposals_state_path()
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=1)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        log.error(f"[disposals_model] failed to save state: {e}")
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def _disposals_committed(row: dict) -> float:
+    """Read-only: dollars already committed for this selection. Used so the fills
+    file reports a REAL `selection_committed` on the paths that place nothing —
+    that field is what the model computes its shortfall from, so writing 0.0 there
+    would tell it the whole tranche is still owed."""
+    try:
+        with _DISPOSALS_STATE_LOCK:
+            state = _disposals_load_state()
+            sel = state.get("selections", {}).get(_disposals_selection_id(row)) or {}
+            return round(float(sel.get("committed") or 0), 2)
+    except Exception:
+        return 0.0
+
+
+def _disposals_selection_id(row: dict) -> str:
+    """Selection identity: the bet itself, independent of which message carried it.
+
+    NORMALISED, because every cap in the ledger is keyed off this string: an emitter
+    that changes `CD_I1001` to `cd_i1001`, pads whitespace, or formats the line as
+    `24.50` instead of `24.5` would otherwise mint a BRAND NEW selection with a fresh
+    full allowance and walk straight past the exposure cap and the per-fixture cap.
+    Case-folded, stripped, and the line canonicalised through float()."""
+    def _t(v) -> str:
+        return str(v or "").strip().casefold()
+
+    try:
+        line = f"{float(row.get('line')):g}"
+    except (TypeError, ValueError):
+        line = _t(row.get("line"))
+    return f"{_t(row.get('evt'))}~{_t(row.get('pid'))}~{line}~{_t(row.get('side'))}"
+
+
+def _disposals_claim(row: dict):
+    """Admit or refuse this message, and return how much of it may be placed.
+
+    Returns (allowed_stake, reason). allowed_stake == 0.0 means DO NOT PLACE and
+    `reason` explains why (the caller alerts). Claims are written BEFORE placement
+    so a crash mid-flight cannot re-admit the same key on restart.
+    """
+    sel_id = _disposals_selection_id(row)
+    key = row["key"]
+    requested = float(row["stake"])
+    target = float(row["target"])
+    with _DISPOSALS_STATE_LOCK:
+        state = _disposals_load_state()
+        if state.get("state_corrupt"):
+            return 0.0, ("exposure ledger is CORRUPT — refusing to place until it is "
+                         "repaired (placing blind risks double-staking every open "
+                         "selection)")
+        sel = state["selections"].setdefault(
+            sel_id, {"committed": 0.0, "ambiguous": 0.0, "target": 0.0,
+                     "keys": [], "manual": False, "player": row.get("player", "")})
+
+        if key in sel["keys"]:
+            return 0.0, (f"repeat key {key!r} — the feed guarantees keys are unique, "
+                         f"so this is an UPSTREAM BUG. Dropped, not placed.")
+
+        if sel.get("manual"):
+            return 0.0, (f"selection {sel_id} previously routed to MANUAL — refusing "
+                         f"to auto-place a further offer against a bet that may have "
+                         f"been placed by hand")
+        if float(sel.get("ambiguous") or 0) > 0:
+            return 0.0, (f"selection {sel_id} has ${sel['ambiguous']:.2f} in an "
+                         f"AMBIGUOUS state (may have landed at the bookie after we "
+                         f"stopped waiting) — refusing a further offer (double-stake)")
+
+        if row["kind"] == "retry" and not DISPOSALS_MODEL_RETRY_ENABLED:
+            return 0.0, "kind=retry and DISPOSALS_MODEL_RETRY_ENABLED=false"
+
+        # Per-fixture player cap. The bound is CORRELATION, not turnover: every bet is
+        # an under, so N unders in one match behave close to one bet at N x the size
+        # and a high-possession blowout takes them together. The feed enforces this
+        # upstream; this is tipbot's independent backstop, because trusting an
+        # external system for a money bound is how you find out it regressed.
+        # Counts DISTINCT pids already carrying money in this fixture; a further
+        # tranche on a player already backed is free (it is the same correlated
+        # position, not a new one).
+        _cap = int(DISPOSALS_MODEL_MAX_PLAYERS_PER_EVENT or 0)
+        _this_live = (float(sel.get("committed") or 0)
+                      + float(sel.get("inflight") or 0))
+        if _cap > 0 and _this_live <= 0:
+            # Normalise the prefix the SAME way _disposals_selection_id does, or the
+            # startswith below never matches a stored id and the cap silently stops
+            # firing (caught by test_fifth_player_in_one_fixture_is_refused).
+            _evt_prefix = f"{str(row.get('evt') or '').strip().casefold()}~"
+            _this_pid = str(row.get("pid") or "").strip().casefold()
+            # Count INFLIGHT as backed too, else a same-tick burst of five messages
+            # for one fixture all pass the cap before any of them commits.
+            _backed = {
+                sid.split("~")[1]
+                for sid, s in state["selections"].items()
+                if sid.startswith(_evt_prefix) and len(sid.split("~")) > 1
+                and (float(s.get("committed") or 0) + float(s.get("inflight") or 0)) > 0
+            }
+            if _this_pid not in _backed and len(_backed) >= _cap:
+                return 0.0, (
+                    f"fixture {row.get('evt', '')} already has {len(_backed)} distinct "
+                    f"players backed (cap {_cap}) — refusing a {len(_backed) + 1}th. "
+                    f"The feed is supposed to enforce this upstream, so this firing "
+                    f"means the model's per-match cap has regressed."
+                )
+
+        # Cap against BOTH the tranche target the feed declared and tipbot's own
+        # independent per-selection ceiling, so a runaway emitter cannot walk a
+        # selection up by inflating `target`.
+        sel["target"] = max(float(sel.get("target") or 0), target)
+        ceiling = min(sel["target"], float(DISPOSALS_MODEL_MAX_SELECTION_STAKE))
+        # RESERVE, don't just check. `inflight` is stake claimed by an offer that is
+        # currently being placed but has not committed yet. place_tip runs in an
+        # executor, so a second message for the SAME selection is free to claim while
+        # the first is still in the air; without counting inflight, both would see the
+        # full headroom and both would place it (verified: two claims each returned
+        # $500 against a $500 target = $1000 down). This is the v6.03
+        # claim-before-place race in a new place.
+        inflight = float(sel.get("inflight") or 0)
+        headroom = round(ceiling - float(sel.get("committed") or 0) - inflight, 2)
+        if headroom <= 0:
+            return 0.0, (f"selection {sel_id} already has "
+                         f"${sel['committed']:.2f} committed"
+                         + (f" + ${inflight:.2f} in flight" if inflight > 0 else "")
+                         + f" of a ${ceiling:.2f} ceiling — nothing left to place")
+        allowed = round(min(requested, headroom), 2)
+        # Claim + reserve NOW, before placement, so neither a crash nor a concurrent
+        # offer can re-admit this money. Released in _disposals_commit.
+        sel["keys"].append(key)
+        sel["inflight"] = round(inflight + allowed, 2)
+        if not _disposals_save_state(state):
+            # FAIL CLOSED. If the claim did not persist, the key and the reservation
+            # do not exist as far as the next offer is concerned, so placing now
+            # would let the very next message re-place the same money.
+            return 0.0, ("could not persist the exposure ledger — refusing to place "
+                         "(an unpersisted claim would let the next offer double-stake)")
+        if allowed < requested:
+            log.info(
+                f"[disposals_model] {sel_id}: requested ${requested:.2f} but only "
+                f"${allowed:.2f} of headroom (committed ${sel['committed']:.2f} of "
+                f"${ceiling:.2f}) — placing the remainder only"
+            )
+        return allowed, ""
+
+
+def _disposals_commit(row: dict, placed: float, ambiguous: float,
+                      manual: bool, reserved: float = 0.0) -> float:
+    """Record the outcome and RELEASE the claim's reservation. Returns the
+    selection's new cumulative committed total.
+
+    `reserved` is what _disposals_claim put into `inflight` for this offer; it is
+    released here whatever the outcome, and replaced by the amount that actually
+    went on. MUST be called even when placement raised, or the reservation leaks and
+    permanently blocks the selection (fail-safe, but it would silently stop topping
+    up) — the caller uses try/finally for exactly that reason.
+
+    `ambiguous` dollars count toward committed: a maybe-landed bet must be treated as
+    ON for exposure purposes, never re-offered against (Guard B's reasoning, v6.03)."""
+    sel_id = _disposals_selection_id(row)
+    with _DISPOSALS_STATE_LOCK:
+        state = _disposals_load_state()
+        if state.get("state_corrupt"):
+            log.error(f"[disposals_model] cannot commit {sel_id}: state corrupt")
+            return 0.0
+        sel = state["selections"].setdefault(
+            sel_id, {"committed": 0.0, "ambiguous": 0.0, "target": 0.0,
+                     "keys": [], "manual": False, "player": row.get("player", "")})
+        if reserved:
+            sel["inflight"] = round(
+                max(0.0, float(sel.get("inflight") or 0) - float(reserved)), 2)
+        sel["committed"] = round(float(sel.get("committed") or 0)
+                                 + float(placed or 0) + float(ambiguous or 0), 2)
+        sel["ambiguous"] = round(float(sel.get("ambiguous") or 0)
+                                 + float(ambiguous or 0), 2)
+        if manual:
+            sel["manual"] = True
+        _disposals_save_state(state)
+        return sel["committed"]
+
+
+def _disposals_write_fill(row: dict, *, requested: float, placed: float,
+                          ambiguous: float, manual: bool, committed: float,
+                          accounts: list, outcome: str, event: str = "") -> None:
+    """Append one record to the fills file the MODEL reads back (contract §4).
+
+    This is the fill-feedback loop that lets the model's own ledger populate
+    Tranche.filled and emit a retry for the SHORTFALL instead of the full stake.
+    Keyed by the model's own `key` so the join is exact rather than fuzzy. Guarded:
+    a logging failure must never break placement."""
+    try:
+        rec = {
+            "key": row.get("key", ""),
+            "evt": row.get("evt", ""),
+            "pid": row.get("pid", ""),
+            "player": row.get("player", ""),
+            "team": row.get("team", ""),
+            "event": event,
+            "market": row.get("market", ""),
+            "side": row.get("side", ""),
+            "line": row.get("line"),
+            "kind": row.get("kind", ""),
+            "target": round(float(row.get("target") or 0), 2),
+            "requested": round(float(requested or 0), 2),
+            "placed": round(float(placed or 0), 2),
+            "unfilled": round(float(requested or 0) - float(placed or 0), 2),
+            "selection_committed": round(float(committed or 0), 2),
+            "accounts": accounts,
+            "outcome": outcome,
+            "ambiguous": round(float(ambiguous or 0), 2),
+            "manual": bool(manual),
+            "processed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        path = DISPOSALS_MODEL_FILLS_PATH
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.error(f"[disposals_model] failed to append fill record: {e}")
+
+
+def _apply_disposals_model_stake(tip: ParsedTip) -> None:
+    """v6.08: clamp a DisposalsModel tip's stake in the PLACING process.
+
+    The stake arrives as DOLLARS on the BET| line (not units), already set as
+    unit_size with units=1.0 so stake_dollars == that figure exactly. This re-applies
+    the ceilings HERE rather than trusting the parse, because the clamp must live in
+    the process that actually places (the $600 lesson, 2026-06-01: a "$1-capped" test
+    placed a real $600 bet because main.py had not been restarted after the .env
+    edit). Two ceilings:
+
+      * DISPOSALS_MODEL_TEST_MODE -> ignore the posted stake entirely and use
+        DISPOSALS_MODEL_TEST_STAKE. Mirrors _apply_dello_flat_stake.
+      * DISPOSALS_MODEL_MAX_STAKE -> hard per-message cap, the accidental-extra-zero
+        guard (a feed bug emitting stake=5000 must not place $5,000).
+
+    Downstream liability caps only ever reduce this further. No-op for any other
+    tipster. Mutates `tip`."""
+    if tip.tipster != DISPOSALS_MODEL_TIPSTER:
+        return
+    posted = round(float(tip.unit_size or 0), 2)
+    if DISPOSALS_MODEL_TEST_MODE:
+        flat = round(float(DISPOSALS_MODEL_TEST_STAKE), 2)
+        if flat <= 0:
+            return
+        if abs(posted - flat) > 0.001:
+            log.warning(
+                f"[disposals_model] TEST MODE: posted stake ${posted} -> forcing "
+                f"${flat} (DISPOSALS_MODEL_TEST_MODE=true; set it false + "
+                f"RESTART for production stakes)"
+            )
+        tip.units = 1.0
+        tip.unit_size = flat
+        return
+    capped = min(posted, round(float(DISPOSALS_MODEL_MAX_STAKE), 2))
+    if capped <= 0:
+        return
+    if abs(posted - capped) > 0.001:
+        log.warning(
+            f"[disposals_model] posted stake ${posted} exceeds the "
+            f"${DISPOSALS_MODEL_MAX_STAKE:.0f} cap -> capping to ${capped} "
+            f"(accidental-extra-zero guard)"
+        )
+    tip.units = 1.0
+    tip.unit_size = capped
+
+
 def _apply_self_bet_flat_stake(tip: ParsedTip) -> None:
     """v5.9x (Wilson 2026-07-12, 07-12 review #2): force a self-bet tip to a FLAT
     total stake = the (capped) dollar figure Wilson typed, regardless of any unit
@@ -2963,6 +3328,32 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
             return _place_sgm_v4(tip)
         return _place_sgm(tip)
 
+    # v6.08 DisposalsModel: its exact-line, price-floor and even-split guards all live
+    # inside _place_afl_fanout, so they are scoped to the PATH rather than to the
+    # tipster. AFL_CONCURRENT_FANOUT defaults true and is not pinned in .env, and
+    # config.py documents "set AFL_CONCURRENT_FANOUT=false to revert" — so ONE flag
+    # flip would route this feed to _place_singles_v4, which calls _execute_bet with
+    # presolved=None. That re-resolves with BARE DEFAULTS (exact_only=False), so
+    # _match_afl_player_prop silently snaps 24.5 -> 23.5 at full stake and reports a
+    # clean success, and _compute_alt_line_candidates then deliberately walks an under
+    # UP to line+1.0. Exactly the failure this feature exists to prevent.
+    # Refuse rather than place on an unguarded path: missing a bet is cheap.
+    if tip.tipster == DISPOSALS_MODEL_TIPSTER and (
+            USE_LEGACY_PLACEMENT or not AFL_CONCURRENT_FANOUT):
+        log.error(
+            "[disposals_model] AFL_CONCURRENT_FANOUT/USE_LEGACY_PLACEMENT would route "
+            "this tip to an UNGUARDED singles path (no exact-line lock, no price "
+            "floor, and an alt-line walk) -> routing to MANUAL instead"
+        )
+        tip.alert_only = True
+        tip.alert_reason = (
+            "DisposalsModel requires the AFL concurrent fan-out (exact-line lock + "
+            "price floor). AFL_CONCURRENT_FANOUT=false / USE_LEGACY_PLACEMENT=true — "
+            "place by hand at the EXACT line or re-enable the fan-out."
+        )
+        notifier.notify_manual_alert(tip)
+        return []
+
     # Single bet placement.
     # v4.0 uses _place_singles_v4 (liability-capped, multi-bookmaker price
     # comparison). Set USE_LEGACY_PLACEMENT=true in .env to fall back to
@@ -3412,6 +3803,12 @@ def _compute_alt_line_candidates(tip: ParsedTip) -> list[float]:
     # Threshold markets use integer lines via pick-your-own-line; ±1 doesn't
     # apply the same way. Skip to avoid sending bad payloads.
     if getattr(tip, "_is_threshold", False):
+        return []
+    # v6.08 DisposalsModel: NEVER walk this tipster's line. For every other tipster an
+    # alt line is a helpful fill; here the line IS the trigger and this function
+    # deliberately moves an under UP by 1.0, which is a materially different bet the
+    # model never selected. Exact line or nothing.
+    if getattr(tip, "tipster", "") == DISPOSALS_MODEL_TIPSTER:
         return []
     leg = tip.legs[0]
     market = leg.market or ""
@@ -5155,10 +5552,18 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # numeric cap (unlimited / mbl / none) we abandon weighting and keep the
     # even split, so weighting can never mis-size. The per-account targets still
     # get budget-capped at the unit + laddered DOWN on reject downstream.
+    # v6.08 DisposalsModel: EXPLICITLY EVEN, never capacity-weighted. Today the
+    # weighting would happen to produce an even split anyway (all seven accounts carry
+    # an identical player_disposals ladder [124, 99, 74, 50], so cap[0] is equal for
+    # each and the RATIO_CAP clamp is a no-op) — but that is an ACCIDENT OF YAML
+    # PARITY. Raise one account's cap for any unrelated reason and the split silently
+    # re-skews toward it, with no error and no test failing. The contract requires an
+    # equal 1:1 share, so take the even path deliberately rather than by coincidence.
+    _force_even_split = tip.tipster == DISPOSALS_MODEL_TIPSTER
     fanout_targets, fanout_decay = (
         _afl_fanout_targets(sessions, sport, liability_market, intended_stake,
                             tip.tipster, tip.units)
-        if AFL_FANOUT_WEIGHTED else ({}, None)
+        if (AFL_FANOUT_WEIGHTED and not _force_even_split) else ({}, None)
     )
     use_weighted = bool(fanout_targets)
     if use_weighted:
@@ -5193,9 +5598,15 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         # catalog 23.5 -> snap to 23.5 at any price). Odds-bearing tips keep the ±1
         # snap (their ceiling catches a bad snap). A no-odds miss -> manual.
         _no_tipster_odds = not (tip.suggested_odds and float(tip.suggested_odds) > 1.0)
+        # v6.08 DisposalsModel: the LINE IS THE TRIGGER, so the ±1.0 nearest-line snap
+        # must be OFF even though the tip carries a price. A silent 24.5 -> 23.5 snap
+        # places a bet the model never selected, at full stake, and reports it as a
+        # clean success; one disposal is worth roughly 7 probability points against a
+        # 3.5-disposal edge. Exact line or manual — missing a bet is cheap.
+        _exact_only = _no_tipster_odds or tip.tipster == DISPOSALS_MODEL_TIPSTER
         _resolved, _manual = _resolve_single_for_placement(
             tip, sess, apply_ceiling=True, apply_floor=False,
-            exact_only=_no_tipster_odds,
+            exact_only=_exact_only,
         )
         resolved_by_bookie[bk] = _resolved  # None when routed to manual
         if _manual is not None:
@@ -5206,6 +5617,46 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     _tm = getattr(tip, "_timing", None)
     if isinstance(_tm, dict):
         _tm["price_check_sec"] = round(_time_mod.time() - _pc_t0, 3)
+
+    # v6.08 DisposalsModel price gates (Wilson 2026-08-01). Two floors, both applied
+    # to the LIVE catalog price, on top of the existing 1.25x MAX_ODDS_MULT ceiling:
+    #   (1) ABSOLUTE floor DISPOSALS_MODEL_MIN_ODDS (1.70) — the model itself refuses
+    #       to TIP below 1.70, so tipbot must refuse to PLACE below it. Break-even is
+    #       ~1.57 at the measured 63.8% hit rate, so a drifted line is real edge lost.
+    #   (2) WORSE gate — live more than DISPOSALS_MODEL_WORSE_GATE (10%) below the
+    #       posted price means the line moved against us since the tip fired.
+    # Either -> the WHOLE tip routes to manual, never a partial placement at a price
+    # the strategy was not measured at.
+    if tip.tipster == DISPOSALS_MODEL_TIPSTER:
+        _dm_live = next((r.get("live_odds") for r in resolved_by_bookie.values()
+                         if r and r.get("live_odds")), None)
+        try:
+            _dm_live = float(_dm_live) if _dm_live is not None else None
+        except (TypeError, ValueError):
+            _dm_live = None
+        _dm_posted = float(tip.suggested_odds or 0) or None
+        _dm_reason = ""
+        if _dm_live is None:
+            if any(r for r in resolved_by_bookie.values() if r):
+                _dm_reason = "no live Sportsbet price for this exact line"
+        elif _dm_live < float(DISPOSALS_MODEL_MIN_ODDS):
+            _dm_reason = (f"live SB {_dm_live} is below the "
+                          f"{float(DISPOSALS_MODEL_MIN_ODDS)} floor (the model would "
+                          f"not have tipped it at this price)")
+        elif (_dm_posted is not None
+              and _dm_live < _dm_posted * (1.0 - float(DISPOSALS_MODEL_WORSE_GATE))):
+            _dm_reason = (f"live SB {_dm_live} is >"
+                          f"{int(float(DISPOSALS_MODEL_WORSE_GATE) * 100)}% below the "
+                          f"posted {_dm_posted} — the line moved against us")
+        if _dm_reason:
+            log.info(f"[disposals_model] price gate -> WHOLE TIP MANUAL: {_dm_reason}")
+            for _bk in list(resolved_by_bookie):
+                resolved_by_bookie[_bk] = None
+                manual_by_bookie.setdefault(_bk, BetResult(
+                    success=False, tip=tip, bookie=_bk,
+                    error=f"disposals price gate: {_dm_reason}",
+                    timestamp=datetime.now(),
+                ))
 
     # v6.00 (review A-HIGH + Wilson's band): a NO-tipster-odds bet (the lone no-odds
     # Eddie player-prop fall-through) has an inert odds ceiling/floor, so enforce
@@ -5587,7 +6038,19 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # placed. If unfilled <= $1 there is nothing to place by hand, so suppress it
     # (the BET PLACED summary already reports the failed/recovered account; the
     # daily review tracks the per-account failure pattern).
-    if unfilled > 1.0:
+    # v6.08: DisposalsModel owns its own shortfall — the model re-offers the unfilled
+    # remainder on its next tick, and tipbot's exposure ledger caps the top-up at the
+    # tranche target. Telling Wilson to ALSO place it by hand is therefore a genuine
+    # double-stake vector (hand-place + the model's re-offer), so the alert is
+    # downgraded to a log line for this tipster only. Every other tipster is
+    # untouched: for them an unfilled remainder really does need a human.
+    if unfilled > 1.0 and tip.tipster == DISPOSALS_MODEL_TIPSTER:
+        log.info(
+            f"[disposals_model] ${unfilled:.2f} unfilled of ${display_intended:.2f} "
+            f"— NOT alerting for a hand-place (the model re-offers the shortfall and "
+            f"the exposure ledger caps the top-up at the tranche target)"
+        )
+    elif unfilled > 1.0:
         log.warning(
             f"AFL fan-out: ${unfilled:.2f} unfilled "
             f"({len(failed_results)} account(s) failed)"
@@ -11191,7 +11654,15 @@ def _resolve_single_for_placement(
     handicap/total/SGM/racing via presolved=None) keeps BOTH (the defaults).
     The catalog line resolver + empty-selection guard are ALWAYS applied — a
     blind POST of an unresolved line places $0 (the Jaxon Prior failure).
+
+    v6.08: `exact_only` is forced ON for DisposalsModel HERE, at the choke point,
+    regardless of what the caller passed. Its exact-line rule is a MONEY invariant, so
+    leaving it to one call site meant any other caller could re-arm the ±1.0 snap
+    silently — including _execute_bet's own presolved=None re-resolve, which uses the
+    bare defaults. Making it intrinsic to the resolver closes every path at once.
     """
+    if getattr(tip, "tipster", "") == DISPOSALS_MODEL_TIPSTER and not exact_only:
+        exact_only = True
     leg = tip.legs[0]
     sid = str(session["session_id"])
     bookie = session.get("bookie", "unknown")
@@ -14402,6 +14873,332 @@ async def _process_self_bet(text: str, msg_time, channel_name: str):
                        msg_time, channel_name, skip_dedup=True)
 
 
+def _disposals_in_quiet_window(now=None) -> bool:
+    """True inside the scheduled HyperBot blackout (default 23:00-07:00 local).
+
+    Bookie sessions are turned off overnight to conserve data, but this feed posts
+    hourly THROUGH the night, so ~8 messages a night arrive with no session to place
+    on. Inside the window the manual ping is suppressed to a log breadcrumb: the feed
+    re-offers hourly and no AFL game starts before 07:00, so nothing is lost and the
+    alternative is eight false 'place by hand' pages every night.
+
+    Handles a window that wraps midnight (start > end)."""
+    now = now or datetime.now()
+    start = int(DISPOSALS_MODEL_QUIET_START_HOUR)
+    end = int(DISPOSALS_MODEL_QUIET_END_HOUR)
+    if start == end:
+        return False
+    h = now.hour
+    return (h >= start or h < end) if start > end else (start <= h < end)
+
+
+def _disposals_parse_start_utc(raw: str):
+    """Parse the BET| `start` field to an AWARE UTC datetime, or None.
+
+    main.py works in NAIVE local datetimes almost everywhere and does not import
+    `timezone`, so comparing an aware ISO timestamp against datetime.now() raises
+    TypeError — inside the crash-guarded dispatcher that would turn 100% of the feed
+    into manual alerts (resolver.py:220-226 documents this exact class biting
+    before). So parse explicitly and return an AWARE value the caller compares
+    against an AWARE now."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        # REFUSE a naive value rather than guess. The contract says UTC with a
+        # trailing Z, so naive is a contract breach — and guessing is dangerous in
+        # BOTH directions here: if the emitter actually sent local AEST, reading it
+        # as UTC puts the bounce 10-11 HOURS LATER than reality, which is the
+        # PERMISSIVE direction and would wave an already-started game through the
+        # in-play gate. Returning None routes it to a loud refusal instead.
+        return None
+    return dt.astimezone(_dt_timezone.utc)
+
+
+def _build_disposals_tip(row: dict, msg_time) -> ParsedTip:
+    """Build a ParsedTip DIRECTLY from a validated BET| row — no LLM round-trip.
+
+    Deliberately NOT routed through _process_tip/route_message like the self-bet
+    channel is: that path reconstructs natural language and re-parses it with an LLM,
+    which is exactly the re-interpretation risk this feed exists to avoid. For this
+    strategy the LINE IS THE TRIGGER.
+
+    Note `market` on the leg is the literal "player_prop", NOT the BET| line's
+    `market=player_disposals`. That field is a schema ASSERTION; the HyperBot
+    resolver only maps AFL player props under market == "player_prop" and derives
+    "player_disposals" itself from the stat. Copying it through would route every
+    tip to manual."""
+    leg = ParsedLeg(
+        market="player_prop",
+        team_full=row["team"],
+        player=row["player"],
+        stat="disposals",
+        line=float(row["line"]),
+        selection="under",
+        raw_text=row["raw"],
+    )
+    tip = ParsedTip(
+        tipster=DISPOSALS_MODEL_TIPSTER,
+        sport="afl",
+        is_sgm=False,
+        legs=[leg],
+        # Stake arrives as DOLLARS. units=1.0 x unit_size=<dollars> makes
+        # stake_dollars exactly the posted figure; _apply_disposals_model_stake
+        # then re-clamps it in the placing process.
+        units=1.0,
+        unit_size=float(row["stake"]),
+        raw_message=row["raw"],
+        timestamp=msg_time,
+        suggested_bookie="sportsbet",
+        suggested_odds=float(row["price"]),
+        units_explicit=True,
+    )
+    # Carried for the placement gates + the fills record; not part of ParsedTip's
+    # schema, so attached dynamically the way other paths attach _timing.
+    tip._disposals_row = row
+    return tip
+
+
+async def _process_disposals_model_tip(text: str, msg_time, channel_name: str):
+    """v6.08: ingest one DisposalsModel message (contract DISPOSALS_MODEL_CONTRACT_v2.md).
+
+    Regex-only. A message with no BET| line is chatter and drops silently; a message
+    WITH one that fails validation is REFUSED LOUDLY (never silently dropped, and
+    never handed to an LLM to reinterpret). Each valid row is gated on start time and
+    the exposure ledger, then placed through the normal AFL fan-out so it inherits
+    the audited ladder, the 538 max-stake rebet, ambiguous/Guard-B handling, the
+    Telegram summary and the bets_placed.csv ledger row."""
+    if disposals_model_parser is None:
+        log.error(f"[{channel_name}] disposals parser module missing — cannot process")
+        return
+    try:
+        parsed = disposals_model_parser.parse(text)
+    except Exception as e:
+        log.exception(f"[{channel_name}] disposals parse crashed: {e}")
+        notifier.notify_image_alert(
+            channel_name, f"DisposalsModel parse CRASHED — place by hand:\n{text[:400]}")
+        return
+    if parsed is None:
+        log.debug(f"[{channel_name}] no BET| line (chatter) -> dropped")
+        return
+
+    for raw_line, reason in parsed.refusals:
+        log.warning(f"[{channel_name}] REFUSED BET| line: {reason} :: {raw_line}")
+        try:
+            notifier.notify_critical(
+                f"⚠️ DisposalsModel REFUSED a bet line\n\n<b>{reason}</b>\n\n"
+                f"<code>{raw_line}</code>\n\nNothing was placed. This is a feed/schema "
+                f"problem, not a market one."
+            )
+        except Exception:
+            pass
+
+    for row in parsed.rows:
+        try:
+            await _place_one_disposals_row(row, msg_time, channel_name)
+        except Exception as e:
+            log.exception(f"[{channel_name}] disposals row failed: {e}")
+            try:
+                notifier.notify_critical(
+                    f"⚠️ DisposalsModel row CRASHED after parse — check whether it "
+                    f"placed before re-sending\n\n<code>{row.get('key', '?')}</code>\n{e}"
+                )
+            except Exception:
+                pass
+
+
+async def _place_one_disposals_row(row: dict, msg_time, channel_name: str):
+    """Gate + place a single validated BET| row."""
+    key = row["key"]
+    sel_id = _disposals_selection_id(row)
+
+    # 1. START-TIME GATE. resolve_afl_event deliberately keeps a game for six hours
+    #    past bounce (resolver.py:263-265), so a delayed or replayed message would
+    #    otherwise place a real IN-PLAY bet at full stake.
+    start_utc = _disposals_parse_start_utc(row["start"])
+    if start_utc is None:
+        log.warning(f"[{channel_name}] {key}: unparseable start {row['start']!r} -> refused")
+        notifier.notify_critical(
+            f"⚠️ DisposalsModel: unparseable start time <code>{row['start']}</code> "
+            f"for {row['player']} — refused, nothing placed.")
+        return
+    now_utc = datetime.now(_dt_timezone.utc)
+    if now_utc.timestamp() > start_utc.timestamp() + float(DISPOSALS_MODEL_START_SLACK_SEC):
+        log.warning(
+            f"[{channel_name}] {key}: start {start_utc.isoformat()} already passed "
+            f"(now {now_utc.isoformat()}) -> REFUSED (never place in-play)")
+        notifier.notify_image_alert(
+            channel_name,
+            f"DisposalsModel: {row['player']} UNDER {row['line']} — bounce time has "
+            f"PASSED, refused (tipbot never places this feed in-play).")
+        return
+
+    # 2. OVERNIGHT BLACKOUT. Bookie sessions are scheduled off 23:00-07:00 to
+    #    conserve data, but this feed posts hourly through the night, so ~8 messages
+    #    arrive with nothing to place on. Breadcrumb and stop BEFORE claiming the key
+    #    (a claim here would be wasted, and the alert would be eight false "place by
+    #    hand" pages a night). Nothing is lost: the feed re-offers hourly with a fresh
+    #    key and no AFL game starts before 07:00. Set the two QUIET_*_HOUR knobs equal
+    #    to disable the window if sessions are left on overnight.
+    if _disposals_in_quiet_window():
+        log.info(
+            f"[{channel_name}] {key}: inside the {DISPOSALS_MODEL_QUIET_START_HOUR}:00-"
+            f"{DISPOSALS_MODEL_QUIET_END_HOUR}:00 HyperBot blackout — not placing "
+            f"{row['player']} UNDER {row['line']} (the feed re-offers after "
+            f"{DISPOSALS_MODEL_QUIET_END_HOUR}:00; no alert raised)"
+        )
+        _disposals_write_fill(row, requested=float(row["stake"]), placed=0.0,
+                              ambiguous=0.0, manual=False,
+                              committed=_disposals_committed(row),
+                              accounts=[], outcome="none")
+        return
+
+    # 3. EXPOSURE LEDGER. Claims the key permanently BEFORE placing, and returns how
+    #    much of the request may actually go on given what this selection already
+    #    carries. This is what makes kind=retry safe.
+    allowed, refuse_reason = _disposals_claim(row)
+    if allowed <= 0:
+        log.warning(f"[{channel_name}] {key}: not placing — {refuse_reason}")
+        _disposals_write_fill(row, requested=float(row["stake"]), placed=0.0,
+                              ambiguous=0.0, manual=False,
+                              committed=_disposals_committed(row),
+                              accounts=[], outcome="refused")
+        # "Nothing left to place" is the ledger working as designed on a fully-filled
+        # selection — it will fire on EVERY tick until bounce, so paging CRITICAL for
+        # it would bury the alerts that matter (this repo has already had a tipster
+        # page ~1200 CRITICALs/day, v6.07 #30). Only genuinely anomalous refusals —
+        # a repeat key, a corrupt ledger, an unpersisted claim, a breached
+        # per-fixture cap — are critical.
+        _benign = "nothing left to place" in refuse_reason
+        try:
+            if _benign:
+                log.info(f"[{channel_name}] {key}: benign refusal, no alert")
+            else:
+                notifier.notify_critical(
+                    f"⚠️ DisposalsModel refused an offer\n\n{refuse_reason}\n\n"
+                    f"<code>{key}</code>\nNothing placed.")
+        except Exception:
+            pass
+        return
+
+    row = dict(row)
+    row["stake"] = allowed
+
+    tip = _build_disposals_tip(row, msg_time)
+    _apply_disposals_model_stake(tip)
+
+    log.info(
+        f"[{channel_name}] DisposalsModel PLACING {row['player']} ({row['team']}) "
+        f"UNDER {row['line']} disposals @ posted {row['price']} — ${tip.stake_dollars} "
+        f"[kind={row['kind']} key={key} sel={sel_id}]"
+    )
+
+    # The reservation MUST be released whatever happens below, including a crash
+    # inside place_tip — otherwise `inflight` leaks and permanently blocks any
+    # further top-up of this selection. Fail-safe (it blocks rather than
+    # double-places) but it would silently stop the strategy filling.
+    results = []
+    placed = ambiguous = 0.0
+    manual = False
+    accounts = []
+    committed = 0.0
+    requested = float(tip.stake_dollars)
+    try:
+        # Use the DEDICATED placement pool (v6.03), not the default executor: the
+        # default pool is shared with every other run_in_executor caller, so a hung
+        # bookie placement could starve unrelated work.
+        results = await _run_in_placement_executor(place_tip, tip) or []
+        placed = round(sum(float(r.stake or 0) for r in results
+                           if getattr(r, "success", False)), 2)
+        # An AMBIGUOUS or cid_unresolved outcome may still land at the bookie after we
+        # stopped waiting, so it counts as exposure. Guard B (v6.03) exists because
+        # treating these as "not placed" and re-staking is a double stake.
+        #
+        # Classify with the SHARED _is_ambiguous_result, not the is_ambiguous FLAG.
+        # A SLOW REJECTION (elapsed >= STAKE_REJECT_LATENCY_THRESHOLD_SEC, e.g. a 538
+        # at 33s — the documented Erasmus case, which HAD landed at the bookie) is
+        # maybe-landed but carries NO flag: `is_ambiguous` is only set by the reconcile
+        # path, and RECONCILE_AMBIGUOUS defaults false. Checking the flags alone
+        # recorded that money as $0 exposure, so the next re-offer would place over a
+        # bet that may already be on. The fan-out itself buckets these correctly; this
+        # now uses the same predicate.
+        #
+        # r.stake can also be None/0 on an ambiguous result, which is why the fan-out
+        # has its own _at_risk_stake falling back to _requested_stake. Mirror that,
+        # then FAIL CONSERVATIVE if it still measures $0.
+        _amb = [r for r in results
+                if _is_ambiguous_result(r)
+                or getattr(r, "is_ambiguous", False)
+                or getattr(r, "cid_unresolved", False)]
+        ambiguous = round(sum(float(r.stake or getattr(r, "_requested_stake", 0) or 0)
+                              for r in _amb), 2)
+        if _amb and ambiguous <= 0:
+            ambiguous = round(max(0.0, float(tip.stake_dollars) - placed), 2)
+            log.warning(
+                f"[disposals_model] {len(_amb)} ambiguous result(s) reported no "
+                f"measurable stake — booking the full ${ambiguous:.2f} remainder as "
+                f"at-risk so nothing re-offers against it")
+        # MANUAL is STICKY: it means a human may place this by hand, so any further
+        # auto-offer would double-stake. It must therefore mean exactly "we told a
+        # human to place it", and nothing broader — a clean no-market or price-gate
+        # miss must NOT stick, or the selection is frozen and the model's later
+        # re-offer (once the market appears) is refused forever.
+        #
+        # For this tipster the ONLY thing that tells a human is place_tip's
+        # alert_only route: the fan-out's "unfilled -> place by hand" alert is
+        # SUPPRESSED for disposals_model (see the unfilled block in _place_afl_fanout),
+        # because the model re-offers the shortfall itself and a hand-place on top of
+        # that is its own double stake.
+        manual = bool(getattr(tip, "alert_only", False))
+        accounts = [
+            {"session_id": str(getattr(r, "session_id", "") or ""),
+             "stake": round(float(r.stake or 0), 2),
+             "odds": getattr(r, "odds", None),
+             "bet_id": str(getattr(r, "bet_id", "") or "")}
+            for r in results if getattr(r, "success", False)
+        ]
+    except BaseException:
+        # Crash or cancellation mid-placement: the bet MAY have landed. Book the
+        # amount that was actually ATTEMPTED (tip.stake_dollars, i.e. post-clamp —
+        # under TEST_MODE that is $7, not the $500 the ledger reserved) as ambiguous
+        # so nothing ever re-offers against it, then re-raise for the caller's alert.
+        ambiguous = round(float(requested), 2)
+        manual = False
+        _disposals_commit(row, 0.0, ambiguous, manual, reserved=float(allowed))
+        _disposals_write_fill(row, requested=requested, placed=0.0,
+                              ambiguous=ambiguous, manual=False,
+                              committed=_disposals_committed(row), accounts=[],
+                              outcome="none",
+                              event=getattr(tip, "event", "") or "")
+        raise
+    committed = _disposals_commit(row, placed, ambiguous, manual,
+                                  reserved=float(allowed))
+
+    if placed >= requested - 0.01:
+        outcome = "filled"
+    elif placed > 0:
+        outcome = "partial"
+    elif manual:
+        outcome = "manual"
+    else:
+        outcome = "none"
+    _disposals_write_fill(row, requested=requested, placed=placed,
+                          ambiguous=ambiguous, manual=manual, committed=committed,
+                          accounts=accounts, outcome=outcome,
+                          event=getattr(tip, "event", "") or "")
+    log.info(
+        f"[{channel_name}] DisposalsModel {key}: outcome={outcome} "
+        f"placed=${placed:.2f}/{requested:.2f} ambiguous=${ambiguous:.2f} "
+        f"selection_committed=${committed:.2f}"
+    )
+
+
 async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
                                    default_units: float, msg_time,
                                    channel_name: str):
@@ -15630,6 +16427,23 @@ async def main():
                 # Leroy is a TEXT tipster; a no-text (image/sticker/empty) post isn't a
                 # tip we can parse. Log so it's visible rather than a silent no-op.
                 log.info(f"[{channel_name}] Betfair BSP post with no text -> ignored")
+            return
+
+        # v6.08 DisposalsModel MACHINE FEED. The post IS the bet, as a fixed 18-field
+        # `BET|v2|...` line. Handled here and RETURNED so it never reaches the LLM
+        # text path below: for this strategy the line IS the trigger, and an LLM
+        # re-reading the human-readable summary above it is exactly the
+        # re-interpretation risk the feed exists to avoid. Chatter (no BET| line)
+        # drops silently inside the processor; a malformed BET| line alerts loudly.
+        # The bot_id sender filter above has already run, so a message from any other
+        # group member never gets here.
+        if channel_cfg.get("machine_feed"):
+            if text:
+                asyncio.create_task(
+                    _process_disposals_model_tip(text, msg_time, channel_name)
+                )
+            else:
+                log.info(f"[{channel_name}] machine-feed post with no text -> ignored")
             return
 
         # v5.9x (Wilson 2026-07-12): Wilson's OWN bet channel. 6-field structured
