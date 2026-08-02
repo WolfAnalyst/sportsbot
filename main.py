@@ -79,6 +79,8 @@ from config import (
     DISPOSALS_MODEL_QUIET_END_HOUR,
     DISPOSALS_MODEL_STATE_PATH,
     DISPOSALS_MODEL_FILLS_PATH,
+    DISPOSALS_MODEL_RECONCILE_ENABLED,
+    DISPOSALS_MODEL_RECONCILE_MODE,
 )
 from groq_parser import parse_tip_image
 from models import ParsedTip, ParsedLeg, BetResult
@@ -2358,7 +2360,114 @@ def _disposals_selection_id(row: dict) -> str:
     return f"{_t(row.get('evt'))}~{_t(row.get('pid'))}~{line}~{_t(row.get('side'))}"
 
 
-def _disposals_claim(row: dict):
+def _disposals_priority_sessions() -> set:
+    """Session ids to sweep for outside exposure: every Sportsbet session that carries
+    an afl.player_disposals liability cap.
+
+    DERIVED from sessions.yaml rather than hardcoding the seven contract ids, so adding
+    or retiring an account cannot leave this list silently stale — the orphan-id class
+    sessions.yaml's own header calls 'the 100004 mistake'."""
+    out = set()
+    try:
+        for s in (hb.get_sessions() or []):
+            if str(s.get("bookie", "")).lower() != "sportsbet":
+                continue
+            sid = str(s.get("session_id") or "")
+            if not sid:
+                continue
+            if session_priority.lookup_liability_cap(sid, "afl", "player_disposals") is not None:
+                out.add(sid)
+    except Exception as e:
+        log.error(f"[disposals_model] could not resolve sweep sessions: {e}")
+    return out
+
+
+def _disposals_match_book_player(model_name: str, book_name: str) -> str:
+    """Compare the model's canonical spelling to Sportsbet's, for the exposure join.
+
+    Returns "yes" / "no" / "unknown". "unknown" is NOT "no": the caller must treat it
+    as unmeasurable exposure and fail closed, because this join's entire job is
+    preventing a double-stake and a missed match is the expensive direction.
+
+    Deliberately NOT using roster.fuzzy_match_player: v6.07 shipped four wrong-player
+    regressions through it, and a wrong match here would mis-attribute money either way
+    (inventing exposure blocks a good bet; missing it permits a double one). So: exact
+    casefold match, else surname + first-initial agreement, else UNKNOWN on a shared
+    surname, else no.
+    """
+    a = " ".join(str(model_name or "").split()).casefold()
+    b = " ".join(str(book_name or "").split()).casefold()
+    if not a or not b:
+        return "unknown"
+    if a == b:
+        return "yes"
+    at, bt = a.split(), b.split()
+    if at[-1] != bt[-1]:
+        return "no"                      # different surname -> different player
+    if at[0] == bt[0]:
+        return "yes"
+    if at[0][:1] == bt[0][:1]:
+        # Same surname, same initial, different given name: "Ollie"/"Oliver" (the
+        # exact case the handover flagged). Treat as the SAME player.
+        return "yes"
+    # Same surname, different initial -> could be two real players (the Daicos case).
+    return "unknown"
+
+
+def _disposals_outside_exposure(row: dict):
+    """Money already ON this selection from ANY source, read from the book.
+
+    Returns (total, accounts, status) where status is "ok" / "unknown". The v6.08
+    exposure ledger only knows THIS tipster's own placements, so it cannot see another
+    tipster's fan-out or a hand-placed bet; a 2026-08-02 sweep found $4,049.60 of live
+    disposals props across 5 accounts, including $574.50 on one selection, none of it
+    visible to the ledger. This closes that.
+
+    status="unknown" on ANY API failure or an ambiguous player join. The caller must
+    NOT read that as zero: a failed sweep reading as zero re-arms the double-stake.
+    """
+    if not DISPOSALS_MODEL_RECONCILE_ENABLED:
+        return 0.0, [], "disabled"
+    try:
+        sessions = [
+            s for s in (hb.get_sessions() or [])
+            if str(s.get("bookie", "")).lower() == "sportsbet"
+            and str(s.get("session_id")) in _disposals_priority_sessions()
+        ]
+        if not sessions:
+            return 0.0, [], "unknown"
+        exposure, errors = reconcile.collect_prop_exposure(hb, sessions, stat="disposals")
+    except Exception as e:
+        log.error(f"[disposals_model] exposure sweep failed: {e}")
+        return 0.0, [], "unknown"
+    if errors:
+        log.warning(f"[disposals_model] exposure sweep had {len(errors)} error(s): "
+                    f"{errors[:3]} — treating exposure as UNKNOWN, not zero")
+        return 0.0, [], "unknown"
+
+    want_line = float(row["line"])
+    want_side = str(row["side"]).casefold()
+    total, accounts, ambiguous = 0.0, [], False
+    for (bp, bline, bside), v in exposure.items():
+        if bside != want_side or abs(float(bline) - want_line) > 0.001:
+            continue
+        verdict = _disposals_match_book_player(row.get("player", ""), v.get("player", ""))
+        if verdict == "yes":
+            total = round(total + float(v["total"]), 2)
+            accounts.extend(v["accounts"])
+        elif verdict == "unknown":
+            ambiguous = True
+            log.warning(
+                f"[disposals_model] AMBIGUOUS player join on the exposure sweep: model "
+                f"{row.get('player')!r} vs book {v.get('player')!r} at {want_side} "
+                f"{want_line} (${v['total']:.2f}) — treating as UNKNOWN")
+    if ambiguous:
+        return total, accounts, "unknown"
+    return total, accounts, "ok"
+
+
+def _disposals_claim(row: dict, outside: float = 0.0,
+                     outside_status: str = "disabled"):
     """Admit or refuse this message, and return how much of it may be placed.
 
     Returns (allowed_stake, reason). allowed_stake == 0.0 means DO NOT PLACE and
@@ -2441,7 +2550,23 @@ def _disposals_claim(row: dict):
         # $500 against a $500 target = $1000 down). This is the v6.03
         # claim-before-place race in a new place.
         inflight = float(sel.get("inflight") or 0)
-        headroom = round(ceiling - float(sel.get("committed") or 0) - inflight, 2)
+        # v6.08b: OUTSIDE money (another tipster's fan-out, or a hand-placed bet) counts
+        # against the ceiling in "block" mode. In "alert" mode it is recorded and
+        # alerted but does not reduce the stake, preserving the handover's relaxed
+        # stance on cross-tipster collisions while making them visible.
+        _outside = 0.0
+        if DISPOSALS_MODEL_RECONCILE_ENABLED and DISPOSALS_MODEL_RECONCILE_MODE == "block":
+            if outside_status == "unknown":
+                return 0.0, (
+                    "the book-exposure sweep FAILED or produced an ambiguous player "
+                    "match, so how much is already on this selection is UNKNOWN — "
+                    "refusing (reading a failed sweep as $0 is how you double-stake)")
+            _outside = round(float(outside or 0), 2)
+        headroom = round(ceiling - float(sel.get("committed") or 0) - inflight - _outside, 2)
+        if _outside > 0:
+            log.info(
+                f"[disposals_model] {sel_id}: ${_outside:.2f} already ON from OUTSIDE "
+                f"this tipster (book sweep) — counted against the ${ceiling:.2f} ceiling")
         if headroom <= 0:
             return 0.0, (f"selection {sel_id} already has "
                          f"${sel['committed']:.2f} committed"
@@ -15072,10 +15197,32 @@ async def _place_one_disposals_row(row: dict, msg_time, channel_name: str):
                               accounts=[], outcome="none")
         return
 
-    # 3. EXPOSURE LEDGER. Claims the key permanently BEFORE placing, and returns how
+    # 3. BOOK EXPOSURE SWEEP (v6.08b), done OUTSIDE the state lock because it makes
+    #    network calls. Reads what is ACTUALLY on this selection from /api/pending_bets,
+    #    including money from other tipsters and hand-placed bets that the ledger is
+    #    structurally blind to. Swept at claim time rather than on a background poll so
+    #    the number is fresh exactly when it matters and there is no staleness to reason
+    #    about.
+    outside, outside_accounts, outside_status = await _run_in_placement_executor(
+        _disposals_outside_exposure, row)
+    if outside > 0 or outside_status == "unknown":
+        log.warning(
+            f"[{channel_name}] {key}: book sweep says ${outside:.2f} already ON this "
+            f"selection from outside this tipster (status={outside_status}, "
+            f"{len(outside_accounts)} account(s)) — mode={DISPOSALS_MODEL_RECONCILE_MODE}")
+        try:
+            notifier.notify_info(
+                f"ℹ️ DisposalsModel: {row['player']} {row['side'].upper()} {row['line']} "
+                f"already has <b>${outside:.2f}</b> on it from outside this tipster "
+                f"(status {outside_status}). Mode={DISPOSALS_MODEL_RECONCILE_MODE}.")
+        except Exception:
+            pass
+
+    # 4. EXPOSURE LEDGER. Claims the key permanently BEFORE placing, and returns how
     #    much of the request may actually go on given what this selection already
     #    carries. This is what makes kind=retry safe.
-    allowed, refuse_reason = _disposals_claim(row)
+    allowed, refuse_reason = _disposals_claim(row, outside=outside,
+                                             outside_status=outside_status)
     if allowed <= 0:
         log.warning(f"[{channel_name}] {key}: not placing — {refuse_reason}")
         _disposals_write_fill(row, requested=float(row["stake"]), placed=0.0,

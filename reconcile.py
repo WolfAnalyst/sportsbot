@@ -548,3 +548,138 @@ if __name__ == "__main__":
     print(f"test5 attempt-smaller-than-pending -> {r} (expect [])"); passed &= (r == [])
 
     print("\nALL PASS" if passed else "\nFAILURES ABOVE")
+
+
+# ── Player-prop EXPOSURE sweep (v6.08b, 2026-08-02) ─────────────────────────
+# WHY THIS EXISTS. The DisposalsModel exposure ledger caps cumulative stake per
+# selection, but it is keyed on THAT TIPSTER'S OWN record of its own placements, so it
+# is structurally blind to the same selection being backed from anywhere else: another
+# tipster's fan-out, or Wilson by hand. A live probe on 2026-08-02 found 29 pending
+# records across 5 Sportsbet accounts, almost all DISPOSALS UNDERS at liability-capped
+# fan-out shares -- i.e. another tipster already holding the exact positions the model
+# would tip. A model bet on one of those would see $0 committed and add a full stake on
+# top. `/api/pending_bets` is the only source that observes what is ACTUALLY on rather
+# than what either side believes it did.
+#
+# SNAPSHOT SEMANTICS, agreed with the model side: each sweep returns the CURRENT FULL
+# SET of unsettled bets, so a later observation for a selection REPLACES the earlier
+# one. It is never a delta. Summing successive sweeps would inflate exposure on every
+# poll and progressively suppress real bets.
+
+# Sportsbet labels a player-prop line as "<Player> <N>+ <Stat>" and puts the SIDE in
+# the PARENTHETICAL, not the label:
+#     "Jayden Short 22.5+ Disposals (jayden Short Under)"   -> UNDER 22.5
+#     "Tom Mccarthy 23.5+ Disposals (tom Mccarthy)"         -> OVER  23.5
+# So the "N+" prefix looks like an over and is NOT one. Anything that reads the side
+# off the label gets EVERY under backwards -- a wrong-bet class, which is why this
+# parse lives in exactly one tested place. Verified against 29 live records.
+_PROP_BET_RE = _re_compile = None
+try:
+    import re as _re
+    _PROP_BET_RE = _re.compile(
+        r"^\s*(?P<player>.+?)\s+(?P<line>\d+(?:\.\d+)?)\s*\+\s*(?P<stat>[A-Za-z_ ]+?)\s*"
+        r"\((?P<sel>[^)]*)\)\s*$"
+    )
+    _UNDER_TOKEN_RE = _re.compile(r"\bunder\b", _re.IGNORECASE)
+except Exception:  # pragma: no cover
+    _PROP_BET_RE = None
+    _UNDER_TOKEN_RE = None
+
+
+def parse_player_prop_bet(bet_text: str):
+    """Parse a Sportsbet player-prop `bet` string from /api/pending_bets.
+
+    Returns {player, line, side, stat} or None when the text is not a player prop we
+    understand (an h2h, a line bet, a multi, an unknown shape). None means "do not
+    count this", never "assume something".
+
+    The side comes from the PARENTHETICAL via a word-boundary token test, not from the
+    "N+" label and not from a substring: `"over" in "Overton"` is the bug this repo
+    already fixed once in the bet ledger.
+    """
+    if not bet_text or _PROP_BET_RE is None:
+        return None
+    m = _PROP_BET_RE.match(str(bet_text))
+    if not m:
+        return None
+    player = (m.group("player") or "").strip()
+    sel = m.group("sel") or ""
+    stat = (m.group("stat") or "").strip().lower().replace(" ", "_")
+    try:
+        line = float(m.group("line"))
+    except (TypeError, ValueError):
+        return None
+    if not player or line <= 0 or not stat:
+        return None
+    # A multi/SGM leg string would carry several props; refuse rather than half-read it.
+    if "/" in str(bet_text) or " and " in str(bet_text).lower():
+        return None
+    side = "under" if (_UNDER_TOKEN_RE and _UNDER_TOKEN_RE.search(sel)) else "over"
+    return {"player": player, "line": line, "side": side, "stat": stat}
+
+
+def collect_prop_exposure(hb, sessions, *, stat="disposals", sport="aussie_rules"):
+    """Sweep /api/pending_bets across `sessions` and total the money ON per selection.
+
+    Returns (exposure, errors):
+      exposure: {(player_lower, line, side): {"total": float, "accounts": [...],
+                                              "events": [...], "player": <as seen>}}
+      errors:   [(session_id, reason), ...] -- an API failure is NOT zero exposure.
+
+    The caller MUST treat a non-empty `errors` as "unknown", never as "nothing is on":
+    a failed sweep that reads as zero would re-arm exactly the double-stake this
+    function exists to prevent.
+    """
+    exposure = {}
+    errors = []
+    for s in (sessions or []):
+        sid = str(s.get("session_id") or "")
+        acct = s.get("account_id")
+        if not acct:
+            errors.append((sid, "no account_id"))
+            continue
+        try:
+            resp = hb.get_pending_bets(str(acct))
+        except Exception as e:
+            errors.append((sid, f"exception: {e}"))
+            continue
+        if not isinstance(resp, dict):
+            errors.append((sid, f"unexpected response type {type(resp).__name__}"))
+            continue
+        if resp.get("success") is False:
+            errors.append((sid, f"api error: {resp.get('error')}"))
+            continue
+        bets = resp.get("pending_bets") or resp.get("bets") or []
+        if not isinstance(bets, list):
+            errors.append((sid, "pending list missing"))
+            continue
+        for b in bets:
+            if not isinstance(b, dict):
+                continue
+            if b.get("result") is not None:
+                continue  # settled; only unsettled money is exposure
+            if sport and str(b.get("sport") or "").lower() != sport:
+                continue
+            parsed = parse_player_prop_bet(b.get("bet"))
+            if not parsed:
+                continue
+            if stat and parsed["stat"] != stat:
+                continue
+            try:
+                stake = float(b.get("stake") or 0)
+            except (TypeError, ValueError):
+                continue
+            if stake <= 0:
+                continue
+            k = (parsed["player"].strip().casefold(), parsed["line"], parsed["side"])
+            slot = exposure.setdefault(
+                k, {"total": 0.0, "accounts": [], "events": [], "player": parsed["player"]})
+            slot["total"] = round(slot["total"] + stake, 2)
+            slot["accounts"].append({
+                "session_id": sid, "stake": round(stake, 2),
+                "odds": b.get("odds"), "bet_id": b.get("id"),
+            })
+            ev = str(b.get("event") or "")
+            if ev and ev not in slot["events"]:
+                slot["events"].append(ev)
+    return exposure, errors
