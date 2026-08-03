@@ -47,7 +47,72 @@ COLUMNS = [
     # re-bet". Appended column (the ledger is a documented superset; existing rows
     # leave it blank, a fresh CSV headers it). Blank for the vast majority of bets.
     "note",
+    # v6.08g: the specific Tip Titans titan (OC), or the standalone racing tipster's
+    # display code. Blank for sports rows. See the `tipster` note below — this exists so
+    # making `tipster` uniform does not throw away which titan a Tip Titans bet came from.
+    "titan",
 ]
+
+# v6.08g — `tipster` IS NOW UNIFORM. It previously carried two conventions depending on
+# which writer produced the row: racing wrote the uppercase titan code from
+# parsed["titan"] (OC / ZAK / TRIAL / LEROY) while sports wrote the lowercase internal id
+# from tip.tipster (eddie_afl / saiyan_afl / shook / ...). Joining that column against
+# config.TIPSTER_CHANNELS therefore worked for sports and SILENTLY FAILED for racing —
+# the sort of mismatch that halves a P/L report without erroring. Every row now carries
+# the lowercase internal id, and the titan code moved to `titan` so nothing is lost.
+
+# Titan display code -> stable source id. Tip Titans is one FEED with several titans, so
+# every titan maps to `tiptitans` and the specific titan stays visible in `tipster`.
+# UNKNOWN CODES MAP TO tiptitans on purpose, the same fail-safe direction as
+# notifier._RACING_SOURCE_LABELS: an unrecognised code is far more likely to be a new
+# titan than a new standalone tipster. The two maps must keep the same key set —
+# test_bets_ledger_tipster_id.py pins that so they cannot drift apart.
+_TITAN_TO_TIPSTER_ID = {
+    # standalone racing tipsters — their own feeds, NOT Tip Titans
+    "ZAK": "zak_racing",
+    "TRIAL": "trial_sniper",
+    "LEROY": "leroy",
+    # known Tip Titans codes, listed explicitly so the mapping is case-insensitive for
+    # them too rather than relying on the all-caps heuristic below. OC is the only titan
+    # seen in 1,081 rows of history; a new one falls to _TITAN_DEFAULT_ID.
+    "OC": "tiptitans",
+}
+_TITAN_DEFAULT_ID = "tiptitans"
+
+
+def titan_code_for(tipster: str) -> str:
+    """The titan/racing display code for a `tipster` cell, or "" if it is a sports id.
+
+    Used to populate the `titan` column and to preserve it when normalising history.
+    A titan code is ALL-CAPS by convention at both writers (parsed["titan"]).
+    """
+    t = str(tipster or "").strip()
+    if not t:
+        return ""
+    if t.upper() in _TITAN_TO_TIPSTER_ID:
+        return t.upper()
+    return t.upper() if t.isupper() else ""
+
+
+def tipster_id_for(tipster: str) -> str:
+    """Stable source id for a `tipster` cell, from EITHER writer's convention.
+
+    Sports ids already are the internal id and pass through unchanged. A racing titan
+    code maps via _TITAN_TO_TIPSTER_ID. Deterministic and pure, so it can also backfill
+    history from the existing column.
+    """
+    t = str(tipster or "").strip()
+    if not t:
+        return ""
+    if t.upper() in _TITAN_TO_TIPSTER_ID:
+        return _TITAN_TO_TIPSTER_ID[t.upper()]
+    # Sports rows are already lowercase internal ids (eddie_afl, saiyan_afl, shook, ...).
+    # Anything else that is ALL-CAPS is a titan code we have not seen before.
+    if t.isupper():
+        return _TITAN_DEFAULT_ID
+    return t
+
+
 _lock = Lock()
 _logged_bet_ids: set = set()
 _seeded = False
@@ -63,6 +128,7 @@ def _seed_logged_ids() -> None:
     if _seeded:
         return
     _seeded = True
+    _migrate_ledger_columns()
     try:
         if os.path.exists(_LEDGER_PATH) and os.path.getsize(_LEDGER_PATH) > 0:
             with open(_LEDGER_PATH, newline="", encoding="utf-8") as f:
@@ -72,6 +138,121 @@ def _seed_logged_ids() -> None:
                         _logged_bet_ids.add(bid)
     except Exception as e:
         log.error(f"bet_ledger: failed to seed dedup ids from CSV: {e}")
+
+
+def _migrate_ledger_columns() -> bool:
+    """Bring an existing bets_placed.csv up to the current COLUMNS, once.
+
+    THE ROOT CAUSE THIS FIXES. `_write_row` only writes a header when the file is FRESH,
+    so appending a column to COLUMNS silently desynced the file: `note` was added in v5.92
+    and every row written since carried 20 fields under a 19-column header. Measured on the
+    live file 2026-08-03: 1,640 rows at 19 fields, 1,927 at 20, and **10 rows with real
+    stranded `note` text** (the 403-proxy re-bet annotations) that no consumer could read
+    by name, because DictReader files a surplus value under the None key. Every reader here
+    uses DictReader, which is why it stayed invisible rather than crashing.
+
+    Repairs in ONE atomic pass: writes the full header, pads short rows, and backfills
+    `tipster_id` from the existing `tipster` cell (pure and deterministic, so history gets
+    the same value it would have been written with). Keeps a one-off `.bak_precolmigrate`
+    copy — this is a money ledger and the rewrite touches every row.
+
+    Returns True if it migrated. Idempotent: a file whose header already matches is left
+    untouched, so this is safe to call on every process start. Never raises; on any failure
+    the original file is left exactly as it was and appends continue as before.
+    """
+    try:
+        if not os.path.exists(_LEDGER_PATH) or os.path.getsize(_LEDGER_PATH) == 0:
+            return False
+        with open(_LEDGER_PATH, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        if not rows:
+            return False
+        header = rows[0]
+        if header == COLUMNS:
+            return False
+        missing = [c for c in COLUMNS if c not in header]
+        # `tipster_id` was a short-lived intermediate column (added and superseded on
+        # 2026-08-03): its job is now done by the normalised `tipster`, so it is dropped
+        # rather than carried. Anything ELSE unknown is real data and stops the migration.
+        _RETIRED = {"tipster_id"}
+        extra = [c for c in header if c not in COLUMNS and c not in _RETIRED]
+        if extra:
+            # A column we no longer know about. Do NOT drop data on a money ledger:
+            # leave the file alone and say so loudly.
+            log.error(
+                f"bet_ledger: {_LEDGER_PATH} has unknown column(s) {extra} — NOT "
+                f"migrating (refusing to drop ledger data). Reconcile COLUMNS by hand."
+            )
+            return False
+        bak = _LEDGER_PATH + ".bak_precolmigrate"
+        if not os.path.exists(bak):
+            with open(_LEDGER_PATH, "rb") as src, open(bak, "wb") as dst:
+                dst.write(src.read())
+        idx = {name: i for i, name in enumerate(header)}
+        tmp = _LEDGER_PATH + ".tmp_colmigrate"
+        n = 0
+        fixed_side = 0
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+            w.writeheader()
+            for raw in rows[1:]:
+                if not raw:
+                    continue
+                rec = {}
+                for name, i in idx.items():
+                    rec[name] = raw[i] if i < len(raw) else ""
+                # The surplus value a 20-field row carried under the old 19-col header
+                # was `note`, in COLUMNS order. Recover it rather than discard it.
+                if len(raw) > len(header):
+                    for j, name in enumerate(
+                            [c for c in COLUMNS if c not in header], start=len(header)):
+                        if j < len(raw):
+                            rec.setdefault(name, raw[j])
+                            rec[name] = raw[j]
+                # NORMALISE `tipster` to the internal id and preserve the titan code.
+                # Order matters: read the ORIGINAL tipster value before overwriting it.
+                _orig_tipster = rec.get("tipster")
+                if not str(rec.get("titan") or "").strip():
+                    rec["titan"] = titan_code_for(_orig_tipster)
+                rec["tipster"] = tipster_id_for(_orig_tipster)
+                # BACKFILL `side` on player props. v6.07 fixed the writer (side now comes
+                # from the structured direction) but never backfilled history: 531 of 1,312
+                # player-prop rows carried a blank side, all June/July, so a third of the
+                # history could not be told over from under. The direction IS recoverable:
+                # an UNDER's selection ends " Under" while an OVER's is the bare player
+                # name, because an AFL over places on the base O/U market with a bare-name
+                # selection (main.py's _match_afl_player_prop). Verified against the 781
+                # rows that DO carry a side: ends_under -> under 689/689, bare name -> over
+                # 92/92, zero counterexamples — and the same convention appears in live
+                # /api/pending_bets text. This only materialises a derivable value.
+                if ("player_" in str(rec.get("market") or "")
+                        and not str(rec.get("side") or "").strip()):
+                    _sel = str(rec.get("selection") or "").strip().lower()
+                    if _sel.endswith(" under"):
+                        rec["side"] = "under"
+                    elif _sel.endswith(" over"):
+                        rec["side"] = "over"
+                    elif _sel:
+                        rec["side"] = "over"      # bare player name = the over ladder
+                    fixed_side += 1
+                w.writerow({c: rec.get(c, "") for c in COLUMNS})
+                n += 1
+        os.replace(tmp, _LEDGER_PATH)
+        log.warning(
+            f"bet_ledger: migrated {_LEDGER_PATH} to {len(COLUMNS)} columns "
+            f"(added {missing}), {n} row(s) rewritten, tipster normalised to the "
+            f"internal id, titan preserved, {fixed_side} blank player-prop side(s) "
+            f"backfilled. "
+            f"Backup at {bak}"
+        )
+        return True
+    except Exception as e:
+        log.error(f"bet_ledger: column migration failed ({e}) — file left unchanged")
+        try:
+            os.unlink(_LEDGER_PATH + ".tmp_colmigrate")
+        except Exception:
+            pass
+        return False
 
 
 def _num(v):
@@ -177,7 +358,11 @@ def log_sports_bet(tip, result, account: str = "") -> None:
         _write_row({
             "placed_at": placed_at,
             "date": today,
-            "tipster": getattr(tip, "tipster", "") or "",
+            # Uniform: the internal id. A sports tipster already IS one, but go through
+            # the same helper both writers use so the column can never diverge again.
+            "tipster": tipster_id_for(getattr(tip, "tipster", "")),
+            "titan": "",          # sports bets have no titan
+
             "sport": getattr(tip, "sport", "") or "",
             "event": getattr(tip, "event", "") or "",
             "market": market,
@@ -215,7 +400,12 @@ def log_racing_bet(parsed: dict, placement: dict, account: str = "") -> None:
         _write_row({
             "placed_at": placed_at,
             "date": parsed.get("date") or today,
-            "tipster": parsed.get("titan") or parsed.get("tipster") or "",
+            # Uniform: the internal id, the SAME convention the sports writer uses, so
+            # one join works across every row. The titan/display code moves to `titan`.
+            "tipster": tipster_id_for(
+                parsed.get("titan") or parsed.get("tipster") or ""),
+            "titan": titan_code_for(
+                parsed.get("titan") or parsed.get("tipster") or ""),
             "sport": "racing",
             "event": f"{track} R{race_num}".strip() if race_num is not None else track,
             "market": parsed.get("market") or "win",
