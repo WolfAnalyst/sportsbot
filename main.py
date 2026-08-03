@@ -64,6 +64,9 @@ from config import (
     SA_THOROUGHBRED_TRACKS,
     AFL_PERIOD_MARKETS_ENABLED,
     SAIYAN_HC_SGM_ENABLED,
+    SESSION_BLACKOUT_ALERTS_QUIET,
+    SESSION_BLACKOUT_START_HOUR,
+    SESSION_BLACKOUT_END_HOUR,
     # v6.08 DisposalsModel (AFL player-disposals UNDER machine feed)
     DISPOSALS_MODEL_ENABLED,
     DISPOSALS_MODEL_MAX_STAKE,
@@ -2794,6 +2797,31 @@ def _disposals_emit_reconciliation() -> tuple:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception as e:
             log.error(f"[disposals_model] failed to append reconciliation record: {e}")
+    # v6.08f: ALWAYS emit one sweep record, even for a zero-selection sweep.
+    # The per-selection records above are written one PER SELECTION, so a sweep that finds
+    # nothing writes nothing at all — and then the model cannot distinguish "the sweep ran
+    # and the book is empty" from "the sweep never ran". That is the same silence-vs-
+    # evidence gap this whole exchange has been closing (it is why they send a NOOP
+    # heartbeat, and why absence of feedback has to mean "assume it is on"). Observed live:
+    # the first nine sweeps after enabling all found 0 selections, so the model would have
+    # seen an empty file and had no way to tell which case it was in.
+    try:
+        _sweep = {
+            "type": "reconciliation_sweep",
+            "source": "pending_bets",
+            "status": status,
+            "semantics": "snapshot",
+            "market": "player_disposals",
+            "selections": len(exposure),
+            "stake_total": round(total, 2),
+            "observed_at": observed_at,
+        }
+        path = DISPOSALS_MODEL_FILLS_PATH
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(_sweep, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.error(f"[disposals_model] failed to append the sweep record: {e}")
     log.info(
         f"[disposals_model] reconciliation snapshot: {len(exposure)} disposals "
         f"selection(s), ${total:,.2f} on the book, status={status}"
@@ -16329,6 +16357,33 @@ WATCHDOG_INTERVAL_SEC = 300  # 5 minutes
 WATCHDOG_RECHECK_DELAY_SEC = 60  # +1 min follow-up after a drop
 WATCHDOG_CRITICAL_AFTER_SEC = 900  # 15 min -> Critical
 
+
+def _in_session_blackout(now=None) -> bool:
+    """True inside the SCHEDULED nightly HyperBot shutdown (default 23:00-07:00 local).
+
+    Wilson scheduled every bookie session off overnight (2026-08-01) to conserve data.
+    The session monitors predate that and cannot tell a scheduled shutdown from a crash,
+    so they page CRITICAL for it: on the night of 2026-08-02 that was 5 criticals, on the
+    MONEY chat -- the one carrying the "MAY have LANDED, VERIFY" pages. Training yourself
+    to ignore that chat is a far worse outcome than the noise itself, and it is exactly
+    the v6.07 #30 failure (a tipster burying the alerts that mattered under ~1200/day).
+
+    So inside the window a confirmed drop is reported as INFO instead. It is still
+    detected, still logged, still visible -- only the paging is suppressed. A session that
+    is genuinely dead overnight escalates to CRITICAL on the first cycle after the window
+    ends, so the worst case is a delay to 07:00, and no AFL match starts before then.
+    Daytime drops are untouched and still page (2026-08-03 11:20 and 12:46 were real).
+
+    Handles a window that wraps midnight. Set the two hours equal to disable.
+    """
+    now = now or datetime.now()
+    start = int(SESSION_BLACKOUT_START_HOUR)
+    end = int(SESSION_BLACKOUT_END_HOUR)
+    if not SESSION_BLACKOUT_ALERTS_QUIET or start == end:
+        return False
+    h = now.hour
+    return (h >= start or h < end) if start > end else (start <= h < end)
+
 # v5.61 (Wilson 2026-06-14): this in-process watchdog stamps a liveness
 # heartbeat every cycle (and at startup). check_session_health.py — the
 # SEPARATE scheduled BACKUP monitor — reads it and STAYS SILENT while the
@@ -16502,6 +16557,19 @@ def _partition_crashed_alerts(crashed: list, active_count: int):
 
     critical_msg = None
     info_msg = None
+    # v6.08f: inside the SCHEDULED nightly shutdown, a confirmed drop is expected, not a
+    # crash. Report it as INFO so the money chat is not paged for something Wilson turned
+    # off himself. Everything is still detected and logged, and a session still down after
+    # the window escalates to CRITICAL on the next cycle.
+    if placeable and _in_session_blackout():
+        info_msg = (
+            f"{len(placeable) + len(inert)} session(s) down during the scheduled "
+            f"{SESSION_BLACKOUT_START_HOUR}:00-{SESSION_BLACKOUT_END_HOUR}:00 HyperBot "
+            f"shutdown — EXPECTED, not paging. Active remaining: {active_count}. "
+            f"Anything still down after {SESSION_BLACKOUT_END_HOUR}:00 will page.\n"
+            + _lines(placeable + inert)
+        )
+        return None, info_msg
     if placeable:
         critical_msg = (
             f"{len(placeable)} session(s) confirmed crashed "
