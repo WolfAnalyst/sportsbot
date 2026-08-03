@@ -16525,7 +16525,7 @@ def _is_owned_session(sid: str) -> bool:
     return session_priority.get_session_meta(str(sid)) is not None
 
 
-def _partition_crashed_alerts(crashed: list, active_count: int):
+def _partition_crashed_alerts(crashed: list, active_count: int, now=None):
     """FIX 4 (2026-06-12): split a confirmed-crashed batch into the CRITICAL
     message (placeable sessions, inert ones footnoted) and/or the INFO
     message (inert-only batch). PURE — no sends, unit-tested; the watchdog
@@ -16561,7 +16561,12 @@ def _partition_crashed_alerts(crashed: list, active_count: int):
     # crash. Report it as INFO so the money chat is not paged for something Wilson turned
     # off himself. Everything is still detected and logged, and a session still down after
     # the window escalates to CRITICAL on the next cycle.
-    if placeable and _in_session_blackout():
+    # `now` is an explicit parameter, not a bare datetime.now(), because v6.08f made this
+    # function read the WALL CLOCK and thereby made an existing test CLOCK-DEPENDENT: it
+    # passed 07:00-23:00 and failed overnight. That shipped unnoticed because the deploy
+    # happened at 15:16, and it would have blocked the pre-commit gate on any night-time
+    # commit. A severity decision that varies by time of day has to be injectable.
+    if placeable and _in_session_blackout(now):
         info_msg = (
             f"{len(placeable) + len(inert)} session(s) down during the scheduled "
             f"{SESSION_BLACKOUT_START_HOUR}:00-{SESSION_BLACKOUT_END_HOUR}:00 HyperBot "
