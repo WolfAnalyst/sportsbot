@@ -81,6 +81,18 @@ from config import (
     DISPOSALS_MODEL_FILLS_PATH,
     DISPOSALS_MODEL_RECONCILE_ENABLED,
     DISPOSALS_MODEL_RECONCILE_MODE,
+    # v6.08e NOOP liveness detector
+    DISPOSALS_MODEL_LIVENESS_ENABLED,
+    DISPOSALS_MODEL_LIVENESS_PATH,
+    DISPOSALS_MODEL_SILENCE_HOURS,
+    DISPOSALS_MODEL_LIVENESS_POLL_SEC,
+    DISPOSALS_MODEL_ACTIVE_START_DAY,
+    DISPOSALS_MODEL_ACTIVE_START_HOUR,
+    DISPOSALS_MODEL_ACTIVE_END_DAY,
+    DISPOSALS_MODEL_ACTIVE_END_HOUR,
+    DISPOSALS_MODEL_SEQ_GAP_ALERT,
+    DISPOSALS_MODEL_SEQ_RESET_TOLERANCE,
+    DISPOSALS_MODEL_LIVENESS_CRITICAL,
 )
 from groq_parser import parse_tip_image
 from models import ParsedTip, ParsedLeg, BetResult
@@ -2555,8 +2567,9 @@ def _disposals_claim(row: dict, outside: float = 0.0,
                 return 0.0, (
                     f"fixture {row.get('evt', '')} already has {len(_backed)} distinct "
                     f"players backed (cap {_cap}) — refusing a {len(_backed) + 1}th. "
-                    f"The feed is supposed to enforce this upstream, so this firing "
-                    f"means the model's per-match cap has regressed."
+                    f"The model enforces the same bound upstream (ledger.plan, "
+                    f"MAX_PLAYERS_PER_EVENT=4), so this firing means either that cap "
+                    f"regressed or money reached the selection from elsewhere."
                 )
 
         # Cap against BOTH the tranche target the feed declared and tipbot's own
@@ -2806,6 +2819,434 @@ async def _disposals_reconciliation_loop():
         except Exception as e:
             log.error(f"[disposals_model] reconciliation loop error: {e}")
         await asyncio.sleep(3600)
+
+
+# ── v6.08e NOOP LIVENESS DETECTOR ───────────────────────────────────────────────
+# The model sends `NOOP|v2|ts=<iso>|seq=<n>` on a tick that produced no bets. Three
+# multi-hour "alive but silent" outages in this repo were all found late because
+# silence is ambiguous; a positive heartbeat makes it unambiguous.
+#
+# THE ONE RULE THIS MUST NOT BREAK (v6.07, the X-watcher): a heartbeat stamped BEFORE
+# the work measures loop spin, not progress. That stamp stayed fresh for hours while
+# the watcher was blind. So the stamp here happens ONLY when a real message from the
+# feed's locked sender is actually in hand — it is not a timer and cannot be reached
+# without a receive.
+#
+# WHAT COUNTS AS EXPECTED SILENCE, read off the model's own scheduler and run log on
+# 2026-08-03 rather than assumed. This is the part that decides whether the detector is
+# useful or just a pager:
+#   * The Windows task fires HOURLY, 24/7 (live registration: Interval PT1H, Duration
+#     P1D, StartBoundary 00:00; last run 05:00, next 06:00, 0 missed). Note the repo's
+#     own install_tip_schedule.ps1 would register 07:00-21:00 instead, so re-running
+#     that installer would silently delete every overnight tick.
+#   * But the heartbeat is NOT emitted on every tick, despite noop_line's docstring
+#     saying so. FOUR silent no-output paths reach no heartbeat at all: three early
+#     exits in tip_schedule.py (outside the Thu 07:00 - Sun 21:00 Melbourne block, no
+#     upcoming match, next bounce > LOOKAHEAD_HOURS=24h) plus `if found.empty` inside
+#     send_tips_telegram.py. A tick that sends a WATCH block skips it too.
+#   * Measured consequence: Sun 2026-08-02 17:00, 18:00, 19:00 and 20:00 were all
+#     inside the block and all silent (next bounce 98.5h away), right after an
+#     afternoon of watch messages.
+# So "inside the active window" does NOT imply "a heartbeat is due". Two mitigations
+# below: the BURST rule (never expect a message before the feed's first of the window)
+# and an honest DISPOSALS_MODEL_SILENCE_HOURS default of 24h. The real fix is upstream:
+# heartbeat on all four paths, then the threshold drops to 3h. Raised with them.
+_DISPOSALS_LIVENESS_LOCK = threading.Lock()
+
+# One-slot cap on the deferred gap report, so an overnight full of gaps cannot grow the
+# state file without bound: later gaps accumulate into the counters, not into a list.
+_LIVENESS_KINDS = ("noop", "bet", "other")
+
+# IN-MEMORY MIRROR OF THE ALERT LATCH, and the reason it exists.
+#
+# The throttle that makes one outage one alert was latched ONLY in the state file, and
+# _disposals_save_liveness swallows every write error and returns a bool nobody reads. So
+# if the file became unwritable (a Windows AV/backup lock on os.replace, or a full disk)
+# after having been written once, every poll re-loaded a state with no latch, re-decided
+# that the feed was silent, and re-sent the SAME alert: ~64 identical pages a day at the
+# 900s poll, in the detector whose entire design goal is not to cry wolf. Worse, the same
+# failure freezes `last_seen`, so the repeated alert is false as well as duplicated.
+#
+# Mirroring the latch in memory closes it: the file is still the source of truth ACROSS a
+# restart (which is what the persistence was for), and the process-local copy covers the
+# case the file cannot be written. Either one being set suppresses a repeat.
+_DISPOSALS_LIVENESS_MEM = {"silence_alerted_for": None, "cleared_latch": None,
+                           "flushed_gap": None}
+
+
+def _disposals_liveness_path() -> str:
+    """Read from the module global on EVERY call (never cached) so a test can
+    monkeypatch it, exactly as _disposals_state_path does."""
+    return DISPOSALS_MODEL_LIVENESS_PATH
+
+
+def _disposals_load_liveness() -> dict:
+    """Load the liveness state. FAILS OPEN, and that is deliberate.
+
+    The exposure ledger next door fails CLOSED on a corrupt file because losing it
+    means losing the caps that stop a double-stake. This file holds no money state at
+    all — the worst a lost one costs is a missed liveness sample and one restart's
+    worth of blindness. Failing closed here would mean a corrupt file PAGES, which is
+    the opposite of what an anti-noise detector should do. So a missing or corrupt
+    file both read as a clean slate."""
+    path = _disposals_liveness_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("unexpected shape")
+        return data
+    except Exception as e:
+        log.warning(f"[disposals_model] liveness state unreadable ({e}) — starting "
+                    f"from a clean slate (this file carries no money state)")
+        return {}
+
+
+def _disposals_save_liveness(state: dict) -> bool:
+    """Atomic tmp+replace, same as the exposure ledger. A failure is logged and
+    swallowed: it must never be able to stop a message being processed."""
+    path = _disposals_liveness_path()
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=1)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        log.error(f"[disposals_model] failed to save liveness state: {e}")
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def _disposals_active_window_start(now=None):
+    """The datetime the CURRENT active window opened, or None if we are outside it.
+
+    Mirrors the model's own in_match_block (scripts/tip_schedule.py): continuous from
+    Thursday 07:00 to Sunday 21:00 local, INCLUDING the intervening nights. Returning
+    the window's START (not just a bool) is what lets the burst rule ask "has the feed
+    spoken since this window opened?".
+
+    Local naive arithmetic, matching main.py everywhere else. tipbot and the model run
+    on the SAME machine, so local == the model's Australia/Melbourne. The only cost is
+    that a DST changeover inside a window shifts its end by an hour, twice a year,
+    which is immaterial for a liveness boundary.
+
+    Start day == end day AND start hour == end hour disables the gating entirely
+    (always active), mirroring how the quiet-window knobs treat start == end."""
+    now = now or datetime.now()
+    sd = int(DISPOSALS_MODEL_ACTIVE_START_DAY) % 7
+    sh = int(DISPOSALS_MODEL_ACTIVE_START_HOUR)
+    ed = int(DISPOSALS_MODEL_ACTIVE_END_DAY) % 7
+    eh = int(DISPOSALS_MODEL_ACTIVE_END_HOUR)
+    duration_h = ((ed - sd) % 7) * 24 + (eh - sh)
+    if duration_h <= 0:
+        # Degenerate/disabled window: treat the feed as ALWAYS active. Anchoring to the
+        # top of the current hour looked reasonable and did the opposite of what it says:
+        # the burst rule is `last_seen < window_start`, so a window that starts an hour ago
+        # suppresses every silence longer than an hour, i.e. all of them. Setting the knobs
+        # to "no gating" switched the detector OFF instead of making it maximally
+        # sensitive, silently. Anchor far in the past so the burst rule can never suppress.
+        return now - _timedelta(days=3650)
+    start = (now - _timedelta(days=(now.weekday() - sd) % 7)).replace(
+        hour=sh, minute=0, second=0, microsecond=0)
+    if start > now:
+        start -= _timedelta(days=7)
+    return start if now < start + _timedelta(hours=duration_h) else None
+
+
+def _disposals_note_feed_message(text: str, now=None) -> list:
+    """Stamp a SUCCESSFUL receive from the feed, and read the heartbeat if present.
+
+    Called for EVERY message that clears the channel's locked-sender check — a bet, a
+    watch list, a NOOP, or plain chatter. All of them are proof the model is alive and
+    that telethon is delivering, which is exactly what is being measured.
+
+    Returns a list of (level, text) alerts for the caller to send. Returning them
+    rather than sending inline keeps this function pure enough to unit-test and keeps
+    Telegram I/O out of the message-dispatch path."""
+    now = now or datetime.now()
+    alerts = []
+    noop = None
+    try:
+        if disposals_model_parser is not None:
+            noop = disposals_model_parser.parse_noop(text)
+    except Exception as e:  # a broken heartbeat must never block a real bet
+        log.warning(f"[disposals_model] NOOP parse failed: {e}")
+
+    with _DISPOSALS_LIVENESS_LOCK:
+        state = _disposals_load_liveness()
+        kind = "noop" if noop else ("bet" if (text and "BET|" in text) else "other")
+
+        # RECOVERY, reported once: only if we actually told anyone it was silent.
+        #
+        # The in-process view wins while the process lives, and the file only seeds it at
+        # startup. That ordering matters when writes are failing: clearing the latch on disk
+        # can fail silently, and reading the disk first would then re-announce "feed is
+        # BACK" on every subsequent message. `cleared_latch` remembers which latch value
+        # this process has already reported on, so a stale one on disk is ignored.
+        _mem_latch = _DISPOSALS_LIVENESS_MEM.get("silence_alerted_for")
+        latched = _mem_latch if _mem_latch is not None else state.get("silence_alerted_for")
+        if latched is not None and latched != _DISPOSALS_LIVENESS_MEM.get("cleared_latch"):
+            silent_since = state.get("last_seen_iso") or "?"
+            alerts.append((
+                "info",
+                f"DisposalsModel feed is BACK. First message since {silent_since} "
+                f"(a {kind}). The silence alert is cleared."))
+            state["silence_alerted_for"] = None
+            _DISPOSALS_LIVENESS_MEM["silence_alerted_for"] = None
+            _DISPOSALS_LIVENESS_MEM["cleared_latch"] = latched
+
+        # A LINE THAT LOOKS LIKE A HEARTBEAT BUT DID NOT PARSE. This is the one case the
+        # silence timer genuinely cannot cover for, because the unreadable message itself
+        # refreshes last_seen: the feed looks alive while seq-gap detection is dead. Say so
+        # ONCE per distinct shape, not once per message, and clear the latch when a
+        # heartbeat reads cleanly again.
+        if noop is None and text and disposals_model_parser is not None \
+                and getattr(disposals_model_parser, "NOOP_PREFIX", "NOOP|") in text:
+            offending = next((ln.strip() for ln in text.splitlines() if "NOOP|" in ln), "")[:80]
+            # Latch on the SHAPE, not the text: every heartbeat carries a different seq and
+            # ts, so latching on the raw line would alert on every single message, which is
+            # the storm this is meant to prevent. Digits collapse to '#', so a changed field
+            # layout is a new shape and re-alerts, while a normal counter tick does not.
+            shape = re.sub(r"\d+", "#", offending)
+            log.warning(f"[disposals_model] a NOOP| line did not parse: {offending!r} — "
+                        f"seq-gap detection is blind until the shape is readable")
+            if state.get("noop_unparsed_alerted") != shape:
+                state["noop_unparsed_alerted"] = shape
+                alerts.append((
+                    "info",
+                    f"DisposalsModel heartbeat is UNREADABLE, so seq-gap detection is off: "
+                    f"{offending!r}. The feed still counts as alive (the message arrived), "
+                    f"but gaps can no longer be seen. If a field was added to NOOP|, "
+                    f"tipbot's parser needs to learn it."))
+        elif noop is not None and state.get("noop_unparsed_alerted") is not None:
+            state["noop_unparsed_alerted"] = None
+
+        if noop is not None:
+            prev = state.get("last_seq")
+            keep_high_water = False
+            if isinstance(prev, int):
+                if noop.seq == prev + 1:
+                    pass                      # the normal case
+                elif noop.seq > prev + 1:
+                    missed = noop.seq - prev - 1
+                    # DEFERRED, not sent here: a gap found at 03:00 must not page.
+                    # The loop flushes it once outside the blackout. One slot,
+                    # accumulating, so a bad night cannot grow this file.
+                    pend = state.get("pending_seq_gap") or {}
+                    pend["missed_total"] = int(pend.get("missed_total") or 0) + missed
+                    pend["gaps"] = int(pend.get("gaps") or 0) + 1
+                    pend["from_seq"] = pend.get("from_seq", prev)
+                    pend["to_seq"] = noop.seq
+                    pend["last_at"] = now.isoformat(timespec="seconds")
+                    state["pending_seq_gap"] = pend
+                    log.warning(
+                        f"[disposals_model] heartbeat SEQ GAP: {prev} -> {noop.seq} "
+                        f"({missed} missed), queued for alert")
+                elif noop.seq == prev:
+                    # A repeat rather than a gap: a resend or a replayed message.
+                    log.info(f"[disposals_model] duplicate heartbeat seq={noop.seq}")
+                elif prev - noop.seq <= int(DISPOSALS_MODEL_SEQ_RESET_TOLERANCE):
+                    # A SMALL step backwards is late or out-of-order delivery, not a
+                    # reset. Keep the high-water mark and say nothing: treating this as
+                    # a reset would both raise a spurious alert and CLEAR a real pending
+                    # gap report, losing it.
+                    log.info(f"[disposals_model] out-of-order heartbeat seq={noop.seq} "
+                             f"(high-water {prev}) — ignored, not a reset")
+                    keep_high_water = True
+                else:
+                    # A LARGE step backwards means the model's SEQ_FILE was lost and the
+                    # counter restarted (it is relative to CWD and gitignored, and its
+                    # own comment says a reset "reads as one missed tick"). Not an
+                    # outage, and NOT a gap — alerting it as one would be wrong. The
+                    # pending gap is cleared because the old numbering is now meaningless.
+                    alerts.append((
+                        "info",
+                        f"DisposalsModel heartbeat counter went BACKWARDS: {prev} -> "
+                        f"{noop.seq}. That is a seq-file reset on the model side, not "
+                        f"a missed tick. Re-baselining; gap detection resumes from here."))
+                    # Deliberately NOT clearing pending_seq_gap. A gap recorded before
+                    # the reset is still accurate history (those heartbeats really did
+                    # go missing), and dropping it here would discard an unreported
+                    # finding just because the counter later restarted.
+            if not keep_high_water:
+                state["last_seq"] = noop.seq
+            state["last_seq_iso"] = now.isoformat(timespec="seconds")
+            state["last_noop_ts"] = noop.ts
+
+        state["last_seen_epoch"] = now.timestamp()
+        state["last_seen_iso"] = now.isoformat(timespec="seconds")
+        state["last_seen_kind"] = kind
+        _disposals_save_liveness(state)
+    return alerts
+
+
+def _disposals_liveness_check(now=None) -> list:
+    """Decide whether the feed has gone quiet. Returns (level, text) alerts to send.
+
+    Pure apart from the state file, so every branch is unit-testable without a clock.
+
+    THE BURST RULE. Silence only counts once the feed has ALREADY spoken inside the
+    current active window. Before its first message of the window the model may simply
+    be taking one of its three silent early exits (see the header above), so there is
+    nothing to be late for. After it has spoken, an hourly feed going quiet for
+    DISPOSALS_MODEL_SILENCE_HOURS is a real signal.
+
+    TWO HONEST LIMITATIONS, both deliberate, both fixed by the same upstream change:
+      * a feed that dies BEFORE it first speaks in a window is not detected at all, and
+      * the threshold has to default to 24h, because up to ~22h of in-window silence is
+        legitimate today (a round whose last game is on Saturday leaves a game-free
+        Sunday, and the four silent paths in the header mean nothing is emitted).
+    Once the model heartbeats on all four paths, silence becomes real evidence and
+    DISPOSALS_MODEL_SILENCE_HOURS drops to 3. Until then this catches a dead feed, not
+    a late one, and the seq-gap check does the sensitive work."""
+    now = now or datetime.now()
+    alerts = []
+    with _DISPOSALS_LIVENESS_LOCK:
+        state = _disposals_load_liveness()
+
+        # Never page during the HyperBot blackout. Nothing can be placed then, so a
+        # quiet feed costs nothing, and the v6.07 lesson was a tipster paging ~1200
+        # criticals a day. Detection continues; only the telling waits for 07:00.
+        if _disposals_in_quiet_window(now):
+            return []
+
+        # Flush any gap found overnight, now that it is a reasonable hour.
+        pend = state.get("pending_seq_gap")
+        # The flush is recorded by clearing pending_seq_gap ON DISK, so an unwritable
+        # state file (full disk, read-only logs dir, or an AV/backup process holding it
+        # so os.replace raises) would leave the gap in the reloaded state and re-emit the
+        # IDENTICAL alert every poll — ~96 a day, in the detector whose whole design note
+        # is about not burying the money alerts (v6.07 #30). _disposals_save_liveness
+        # swallows write errors, so disk alone cannot be the latch. Mirror it in memory,
+        # exactly as the silence and recovery latches below already do.
+        _pend_id = None
+        if pend:
+            _pend_id = (pend.get("from_seq"), pend.get("to_seq"), pend.get("last_at"))
+            if _pend_id == _DISPOSALS_LIVENESS_MEM.get("flushed_gap"):
+                pend = None
+                state["pending_seq_gap"] = None
+        if pend and DISPOSALS_MODEL_SEQ_GAP_ALERT:
+            gaps = int(pend.get("gaps") or 0)
+            # CAREFUL WITH THE WORDING. seq only increments on the model's NO-BET path,
+            # so the missing heartbeats are by construction ticks that produced no bets:
+            # no bet was lost with them. What the gap actually evidences is that a
+            # message the model sent did not reach us (or was never sent after the
+            # counter had already advanced, since seq is consumed BEFORE the send and
+            # the result is discarded) — and that same path carries the real bets.
+            alerts.append((
+                "critical",
+                f"DisposalsModel heartbeat GAP: {pend.get('missed_total')} tick(s) "
+                f"missing (seq {pend.get('from_seq')} -> {pend.get('to_seq')}"
+                f"{f', {gaps} separate gaps' if gaps > 1 else ''}, last "
+                f"{pend.get('last_at')}). Those ticks produced no bets by construction, "
+                f"so nothing was necessarily lost. What it does mean is that a message "
+                f"the model sent never arrived, and the same path carries real bets. "
+                f"Check the model's scheduled task log."))
+        elif pend:
+            log.info(f"[disposals_model] discarding a heartbeat gap report "
+                     f"({pend.get('missed_total')} missed): "
+                     f"DISPOSALS_MODEL_SEQ_GAP_ALERT is false")
+        if pend:
+            state["pending_seq_gap"] = None
+            _DISPOSALS_LIVENESS_MEM["flushed_gap"] = _pend_id
+            _disposals_save_liveness(state)
+
+        last = state.get("last_seen_epoch")
+        if not isinstance(last, (int, float)):
+            return alerts          # never seen anything: nothing to be late for
+
+        window_start = _disposals_active_window_start(now)
+        if window_start is None:
+            return alerts          # outside the match block: silence is expected
+
+        if last < window_start.timestamp():
+            return alerts          # the burst has not started this window yet
+
+        quiet_h = (now.timestamp() - last) / 3600.0
+        if quiet_h < float(DISPOSALS_MODEL_SILENCE_HOURS):
+            return alerts
+
+        # THROTTLE: latched on the last-seen stamp that triggered it, PERSISTED so one
+        # outage is one alert across restarts, AND mirrored in memory so it survives the
+        # file becoming unwritable. Persistence alone was not enough: _disposals_save_
+        # liveness swallows write errors, so a locked or full disk turned "one alert per
+        # outage" into one alert per poll. Either latch suppresses. It clears on the next
+        # receive.
+        if last in (state.get("silence_alerted_for"),
+                    _DISPOSALS_LIVENESS_MEM.get("silence_alerted_for")):
+            return alerts
+        state["silence_alerted_for"] = last
+        _DISPOSALS_LIVENESS_MEM["silence_alerted_for"] = last
+        _disposals_save_liveness(state)
+        alerts.append((
+            "critical",
+            f"DisposalsModel feed has been SILENT for {quiet_h:.1f}h "
+            f"(last message {state.get('last_seen_iso')}, a "
+            f"{state.get('last_seen_kind')}). It ticks hourly inside its Thu 07:00 - "
+            f"Sun 21:00 window and has already spoken in this one. Check the model's "
+            f"scheduled task and Telegram. NOTE this is not proof of an outage: the "
+            f"model does not heartbeat on its four no-output paths, so a round whose "
+            f"last game has already been played is legitimately silent for the rest of "
+            f"the window (30.5h at the Grand Final). Silence becomes real evidence, and "
+            f"the threshold drops to 3h, once the heartbeat covers those paths."))
+    return alerts
+
+
+def _disposals_send_liveness_alerts(alerts: list) -> None:
+    """Send what the detector produced.
+
+    Routed to the MAINTENANCE chat by default, even for level="critical". The critical
+    chat carries money pages, and burying those is exactly v6.07 finding #30. The level
+    is still carried through so DISPOSALS_MODEL_LIVENESS_CRITICAL can escalate the real
+    outage alerts without also promoting the informational ones.
+
+    Plain text only: notify_info and notify_critical both _escape_html their whole
+    argument, so a tag would arrive as literal "&lt;b&gt;" rather than as formatting."""
+    for level, text in alerts or []:
+        try:
+            if level == "critical" and DISPOSALS_MODEL_LIVENESS_CRITICAL:
+                notifier.notify_critical(text)
+            else:
+                notifier.notify_info(text)
+        except Exception as e:
+            log.error(f"[disposals_model] liveness alert failed to send: {e}")
+
+
+def _disposals_liveness_tick() -> None:
+    """One check-and-send, SYNCHRONOUS. Run in a worker thread by both callers.
+
+    notifier._send is a blocking requests POST with a 20s read timeout and one retry,
+    so a single alert can pin whatever thread it is on for ~45s. On the event loop that
+    stalls every tip in flight, which is a steep price for a diagnostic."""
+    _disposals_send_liveness_alerts(_disposals_liveness_check())
+
+
+async def _disposals_liveness_loop():
+    """Periodic silence check. Exception-proof, same shape as the reconciliation loop."""
+    if not (DISPOSALS_MODEL_LIVENESS_ENABLED and DISPOSALS_MODEL_ENABLED):
+        return
+    poll = max(60, int(DISPOSALS_MODEL_LIVENESS_POLL_SEC))
+    log.info(f"[disposals_model] NOOP liveness detector started (poll {poll}s, "
+             f"silence threshold {DISPOSALS_MODEL_SILENCE_HOURS}h, window "
+             f"day{DISPOSALS_MODEL_ACTIVE_START_DAY}@{DISPOSALS_MODEL_ACTIVE_START_HOUR}:00"
+             f" -> day{DISPOSALS_MODEL_ACTIVE_END_DAY}@{DISPOSALS_MODEL_ACTIVE_END_HOUR}:00)")
+    while True:
+        await asyncio.sleep(poll)
+        try:
+            # Default pool, NOT _PLACEMENT_EXECUTOR: that one is deliberately isolated
+            # so a wedged notifier can never consume a placement worker.
+            await asyncio.get_running_loop().run_in_executor(
+                None, _disposals_liveness_tick)
+        except Exception as e:
+            log.error(f"[disposals_model] liveness loop error: {e}")
 
 
 def _apply_disposals_model_stake(tip: ParsedTip) -> None:
@@ -16739,6 +17180,26 @@ async def main():
         # The bot_id sender filter above has already run, so a message from any other
         # group member never gets here.
         if channel_cfg.get("machine_feed"):
+            # v6.08e LIVENESS STAMP. Every message from this channel's locked sender is
+            # proof the model is alive AND that telethon is delivering — a bet, a watch
+            # list, a NOOP heartbeat or chatter, with or without text. Stamped HERE,
+            # where a real message is already in hand, and never on a timer: the v6.07
+            # X-watcher heartbeat was stamped before the work it claimed to measure and
+            # stayed fresh for 14 hours while the watcher was blind.
+            if DISPOSALS_MODEL_LIVENESS_ENABLED:
+                try:
+                    _live_alerts = _disposals_note_feed_message(text or "")
+                    if _live_alerts:
+                        # Fire-and-forget on the DEFAULT pool. notifier._send blocks for
+                        # up to ~45s (20s read timeout, one retry), and this runs inline
+                        # in the telethon handler — sending here would stall every tip in
+                        # flight behind a diagnostic. Not awaited: the send is best-effort
+                        # and _disposals_send_liveness_alerts swallows its own failures.
+                        asyncio.get_running_loop().run_in_executor(
+                            None, _disposals_send_liveness_alerts, _live_alerts)
+                except Exception as e:
+                    # Liveness is diagnostics. It must never be able to stop a bet.
+                    log.error(f"[{channel_name}] liveness stamp failed: {e}")
             if text:
                 asyncio.create_task(
                     _process_disposals_model_tip(text, msg_time, channel_name)
@@ -17047,6 +17508,18 @@ async def main():
     # the placement side is still switched off.
     if DISPOSALS_MODEL_RECONCILE_ENABLED:
         asyncio.create_task(_disposals_reconciliation_loop())
+
+    # v6.08e: NOOP liveness detector. Gated on DISPOSALS_MODEL_ENABLED as well as its
+    # own switch, and that is the opposite of the reconciliation loop above ON PURPOSE:
+    # reconciliation reads the BOOK, which holds live money whether or not this tipster
+    # is on, while liveness reads the CHANNEL, which is only registered when the tipster
+    # is enabled. Running it while dormant would observe permanent silence and page
+    # forever about a feed nobody has switched on.
+    if DISPOSALS_MODEL_LIVENESS_ENABLED and DISPOSALS_MODEL_ENABLED:
+        asyncio.create_task(_disposals_liveness_loop())
+    elif DISPOSALS_MODEL_LIVENESS_ENABLED:
+        log.info("[disposals_model] liveness detector idle (DISPOSALS_MODEL_ENABLED=false, "
+                 "so the channel is not registered and there is nothing to watch)")
 
     # v6.07 (sweep #29): report priority sessions that were DEAD at startup. The
     # watchdog above can only see TRANSITIONS out of the already-active set, so a

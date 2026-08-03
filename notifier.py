@@ -1016,7 +1016,34 @@ def notify_tip_unfilled_with_placements(
     return _send_alert("\n".join(parts))
 
 
-# ── Tip Titans notifications ────────────────────────────────────────
+# ── Racing notifications (Tip Titans + the standalone racing tipsters) ──
+# v6.08e (Wilson 2026-08-03): these three alerts were hardcoded "TIP TITANS", but the
+# SAME functions serve the standalone racing tipsters too — Zak Trussell and The Trial
+# Sniper come from their own Telegram channels via the image/text auto-place path, and
+# Leroy via Betfair BSP. None of them are Tip Titans, so every one of their bet-log
+# messages was mislabelled (and the "Titan:" field with it).
+#
+# Derived from the `titan` code rather than switched per call site, and UNKNOWN CODES
+# KEEP "TIP TITANS": Tip Titans is a service with several titans, so an unrecognised
+# code is far more likely to be a real titan than a new standalone tipster. That way
+# this can never relabel a genuine Titans alert — it only names the ones we know are not.
+_RACING_SOURCE_LABELS = {
+    "ZAK": "ZAK RACING",
+    "TRIAL": "TRIAL SNIPER",
+    "LEROY": "LATE MAIL LEROY",
+}
+
+
+def _racing_source(titan) -> tuple:
+    """(header_label, field_label) for a racing alert, from the `titan` code.
+
+    Returns ("TIP TITANS", "Titan") for anything not known to be standalone, so
+    existing Titans messages are byte-identical.
+    """
+    code = str(titan or "").strip().upper()
+    if code in _RACING_SOURCE_LABELS:
+        return _RACING_SOURCE_LABELS[code], "Tipster"
+    return "TIP TITANS", "Titan"
 
 def notify_tiptitans_placed(
     tip_id, parsed, intended_stake, placed, unfilled, test_mode=False,
@@ -1076,9 +1103,10 @@ def notify_tiptitans_placed(
     )
 
     saddle_str = f"{parsed.get('saddle')}. " if parsed.get("saddle") else ""
+    _src, _srcfield = _racing_source(parsed.get("titan"))
     text = (
-        f"<b>🏇 TIP TITANS PLACED</b>{test_tag}\n"
-        f"<b>Titan:</b> {_escape_html(parsed['titan'])}\n"
+        f"<b>🏇 {_src} PLACED</b>{test_tag}\n"
+        f"<b>{_srcfield}:</b> {_escape_html(parsed['titan'])}\n"
         f"<b>Track:</b> {_escape_html(parsed['track'])} R{parsed['race_num']} "
         f"{parsed['race_type']}\n"
         f"<b>Runner:</b> {saddle_str}{_escape_html(parsed['runner'])}\n"
@@ -1275,10 +1303,11 @@ def notify_tiptitans_unfilled(
     quotes_block = _format_bookie_quotes(bookie_quotes, tipster_odds=tipster_odds)
 
     title = "BET UNFILLED" if placed_stake > 0 else "BET FAILED"
+    _src, _srcfield = _racing_source(parsed.get("titan"))
     text = (
-        f"<b>🏇 TIP TITANS {title}</b>\n"
+        f"<b>🏇 {_src} {title}</b>\n"
         f"<b>Tip ID:</b> {tip_id}\n"
-        f"<b>Titan:</b> {_escape_html(parsed['titan'])}\n"
+        f"<b>{_srcfield}:</b> {_escape_html(parsed['titan'])}\n"
         f"<b>Track:</b> {_escape_html(parsed['track'])} R{parsed['race_num']}\n"
         f"<b>Runner:</b> {saddle_str}{_escape_html(parsed['runner'])}\n"
         f"<b>Market:</b> {parsed['market'].capitalize()}"
@@ -1307,10 +1336,11 @@ def notify_tiptitans_manual_alert(
     """
     quotes_block = _format_bookie_quotes(bookie_quotes, tipster_odds=odds)
 
+    _src, _srcfield = _racing_source(titan)
     text = (
-        f"<b>🏇 TIP TITANS MANUAL</b>\n"
+        f"<b>🏇 {_src} MANUAL</b>\n"
         f"<b>Tip ID:</b> {tip_id}\n"
-        f"<b>Titan:</b> {_escape_html(titan)}\n"
+        f"<b>{_srcfield}:</b> {_escape_html(titan)}\n"
         f"<b>Event:</b> {_escape_html(event)}\n"
         f"<b>Selection:</b> {_escape_html(title)}\n"
         f"<b>Market:</b> {_escape_html(bet_type)} "
