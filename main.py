@@ -15720,7 +15720,28 @@ async def _process_disposals_model_tip(text: str, msg_time, channel_name: str):
             channel_name, f"DisposalsModel parse CRASHED — place by hand:\n{text[:400]}")
         return
     if parsed is None:
-        log.debug(f"[{channel_name}] no BET| line (chatter) -> dropped")
+        # v6.08k: this used to be log.debug, and the root logger runs at INFO — so a WATCH
+        # message arriving and being correctly ignored left NO TRACE AT ALL. The only
+        # record was the liveness stamp, which keeps just the LAST message, so there was
+        # no audit trail showing the feed was being read and handled.
+        #
+        # "Drops silently" must mean no ALERT, not no RECORD. Without a breadcrumb there is
+        # no way to tell "WATCH arrived and was correctly dropped" from "nothing arrived"
+        # or from "the parser broke and is dropping real bets" — the same silence-vs-
+        # evidence gap that made the reconciliation sweep and the NOOP heartbeat necessary.
+        # One line per message, ~1-2/hour, and it names WHY nothing was placed.
+        _n = len(text.splitlines())
+        if disposals_model_parser.NOOP_PREFIX in text:
+            _kind = "NOOP heartbeat"          # liveness detector owns the seq accounting
+        elif "watch" in text.lower():
+            _kind = "WATCH list"
+        else:
+            _kind = "chatter"
+        _first = next((l.strip() for l in text.splitlines() if l.strip()), "")
+        log.info(
+            f"[{channel_name}] {_kind}: no BET| line -> NOTHING PLACED "
+            f"({_n} line(s)) :: {_first[:110]}"
+        )
         return
 
     for raw_line, reason in parsed.refusals:
