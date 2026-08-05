@@ -2515,6 +2515,24 @@ def _disposals_claim(row: dict, outside: float = 0.0,
     key = row["key"]
     requested = float(row["stake"])
     target = float(row["target"])
+    # v6.08l: in TEST MODE the per-selection CEILING must be the test stake, not the
+    # model's full target. Found by the 2026-08-05 dry run, which placed case F, then
+    # replayed it as a retry and watched selection_committed go $7 -> $14.
+    #
+    # The ledger was working: it capped the $500 retry to the $493 remainder. But
+    # _apply_disposals_model_stake runs AFTER the claim and forces the flat test stake,
+    # so the cap it computed was discarded and another $7 went on. Nothing breached the
+    # $500 ceiling — it just never got near it, so the ledger could not stop the drip:
+    # the model retries the shortfall hourly, tipbot places another $7 each time, and a
+    # selection accrues $7/hour up to ~71 retries. Across ~8 selections retried from
+    # ~12h out that is ~$672 of real money in a mode whose whole purpose is one small
+    # bet. Clamping the ceiling here makes the FIRST test placement fill the selection,
+    # so every later retry takes the designed benign "nothing left to place" path
+    # (log-only, no alert) instead of quietly adding stake.
+    if DISPOSALS_MODEL_TEST_MODE:
+        _test_stake = round(float(DISPOSALS_MODEL_TEST_STAKE), 2)
+        if _test_stake > 0:
+            target = min(target, _test_stake)
     with _DISPOSALS_STATE_LOCK:
         state = _disposals_load_state()
         if state.get("state_corrupt"):
@@ -3301,6 +3319,19 @@ def _apply_disposals_model_stake(tip: ParsedTip) -> None:
         flat = round(float(DISPOSALS_MODEL_TEST_STAKE), 2)
         if flat <= 0:
             return
+        # v6.08l: never force the stake ABOVE what the ledger just reserved. `posted` is
+        # row["stake"], which _place_one_disposals_row has already set to the claim's
+        # `allowed`, so overriding it upward discards the exposure cap — the exact defect
+        # the ceiling clamp in _disposals_claim was added to close, one layer lower.
+        #
+        # It needs a PARTIAL fill to bite, which is routine on this feed: the stake is
+        # split evenly across ~5 Sportsbet accounts, so one clean-rejected leg (price
+        # moved past the worse-gate, session hiccup, proxy 403) leaves a shortfall. The
+        # model then retries it, `allowed` comes back as the small remainder, and the old
+        # unconditional `flat` re-inflated it to the full test stake: $5.60 filled + $7
+        # retried = $12.60 committed against a $7 ceiling. Mirrors the production branch
+        # below, which has always taken min(posted, cap) rather than overriding upward.
+        flat = min(flat, posted) if posted > 0 else flat
         if abs(posted - flat) > 0.001:
             log.warning(
                 f"[disposals_model] TEST MODE: posted stake ${posted} -> forcing "
