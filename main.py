@@ -2825,7 +2825,17 @@ def _disposals_emit_reconciliation() -> tuple:
     # seen an empty file and had no way to tell which case it was in.
     try:
         _sweep = {
-            "type": "reconciliation_sweep",
+            # v6.08m: MUST be "reconciliation", not "reconciliation_sweep". The model's
+            # load_fills accepts a record only `if rec.get("key") or rec.get("type") ==
+            # "reconciliation"`, so a distinct type here was SILENTLY DISCARDED: all 42
+            # records on disk were invisible and its summarise() still reported "no tipbot
+            # fills on disk yet". This record exists precisely to distinguish "the sweep ran
+            # and the book is empty" from "the sweep never ran", so having it dropped left
+            # open the exact silence-vs-evidence gap it was added to close. `kind` carries
+            # the sweep/per-selection distinction instead, additively, so the reader can
+            # still tell them apart without gating on `type`.
+            "type": "reconciliation",
+            "kind": "sweep",
             "source": "pending_bets",
             "status": status,
             "semantics": "snapshot",
@@ -12476,6 +12486,25 @@ def _resolve_single_for_placement(
             target_odds = _afl_target_odds(tip.sport, basis_odds)
             _pct = 80 if ((tip.sport or "").lower() == "afl" and basis_odds > 2.00) else 90
             log.info(f"Target odds: {target_odds} ({_pct}% of {basis_label}, floor 1.01)")
+            # v6.08m: DisposalsModel refuses anything under DISPOSALS_MODEL_MIN_ODDS (1.70)
+            # at resolve time, but the floor SENT TO HYPERBOT was a flat 90% of posted, so
+            # posted 1.73 floored at 1.56 — below the model's own threshold and at/below the
+            # ~1.57 break-even the gate's own comment cites. A price fall between our
+            # price-check and HB's fill was therefore acceptable at a price the strategy
+            # would have rejected. Raising a floor can only produce a CLEAN REJECTION, never
+            # a worse bet, so this is one-directional and safe. Measured rate is low (one
+            # >10% same-line single-tick drop in 5,001 archived transitions, 0.02%), but the
+            # gate was genuinely absent at fill time. Scoped to this tipster: every other
+            # tipster keeps the 10%/20% tolerance deliberately tuned for it.
+            if tip.tipster == DISPOSALS_MODEL_TIPSTER and target_odds is not None:
+                _dm_floor = round(float(DISPOSALS_MODEL_MIN_ODDS), 2)
+                if target_odds < _dm_floor:
+                    log.info(
+                        f"Target odds: raising {target_odds} -> {_dm_floor} "
+                        f"(DISPOSALS_MODEL_MIN_ODDS; the model itself refuses below this, "
+                        f"so accepting a fill under it would place a bet the strategy "
+                        f"rejected)")
+                    target_odds = _dm_floor
     else:
         log.info("Target odds: omitted (price-change retry, accepting current market)")
 
