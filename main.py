@@ -2308,11 +2308,13 @@ def _disposals_load_state() -> dict:
     if not os.path.exists(path):
         # v6.08n: a MISSING file is only a clean first run if nothing was ever placed.
         # This ledger is the ONLY thing stopping a serial double-stake on this feed:
-        # kind=retry re-offers the FULL tranche every hour, not the shortfall (see
-        # config.py's DISPOSALS_MODEL_RETRY_ENABLED notes; James Worpel was offered
-        # $500.00 six times in six hours and the ledger clamped every one). So a
-        # deleted, reset or re-pathed state file would re-admit every key and re-stake
-        # every open selection at full size.
+        # CORRECTED 2026-08-10: an earlier version of this comment said kind=retry
+        # re-offers the FULL tranche every hour. It does NOT. The fills file shows the
+        # model asks for the SHORTFALL and re-derives it after each partial fill (Worpel:
+        # base $500 -> $403 placed, then $97, $97, $97, $82.20, $82.20, $69 to target).
+        # The real risk is narrower but still real: a deleted, reset or re-pathed state
+        # file re-admits KEYS that were already used and drops the per-selection cap, so a
+        # re-sent or replayed message places again on top of money already on.
         #
         # The fills file is an independent, append-only record of what actually went on.
         # If it already carries bet records while the ledger is gone, the two disagree
@@ -5728,6 +5730,29 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
             log.warning(f"{label}: reconcile says not-placed BUT this was a HARD poll "
                         f"deadline (cid never resolved) — staying CONSERVATIVE "
                         f"(debit-as-placed), NOT converting to unfilled (Guard B)")
+            # v6.08o: Guard B is right to hold here, but until now nothing ever came
+            # BACK to it. $515.70 across 6 events in three days was debited-as-placed and
+            # never revisited. Racing has had a deferred re-check since 07-06; sports had
+            # none. Schedule one: it re-queries the book on a much longer window and, if
+            # the bet is still absent, says so definitively and releases any PROVEN-absent
+            # disposals ledger exposure so the feed can re-offer that shortfall itself.
+            # ALERT-ONLY — it never re-places, because a late land would double-stake.
+            try:
+                _sel_id = None
+                if getattr(tip, "tipster", "") == DISPOSALS_MODEL_TIPSTER:
+                    _sel_id = getattr(tip, "_disposals_sel_id", None)
+                _schedule_deferred_sports_cid_verify(
+                    session_id=sess.get("session_id"), bookie=sess.get("bookie", "?"),
+                    # _eff_step, not r.stake: an ambiguous result frequently reports no
+                    # measurable stake, and stake=0 fails verify_bet_landed's stake gate
+                    # against every real pending bet, so the check would ALWAYS say
+                    # "absent" and page a bogus $0.00 CRITICAL. Raised in review.
+                    tip=tip, stake=float(_eff_step or 0), odds=r.odds,
+                    selection_text=(getattr(r, "placed_selection", "")
+                                    or getattr(tip, "raw_message", "") or "")[:90],
+                    sel_id=_sel_id)
+            except Exception as _e:
+                log.warning(f"{label}: could not schedule the deferred verify: {_e}")
             return r
         r.is_ambiguous = False
         r.stake = 0
@@ -5744,6 +5769,156 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
              f"({decision.get('reason', action)}) — conservative "
              f"debit-as-placed stands")
     return r
+
+
+SPORTS_DEFERRED_CID_VERIFY_ENABLED = os.getenv(
+    "SPORTS_DEFERRED_CID_VERIFY_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# 420s, NOT racing's 150s. hyperbot_client documents the wall-clock on a cid timeout as
+# ~5 MINUTES, so a re-check at 150s lands INSIDE the window where the bet may still be
+# resolving and "still absent" would mean very little. Waiting past it makes the finding
+# worth paging about.
+SPORTS_DEFERRED_CID_VERIFY_DELAY_SEC = int(
+    os.getenv("SPORTS_DEFERRED_CID_VERIFY_DELAY_SEC", "420"))
+SPORTS_DEFERRED_CID_VERIFY_WINDOW_SEC = float(
+    os.getenv("SPORTS_DEFERRED_CID_VERIFY_WINDOW_SEC", "45"))
+
+
+def _disposals_release_ambiguous(sel_id: str, amount: float, why: str) -> float:
+    """Give back ambiguous dollars a deferred re-check has PROVEN absent from the book.
+
+    v6.08o. `committed = placed + ambiguous` is the money-safety invariant, and ambiguous
+    is deliberately counted as ON so a re-offer cannot double-stake something that may
+    yet land. The gap was that nothing ever released it once proven absent: Archie
+    Roberts sat at committed $500.00 against a $500.00 target with $100.00 of that
+    ambiguous and only $400.00 on the book, so the selection read FULL and every later
+    offer was refused. $173.60 was frozen this way in three days.
+
+    Only ever called from the deferred verifier, and only on a POSITIVE not-landed
+    finding. Never on an inconclusive one: releasing on "we could not tell" would re-arm
+    the exact double-stake Guard B exists to prevent. Returns the amount released.
+    """
+    if amount <= 0 or not sel_id:
+        return 0.0
+    with _DISPOSALS_STATE_LOCK:
+        state = _disposals_load_state()
+        if state.get("state_corrupt"):
+            log.error(f"[disposals_model] cannot release ${amount:.2f} on {sel_id}: "
+                      f"ledger is CORRUPT")
+            return 0.0
+        sel = (state.get("selections") or {}).get(sel_id)
+        if not sel:
+            return 0.0
+        _amb = float(sel.get("ambiguous") or 0.0)
+        _give = round(min(amount, _amb), 2)
+        if _give <= 0:
+            return 0.0
+        sel["ambiguous"] = round(_amb - _give, 2)
+        sel["committed"] = round(max(0.0, float(sel.get("committed") or 0.0) - _give), 2)
+        if not _disposals_save_state(state):
+            log.error(f"[disposals_model] release of ${_give:.2f} on {sel_id} did NOT "
+                      f"persist — leaving the ledger as-is")
+            return 0.0
+        log.warning(
+            f"[disposals_model] RELEASED ${_give:.2f} of ambiguous on {sel_id} ({why}) "
+            f"— committed now ${sel['committed']:.2f}, so the shortfall is offerable again"
+        )
+        return _give
+
+
+def _schedule_deferred_sports_cid_verify(*, session_id, bookie, tip, stake, odds,
+                                         selection_text, sel_id=None):
+    """Fire-and-forget: re-query the book later for a sports bet whose cid never resolved.
+
+    v6.08o. Ported from racing (`racing_placer._schedule_deferred_cid_verify`, live since
+    the 07-06 work). The AFL fan-out had no equivalent, so a hard-poll-deadline ambiguous
+    was debited-as-placed by Guard B and then nothing ever revisited it: $515.70 across 6
+    events in three days, $342.10 of it with no ledger row at all.
+
+    ALERT-ONLY. It never re-places, because Guard B's conservatism is the only thing
+    stopping a late-landing bet from being double-staked. Its one state effect is
+    releasing PROVEN-absent ambiguous dollars in the disposals ledger, which unfreezes a
+    selection for the model's own retry rather than placing anything itself.
+    """
+    if not SPORTS_DEFERRED_CID_VERIFY_ENABLED:
+        return
+    try:
+        _label = f"{getattr(tip, 'tipster', '?')} {selection_text}"
+        _event = getattr(tip, "event", "") or ""
+        _sport = getattr(tip, "sport", "") or ""
+        import time as _t0
+        submit_ts = _t0.time()
+
+        def _worker():
+            try:
+                # reconcile and time are imported LOCALLY throughout this module (see
+                # :1108, :2511, :6385); keep that pattern rather than adding a global.
+                import time as _t
+                import reconcile
+                _t.sleep(max(0, SPORTS_DEFERRED_CID_VERIFY_DELAY_SEC))
+                _sess = {}
+                for s in (hb.get_sessions_or_none() or []):
+                    if str(s.get("session_id")) == str(session_id):
+                        _sess = s
+                        break
+                acct = _sess.get("account_id")
+                if not acct:
+                    log.warning(
+                        f"[deferred-verify] {_label}: session {session_id} is no longer "
+                        f"active, cannot confirm ${stake:.2f} on {bookie} — the original "
+                        f"ambiguous alert stands as the record")
+                    return
+                res = reconcile.verify_bet_landed(
+                    hb, acct, event=_event, stake=stake, sport=_sport,
+                    selection_text=selection_text, after_ts=submit_ts,
+                    max_wait_sec=SPORTS_DEFERRED_CID_VERIFY_WINDOW_SEC)
+                waited = int(_t.time() - submit_ts)
+                if res.get("reconcile_failed"):
+                    log.warning(
+                        f"[deferred-verify] {_label}: INCONCLUSIVE (pending_bets "
+                        f"unavailable) for ${stake:.2f} {bookie}:{session_id} — the "
+                        f"conservative debit-as-placed stands")
+                    return
+                if res.get("landed"):
+                    log.info(
+                        f"[deferred-verify] {_label}: LANDED after all — ${stake:.2f} @ "
+                        f"{odds} on {bookie}:{session_id} is at the bookie. No action.")
+                    return
+                # DELIBERATELY DOES NOT RELEASE THE LEDGER. Raised in review and then
+                # verified against the source: verify_bet_landed returns landed=False for
+                # "not found in the poll window" (reconcile.py's own log line says "NOT
+                # FOUND after Ns"), which is absence of evidence, not proof the bet is
+                # dead. Releasing the exposure would let the model re-offer the shortfall,
+                # and if the original then landed late that is a DOUBLE STAKE — precisely
+                # what Guard B debits-as-placed to prevent. Racing's equivalent has always
+                # been alert-only for this reason; an earlier draft of this function went
+                # further, which was wrong. _disposals_release_ambiguous stays as an
+                # OPERATOR tool for once a human has confirmed absence at the bookie.
+                log.error(
+                    f"[deferred-verify] {_label}: STILL ABSENT after {waited}s — "
+                    f"${stake:.2f} @ {odds} on {bookie}:{session_id} almost certainly did "
+                    f"NOT land")
+                notifier.notify_critical(
+                    f"⚠️ UNRESOLVED BET now looks NOT PLACED (deferred {waited}s re-check)"
+                    f"\n{_label} — {_event}"
+                    f"\n<b>${stake:.2f}</b> @ {odds} on {bookie}:{session_id}"
+                    f"\n\nIt was counted as maybe-placed at the time (correctly — a "
+                    f"re-place could have double-staked), so NOTHING was re-shopped and "
+                    f"this stake is UNFILLED."
+                    + (f"\n\n<b>${stake:.2f} is still booked as maybe-placed</b> in the "
+                       f"DisposalsModel ledger, so that selection reads fuller than it is "
+                       f"and will not be re-offered. Deliberately NOT auto-released: a "
+                       f"late land would then double-stake."
+                       if sel_id else "")
+                    + f"\n\nIf the game has not started: verify the account, then place "
+                      f"MANUALLY. The bot will NOT place it.")
+            except Exception as e:
+                log.warning(f"[deferred-verify] {_label}: failed: {e}")
+
+        threading.Thread(target=_worker,
+                         name=f"sports-cid-verify-{str(session_id)[:8]}",
+                         daemon=True).start()
+    except Exception as e:
+        log.warning(f"could not schedule the deferred sports cid verify: {e}")
 
 
 def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetResult:
@@ -16035,6 +16210,12 @@ async def _place_one_disposals_row(row: dict, msg_time, channel_name: str):
 
     tip = _build_disposals_tip(row, msg_time)
     _apply_disposals_model_stake(tip)
+    # v6.08o: carry the ledger key onto the tip so a deferred cid re-check, which runs
+    # minutes later on its own thread and only ever sees the BetResult and the tip, can
+    # release PROVEN-absent ambiguous dollars against the right selection. Without this
+    # the release path is unreachable and ambiguous money stays frozen forever (Archie
+    # Roberts read FULL at $500.00 committed with only $400.00 on the book).
+    tip._disposals_sel_id = sel_id
 
     log.info(
         f"[{channel_name}] DisposalsModel PLACING {row['player']} ({row['team']}) "
