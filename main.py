@@ -5566,6 +5566,11 @@ def _v4_get_active_sessions_unfiltered(tip: ParsedTip) -> list[dict]:
     # session, `sessions` becomes empty and the tip routes to manual. This is
     # the "sportsbet specific" guarantee — never place EasyMoney on Tab/etc.
     forced_bookie = TIPSTERS_FORCE_BOOKIE.get(tip.tipster)
+    # v6.08p: a Saiyan top-up is built entirely on SPORTSBET's cap-rise behaviour, so it
+    # must not spill onto another book. saiyan_afl is in TIPSTERS_IGNORE_SUGGESTED_BOOKIE,
+    # so setting tip.suggested_bookie was dead code -- caught in review. Force it here.
+    if getattr(tip, "_saiyan_topup", False):
+        forced_bookie = "sportsbet"
     if forced_bookie:
         sessions = [s for s in sessions if (s.get("bookie", "") or "").lower() == forced_bookie]
         if not sessions:
@@ -5919,6 +5924,249 @@ def _schedule_deferred_sports_cid_verify(*, session_id, bookie, tip, stake, odds
                          daemon=True).start()
     except Exception as e:
         log.warning(f"could not schedule the deferred sports cid verify: {e}")
+
+
+SAIYAN_TOPUP_ENABLED = os.getenv("SAIYAN_TOPUP_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes")
+SAIYAN_TOPUP_PATH = os.getenv("SAIYAN_TOPUP_PATH", "logs/saiyan_topup_queue.json").strip()
+SAIYAN_TOPUP_POLL_SEC = int(os.getenv("SAIYAN_TOPUP_POLL_SEC", "600"))
+# Stop re-asking this many minutes before bounce. Never in-play, and the last cap step
+# is close enough to the jump that a final attempt is still worth one ask.
+SAIYAN_TOPUP_STOP_MIN_BEFORE = int(os.getenv("SAIYAN_TOPUP_STOP_MIN_BEFORE", "10"))
+_SAIYAN_TOPUP_LOCK = threading.Lock()
+
+
+def _saiyan_topup_load() -> list:
+    try:
+        if not os.path.exists(SAIYAN_TOPUP_PATH):
+            return []
+        with open(SAIYAN_TOPUP_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d.get("pending", []) if isinstance(d, dict) else []
+    except Exception as e:
+        # Fails OPEN (empty), deliberately: this queue holds NO money-safety state. The
+        # worst case of losing it is a top-up that does not happen, which is exactly the
+        # pre-v6.08p behaviour. Contrast the disposals ledger, which fails CLOSED because
+        # losing it would re-admit keys.
+        log.warning(f"[saiyan-topup] queue unreadable ({e}) — treating as empty")
+        return []
+
+
+def _saiyan_topup_save(pending: list) -> None:
+    try:
+        os.makedirs(os.path.dirname(SAIYAN_TOPUP_PATH) or ".", exist_ok=True)
+        tmp = SAIYAN_TOPUP_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"pending": pending,
+                       "updated_at": datetime.now().isoformat(timespec="seconds")}, f,
+                      indent=1)
+        os.replace(tmp, SAIYAN_TOPUP_PATH)
+    except Exception as e:
+        log.warning(f"[saiyan-topup] could not persist the queue: {e}")
+
+
+def _saiyan_queue_topup(tip, intended: float, placed: float,
+                        placed_results: list) -> bool:
+    """Record a Saiyan shortfall so it can be re-asked as Sportsbet's cap rises.
+
+    SCOPED TO SAIYAN by Wilson's instruction. The reference price is the one we ACTUALLY
+    FILLED AT, not the tipped price: Saiyan's tips move the market within seconds of us
+    betting, so topping up against the tipped price would buy a materially worse bet than
+    the one already on. Same line only.
+    """
+    if not SAIYAN_TOPUP_ENABLED or getattr(tip, "tipster", "") != "saiyan_afl":
+        return False
+    if getattr(tip, "is_sgm", False):
+        return False                # SGM legs are priced as a combo; not a single top-up
+    if getattr(tip, "_saiyan_topup", False):
+        return True                 # already ours; the item stays queued by the tick
+    # `placed` arrives as placed + ambiguous: MAYBE-landed stake must not be re-asked.
+    short = round(float(intended) - float(placed), 2)
+    if short <= 1.0:
+        return False
+    leg = (tip.legs or [None])[0]
+    if leg is None:
+        return False
+    fills = [float(r.odds) for r in (placed_results or [])
+             if getattr(r, "success", False) and getattr(r, "odds", None)]
+    if not fills:
+        log.info(f"[saiyan-topup] {tip.event}: ${short:.2f} unfilled but nothing landed, "
+                 f"so there is no achieved price to protect — not queueing")
+        return False
+    # The WORST price we actually took. Topping up must not be worse than the position
+    # we already hold.
+    ref_odds = round(min(fills), 2)
+    item = {
+        "queued_at": datetime.now().isoformat(timespec="seconds"),
+        "tipster": tip.tipster,
+        "event": tip.event,
+        "sport": tip.sport,
+        "market": leg.market,
+        "player": leg.player or "",
+        "stat": leg.stat or "",
+        "line": leg.line,
+        "selection": leg.selection or "",
+        "team_full": leg.team_full or "",
+        "intended": round(float(intended), 2),
+        "placed": round(float(placed), 2),
+        "remaining": short,
+        "ref_odds": ref_odds,
+        "raw_message": (getattr(tip, "raw_message", "") or "")[:200],
+        "attempts": 0,
+    }
+    with _SAIYAN_TOPUP_LOCK:
+        pending = _saiyan_topup_load()
+        pending.append(item)
+        _saiyan_topup_save(pending)
+    log.warning(
+        f"[saiyan-topup] QUEUED ${short:.2f} unfilled on {item['player'] or item['team_full']} "
+        f"{leg.line} ({tip.event}) — will re-ask as Sportsbet's cap rises, same line only, "
+        f"at odds >= {ref_odds} (the worst price we actually filled at)"
+    )
+    return True
+
+
+def _saiyan_topup_bounce_epoch(item: dict):
+    """Bounce time for a queued item, or None. Used only to stop re-asking, never to
+    decide the bet, so a miss is safe: the item simply keeps its schedule until the
+    hard expiry below."""
+    try:
+        import resolver as _rs
+        for t in (item.get("team_full"), (item.get("event") or "").split(" v ")[0]):
+            if not t:
+                continue
+            for g in _rs._fetch_afl_fixtures_by_year():
+                ev = f"{g.get('hteam','')} v {g.get('ateam','')}"
+                if ev == item.get("event") and g.get("unixtime"):
+                    return float(g["unixtime"])
+    except Exception:
+        pass
+    return None
+
+
+def _saiyan_topup_tick():
+    """Re-ask Sportsbet for each queued Saiyan shortfall. Runs off the event loop.
+
+    Sportsbet's per-account TO-WIN cap rises toward bounce (MEASURED: exactly $75.00 at
+    8-12h out across 20+ readings, ~$100 at 2-4h), so a remainder that was refused at
+    placement time becomes placeable later. This never PREDICTS the cap: it re-asks and
+    takes whatever the bookie allows, which is also what makes it robust to capacity
+    already consumed by another tipster or by a hand-placed bet, neither of which tipbot
+    can see.
+
+    GUARDS, all of them Wilson's:
+      * saiyan_afl only;
+      * the SAME line, never a neighbour (exact_only is forced downstream);
+      * odds >= the WORST price we actually filled at, not the tipped price, because a
+        Saiyan tip moves the market within seconds of us betting;
+      * the top-up can never exceed intended - placed;
+      * nothing after bounce.
+    """
+    with _SAIYAN_TOPUP_LOCK:
+        pending = _saiyan_topup_load()
+    if not pending:
+        return
+    import time as _t          # local, matching this module's convention
+    now = _t.time()
+    keep = []
+    for item in pending:
+        try:
+            b = _saiyan_topup_bounce_epoch(item)
+            if b is not None and now >= b - SAIYAN_TOPUP_STOP_MIN_BEFORE * 60:
+                log.info(f"[saiyan-topup] DROPPING {item.get('player')} {item.get('line')} "
+                         f"({item.get('event')}): inside {SAIYAN_TOPUP_STOP_MIN_BEFORE}min "
+                         f"of bounce, ${item.get('remaining')} never got on")
+                continue
+            # Hard expiry so a fixture we cannot resolve cannot live forever.
+            try:
+                age_h = (datetime.now() - datetime.fromisoformat(item["queued_at"])).total_seconds() / 3600
+            except Exception:
+                age_h = 0
+            if age_h > 36:
+                log.info(f"[saiyan-topup] DROPPING {item.get('player')}: queued {age_h:.0f}h ago")
+                continue
+
+            tip = ParsedTip(
+                tipster="saiyan_afl", sport=item.get("sport") or "afl", is_sgm=False,
+                legs=[ParsedLeg(market=item["market"], team_abbr="",
+                                team_full=item.get("team_full") or "",
+                                player=item.get("player") or "",
+                                stat=item.get("stat") or "", line=item.get("line"),
+                                selection=item.get("selection") or "", raw_text="topup",
+                                period="")],
+                units=1.0, unit_size=float(item["remaining"]),
+                raw_message=item.get("raw_message") or "saiyan top-up",
+                timestamp=datetime.now(), event=item.get("event"),
+            )
+            tip.suggested_bookie = "sportsbet"
+            # THE PRICE FLOOR THAT MAKES THIS SAFE. suggested_odds drives the target_odds
+            # sent to HyperBot, so anchoring it to the worst price we actually filled at
+            # means a moved market simply refuses rather than buying a worse bet.
+            tip.suggested_odds = float(item["ref_odds"])
+            tip._saiyan_topup = True
+
+            item["attempts"] = int(item.get("attempts", 0)) + 1
+            log.info(
+                f"[saiyan-topup] RE-ASKING ${item['remaining']:.2f} on {item.get('player')} "
+                f"{item.get('line')} ({item.get('event')}), attempt {item['attempts']}, "
+                f"floor {item['ref_odds']}"
+            )
+            before = float(item["placed"])
+            res = _place_afl_fanout(tip)
+            # Ambiguous counts as COMMITTED, exactly as _disposals_commit treats it: a
+            # maybe-landed top-up that we then re-asked would double-stake. Caught in
+            # review, where `got` had counted clean successes only.
+            got = round(sum(float(r.stake or 0) for r in (res or [])
+                            if getattr(r, "success", False)
+                            or _is_ambiguous_result(r)), 2)
+            if got > 0:
+                item["placed"] = round(before + got, 2)
+                item["remaining"] = round(float(item["intended"]) - item["placed"], 2)
+                log.warning(
+                    f"[saiyan-topup] TOPPED UP ${got:.2f} on {item.get('player')} "
+                    f"{item.get('line')} — now ${item['placed']:.2f} of "
+                    f"${item['intended']:.2f}, ${item['remaining']:.2f} still short")
+                try:
+                    notifier.notify_info(
+                        f"📈 Saiyan top-up: <b>${got:.2f}</b> more on "
+                        f"{item.get('player')} {item.get('line')} as the Sportsbet cap "
+                        f"rose — now ${item['placed']:.2f} of ${item['intended']:.2f}.")
+                except Exception:
+                    pass
+            if item["remaining"] > 1.0:
+                keep.append(item)
+            else:
+                log.warning(f"[saiyan-topup] COMPLETE: {item.get('player')} "
+                            f"{item.get('line')} filled to ${item['placed']:.2f}")
+        except Exception as e:
+            log.error(f"[saiyan-topup] item failed ({e}) — keeping it queued")
+            keep.append(item)
+    with _SAIYAN_TOPUP_LOCK:
+        # Re-read under the lock and merge: the tick releases the lock while it places
+        # (network), so a live tip that queued a NEW item meanwhile would be erased by
+        # writing our stale snapshot. Caught in review. Keys on the fields that identify
+        # a selection, since `queued_at` differs between the two copies.
+        def _k(i):
+            return (i.get("event"), i.get("player"), i.get("line"), i.get("market"))
+        mine = {_k(i) for i in keep}
+        latest = _saiyan_topup_load()
+        merged = list(keep) + [i for i in latest
+                               if _k(i) not in mine and _k(i) not in {_k(x) for x in pending}]
+        _saiyan_topup_save(merged)
+
+
+async def _saiyan_topup_loop():
+    if not SAIYAN_TOPUP_ENABLED:
+        return
+    poll = max(120, SAIYAN_TOPUP_POLL_SEC)
+    log.info(f"[saiyan-topup] loop started (every {poll}s; re-asks unfilled Saiyan "
+             f"stake as the Sportsbet to-win cap rises toward bounce)")
+    while True:
+        await asyncio.sleep(poll)
+        try:
+            await _run_in_placement_executor(_saiyan_topup_tick)
+        except Exception as e:
+            log.error(f"[saiyan-topup] loop error: {e}")
 
 
 def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetResult:
@@ -6591,7 +6839,12 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         # places a bet the model never selected, at full stake, and reports it as a
         # clean success; one disposal is worth roughly 7 probability points against a
         # 3.5-disposal edge. Exact line or manual — missing a bet is cheap.
-        _exact_only = _no_tipster_odds or tip.tipster == DISPOSALS_MODEL_TIPSTER
+        # v6.08p: a Saiyan TOP-UP is same-line-or-nothing (Wilson). Without this the
+        # +/-1.0 snap is live for saiyan and a top-up could land on a neighbouring
+        # line, which is a different bet. Caught in review; the docstring had
+        # claimed this was already forced when it was not.
+        _exact_only = (_no_tipster_odds or tip.tipster == DISPOSALS_MODEL_TIPSTER
+                       or bool(getattr(tip, '_saiyan_topup', False)))
         _resolved, _manual = _resolve_single_for_placement(
             tip, sess, apply_ceiling=True, apply_floor=False,
             exact_only=_exact_only,
@@ -7026,6 +7279,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # placed. If unfilled <= $1 there is nothing to place by hand, so suppress it
     # (the BET PLACED summary already reports the failed/recovered account; the
     # daily review tracks the per-account failure pattern).
+    _saiyan_queued = False      # set by the Saiyan branch below; read by the alert gate
     # v6.08: DisposalsModel owns its own shortfall — the model re-offers the unfilled
     # remainder on its next tick, and tipbot's exposure ledger caps the top-up at the
     # tranche target. Telling Wilson to ALSO place it by hand is therefore a genuine
@@ -7038,11 +7292,41 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             f"— NOT alerting for a hand-place (the model re-offers the shortfall and "
             f"the exposure ledger caps the top-up at the tranche target)"
         )
+    elif unfilled > 1.0 and getattr(tip, "_saiyan_topup", False):
+        # A top-up that is itself still short: log only. Re-alerting here would page once
+        # per poll until bounce, and the queue already owns the remainder.
+        log.info(f"[saiyan-topup] still ${unfilled:.2f} short after this attempt")
     elif unfilled > 1.0:
         log.warning(
             f"AFL fan-out: ${unfilled:.2f} unfilled "
             f"({len(failed_results)} account(s) failed)"
         )
+        # v6.08p (Wilson 2026-08-10): "never let a bet be dead just because it has hit
+        # max stake — later on it should be retried once limits are higher". Sportsbet
+        # caps a player-prop per account on TO-WIN, and that cap RISES toward bounce:
+        # MEASURED exactly $75.00 at 8-12h out (20+ readings, $74.96-$75.04, odds
+        # 1.74-1.94), roughly $100 at 2-4h. So an unfilled remainder is not dead, it is
+        # early. Queue it and re-ask later. SAIYAN ONLY, by Wilson's instruction.
+        try:
+            # Pass placed + ambiguous as "already committed". Ambiguous stake is
+            # MAYBE-LANDED, so re-asking for it is a double-stake vector; `unfilled`
+            # above already nets it out and the queue must agree. Caught in review.
+            _saiyan_queued = _saiyan_queue_topup(
+                tip, intended_stake, round(total_placed + ambiguous_total, 2),
+                placed_results)
+        except Exception as _e:
+            log.warning(f"could not queue a Saiyan top-up: {_e}")
+        # v6.08p: for SAIYAN the queue now re-asks this remainder automatically as the
+        # Sportsbet cap rises, so a "place it by hand" page is the same double-stake
+        # vector already recognised for disposals_model above (hand-place + auto re-offer
+        # both landing). Tell Wilson it is queued instead of telling him to place it.
+        # Caught in review.
+        # v6.08p: the unfilled alert STILL FIRES for Saiyan. Suppressing it (as the
+        # disposals branch does) would have been the tidy way to avoid the hand-place +
+        # auto-re-ask double-stake, but it breaks the v5.90 contract that a genuine
+        # shortfall always reaches Wilson, and it would mean a silently failed queue is a
+        # silently lost bet. Instead the alert stands and a second message says the
+        # remainder is queued and not to hand-place it. Information, not silence.
         notifier.notify_tip_unfilled_with_placements(
             tip, display_intended, total_placed, unfilled,
             placed_results, failed_results,
@@ -7050,6 +7334,18 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             total_elapsed_sec=round(_time_mod.time() - _t_start, 2),
             concurrent_bookies=True,  # fan-out: bookie wall-clock = MAX not SUM
         )
+        if _saiyan_queued:
+            log.warning(f"[saiyan-topup] ${unfilled:.2f} on {tip.event} is queued for "
+                        f"automatic re-ask as the Sportsbet cap rises")
+            try:
+                notifier.notify_info(
+                    f"⏳ That Saiyan ${unfilled:.2f} shortfall is <b>QUEUED for automatic "
+                    f"re-ask</b> closer to bounce, when Sportsbet's per-account cap rises "
+                    f"(same line only, and never worse than the price we already hold). "
+                    f"<b>Do not place it by hand</b> unless you want it on now — doing "
+                    f"both would double up.")
+            except Exception:
+                pass
         _log_jsonl(ERROR_LOG, {
             "type": "tip_unfilled",
             "tipster": tip.tipster,
@@ -12651,6 +12947,13 @@ def _resolve_single_for_placement(
     """
     if getattr(tip, "tipster", "") == DISPOSALS_MODEL_TIPSTER and not exact_only:
         exact_only = True
+    # v6.08p: a Saiyan TOP-UP is same-line-or-nothing (Wilson). Forced HERE as well as in
+    # the fan-out, because this is the choke point every placement passes through and the
+    # whole point of the v6.08 pattern is that a caller cannot bypass it. A test that
+    # called this resolver directly proved the fan-out-only fix was bypassable: it snapped
+    # 23.5 to a carried 24.5, which is a different bet.
+    if getattr(tip, "_saiyan_topup", False) and not exact_only:
+        exact_only = True
     leg = tip.legs[0]
     sid = str(session["session_id"])
     bookie = session.get("bookie", "unknown")
@@ -12708,6 +13011,18 @@ def _resolve_single_for_placement(
             # >10% same-line single-tick drop in 5,001 archived transitions, 0.02%), but the
             # gate was genuinely absent at fill time. Scoped to this tipster: every other
             # tipster keeps the 10%/20% tolerance deliberately tuned for it.
+            # v6.08p: a Saiyan TOP-UP must never accept worse than the price we already
+            # hold. _afl_target_odds discounts by 10% (20% above $2.00), so a fill at 2.17
+            # produced a floor of 1.74 -- we would have bought a materially worse bet than
+            # the position being topped up, which is the exact thing Wilson scoped this
+            # feature to prevent. Send the achieved price itself. Caught in review; the log
+            # line and the comment both claimed the floor was ref_odds when it was not.
+            if getattr(tip, "_saiyan_topup", False) and tip.suggested_odds:
+                _ref = round(float(tip.suggested_odds), 2)
+                if target_odds is None or target_odds < _ref:
+                    log.info(f"Target odds: raising {target_odds} -> {_ref} "
+                             f"(Saiyan top-up: never worse than the price already held)")
+                    target_odds = _ref
             if tip.tipster == DISPOSALS_MODEL_TIPSTER and target_odds is not None:
                 _dm_floor = round(float(DISPOSALS_MODEL_MIN_ODDS), 2)
                 if target_odds < _dm_floor:
@@ -17944,6 +18259,9 @@ async def main():
     # forever about a feed nobody has switched on.
     if DISPOSALS_MODEL_LIVENESS_ENABLED and DISPOSALS_MODEL_ENABLED:
         asyncio.create_task(_disposals_liveness_loop())
+    # v6.08p: re-ask Sportsbet for unfilled Saiyan stake as its to-win cap rises.
+    if SAIYAN_TOPUP_ENABLED:
+        asyncio.create_task(_saiyan_topup_loop())
     elif DISPOSALS_MODEL_LIVENESS_ENABLED:
         log.info("[disposals_model] liveness detector idle (DISPOSALS_MODEL_ENABLED=false, "
                  "so the channel is not registered and there is nothing to watch)")
