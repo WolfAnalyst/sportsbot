@@ -1023,7 +1023,7 @@ IMAGE_PROMPT_AFL = (
     '"bookie": str|null, "units": number|null, "period": "full"|"1st_half"|'
     '"2nd_half"|"1st_quarter"|"2nd_quarter"|"3rd_quarter"|"4th_quarter"|null, '
     '"market_type": "player_prop"|'
-    '"team_line"|"margin"|"total"|"other", "description": str|null} ]}. '
+    '"team_line"|"margin"|"total"|"h2h"|"other", "description": str|null} ]}. '
     "EXTRACT ONLY THE TIPSTER'S ACTUAL SELECTION(S) — the bet(s) they are "
     "backing. This is the HIGHLIGHTED / boxed / bold / centred / largest "
     "selection, or the one added to a betslip/bet-card (the one shown with the "
@@ -1092,13 +1092,18 @@ IMAGE_PROMPT_AFL = (
     "full-game/full-match bet uses \"full\" or null. The period is CRITICAL — "
     "NEVER drop a Half/Quarter qualifier ('Hawthorn -5.5 2nd Half Line' is a "
     "2nd-half line, NOT a full-game line). "
-    "H2H / MONEYLINE / MULTI: if the image shows a bettable selection that fits "
-    "NONE of the market_types above — in particular a HEAD-TO-HEAD / MONEYLINE "
-    "match-winner pick, or a MULTI / PARLAY combining several legs at one combined "
-    "price — do NOT silently omit it. Return a SINGLE tip with "
-    "market_type=\"other\", player/team/stat/line/odds null, and `description` = a "
-    "short plain-English transcription of the bet (each leg + the combined "
-    "odds/stake if shown), e.g. \"MULTI: Carlton win + Geelong win @ 2.40, 1u\". "
+    "HEAD-TO-HEAD / MONEYLINE — a SINGLE team to win the match outright "
+    "('Carlton head-to-head win', 'Carlton ML', 'Carlton to win', 'Carlton H2H'): "
+    "set market_type=\"h2h\", `team` = the ONE team backed, `odds` = the price, "
+    "`units` = the stake if shown, and leave player/stat/line/side null. Exactly "
+    "ONE team. If a half/quarter qualifier is printed ('2nd Half Winner') still set "
+    "`period` — it is a different market and the bot handles it. "
+    "MULTI / PARLAY is NOT h2h: two or more legs combined at ONE price. Return a "
+    "SINGLE tip with market_type=\"other\", player/team/stat/line/odds null, and "
+    "`description` = a short plain-English transcription of every leg plus the "
+    "combined odds/stake, e.g. \"MULTI: Carlton win + Geelong win @ 2.40, 1u\". "
+    "Any OTHER bettable selection fitting none of the market_types above also uses "
+    "market_type=\"other\" with a `description`. Do NOT silently omit any bet. "
     "Set `description` ONLY for a real bettable selection the tipster is backing — "
     "NEVER for a results/recap/commentary graphic (those stay an empty tips list). "
     "Use null for ANY field not printed. "

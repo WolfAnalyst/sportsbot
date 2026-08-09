@@ -2306,6 +2306,43 @@ def _disposals_load_state() -> dict:
     key, so it is surfaced as corrupt and the caller refuses to place."""
     path = _disposals_state_path()
     if not os.path.exists(path):
+        # v6.08n: a MISSING file is only a clean first run if nothing was ever placed.
+        # This ledger is the ONLY thing stopping a serial double-stake on this feed:
+        # kind=retry re-offers the FULL tranche every hour, not the shortfall (see
+        # config.py's DISPOSALS_MODEL_RETRY_ENABLED notes; James Worpel was offered
+        # $500.00 six times in six hours and the ledger clamped every one). So a
+        # deleted, reset or re-pathed state file would re-admit every key and re-stake
+        # every open selection at full size.
+        #
+        # The fills file is an independent, append-only record of what actually went on.
+        # If it already carries bet records while the ledger is gone, the two disagree
+        # about reality, and the safe reading is "the ledger was lost", not "nothing has
+        # been placed". Fail closed and make a human look.
+        try:
+            _fp = DISPOSALS_MODEL_FILLS_PATH
+            if os.path.exists(_fp):
+                with open(_fp, "r", encoding="utf-8") as f:
+                    for _ln in f:
+                        _ln = _ln.strip()
+                        if not _ln:
+                            continue
+                        try:
+                            if (json.loads(_ln) or {}).get("key"):
+                                log.error(
+                                    "[disposals_model] state file is MISSING but "
+                                    f"{_fp} already holds placement records — refusing "
+                                    "to treat this as a clean first run (a lost ledger "
+                                    "would re-admit every key and re-stake every open "
+                                    "selection at FULL size). Restore the ledger, or "
+                                    "delete the fills file if this really is a reset."
+                                )
+                                return {"selections": {}, "state_corrupt": True}
+                        except Exception:
+                            continue
+        except Exception as e:
+            # Never let this guard itself become the outage: an unreadable fills file
+            # is not evidence of prior placement.
+            log.warning(f"[disposals_model] first-run fills check skipped ({e})")
         return {"selections": {}}
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -14862,6 +14899,61 @@ def _build_afl_tip_from_image(raw: dict, tipster: str, unit_size: float,
         if not leg_team or not line:
             alert_only = True
             alert_reason = "team line missing team/line — place manually"
+    elif market_type == "h2h":
+        # v6.08n (Wilson 2026-08-10: "carlton ML to win??"). A plain match-winner was
+        # routed to MANUAL because IMAGE_PROMPT_AFL told the vision model to return
+        # market_type="other" for a HEAD-TO-HEAD *and* for a MULTI in the same
+        # sentence, so a single-leg h2h inherited the never-auto-place treatment the
+        # multi rule exists for. h2h is a first-class market everywhere else in this
+        # file (normalised at :12109, selection backfilled from team_full at :12113,
+        # team-alias normalised at :12128), so nothing downstream needed changing.
+        # Observed: 2026-08-09 18:25 "Carlton head-to-head win @ 1.87, 2.5u" -> manual.
+        #
+        # Three guards, because the failure mode here is placing ONE LEG of a multi:
+        #  1. a single named team is required;
+        #  2. any multi/parlay marker in the raw text refuses, even though the prompt
+        #     now separates them — the prompt is a request, not a guarantee, and one
+        #     leg of a parlay placed at the PARLAY price is a real wrong bet;
+        #  3. a half/quarter h2h is a DIFFERENT market (SB prices it separately), so
+        #     it routes to manual rather than silently becoming a full-game winner.
+        leg = ParsedLeg(market="h2h", team_full=leg_team, player="",
+                        stat="", line=0.0, selection=leg_team)
+        # `description` is the ONLY one of these the AFL image schema actually emits
+        # (IMAGE_PROMPT_AFL has no selection/market_detail/title key) — the others are
+        # kept solely so a future schema change is picked up rather than silently
+        # ignored, and must NOT be mistaken for live coverage. Raised in review.
+        _h2h_desc = str(raw.get("description") or "").strip()
+        _h2h_txt = " ".join(str(raw.get(k) or "") for k in
+                            ("selection", "description", "market_detail", "title"))
+        if not leg_team:
+            alert_only = True
+            alert_reason = "head-to-head tip with no team — place manually"
+        elif _h2h_desc:
+            # The prompt sets `description` ONLY for a MULTI or an unschematic bet, and
+            # explicitly leaves it null for a schematic h2h. So a populated description
+            # on an h2h means the model was unsure or is describing several legs, and
+            # placing one leg of a parlay at the COMBINED price is a real wrong bet.
+            # Refuse on presence, not on keywords: keyword matching only catches the
+            # phrasings we thought of.
+            alert_only = True
+            alert_reason = (
+                f"head-to-head carrying a free-text description ({_h2h_desc[:70]!r}) — "
+                f"the schema leaves that null for a plain match winner, so this may be a "
+                f"MULTI; never auto-place one leg at the combined price — place by hand"
+            )
+        elif re.search(r"(?i)\b(multi|parlay|sgm|same[- ]game|acca|accumulator)\b|\+",
+                       _h2h_txt):
+            alert_only = True
+            alert_reason = (
+                "head-to-head that mentions a MULTI/PARLAY leg — never auto-place one "
+                "leg of a multi at the combined price; place by hand"
+            )
+        elif _period and _afl_period_code(_period):
+            alert_only = True
+            alert_reason = (
+                f"{_period} head-to-head is a SEPARATE Sportsbet market from the "
+                f"full-game winner — place by hand (never silently full-game)"
+            )
     elif market_type == "margin":
         # v6.00 (E safety guard, Wilson's "St Kilda 1-39 must NOT become -38.5 HC"):
         # a winning-margin RANGE BAND ("Team 1-39" / "20-39" / "40-59") is NOT a
