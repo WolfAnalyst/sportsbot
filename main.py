@@ -972,6 +972,18 @@ _CID_UNRESOLVED_MARKERS = (
     "cid timeout",
     "poll budget exhausted",
     "bet status unknown",
+    # v6.08r (2026-08-13): a LOST POST is maybe-landed, not not-placed. 2026-08-11
+    # 08:37:55 sportsbet:118458 returned "[placement_uncertain] bet POST answer lost
+    # (TLSClientExeption); Sportsbet may hold this coupon (elapsed 31.9s)". None of the
+    # markers above matched, so _err_is_cid_unresolved was False, the 30s pending_bets
+    # poll then read absence as proof, and $500.00 was SPILLED to the next bookie 33s
+    # later. If Sportsbet subsequently registered the held coupon that is $500.00 of
+    # unintended double exposure on one runner, off-ledger. The bookie telling us it
+    # MAY hold the coupon is the strongest possible maybe-landed signal, and 30 seconds
+    # cannot disprove it.
+    "placement_uncertain",
+    "answer lost",
+    "may hold this coupon",
 )
 
 
@@ -5933,6 +5945,8 @@ SAIYAN_TOPUP_POLL_SEC = int(os.getenv("SAIYAN_TOPUP_POLL_SEC", "600"))
 # Stop re-asking this many minutes before bounce. Never in-play, and the last cap step
 # is close enough to the jump that a final attempt is still worth one ask.
 SAIYAN_TOPUP_STOP_MIN_BEFORE = int(os.getenv("SAIYAN_TOPUP_STOP_MIN_BEFORE", "10"))
+# Backstop independent of the clock, so a bad bounce lookup cannot page forever.
+SAIYAN_TOPUP_MAX_ATTEMPTS = int(os.getenv("SAIYAN_TOPUP_MAX_ATTEMPTS", "8"))
 _SAIYAN_TOPUP_LOCK = threading.Lock()
 
 
@@ -5975,6 +5989,14 @@ def _saiyan_queue_topup(tip, intended: float, placed: float,
     the one already on. Same line only.
     """
     if not SAIYAN_TOPUP_ENABLED or getattr(tip, "tipster", "") != "saiyan_afl":
+        return False
+    # v6.08q: NEVER queue from a test run. test_afl_sgm_fixes.py drives the real
+    # _place_afl_fanout with a saiyan_afl tip and does not patch SAIYAN_TOPUP_PATH, so the
+    # suite wrote 28 fake items ("Team A v Team B", player "P") into the LIVE queue during
+    # the deploy's own pre-commit gate. Production then re-asked each of them 21 times,
+    # firing a BET FAILED page every attempt. Tests that want this path monkeypatch the
+    # path AND clear this flag.
+    if os.getenv("TIPBOT_TESTING", "").strip().lower() in ("1", "true", "yes"):
         return False
     if getattr(tip, "is_sgm", False):
         return False                # SGM legs are priced as a combo; not a single top-up
@@ -6072,10 +6094,29 @@ def _saiyan_topup_tick():
     for item in pending:
         try:
             b = _saiyan_topup_bounce_epoch(item)
-            if b is not None and now >= b - SAIYAN_TOPUP_STOP_MIN_BEFORE * 60:
+            if b is None:
+                # FAIL SAFE. Wilson: "need to stop the retries after the game starts".
+                # resolver._fetch_afl_fixtures_by_year() returns only INCOMPLETE games, so
+                # a fixture DISAPPEARS from it the moment it starts -- which is precisely
+                # when we must stop. The old code treated an unresolvable bounce as "keep
+                # going" and re-asked until the 36h expiry, which is how one slate reached
+                # attempt 21 and paged BET FAILED every 600s. If we cannot PROVE the game
+                # has not started, we do not bet.
+                log.warning(
+                    f"[saiyan-topup] DROPPING {item.get('player')} {item.get('line')} "
+                    f"({item.get('event')}): cannot resolve a bounce time, so we cannot "
+                    f"prove it is still pre-game. ${item.get('remaining')} never got on")
+                continue
+            if now >= b - SAIYAN_TOPUP_STOP_MIN_BEFORE * 60:
                 log.info(f"[saiyan-topup] DROPPING {item.get('player')} {item.get('line')} "
                          f"({item.get('event')}): inside {SAIYAN_TOPUP_STOP_MIN_BEFORE}min "
                          f"of bounce, ${item.get('remaining')} never got on")
+                continue
+            if int(item.get("attempts", 0)) >= SAIYAN_TOPUP_MAX_ATTEMPTS:
+                log.warning(
+                    f"[saiyan-topup] DROPPING {item.get('player')} {item.get('line')}: "
+                    f"{item.get('attempts')} attempts is enough, ${item.get('remaining')} "
+                    f"never got on")
                 continue
             # Hard expiry so a fixture we cannot resolve cannot live forever.
             try:

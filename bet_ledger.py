@@ -51,6 +51,18 @@ COLUMNS = [
     # display code. Blank for sports rows. See the `tipster` note below — this exists so
     # making `tipster` uniform does not throw away which titan a Tip Titans bet came from.
     "titan",
+    # v6.08r: WHICH runner the bookie actually bound, and HOW it was matched
+    # (exact_name / substring_name / saddle_#N). Racing rows only; blank for sports.
+    #
+    # The ledger previously recorded ONLY the tipster's own string, so a saddle-only
+    # match - which is a POSITIONAL guess, not a name match - was invisible downstream.
+    # 2026-08-11 tip 62701 read "RUBY RHAYNE BOW" and all four priced bookies bound
+    # saddle #5 to "Rebecca Rhayne Bow"; $700.00 went on and every review of the ledger
+    # would read it back as the tipster's runner. Recording the matched name and the
+    # method makes a wrong-runner placement greppable after the fact, which is the whole
+    # point of keeping a ledger.
+    "runner_match",
+    "match_method",
 ]
 
 # v6.08g — `tipster` IS NOW UNIFORM. It previously carried two conventions depending on
@@ -395,6 +407,11 @@ def log_racing_bet(parsed: dict, placement: dict, account: str = "") -> None:
         saddle = parsed.get("saddle")
         runner = parsed.get("runner") or ""
         selection = f"{saddle}. {runner}".strip(". ").strip() if saddle else runner
+        # v6.08r: the bookie's own matched name + how it got there. `selection` keeps the
+        # tipster's wording (every downstream consumer and the Bet Record feed depend on
+        # it), so these go in ALONGSIDE it rather than replacing it.
+        _rmatch = (placement.get("runner_match") or "").strip()
+        _rmethod = (placement.get("match_method") or "").strip()
         stake = _num(placement.get("stake"))
         odds = _num(placement.get("odds"))
         _write_row({
@@ -422,6 +439,8 @@ def log_racing_bet(parsed: dict, placement: dict, account: str = "") -> None:
             "correlation_id": placement.get("correlation_id") or "",
             "units": _num(parsed.get("units")) if parsed.get("units") is not None else "",
             "unit_size": "",
+            "runner_match": _rmatch,
+            "match_method": _rmethod,
         })
     except Exception as e:
         log.error(f"bet_ledger.log_racing_bet failed: {e}")
