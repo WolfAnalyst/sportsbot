@@ -872,6 +872,114 @@ def _stat_market_map(sport: str) -> dict[str, str]:
     return {}
 
 
+# v6.08v: AFL / AFLW EVENT COLLISION.
+# Sportsbet carries an AFLW fixture under the same team names as the men's AFL one, and
+# HyperBot's event matching is NAME-BASED and NON-DETERMINISTIC between them. Measured
+# 2026-08-14 on one string, "Fremantle v Adelaide Crows", against session 118458:
+#     12:12 -> men's  (109 markets, Rory Laird present)
+#     12:37 -> AFLW   (6 markets, no Laird)      <- same string, 25 min later
+#     12:58 -> men's  again
+# So no alias can fix this: the same request returns different events at different times.
+# It cost a DisposalsModel tip (Laird U22.5, $500) and three Saiyan tips ($1,800) in one
+# afternoon, each logged as the misleading "line not carried in catalog".
+#
+# It failed SAFE only by luck. No AFLW player is named Laird, so nothing matched. A shared
+# surname would have priced, and possibly PLACED, against the wrong competition entirely.
+#
+# The response tells us which event it matched, and we have independent ground truth:
+#     start_time_iso           men's 2026-08-14 20:10  vs  AFLW 2026-08-16 14:35
+#     competition_external_id  men's 17131             vs  AFLW 46287
+# Squiggle gives the real bounce, so start_time is the check that needs no hard-coded ids.
+AFL_EVENT_VERIFY = os.getenv("AFL_EVENT_VERIFY", "true").strip().lower() == "true"
+AFL_EVENT_START_TOLERANCE_SEC = int(os.getenv("AFL_EVENT_START_TOLERANCE_SEC", "3600"))
+
+
+def _afl_expected_bounce(event: str):
+    """Real bounce epoch for an AFL event string, from Squiggle, or None if unknown.
+
+    None means "no ground truth", and every caller must then fall back to the previous
+    behaviour rather than refuse: a Squiggle outage must not block every AFL bet.
+    """
+    try:
+        if not event or " v " not in event:
+            return None
+        import resolver as _rs
+        home, away = [x.strip().lower() for x in event.split(" v ", 1)]
+        for g in _rs._fetch_afl_fixtures_by_year():
+            h = (g.get("hteam") or "").lower()
+            a = (g.get("ateam") or "").lower()
+            if not g.get("unixtime"):
+                continue
+            if (home in h or h in home) and (away in a or a in away):
+                return float(g["unixtime"])
+    except Exception as e:
+        log.warning(f"AFL bounce lookup failed for {event!r}: {e}")
+    return None
+
+
+def _afl_event_name_candidates(event: str, bookie: str, sport: str) -> list:
+    """Ordered event strings to try for the same fixture. The aliased form first (it is
+    what every other path sends), then plain, then the REVERSED pairing, which is what
+    actually reached the men's game on 2026-08-14 when the others did not."""
+    out, seen = [], set()
+    for cand in (_bookie_event(event, bookie, sport), event):
+        if cand and cand not in seen:
+            seen.add(cand)
+            out.append(cand)
+    if event and " v " in event:
+        h, a = [x.strip() for x in event.split(" v ", 1)]
+        for cand in (f"{a} v {h}", _bookie_event(f"{a} v {h}", bookie, sport)):
+            if cand and cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+    return out
+
+
+def _price_check_afl_verified(*, session_id, sport, event, bookie, markets_filter=None):
+    """price_check_sports for AFL, but PROVING the response is the fixture we asked for.
+
+    Returns (response, event_string_used) on success, or (None, None) when no candidate
+    matched the expected bounce, which the caller must treat as "not carried" -> manual.
+    A wrong-competition board must never be priced.
+    """
+    expected = _afl_expected_bounce(event) if AFL_EVENT_VERIFY else None
+    cands = _afl_event_name_candidates(event, bookie, sport)
+    first = None
+    for cand in cands:
+        try:
+            pc = hb.price_check_sports(session_id=session_id, sport=sport, event=cand,
+                                       markets_filter=markets_filter)
+        except Exception as e:
+            log.warning(f"AFL price check failed for {cand!r}: {e}")
+            continue
+        if first is None:
+            first = (pc, cand)
+        if expected is None:
+            return pc, cand          # no ground truth -> previous behaviour, unchanged
+        st = pc.get("start_time_iso")
+        try:
+            drift = abs(float(st) - expected)
+        except (TypeError, ValueError):
+            # No start time on the envelope: cannot verify, so do not tighten.
+            return pc, cand
+        if drift <= AFL_EVENT_START_TOLERANCE_SEC:
+            if cand != cands[0]:
+                log.warning(
+                    f"AFL event verify: {cands[0]!r} matched the WRONG fixture; "
+                    f"{cand!r} resolves to the right one (comp_id="
+                    f"{pc.get('competition_external_id')}) — using it")
+            return pc, cand
+        log.warning(
+            f"AFL event verify: {cand!r} matched an event starting "
+            f"{int(drift)//3600}h from the real bounce (comp_id="
+            f"{pc.get('competition_external_id')}, markets={len(pc.get('markets') or {})})"
+            f" — WRONG FIXTURE, trying the next name form")
+    log.error(
+        f"AFL event verify: NO name form resolved {event!r} to its real fixture "
+        f"(tried {cands}). Refusing to price a different competition — routing to manual.")
+    return None, None
+
+
 def _bookie_event(event: str, bookie: str, sport: str) -> str:
     """
     Translate Squiggle-format event name to bookmaker-specific format
@@ -895,10 +1003,20 @@ def _bookie_event(event: str, bookie: str, sport: str) -> str:
     aliases = BOOKIE_AFL_ALIASES.get((bookie or "").lower())
     if not aliases:
         return event
-    out = event
-    for squiggle_name, bookie_name in aliases.items():
-        out = out.replace(squiggle_name, bookie_name)
-    return out
+    # v6.08s: alias each SIDE of "A v B" as a WHOLE name, never as a substring.
+    # The old plain .replace() was safe only because the single existing alias
+    # ("Greater Western Sydney") is not contained in another club name. The moment an
+    # alias like "Adelaide" -> "Adelaide Crows" is added, a substring replace turns
+    # "Port Adelaide" into "Port Adelaide Crows" and every Port Adelaide fixture stops
+    # resolving. Splitting on " v " and matching the full side makes that impossible.
+    parts = event.split(" v ")
+    if len(parts) == 2:
+        return " v ".join(aliases.get(p.strip(), p.strip()) for p in parts)
+    # Unexpected shape (no " v "). Only a WHOLE-STRING match is safe here: a substring
+    # replace would turn "Port Adelaide" into "Port Adelaide Crows". An earlier version
+    # guarded by checking the alias against other alias KEYS, which does not help,
+    # because "Port Adelaide" is a club name, not an alias key. Caught by its own test.
+    return aliases.get(event.strip(), event)
 
 
 def _ladder_steps(remaining: float) -> list[float]:
@@ -13098,11 +13216,20 @@ def _resolve_single_for_placement(
         # 2026-06-01: divert to manual instead, mirroring the odds-ceiling guard.
         _afl_pp_resolved = False
         try:
-            _event_pc = _bookie_event(tip.event, bookie, tip.sport)
-            _pc = hb.price_check_sports(
-                session_id=sid, sport=tip.sport, event=_event_pc,
-                markets_filter=["player_props"],
-            )
+            # v6.08v: VERIFY the matched fixture, do not just name it. HyperBot's event
+            # matching is non-deterministic between the AFL and AFLW games of the same
+            # teams, so this asks, checks start_time_iso against Squiggle's real bounce,
+            # and retries other name forms until one is genuinely tonight's fixture. A
+            # None response means every form matched the wrong competition, which must be
+            # treated exactly like "not carried" -> manual, never priced.
+            _pc, _event_pc = _price_check_afl_verified(
+                session_id=sid, sport=tip.sport, event=tip.event, bookie=bookie,
+                markets_filter=["player_props"])
+            if _pc is None:
+                log.error(
+                    f"AFL single: could not resolve {tip.event!r} to its real fixture on "
+                    f"{bookie}:{sid} (AFL/AFLW collision) — routing to manual")
+                _pc = {}
             if _pc.get("success"):
                 # Use the ORIGINAL tipped line (leg.line), not the resolved
                 # line: the singles threshold normaliser rounds "22.5+" via

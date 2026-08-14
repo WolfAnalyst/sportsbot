@@ -159,6 +159,20 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
     distinctive needle 'NOTIFY LOST (final)' — previously a single failed
     POST silently dropped the message (including CRITICALs and manual-bet
     alerts) with only a generic error line."""
+    # v6.08t: NEVER send a real Telegram from a test run. There is no legitimate case for
+    # it, and the harm is concrete: test_saiyan_topup stubs the fan-out to return a
+    # SUCCESSFUL top-up, so _saiyan_topup_tick fired a genuine "Saiyan top-up: $X more on
+    # Patrick Dangerfield" alert on EVERY full-suite run, and the suite runs on every
+    # deploy through the pre-commit gate. Wilson saw the spam and asked where it came
+    # from. Same class as the 2026-08-10 incident where the suite wrote fake items into
+    # the live top-up queue, so the guard belongs HERE at the single transport choke
+    # point rather than in each test, where the next one will forget it.
+    #
+    # Returns True (the send "succeeded") so any test asserting on the return value keeps
+    # its meaning; the message is logged instead of posted.
+    if os.getenv("TIPBOT_TESTING", "").strip().lower() in ("1", "true", "yes"):
+        log.info(f"[TIPBOT_TESTING] notification suppressed: {str(text)[:160]}")
+        return True
     target = chat_id or NOTIFY_CHAT_ID
     if not NOTIFY_BOT_TOKEN or not target:
         log.warning("Notification bot not configured, skipping")
