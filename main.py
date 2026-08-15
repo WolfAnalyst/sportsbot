@@ -7519,7 +7519,17 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # double-stake vector (hand-place + the model's re-offer), so the alert is
     # downgraded to a log line for this tipster only. Every other tipster is
     # untouched: for them an unfilled remainder really does need a human.
-    if unfilled > 1.0 and tip.tipster == DISPOSALS_MODEL_TIPSTER:
+    # v6.08x: ...but ONLY when something actually landed. The suppression above rests
+    # entirely on "the model re-offers the shortfall", and that promise only means
+    # anything for a PARTIAL fill on a selection the bookie is really carrying. At
+    # placed == $0.00 there is no live selection, nothing for the ledger to cap, and
+    # MEASURED on 2026-08-15, no re-offer either: Xerri and Zorko each lost the whole
+    # $500 and the only later mention of either name in the log is the deferred verify
+    # proving the stake absent. The alert this branch swallowed renders as BET FAILED
+    # when nothing placed (notifier.py), so the one message that would have told Wilson
+    # the tip was dead is precisely the one that was suppressed. A total miss is not a
+    # shortfall, it is a failure, and it pages.
+    if unfilled > 1.0 and tip.tipster == DISPOSALS_MODEL_TIPSTER and total_placed > 0:
         log.info(
             f"[disposals_model] ${unfilled:.2f} unfilled of ${display_intended:.2f} "
             f"— NOT alerting for a hand-place (the model re-offers the shortfall and "
@@ -13209,6 +13219,10 @@ def _resolve_single_for_placement(
     # resolution blocks below and checked once against the max-odds ceiling
     # before placing (wrong-selection guard). None => no live odds => no ceiling.
     _resolved_live_odds = None
+    # The event name PROVED to reach the real fixture (AFL only, set by
+    # _price_check_afl_verified). None => never verified => the POST falls back to the
+    # tipped name exactly as before, so no non-AFL path changes behaviour.
+    _event_verified = None
 
     # ── Target odds (10% below the relevant price, floored at 1.01) ─
     # Prefer the per-bookie alt-line odds if this is an auto-alt attempt;
@@ -13299,6 +13313,11 @@ def _resolve_single_for_placement(
             _pc, _event_pc = _price_check_afl_verified(
                 session_id=sid, sport=tip.sport, event=tip.event, bookie=bookie,
                 markets_filter=["player_props"])
+            # Keep the verified name in a variable NOTHING else writes to. `_event_pc` is
+            # reused by three later price-check blocks, which is exactly how the verified
+            # answer went missing before it could reach the payload.
+            if _event_pc:
+                _event_verified = _event_pc
             if _pc is None:
                 log.error(
                     f"AFL single: could not resolve {tip.event!r} to its real fixture on "
@@ -13731,6 +13750,12 @@ def _resolve_single_for_placement(
             "stat": stat, "line": line, "target_odds": target_odds,
             "proposition_id": _resolved_prop_id,
             "live_odds": _resolved_live_odds,
+            # v6.08x: the name form that VERIFIABLY resolved to the real fixture.
+            # `_price_check_afl_verified` works out which rendering reaches the men's
+            # board and logs "using it", but until now that answer died here and the POST
+            # rebuilt the event from `tip.event`, so HyperBot re-matched the name and
+            # could land somewhere else entirely. It did, twice, on 2026-08-15.
+            "event_verified": _event_verified,
         },
         None,
     )
@@ -13779,7 +13804,22 @@ def _execute_bet(
     # Translate Squiggle-format event to bookmaker-specific format
     # (e.g. sportsbet AFL "Greater Western Sydney" -> "GWS Giants").
     # Internal logic (audit logs, notifications) keeps the Squiggle name.
-    event_for_hb = _bookie_event(tip.event, bookie, tip.sport)
+    #
+    # v6.08x: PREFER the name that was PROVED to reach the real fixture. Resolution
+    # already worked this out and logged "using it"; sending the tipped name instead let
+    # HyperBot re-match by string and pick a different competition's board. On 2026-08-15
+    # that cost $1,000: Xerri's five POSTs went to the AFLW board (comp 46287) and
+    # Zorko's to comp 44839, which carries only head_to_head and line, seconds after the
+    # log said the men's board (17131) had been found under a reversed name.
+    #
+    # `_bookie_event` still runs on it, so the GWS alias keeps working, and the fallback
+    # is the exact previous expression, so any path that never verified is unchanged.
+    _verified_event = (resolved.get("event_verified")
+                       if isinstance(resolved, dict) else None)
+    event_for_hb = _bookie_event(_verified_event or tip.event, bookie, tip.sport)
+    if _verified_event and _verified_event != tip.event:
+        log.info(f"AFL event verify: posting under the VERIFIED fixture name "
+                 f"{event_for_hb!r} (tipped as {tip.event!r})")
 
     # Mirror place_single_sports_bet's actual payload EXACTLY so the log never
     # misleads — empty selection/stat are OMITTED there, not sent as "".
