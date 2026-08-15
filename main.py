@@ -892,6 +892,19 @@ def _stat_market_map(sport: str) -> dict[str, str]:
 # Squiggle gives the real bounce, so start_time is the check that needs no hard-coded ids.
 AFL_EVENT_VERIFY = os.getenv("AFL_EVENT_VERIFY", "true").strip().lower() == "true"
 AFL_EVENT_START_TOLERANCE_SEC = int(os.getenv("AFL_EVENT_START_TOLERANCE_SEC", "3600"))
+# v6.08x (Wilson: "all our tips are afl ONLY not the womens teams"). Sportsbet's
+# competition_external_id separates them outright, measured 2026-08-14/15 across every
+# fixture probed: 17131 = men's AFL, 46287 = AFLW.
+#
+# Used as a REJECT list, not an allow list, and that asymmetry is deliberate. Requiring
+# ==17131 would block every AFL bet the day Sportsbet renumbers the competition (a new
+# season, a restructure), turning a naming nuisance into a total outage. Rejecting a KNOWN
+# women's id can only ever refuse a bet we would never want, and the start-time check below
+# still catches any wrong fixture whose id we have not seen before.
+AFL_BLOCKED_COMPETITION_IDS = {
+    x.strip() for x in os.getenv("AFL_BLOCKED_COMPETITION_IDS", "46287").split(",")
+    if x.strip()
+}
 
 
 def _afl_expected_bounce(event: str):
@@ -917,21 +930,73 @@ def _afl_expected_bounce(event: str):
     return None
 
 
+# Common alternate club renderings. ONLY used to generate extra candidates for the
+# verified probe below, never applied blindly: every candidate is checked against the
+# fixture's real bounce before it can be priced, so a wrong rendering is simply rejected.
+# That is what makes a wide list safe here when a blind alias was not.
+_AFL_CLUB_ALTERNATES = {
+    "Adelaide": ["Adelaide Crows"],
+    "Brisbane Lions": ["Brisbane"],
+    "Carlton": ["Carlton Blues"],
+    "Collingwood": ["Collingwood Magpies"],
+    "Essendon": ["Essendon Bombers"],
+    "Fremantle": ["Fremantle Dockers"],
+    "Geelong": ["Geelong Cats"],
+    "Gold Coast": ["Gold Coast Suns"],
+    "Greater Western Sydney": ["GWS Giants", "GWS"],
+    "Hawthorn": ["Hawthorn Hawks"],
+    "Melbourne": ["Melbourne Demons"],
+    "North Melbourne": ["North Melbourne Kangaroos", "Kangaroos"],
+    "Port Adelaide": ["Port Adelaide Power"],
+    "Richmond": ["Richmond Tigers"],
+    "St Kilda": ["St Kilda Saints"],
+    "Sydney": ["Sydney Swans"],
+    "West Coast": ["West Coast Eagles"],
+    "Western Bulldogs": ["Footscray"],
+}
+AFL_EVENT_MAX_CANDIDATES = int(os.getenv("AFL_EVENT_MAX_CANDIDATES", "10"))
+
+
 def _afl_event_name_candidates(event: str, bookie: str, sport: str) -> list:
-    """Ordered event strings to try for the same fixture. The aliased form first (it is
-    what every other path sends), then plain, then the REVERSED pairing, which is what
-    actually reached the men's game on 2026-08-14 when the others did not."""
+    """Ordered event strings to try for the same fixture.
+
+    v6.08x: WIDENED. The first version tried only the aliased form, the plain form and the
+    reversal, and on 2026-08-15 all of them matched the AFLW board for
+    'North Melbourne v Geelong' (comp 46287), so the verified probe correctly refused and
+    THREE Saiyan tips worth $1,800 went to manual. Correct behaviour, too few options: the
+    men's game was reachable, just not by those two names.
+
+    Club nicknames are now mixed in on both sides and in both orders. This is only safe
+    BECAUSE each candidate is verified against the real bounce before it can be priced --
+    a blind nickname alias was tried twice and reverted, since applying one unconditionally
+    breaks the fixtures that already resolve (measured: 'North Melbourne v Geelong' gives
+    109 markets as-is and 9 as 'North Melbourne Kangaroos v Geelong Cats')."""
     out, seen = [], set()
-    for cand in (_bookie_event(event, bookie, sport), event):
-        if cand and cand not in seen:
-            seen.add(cand)
-            out.append(cand)
-    if event and " v " in event:
-        h, a = [x.strip() for x in event.split(" v ", 1)]
-        for cand in (f"{a} v {h}", _bookie_event(f"{a} v {h}", bookie, sport)):
-            if cand and cand not in seen:
-                seen.add(cand)
-                out.append(cand)
+
+    def _add(c):
+        if c and c not in seen and len(out) < AFL_EVENT_MAX_CANDIDATES:
+            seen.add(c)
+            out.append(c)
+
+    _add(_bookie_event(event, bookie, sport))
+    _add(event)
+    if not event or " v " not in event:
+        return out
+    h, a = [x.strip() for x in event.split(" v ", 1)]
+    _add(f"{a} v {h}")
+    _add(_bookie_event(f"{a} v {h}", bookie, sport))
+    ha = [h] + list(_AFL_CLUB_ALTERNATES.get(h, []))
+    aa = [a] + list(_AFL_CLUB_ALTERNATES.get(a, []))
+    # One side renamed at a time first (that is what worked on 08-14), then both.
+    for alt in ha[1:]:
+        _add(f"{alt} v {a}")
+        _add(f"{a} v {alt}")
+    for alt in aa[1:]:
+        _add(f"{h} v {alt}")
+        _add(f"{alt} v {h}")
+    for xh in ha[1:]:
+        for xa in aa[1:]:
+            _add(f"{xh} v {xa}")
     return out
 
 
@@ -954,6 +1019,15 @@ def _price_check_afl_verified(*, session_id, sport, event, bookie, markets_filte
             continue
         if first is None:
             first = (pc, cand)
+        # Wrong COMPETITION is decisive on its own and needs no ground truth, so it is
+        # checked before the start-time comparison: an AFLW board is never a bet we want,
+        # whatever the clock says.
+        _comp = str(pc.get("competition_external_id") or "").strip()
+        if _comp and _comp in AFL_BLOCKED_COMPETITION_IDS:
+            log.warning(
+                f"AFL event verify: {cand!r} is competition {_comp} (AFLW), not men's AFL "
+                f"— rejecting and trying the next name form")
+            continue
         if expected is None:
             return pc, cand          # no ground truth -> previous behaviour, unchanged
         st = pc.get("start_time_iso")

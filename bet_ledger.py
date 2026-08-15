@@ -441,6 +441,10 @@ def log_racing_bet(parsed: dict, placement: dict, account: str = "") -> None:
             "unit_size": "",
             "runner_match": _rmatch,
             "match_method": _rmethod,
+            # v6.08w: racing rows can carry a note too. The sports writer has always had
+            # one; racing never did, so a HAND-PLACED bet recorded here had no way to say
+            # so and read identically to an auto-placement.
+            "note": (parsed.get("note") or placement.get("note") or ""),
         })
     except Exception as e:
         log.error(f"bet_ledger.log_racing_bet failed: {e}")

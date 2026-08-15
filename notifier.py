@@ -432,6 +432,50 @@ def notify_bet_placed(result) -> bool:
     return _send_success(text)
 
 
+# The ONLY failure reasons a top-up re-ask is allowed to swallow. Both mean "the market
+# did not offer what we asked for", which is the precise condition the top-up exists to
+# retry, so hitting them again is a duplicate of an alert the operator already received.
+#
+# Everything NOT on this list still pages, even on a retry. That distinction was the
+# review finding on the first cut of this fix: `_place_afl_fanout` funnels FIVE different
+# failures through one notify_bet_failed call, and gating on the tip marker alone also
+# silenced "No active HyperBot sessions" (main.py:6922). A session, auth or proxy outage
+# can start BETWEEN the original placement and a retry tick, so that one is genuinely new
+# information and must never be suppressed as though it were the line moving.
+_TOPUP_DUPLICATE_FAILURES = (
+    "not carried",              # line moved off the board (the Bergman case)
+    "no placeable accounts",    # the to-win cap has not risen yet
+)
+
+
+def _is_silent_retry(tip, reason: str = "") -> bool:
+    """A RETRY of stake that already alerted once must not alert again FOR THE SAME REASON.
+
+    2026-08-15. Miles Bergman's Saiyan tip filled $375.20 of $600.00 and the shortfall
+    was queued for top-up. Sportsbet then moved his two-way disposals line from 20.5 to
+    19.5, so the exact-line rule correctly refused every re-ask -- but each refusal ran
+    the ordinary "route to manual" path and fired a FRESH manual-bet alert. Seven
+    attempts, seven identical Telegrams for one tip that had already been reported.
+
+    The alert is the bug, not the refusal: the top-up is a BONUS attempt on stake the
+    operator was already told about, so a failed one is a no-op and must be silent. Only
+    the successful top-up still notifies (the "cap rose" message), because that one
+    carries new information -- money moved.
+
+    Two conditions, BOTH required:
+      1. the tip carries the marker `_saiyan_topup_tick` sets on its own synthetic tip,
+         so an ORIGINAL tip failing to place is completely unaffected, and
+      2. the failure is one the top-up is expected to hit (see the tuple above).
+
+    Fails SAFE: an unrecognised reason, or no reason at all, alerts. Silence is the more
+    expensive mistake here, because a bet nobody hears about is a bet nobody places.
+    """
+    if not getattr(tip, "_saiyan_topup", False):
+        return False
+    r = (reason or "").lower()
+    return any(m in r for m in _TOPUP_DUPLICATE_FAILURES)
+
+
 def notify_bet_failed(result) -> bool:
     """Bet placement failed - goes to Manual Bets (#1).
 
@@ -444,6 +488,8 @@ def notify_bet_failed(result) -> bool:
     Ash isn't on the market for the resolved game). 2026-05-03 enrichment.
     """
     tip = result.tip
+    if _is_silent_retry(tip, getattr(result, "error", "")):
+        return True
     legs_lines = []
     for leg in tip.legs:
         if leg.market in ("h2h", "head_to_head"):
@@ -496,6 +542,8 @@ def notify_bet_failed(result) -> bool:
 
 def notify_manual_alert(tip) -> bool:
     """Alert for tips that need manual placement (SGMs, LIVE, etc)."""
+    if _is_silent_retry(tip, getattr(tip, "alert_reason", "")):
+        return True
     legs_lines = []
     for leg in tip.legs:
         if leg.market in ("h2h", "head_to_head"):
