@@ -7529,7 +7529,29 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # when nothing placed (notifier.py), so the one message that would have told Wilson
     # the tip was dead is precisely the one that was suppressed. A total miss is not a
     # shortfall, it is a failure, and it pages.
-    if unfilled > 1.0 and tip.tipster == DISPOSALS_MODEL_TIPSTER and total_placed > 0:
+    # v6.08y: the question is whether the SELECTION is alive, not whether this tranche
+    # filled. Gating on `total_placed` alone was too blunt and started paging hourly on
+    # 2026-08-15: Kysaiah Pickett had $425.74 genuinely on the book with the model
+    # re-offering the last $74.26 every hour, and each of those re-offers placed $0.00
+    # and so fired a fresh BET FAILED. That is the Bergman noise pattern again. Read the
+    # ledger for prior tranches (the commit for THIS run happens after the fan-out
+    # returns, so this sees earlier fills only) and net off ambiguous, since maybe-landed
+    # dollars are exactly the ones that might not be there. Fails OPEN: any error, or no
+    # selection id, leaves the money-losing case alerting.
+    _selection_on_book = 0.0
+    if tip.tipster == DISPOSALS_MODEL_TIPSTER:
+        try:
+            _sid = getattr(tip, "_disposals_sel_id", None)
+            if _sid:
+                _sel = (_disposals_load_state().get("selections") or {}).get(_sid) or {}
+                _selection_on_book = round(
+                    float(_sel.get("committed") or 0.0)
+                    - float(_sel.get("ambiguous") or 0.0), 2)
+        except Exception as _e:
+            log.warning(f"[disposals_model] could not read prior fills for the alert "
+                        f"gate ({_e}) — alerting, which is the safe direction")
+    if (unfilled > 1.0 and tip.tipster == DISPOSALS_MODEL_TIPSTER
+            and (total_placed > 0 or _selection_on_book > 0)):
         log.info(
             f"[disposals_model] ${unfilled:.2f} unfilled of ${display_intended:.2f} "
             f"— NOT alerting for a hand-place (the model re-offers the shortfall and "
