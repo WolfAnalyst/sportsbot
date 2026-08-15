@@ -200,7 +200,19 @@ _afl_log = logging.getLogger("apiafl")
 _afl_log.setLevel(logging.INFO)
 _afl_log.propagate = False
 if not _afl_log.handlers:
-    _afl_handler = logging.FileHandler(LOG_DIR / "apiafl.log", encoding="utf-8")
+    # v6.08z: a TEST RUN MUST NOT WRITE HERE. The v6.08x/y test files drive the real
+    # _execute_bet and _place_afl_fanout with real fixture names, so every run wrote
+    # lines like `PLACED bookie=sportsbet sid=53522 bet_id=B1 odds=1.85 stake=$100.00`
+    # into the production AFL log, indistinguishable from a genuine placement. That is
+    # the one file used to reconstruct AFL incidents, and the pre-commit gate runs the
+    # full suite on every commit, so the contamination compounded silently.
+    # Redirected rather than silenced, so a test that wants the trail still has it.
+    # Mirrors what _audit_log_path() already does for the other audit writers.
+    _afl_log_file = LOG_DIR / "apiafl.log"
+    if os.getenv("TIPBOT_TESTING", "").strip().lower() in ("1", "true", "yes"):
+        import tempfile as _tf
+        _afl_log_file = Path(_tf.gettempdir()) / "tipbot_test_apiafl.log"
+    _afl_handler = logging.FileHandler(_afl_log_file, encoding="utf-8")
     _afl_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     )
@@ -1460,6 +1472,16 @@ def _sb_max_stake_target(resp, bookie, attempted_stake):
         return None
     mx = _extract_max_stake(resp)
     if mx is None or mx < 1.0:
+        # v6.08z: say WHY the rebet did not fire. The 08-15 audit could not tell whether
+        # Karl Amon's $600 was genuinely unfillable or whether Sportsbet simply returned
+        # no max: all 20 POSTs got 538, the rebet never fired, and this branch returned
+        # None in silence, so "cap exhausted" stayed an inference forever. The existing
+        # MAX-STAKE REBET SKIPPED warning lives inside the `_mx_target is not None`
+        # branch, so its absence proves nothing. One line turns that into a measurement.
+        log.info(
+            f"MAX-STAKE REBET not possible on {bookie}: Sportsbet returned "
+            f"{'NO max_stake field' if mx is None else f'max ${mx:.2f} (below the $1.00 floor)'}"
+            f" on a 538 for ${attempted_stake} — no rebet rung exists")
         return None
     try:
         if attempted_stake and mx >= float(attempted_stake):
@@ -6283,6 +6305,11 @@ def _saiyan_topup_tick():
     import time as _t          # local, matching this module's convention
     now = _t.time()
     keep = []
+    # v6.08z: stake that gives up is NEWS, not a log line. On 2026-08-15 five selections
+    # were dropped at 13:19 and 13:47 totalling $1,148.12, the largest of them $559.04,
+    # with SIX HOURS AND TWENTY-THREE MINUTES still to run before the 20:10 bounce. Every
+    # one was a bare log.warning, so nobody could hand-place any of it.
+    _topup_dropped = []
     for item in pending:
         try:
             b = _saiyan_topup_bounce_epoch(item)
@@ -6304,11 +6331,29 @@ def _saiyan_topup_tick():
                          f"({item.get('event')}): inside {SAIYAN_TOPUP_STOP_MIN_BEFORE}min "
                          f"of bounce, ${item.get('remaining')} never got on")
                 continue
+            # v6.08z: RETIRE A MOVED LINE IMMEDIATELY. A `not carried` failure means
+            # Sportsbet no longer offers the exact line we filled at, and the exact-line
+            # rule will refuse every future re-ask identically, so attempts 2..8 are
+            # guaranteed-identical refusals that burn a whole cycle of the cap window.
+            # MEASURED 2026-08-15: Bergman spent all 8 that way (zero POSTs, zero 538s).
+            # A 538 is the opposite case and must keep retrying: it means capacity exists
+            # but is currently full, and the cap RISES toward bounce.
+            _last = str(item.get("last_error") or "").lower()
+            if (int(item.get("attempts", 0)) >= 1 and "not carried" in _last
+                    and "538" not in _last and "stake too high" not in _last):
+                log.warning(
+                    f"[saiyan-topup] RETIRING {item.get('player')} {item.get('line')} after "
+                    f"{item.get('attempts')} attempt(s): the line has moved off the board, so "
+                    f"every further re-ask is the same refusal. ${item.get('remaining')} "
+                    f"never got on")
+                _topup_dropped.append((item, "line moved off the board"))
+                continue
             if int(item.get("attempts", 0)) >= SAIYAN_TOPUP_MAX_ATTEMPTS:
                 log.warning(
                     f"[saiyan-topup] DROPPING {item.get('player')} {item.get('line')}: "
                     f"{item.get('attempts')} attempts is enough, ${item.get('remaining')} "
                     f"never got on")
+                _topup_dropped.append((item, f"{item.get('attempts')} attempts exhausted"))
                 continue
             # Hard expiry so a fixture we cannot resolve cannot live forever.
             try:
@@ -6352,6 +6397,15 @@ def _saiyan_topup_tick():
             got = round(sum(float(r.stake or 0) for r in (res or [])
                             if getattr(r, "success", False)
                             or _is_ambiguous_result(r)), 2)
+            # v6.08z: remember WHY this attempt failed, so the retire check below can tell
+            # "the cap has not risen yet" (worth re-asking, capacity may appear) from
+            # "the line moved off the board" (never worth re-asking, the exact-line rule
+            # will refuse identically forever). MEASURED 2026-08-15: Bergman burned all 8
+            # attempts on `not carried in catalog`, zero POSTs, zero 538s, because
+            # Sportsbet had moved his two-way line 20.5 -> 19.5.
+            if got <= 0:
+                _errs = " | ".join(str(getattr(r, "error", "") or "") for r in (res or []))
+                item["last_error"] = _errs[:300]
             if got > 0:
                 item["placed"] = round(before + got, 2)
                 item["remaining"] = round(float(item["intended"]) - item["placed"], 2)
@@ -6386,6 +6440,22 @@ def _saiyan_topup_tick():
         merged = list(keep) + [i for i in latest
                                if _k(i) not in mine and _k(i) not in {_k(x) for x in pending}]
         _saiyan_topup_save(merged)
+
+    # Alert OUTSIDE the lock: a Telegram round-trip must not hold the queue.
+    if _topup_dropped:
+        try:
+            _tot = round(sum(float(i.get("remaining") or 0) for i, _ in _topup_dropped), 2)
+            _lines = "\n".join(
+                f"  {i.get('player')} {i.get('line')} — <b>${float(i.get('remaining') or 0):.2f}</b>"
+                f" ({why})"
+                for i, why in _topup_dropped)
+            notifier.notify_info(
+                f"⚠️ Saiyan top-up GAVE UP on <b>${_tot:.2f}</b>\n{_lines}\n\n"
+                f"These will NOT be re-asked again. Nothing is on for this stake, so it is "
+                f"yours to hand-place if you still want it. A retired line has moved and "
+                f"will not come back; an exhausted one simply ran out of attempts.")
+        except Exception as _e:
+            log.warning(f"[saiyan-topup] could not alert the dropped stake: {_e}")
 
 
 async def _saiyan_topup_loop():
