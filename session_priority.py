@@ -414,6 +414,35 @@ def get_session_meta(session_id: str) -> Optional[SessionMeta]:
     return _session_meta.get(str(session_id))
 
 
+def session_label(session_id, fallback_bookie: str = "") -> str:
+    """Human label for a session: "Denzel Sportsbet (s118458)".
+
+    v6.12 (Wilson): "mention the bookie NAME not just the session id ... i cant remember
+    the bookie id's but can remember the name (eg. Daniel Sportsbet)". Every alert that
+    asks the operator to go and check an account by hand must name that account.
+
+    Lives HERE, not in notifier, for two reasons. The metadata is owned by this module, and
+    more practically: several tests (and any future code) replace `main.notifier` with a
+    stub, so routing the lookup through notifier made a label call crash on a stub that had
+    not been taught the method. Caught by the suite on the first attempt at this change.
+
+    Never raises and always returns something: this runs inside alert paths, where an
+    exception would replace a degraded message with no message at all.
+    """
+    sid = str(session_id) if session_id is not None else ""
+    try:
+        meta = _session_meta.get(sid)
+        if meta and meta.name:
+            bookie = (getattr(meta, "bookmaker", "") or fallback_bookie or "").strip()
+            if bookie:
+                return f"{meta.name} {bookie.capitalize()} (s{sid})"
+            return f"{meta.name} (s{sid})"
+    except Exception:
+        pass
+    bookie = (fallback_bookie or "").strip()
+    return f"{bookie} (s{sid})" if bookie else (f"s{sid}" if sid else "unknown session")
+
+
 def get_priority_config() -> PriorityConfig:
     """Return the current priority config (read-only access)."""
     return _priority_config

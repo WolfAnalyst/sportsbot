@@ -1353,7 +1353,10 @@ def _emit_sports_ambiguous_alert(tip, ambiguous_outcomes: list[dict]) -> None:
         _cid = a.get("correlation_id")
         cid_tag = f"\n    cid: {_esc(str(_cid))}" if _cid else ""
         lines.append(
-            f"  {_esc(str(a.get('bookie', '')))}:{_esc(str(a.get('session_id', '')))} "
+            # v6.12: name the ACCOUNT, not the session id. This alert asks Wilson to go
+            # and check a bookie account by hand, so "sportsbet:118458" is the worst
+            # possible rendering: he remembers "Denzel Sportsbet", not the number.
+            f"  {_esc(session_priority.session_label(a.get('session_id', ''), a.get('bookie', '')))} "
             f"${a.get('stake', 0):.2f} @ {a.get('odds')} - "
             f"{_esc(str(a.get('reason', 'ambiguous')))}{latency_tag}"
             f"\n    err: {_esc(str(a.get('error', ''))[:200])}{cid_tag}"
@@ -6131,7 +6134,10 @@ def _schedule_deferred_sports_cid_verify(*, session_id, bookie, tip, stake, odds
                 notifier.notify_critical(
                     f"⚠️ UNRESOLVED BET now looks NOT PLACED (deferred {waited}s re-check)"
                     f"\n{_label} — {_event}"
-                    f"\n<b>${stake:.2f}</b> @ {odds} on {bookie}:{session_id}"
+                    # v6.12: name the ACCOUNT. This message tells Wilson to go and check
+                    # a bookie account by hand, so a session id is the wrong thing to show.
+                    f"\n<b>${stake:.2f}</b> @ {odds} on "
+                    f"{session_priority.session_label(session_id, bookie)}"
                     f"\n\nIt was counted as maybe-placed at the time (correctly — a "
                     f"re-place could have double-staked), so NOTHING was re-shopped and "
                     f"this stake is UNFILLED."

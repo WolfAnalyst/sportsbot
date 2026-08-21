@@ -17,11 +17,195 @@ from requests.exceptions import ReadTimeout  # v5.71: module-level so the
 # except clause resolves independently of a mocked `requests` in tests
 import logging
 import os
+import json
+import threading
 from config import NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID, NOTIFY_SUCCESS_CHAT_ID
 
 log = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}"
+
+# ── v6.13 DURABLE NOTIFICATION QUEUE ─────────────────────────────────────────
+# A message that cannot be sent now is kept on disk and sent later. Nothing is ever
+# discarded except the one case where resending would DUPLICATE (see _nq_drain).
+#
+# Why a queue and not more retries: measured on 2026-08-21, Telegram refused a single
+# message sent after five hours of silence, at 6/min against a ~20/min limit, across all
+# four chats at once, with zero 400s. The throttle is adaptive and on their side, so no
+# retry policy can beat it. Late delivery of a bet log is fine. Loss is not.
+_NQ_PATH = os.getenv("NOTIFY_QUEUE_PATH", "logs/notify_queue.jsonl")
+# Pace: Telegram's group-chat guidance is ~20 messages/minute, so 4s between sends (15/min)
+# leaves headroom. Only applies when there is a backlog; a lone message goes immediately.
+_NQ_MIN_INTERVAL = float(os.getenv("NOTIFY_MIN_INTERVAL_SEC", "4.0"))
+# How long a message may sit before we shout about it in the log. It stays queued.
+_NQ_STALE_SEC = float(os.getenv("NOTIFY_STALE_ALERT_SEC", "900"))
+# After a 429, stop sending on EVERY chat for this long. Telegram asked for 8s on
+# 2026-08-21; 20s is deliberately generous because the documented penalty for knocking
+# early is an ESCALATING cooldown, so over-waiting is cheap and under-waiting is not.
+_NQ_COOLDOWN_SEC = float(os.getenv("NOTIFY_COOLDOWN_SEC", "20.0"))
+_nq_lock = threading.Lock()
+_nq_thread = None
+_nq_cooldown_until = 0.0     # global: set by a 429, blocks ALL chats (the limit is bot-wide)
+_nq_last_outcome = ""        # set by _send_now so the drainer can classify the failure
+_nq_last_send_ts = 0.0
+
+
+def _nq_mark(outcome: str) -> None:
+    """Record WHY the last _send_now failed, so the drainer can act on it.
+
+    Three classes, and the distinction is money-critical:
+      throttled  -> temporary, message is fine, REQUEUE (429, connect failure)
+      uncertain  -> the POST was transmitted, so a resend DUPLICATES. Drop, loudly.
+      (anything) -> permanent rejection, drop; requeueing would spin forever.
+    """
+    global _nq_last_outcome
+    _nq_last_outcome = outcome
+    if outcome == "throttled":
+        # A 429 is bot-wide, not per-chat: on 2026-08-21 it hit all four chats at once.
+        # So pause EVERY chat, and honour Telegram's own delay. The docs are explicit that
+        # knocking again before it expires escalates the cooldown.
+        global _nq_cooldown_until
+        _nq_cooldown_until = max(_nq_cooldown_until, time.time() + _NQ_COOLDOWN_SEC)
+
+
+def _nq_enqueue(text: str, chat_id: str, parse_mode: str) -> bool:
+    """Append to the durable queue and make sure the drainer is running."""
+    if not NOTIFY_BOT_TOKEN or not chat_id:
+        log.warning("Notification bot not configured, skipping")
+        print(f"[NOTIFY] {text}")
+        return False
+    rec = {"text": text, "chat_id": str(chat_id), "parse_mode": parse_mode,
+           "queued_at": time.time(), "attempts": 0}
+    try:
+        with _nq_lock:
+            os.makedirs(os.path.dirname(_NQ_PATH) or ".", exist_ok=True)
+            with open(_NQ_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        # Last resort: the queue file is unwritable. Try the wire directly rather than
+        # lose the message, which is the whole point of this machinery.
+        log.error(f"notify queue unwritable ({e}) — sending inline instead")
+        return _send_now(text, chat_id, parse_mode)
+    _nq_start()
+    return True
+
+
+def _nq_start() -> None:
+    global _nq_thread
+    with _nq_lock:
+        if _nq_thread is not None and _nq_thread.is_alive():
+            return
+        _nq_thread = threading.Thread(target=_nq_drain, name="notify-queue",
+                                      daemon=True)
+        _nq_thread.start()
+    log.info(f"notify queue drainer started (pace {_NQ_MIN_INTERVAL:.1f}s between sends)")
+
+
+def _nq_load() -> list:
+    try:
+        if not os.path.exists(_NQ_PATH):
+            return []
+        out = []
+        with open(_NQ_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue          # skip a torn line, keep the rest
+        return out
+    except Exception as e:
+        log.error(f"notify queue unreadable: {e}")
+        return []
+
+
+def _nq_save(items: list) -> None:
+    try:
+        tmp = _NQ_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for it in items:
+                f.write(json.dumps(it) + "\n")
+        os.replace(tmp, _NQ_PATH)
+    except Exception as e:
+        log.error(f"notify queue not saved: {e}")
+
+
+def _nq_drain() -> None:
+    """Send queued messages, oldest first, pacing and honouring Telegram's cooldown."""
+    global _nq_cooldown_until, _nq_last_send_ts
+    idle = 0
+    while True:
+        try:
+            with _nq_lock:
+                items = _nq_load()
+            if not items:
+                idle += 1
+                # Exit after ~5 minutes idle; the next enqueue restarts us.
+                if idle > 150:
+                    log.info("notify queue empty — drainer exiting until next message")
+                    return
+                time.sleep(2)
+                continue
+            idle = 0
+
+            now = time.time()
+            if now < _nq_cooldown_until:
+                time.sleep(min(5.0, _nq_cooldown_until - now))
+                continue
+            gap = _NQ_MIN_INTERVAL - (now - _nq_last_send_ts)
+            if len(items) > 1 and gap > 0:
+                time.sleep(gap)
+
+            rec = items[0]
+            waited = time.time() - float(rec.get("queued_at") or 0)
+            if waited > _NQ_STALE_SEC and rec.get("attempts", 0) % 20 == 0:
+                log.error(
+                    f"notify queue BACKLOG: oldest message has waited {waited / 60:.0f}min "
+                    f"({len(items)} queued). NOT lost, still retrying. "
+                    f"preview: {str(rec.get('text'))[:70]}")
+
+            global _nq_last_outcome
+            _nq_last_outcome = ""
+            _nq_last_send_ts = time.time()
+            ok = _send_now(rec["text"], rec.get("chat_id", ""),
+                           rec.get("parse_mode", "HTML"))
+            outcome = _nq_last_outcome
+
+            with _nq_lock:
+                cur = _nq_load()
+                # Only pop if the head is still the record we just sent: another process
+                # or an inline fallback could have rewritten the file underneath us.
+                if cur and cur[0].get("queued_at") == rec.get("queued_at") \
+                        and cur[0].get("text") == rec.get("text"):
+                    head, rest = cur[0], cur[1:]
+                else:
+                    head, rest = None, cur
+
+                if ok:
+                    _nq_save(rest if head is not None else cur)
+                elif outcome == "throttled":
+                    # Requeue at the FRONT: order matters for a bet log, and the message
+                    # is fine, only the timing was wrong.
+                    if head is not None:
+                        head["attempts"] = int(head.get("attempts", 0)) + 1
+                        _nq_save([head] + rest)
+                elif outcome == "uncertain":
+                    # A read timeout means the POST was TRANSMITTED and very likely
+                    # delivered. Resending duplicates it (the 2026-06-16 Turang/Olson
+                    # double-send). This is the ONE case we drop, and we say so loudly.
+                    log.error(
+                        f"notify DELIVERY-UNCERTAIN, dropping to avoid a duplicate "
+                        f"(chat={rec.get('chat_id')}): {str(rec.get('text'))[:80]}")
+                    _nq_save(rest if head is not None else cur)
+                else:
+                    # Permanent (400 chat-not-found, bot blocked, malformed): requeueing
+                    # would spin forever. _send_now already logged NOTIFY LOST.
+                    _nq_save(rest if head is not None else cur)
+        except Exception as e:
+            log.error(f"notify queue drainer error: {e}")
+            time.sleep(5)
 
 # ── Chat destinations (loaded from .env with fallback to NOTIFY_CHAT_ID) ──
 NOTIFY_MANUAL_CHAT_ID = os.getenv("NOTIFY_MANUAL_CHAT_ID", "") or NOTIFY_CHAT_ID
@@ -37,6 +221,25 @@ def _escape_html(text: str) -> str:
     text = text.replace("<", "&lt;")
     text = text.replace(">", "&gt;")
     return text
+
+
+def session_label(session_id, fallback_bookie: str = "") -> str:
+    """Public alias for _session_label, for callers outside this module.
+
+    v6.12 (Wilson): every operator-facing alert must name the ACCOUNT, not a session id.
+    "sportsbet:118458" is unreadable at 3am; "Denzel Sportsbet (s118458)" is not. Three
+    alert sites still rendered the raw pair: the sports ambiguous CRITICAL, and both
+    deferred-verify CRITICALs (sports and racing). Those are exactly the messages that ask
+    the operator to go and check an account by hand, so they are the worst place to print
+    a number nobody remembers.
+    """
+    return _session_label(session_id, fallback_bookie)
+
+
+# NOTE: the canonical implementation now lives in session_priority.session_label, which
+# owns the metadata and, crucially, is never replaced by a test stub the way `notifier` is.
+# This module keeps its own copy because _session_label predates it and is used by the
+# BET PLACED / BET UNFILLED summaries; the two render identically.
 
 
 def _session_label(session_id, fallback_bookie: str = "") -> str:
@@ -152,13 +355,25 @@ def _render_timing_block(
 
 
 def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
-    """Send a message via the notification bot.
+    """Hand a message to the durable queue. Returns True once it is safely enqueued.
 
-    v5.56 (audit): transient failures (network exception, HTTP 5xx, 429) get
-    ONE retry after a short pause, and a FINAL failure always logs the
-    distinctive needle 'NOTIFY LOST (final)' — previously a single failed
-    POST silently dropped the message (including CRITICALs and manual-bet
-    alerts) with only a generic error line."""
+    v6.13. Wilson: "i rlly need the problem fixed as its crucial i dont miss this msgs".
+
+    Every previous fix here tried harder to send RIGHT NOW, and each one still lost
+    messages, because the failure is not ours to control. MEASURED on 2026-08-21: the very
+    first 429 landed on a SINGLE message after a five-hour-thirteen-minute silence, peak
+    traffic was 6/min against a ~20/min limit, zero minutes exceeded it, and refusals hit
+    all four chats at once. The same message types both succeeded and failed that day, and
+    there were zero 400s, so it was neither our volume nor our content. Telegram's limits
+    are adaptive and undocumented, tightening on global load and per-bot reputation, so
+    "send harder" can never be correct.
+
+    So stop trying to win the race. A message that cannot go now is QUEUED and goes later.
+    Late is acceptable for a bet log; lost is not. 731 NOTIFY LOST across the logs is what
+    the old approach cost, including 69 BET FAILED alerts in a single day.
+
+    The transport itself is unchanged and lives in _send_now.
+    """
     # v6.08t: NEVER send a real Telegram from a test run. There is no legitimate case for
     # it, and the harm is concrete: test_saiyan_topup stubs the fan-out to return a
     # SUCCESSFUL top-up, so _saiyan_topup_tick fired a genuine "Saiyan top-up: $X more on
@@ -173,6 +388,18 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
     if os.getenv("TIPBOT_TESTING", "").strip().lower() in ("1", "true", "yes"):
         log.info(f"[TIPBOT_TESTING] notification suppressed: {str(text)[:160]}")
         return True
+    return _nq_enqueue(text, chat_id or NOTIFY_CHAT_ID, parse_mode)
+
+
+def _send_now(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
+    """The actual Telegram transport. Called ONLY by the queue drainer.
+
+    Return semantics matter to the drainer:
+      True  -> delivered, drop from the queue
+      False -> not delivered; the drainer decides whether to requeue, using
+               _nq_last_outcome to tell "throttled, try again" from
+               "delivery uncertain, must NOT resend" from "permanently rejected".
+    """
     target = chat_id or NOTIFY_CHAT_ID
     if not NOTIFY_BOT_TOKEN or not target:
         log.warning("Notification bot not configured, skipping")
@@ -226,6 +453,7 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
                 f"{e} | preview: {preview} — request reached Telegram; NOT "
                 f"retrying (a retry would duplicate the message)"
             )
+            _nq_mark("uncertain")     # v6.13: drainer must NOT requeue this one
             return False
         except Exception as e:
             # Connect-level failures (ConnectTimeout / ConnectionError / DNS /
@@ -240,6 +468,7 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
                 continue
             log.error(f"NOTIFY LOST (final): NOT delivered after retry "
                       f"(chat={target}) | preview: {preview}")
+            _nq_mark("throttled")    # connect failure: never reached Telegram, safe to requeue
             return False
 
         if resp.status_code == 200:
@@ -310,6 +539,11 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
                         f"attempt {attempt + 1}/5 (chat={target})")
             time.sleep(_wait)
             continue
+        # v6.13: classify so the queue can decide. A 429 is temporary and the message is
+        # fine, so it goes back on the queue; anything else is permanent and dropping it
+        # is correct (requeueing a 400 would spin forever).
+        if resp.status_code == 429:
+            _nq_mark("throttled")
         log.error(f"NOTIFY LOST (final): NOT delivered (chat={target}) "
                   f"| preview: {preview}")
         return False
