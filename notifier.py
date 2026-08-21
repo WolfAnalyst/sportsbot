@@ -185,7 +185,17 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
     preview = text.replace("\n", " ")[:80]
 
     url = f"{TELEGRAM_API.format(token=NOTIFY_BOT_TOKEN)}/sendMessage"
-    for attempt in (1, 2):
+    # v6.10: give a RATE LIMIT more than one 2-second retry. A 429 is Telegram saying
+    # "later", not "never", and it tells us exactly how much later in
+    # parameters.retry_after. The old policy slept a fixed 2s and gave up on attempt 2,
+    # so it retried while still throttled and discarded the message. MEASURED: 731
+    # NOTIFY LOST across the logs, including 69 BET FAILED alerts on 2026-08-10 (the day
+    # of 588 top-up re-asks) and SGM BET PLACED / MANUAL BET ALERT messages. On
+    # 2026-08-21, 19 sends hit 429 and 9 were lost outright, one of them the Nick Daicos
+    # top-up notice Wilson went looking for. A dropped alert is the silent-drop class
+    # this project keeps paying for, so a rate limit now gets real attempts with the
+    # bookie's, sorry, Telegram's OWN stated delay honoured.
+    for attempt in (1, 2, 3, 4, 5):
         try:
             _payload = {"chat_id": target, "text": text}
             if parse_mode:
@@ -220,8 +230,11 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
         except Exception as e:
             # Connect-level failures (ConnectTimeout / ConnectionError / DNS /
             # refused) mean the request did NOT reach Telegram -> safe to retry.
+            # Connect-level retry stays at ONE extra attempt: unlike a 429 there is no
+            # server-stated delay to honour, and a hard connect failure rarely clears in
+            # seconds. Deliberately narrower than the rate-limit path above.
             log.error(f"Telegram send EXCEPTION (chat={target}, attempt "
-                      f"{attempt}/2): {e} | preview: {preview}")
+                      f"{attempt}): {e} | preview: {preview}")
             if attempt == 1:
                 time.sleep(2)
                 continue
@@ -235,7 +248,7 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
 
         log.error(
             f"Telegram send FAILED (chat={target}, status={resp.status_code}, "
-            f"attempt {attempt}/2): {resp.text[:300]} | preview: {preview}"
+            f"attempt {attempt}/5): {resp.text[:300]} | preview: {preview}"
         )
         if "can't parse entities" in resp.text:
             # H (2026-05-31): the retry already omits parse_mode (so Telegram
@@ -275,8 +288,27 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
             return False
         # Transient server-side classes get the one retry; other 4xx
         # (chat not found, bot blocked...) won't improve — fail loud now.
-        if attempt == 1 and (resp.status_code == 429 or resp.status_code >= 500):
-            time.sleep(2)
+        # A 429 gets the full budget; a 5xx keeps its single retry. Deliberately narrow:
+        # a rate limit is a KNOWN-temporary condition that reports its own clearance time,
+        # whereas a 503 is an opaque server fault with no stated recovery, so hammering it
+        # five times buys nothing and delays the loud failure.
+        _retryable = (resp.status_code == 429 and attempt < 5) or (
+            resp.status_code >= 500 and attempt == 1)
+        if _retryable:
+            _wait = 2.0
+            if resp.status_code == 429:
+                # Honour Telegram's OWN number. It is authoritative and retrying sooner
+                # is guaranteed to fail: on 2026-08-21 it said retry_after=8 twice and
+                # both 2-second retries were refused.
+                try:
+                    _ra = ((resp.json() or {}).get("parameters") or {}).get("retry_after")
+                    if _ra is not None:
+                        _wait = min(60.0, max(1.0, float(_ra) + 0.5))
+                except Exception:
+                    pass
+            log.warning(f"Telegram {resp.status_code}, waiting {_wait:.1f}s before "
+                        f"attempt {attempt + 1}/5 (chat={target})")
+            time.sleep(_wait)
             continue
         log.error(f"NOTIFY LOST (final): NOT delivered (chat={target}) "
                   f"| preview: {preview}")
