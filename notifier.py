@@ -19,11 +19,43 @@ import logging
 import os
 import json
 import threading
+import sys
 from config import NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID, NOTIFY_SUCCESS_CHAT_ID
 
 log = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}"
+
+# ── v6.14 UN-POPPABLE TEST GUARD ─────────────────────────────────────────────
+# Set True ONLY by a test that exercises the transport with requests.post patched, so
+# nothing can leave the machine. Everything else is blocked under pytest by default.
+_ALLOW_TEST_TRANSPORT = False
+
+
+def _blocked_by_test_guard() -> bool:
+    """True when this process must not send a real Telegram.
+
+    v6.14. The TIPBOT_TESTING env var was not a sufficient guard, because any test can
+    unset it for the WHOLE process: test_notify_rate_limit.py did exactly that at module
+    level (`os.environ.pop("TIPBOT_TESTING", None)`), so every test collected afterwards
+    ran unguarded.
+
+    MEASURED 2026-08-22 with a network spy: one full-suite run made 13 REAL Telegram
+    calls to the maintenance channel, all "Saiyan top-up: $100.00 more on Patrick
+    Dangerfield". The pre-commit gate runs the full suite on EVERY commit, so five commits
+    in a day sent roughly 65 junk messages that never appear in logs/tipbot.log, because a
+    test process logs to a temp file. That is both the spam Wilson saw and a block of
+    UNLOGGED traffic against the bot token, which is very likely part of why the 429
+    analysis kept coming up short.
+
+    So the guard no longer trusts an env var alone: `pytest in sys.modules` cannot be
+    popped by a test. Fails CLOSED, i.e. blocked, which is the safe direction.
+    """
+    if _ALLOW_TEST_TRANSPORT:
+        return False
+    if "pytest" in sys.modules:
+        return True
+    return os.getenv("TIPBOT_TESTING", "").strip().lower() in ("1", "true", "yes")
 
 # ── v6.13 DURABLE NOTIFICATION QUEUE ─────────────────────────────────────────
 # A message that cannot be sent now is kept on disk and sent later. Nothing is ever
@@ -385,8 +417,8 @@ def _send(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
     #
     # Returns True (the send "succeeded") so any test asserting on the return value keeps
     # its meaning; the message is logged instead of posted.
-    if os.getenv("TIPBOT_TESTING", "").strip().lower() in ("1", "true", "yes"):
-        log.info(f"[TIPBOT_TESTING] notification suppressed: {str(text)[:160]}")
+    if _blocked_by_test_guard():
+        log.info(f"[test guard] notification suppressed: {str(text)[:160]}")
         return True
     return _nq_enqueue(text, chat_id or NOTIFY_CHAT_ID, parse_mode)
 
