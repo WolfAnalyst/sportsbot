@@ -18048,6 +18048,65 @@ def _sync_freeze_alert(msg: str) -> None:
         pass
 
 
+# ── v6.15 STARTUP WATCHDOG ───────────────────────────────────────────────────
+# The window between "Starting TipBot..." and "Listening for tips..." was completely
+# unguarded, and on 2026-08-22 a power outage left the autostarted process wedged inside
+# it for 88 MINUTES (11:08:40 to 12:36:41). The scheduled task reported Running, a python
+# process was alive burning CPU, and the loop-freeze watchdog never fired. Nothing was
+# listening to any tipster channel, so Eddie's 12:25 tips were never received, and
+# `catch_up=False` means a dead-window tip is DROPPED, never replayed. Wilson had to place
+# them by hand.
+#
+# Why the existing loop watchdog did not cover it, despite its comment claiming it does:
+# it keys on the asyncio liveness STAMP, so it only fires when the loop stops ticking. A
+# startup that blocks while the loop still ticks (or before the watchdog arms) looks
+# perfectly healthy to it. This guard keys on PROGRESS instead: did startup actually
+# finish? That cannot be faked by a ticking loop.
+#
+# Deliberately a plain OS thread, not an asyncio task, so a wedged event loop cannot stop
+# it. Same escape hatch as the loop watchdog: os._exit(1), which tipbot.bat's :start loop
+# relaunches clean.
+STARTUP_WATCHDOG_SEC = float(os.getenv("STARTUP_WATCHDOG_SEC", "180"))
+_startup_done = threading.Event()
+
+
+def _startup_complete() -> None:
+    """Called once startup has genuinely finished (channels registered, loop running)."""
+    _startup_done.set()
+
+
+def _arm_startup_watchdog() -> None:
+    """Kill the process if startup has not completed within STARTUP_WATCHDOG_SEC.
+
+    A HEALTHY start takes about ONE SECOND from "Starting TipBot..." to "Listening for
+    tips..." (measured across today's four clean starts: 03:29, 04:43, 09:54, 12:36). The
+    default 180s is therefore ~180x headroom, so this can only fire on a genuine wedge.
+    """
+    if STARTUP_WATCHDOG_SEC <= 0:
+        log.info("startup watchdog DISABLED (STARTUP_WATCHDOG_SEC<=0)")
+        return
+
+    def _watch():
+        if _startup_done.wait(STARTUP_WATCHDOG_SEC):
+            return          # normal path: startup finished, nothing to do
+        # Log FIRST and to the file, then exit. Do not try to Telegram: a wedge here may
+        # be exactly what is blocking the network, and the 2026-07-29 incident showed a
+        # blocked logger must never sit between the decision and the exit.
+        try:
+            log.critical(
+                f"STARTUP WATCHDOG: startup did not complete within "
+                f"{STARTUP_WATCHDOG_SEC:.0f}s — the process is wedged before it could "
+                f"listen to any tipster channel, so every tip in this window is being "
+                f"DROPPED (catch_up=False). Exiting so tipbot.bat relaunches clean.")
+        except Exception:
+            pass
+        os._exit(1)
+
+    threading.Thread(target=_watch, name="startup-watchdog", daemon=True).start()
+    log.info(f"startup watchdog armed ({STARTUP_WATCHDOG_SEC:.0f}s to reach "
+             f"'Listening for tips')")
+
+
 def _loop_freeze_tick(now: float) -> bool:
     """ONE freeze-check iteration (split from the thread loop for testability). If the
     loop-liveness stamp is frozen (armed AND older than MAX_SILENCE) fire a bounded
@@ -18230,6 +18289,7 @@ async def main():
         # (below) is also covered by the out-of-loop thread.
         asyncio.create_task(_loop_liveness_ticker())
     log.info("Starting TipBot...")
+    _arm_startup_watchdog()
     # Banner: version NUMBER + fingerprint only (v5.39, Wilson) — the full
     # TIPBOT_VERSION is a multi-KB accumulated changelog; it stays in config.py +
     # CHANGELOG.md as the audit record, no need to dump it into every startup log.
@@ -18695,6 +18755,7 @@ async def main():
         log.info(f"Monitoring: {cfg['name']} (chat_id={chat_id})")
 
     log.info("Listening for tips... (Ctrl+C to stop)")
+    _startup_complete()
     await client.run_until_disconnected()
 
     # v5.9x: if the liveness watchdog forced this disconnect (dead/half-open socket),
