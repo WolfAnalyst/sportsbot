@@ -2722,6 +2722,86 @@ def _disposals_match_book_player(model_name: str, book_name: str) -> str:
     return "unknown"
 
 
+def _disposals_exposure_by_tipster(player: str, line, side: str, day: str = "") -> dict:
+    """Who actually has money on this selection, from OUR OWN ledger. {tipster: total}.
+
+    v6.16 (Wilson): the book sweep alert called every dollar on the selection "outside this
+    tipster", including the disposals model's OWN earlier tranches. MEASURED: the Nick
+    Daicos 34.5 sweep reported $436.00 "from outside this tipster" while the ledger's
+    committed for that exact selection was $436.00. Every cent was ours. Wilson read it as
+    a mystery third party and asked, reasonably, why the model was calling itself an
+    outsider.
+
+    Scoped to ONE DAY rather than joined on the event, because the sweep key is
+    (player, line, side) with no event and the model's own event field is a hash. An AFL
+    player has one fixture a day, so the date is a sufficient and much simpler scope.
+
+    Never raises: this only decorates an alert, so a failure must degrade the wording, not
+    lose the message.
+    """
+    out: dict = {}
+    try:
+        import csv as _csv
+        import bet_ledger
+        path = bet_ledger._default_ledger_path()
+        if not os.path.exists(path):
+            return out
+        want_line = float(line)
+        want_side = str(side or "").strip().casefold()
+        want_player = str(player or "").strip().casefold()
+        day = day or datetime.now().strftime("%Y-%m-%d")
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            for r in _csv.DictReader(f):
+                if (r.get("date") or "")[:10] != day:
+                    continue
+                if str(r.get("side") or "").strip().casefold() != want_side:
+                    continue
+                try:
+                    if abs(float(r.get("line") or 0) - want_line) > 0.001:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                # `selection` is e.g. "Nick Daicos Under"; the player is the prefix.
+                sel = str(r.get("selection") or "").strip().casefold()
+                if want_player and want_player not in sel:
+                    continue
+                t = str(r.get("tipster") or "?").strip() or "?"
+                out[t] = round(out.get(t, 0.0) + float(r.get("stake") or 0), 2)
+    except Exception as e:
+        log.debug(f"[disposals_model] tipster attribution unavailable: {e}")
+    return out
+
+
+def _describe_book_exposure(row: dict, book_total: float) -> str:
+    """Human sentence naming WHICH tipsters hold the money on this selection.
+
+    Splits the book total into what our ledger can attribute and what it cannot. The
+    unattributed part is the genuinely interesting number: a hand-placed bet shows in the
+    book but never in our ledger, and that is the case the sweep was built for.
+    """
+    by = _disposals_exposure_by_tipster(row.get("player", ""), row.get("line"),
+                                        row.get("side", ""))
+    if not by:
+        return (f"${book_total:.2f} on the book, NONE of it attributable to a tipbot "
+                f"tipster today (hand-placed, or placed before today)")
+    parts = ", ".join(f"{t} ${v:.2f}" for t, v in
+                      sorted(by.items(), key=lambda kv: -kv[1]))
+    attributed = round(sum(by.values()), 2)
+    unattributed = round(book_total - attributed, 2)
+    s = f"${book_total:.2f} on the book — tipbot placed {parts} today"
+    if unattributed > 1.0:
+        s += f", so ${unattributed:.2f} is NOT from tipbot (hand-placed?)"
+    elif unattributed < -1.0:
+        # Our ledger legitimately exceeds the book: a bet that has settled, or one that
+        # has aged out of the pending_bets window, is still in the CSV but no longer in
+        # the sweep. Say so, rather than print two numbers that look contradictory.
+        s += (f" (ledger is ${-unattributed:.2f} higher than the book — some of ours has "
+              f"settled or left the pending window)")
+    elif len(by) == 1 and DISPOSALS_MODEL_TIPSTER in by:
+        s += " — all of it this model's own earlier tranches, NOT an outside tipster"
+    return s
+
+
 def _disposals_outside_exposure(row: dict):
     """Money already ON this selection from ANY source, read from the book.
 
@@ -16859,15 +16939,19 @@ async def _place_one_disposals_row(row: dict, msg_time, channel_name: str):
     outside, outside_accounts, outside_status = await _run_in_placement_executor(
         _disposals_outside_exposure, row)
     if outside > 0 or outside_status == "unknown":
+        # v6.16: NAME the tipsters. The sweep reads the whole book for this
+        # (player, line, side), which includes this model's OWN earlier tranches, so
+        # calling all of it "outside this tipster" was simply wrong and read as a mystery
+        # third party. See _describe_book_exposure.
+        _who = _describe_book_exposure(row, outside)
         log.warning(
-            f"[{channel_name}] {key}: book sweep says ${outside:.2f} already ON this "
-            f"selection from outside this tipster (status={outside_status}, "
+            f"[{channel_name}] {key}: book sweep: {_who} (status={outside_status}, "
             f"{len(outside_accounts)} account(s)) — mode={DISPOSALS_MODEL_RECONCILE_MODE}")
         try:
             notifier.notify_info(
                 f"ℹ️ DisposalsModel: {row['player']} {row['side'].upper()} {row['line']} "
-                f"already has <b>${outside:.2f}</b> on it from outside this tipster "
-                f"(status {outside_status}). Mode={DISPOSALS_MODEL_RECONCILE_MODE}.")
+                f"— {_who} (status {outside_status}). "
+                f"Mode={DISPOSALS_MODEL_RECONCILE_MODE}.")
         except Exception:
             pass
 
