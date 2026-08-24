@@ -80,6 +80,173 @@ _nq_thread = None
 _nq_cooldown_until = 0.0     # global: set by a 429, blocks ALL chats (the limit is bot-wide)
 _nq_last_outcome = ""        # set by _send_now so the drainer can classify the failure
 _nq_last_send_ts = 0.0
+# v6.18: how many sends are mid-POST. A record is popped only AFTER _send_now returns,
+# so an empty QUEUE FILE does not mean nothing is in flight; flush() waits on this too.
+_nq_inflight = 0
+
+
+_NQ_LOCK_ACQUIRE_SEC = float(os.getenv("NOTIFY_LOCK_ACQUIRE_SEC", "5"))
+_NQ_SEND_SUFFIX = ".send.lock"      # held across a transmission, drainers only
+_NQ_FILE_SUFFIX = ".lock"           # held across a file read/write, everyone
+
+
+class _nq_xlock:
+    """Cross-PROCESS advisory lock. Non-blocking acquire with a retry deadline.
+
+    v6.18. `_nq_lock` is a `threading.Lock`, which is process-local. main.py and
+    x_watcher.py import notifier and run as separate long-lived interpreters against the
+    SAME logs/notify_queue.jsonl, so the pacing gate, the bot-wide 429 cooldown and the
+    read-decide-write pop shared nothing between them. A duplicate BET PLACED is worse
+    than a late one, because it reads as a double bet.
+
+    Two distinct locks, and the split is the whole point:
+
+      `.lock`       fast file mutations (append, pop). NEVER held across a POST, because
+                    enqueue takes it and an alert must never wait on the network.
+      `.send.lock`  the whole read-pace-send-pop cycle, taken by DRAINERS ONLY. This is
+                    what actually closes the duplicate window, and it makes the 4s pacing
+                    gate and the bot-wide 429 cooldown effective ACROSS processes, which
+                    matters because Telegram's 429 is per-bot: knocking again before it
+                    expires escalates the block.
+
+    NOT blocking-with-`LK_LOCK`: msvcrt retries ~10 times at 1s then raises, and a POST is
+    allowed 20s, so a blocking acquire would time out mid-transmission and fail open into
+    exactly the race it exists to prevent. LK_NBLCK plus our own deadline is explicit.
+
+    `fail_open=True` (file lock): on failure, proceed unlocked and warn. An unavailable
+    lock must degrade to the old racy behaviour rather than block a money alert.
+    `fail_open=False` (send lock): on failure, `acquired` stays False and the caller must
+    NOT transmit. Another drainer owns transmission, and a delayed alert beats a duplicate.
+
+    The sentinel is a SEPARATE file, never the queue itself: _nq_save does an os.replace,
+    an atomic rename that would silently detach a lock held on the old inode. Nothing ever
+    WRITES to the sentinel and nothing should: the locked range is byte 0, and content
+    would make the locked byte depend on each opener's append-mode seek position, which
+    defeats mutual exclusion silently. It is never deleted either, because removing a lock
+    file another process holds a handle to is the actual anti-pattern.
+    """
+
+    def __init__(self, path: str, suffix: str = _NQ_FILE_SUFFIX,
+                 timeout: float = None, fail_open: bool = True):
+        self._path = path + suffix
+        self._timeout = _NQ_LOCK_ACQUIRE_SEC if timeout is None else timeout
+        self._fail_open = fail_open
+        self._fh = None
+        self.acquired = False
+
+    def __enter__(self):
+        deadline = time.time() + max(0.0, self._timeout)
+        try:
+            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+            fh = open(self._path, "a+b")
+        except Exception as e:
+            log.debug(f"notify lock file {self._path} unusable ({e})")
+            return self
+        while True:
+            try:
+                try:
+                    import msvcrt
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                except ImportError:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._fh = fh
+                self.acquired = True
+                return self
+            except Exception:
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.05)
+        try:
+            fh.close()
+        except Exception:
+            pass
+        if self._fail_open:
+            log.warning(
+                f"notify queue: could not take {os.path.basename(self._path)} within "
+                f"{self._timeout:.1f}s — proceeding UNLOCKED (a concurrent write is "
+                f"possible; a message could be duplicated or lost)")
+        return self
+
+    def __exit__(self, *exc):
+        if self._fh is None:
+            return False
+        try:
+            try:
+                import msvcrt
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except ImportError:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+        self.acquired = False
+        return False
+
+
+def _nq_shared_pacing() -> tuple:
+    """(last_send_ts, cooldown_until) as last written by ANY process.
+
+    v6.18. Both were process-local globals. Telegram's 429 is bot-wide, so when main.py
+    got throttled and set a 20s cooldown, x_watcher.py knew nothing and kept knocking,
+    which Telegram's own docs say ESCALATES the block. Read under the send lock.
+    """
+    try:
+        with open(_NQ_PATH + ".pacing", encoding="utf-8") as f:
+            d = json.load(f)
+        return float(d.get("last_send_ts") or 0), float(d.get("cooldown_until") or 0)
+    except Exception:
+        return 0.0, 0.0
+
+
+def _nq_write_shared_pacing(last_send_ts: float, cooldown_until: float) -> None:
+    try:
+        os.makedirs(os.path.dirname(_NQ_PATH) or ".", exist_ok=True)
+        with open(_NQ_PATH + ".pacing", "w", encoding="utf-8") as f:
+            json.dump({"last_send_ts": last_send_ts,
+                       "cooldown_until": cooldown_until}, f)
+    except Exception as e:
+        log.debug(f"notify pacing state not written: {e}")
+
+
+def flush(timeout: float = 60.0) -> int:
+    """Drain the queue SYNCHRONOUSLY. Returns the number still pending.
+
+    v6.18. For one-shot scripts. Since v6.13 `_send` only enqueues and delivery happens on
+    a `daemon=True` thread, so a script that sends and then returns from main() kills the
+    drainer before the POST. check_session_health.py does exactly that, and it is the
+    outage backstop: it has not alerted since 2026-06-14, so there are 71 days with no
+    evidence in either direction and, since v6.13, a specific reason to think it could not.
+
+    WAITS ON THE IN-FLIGHT SEND, not just on the file. A record is popped only AFTER
+    `_send_now` returns, so an empty-file check alone can read "done" while a POST is still
+    open. Exiting there kills the socket mid-request with the record still queued, and the
+    next scheduled run resends it: a possible DUPLICATE, in exactly the rate-limited case
+    this machinery exists for. The default budget is sized for the worst legitimate case
+    (a 20s bot-wide cooldown plus a 20s POST plus slack) rather than the 20s that a single
+    cooldown could eat on its own.
+
+    Call this at the end of any short-lived process that sends notifications.
+    """
+    _nq_start()
+    end = time.time() + max(0.0, timeout)
+    while time.time() < end:
+        if not _nq_load() and _nq_inflight == 0:
+            return 0
+        time.sleep(0.25)
+    left = len(_nq_load())
+    if left or _nq_inflight:
+        log.error(
+            f"notify flush: {left} message(s) still queued after {timeout:.0f}s"
+            + (" and a send is STILL IN FLIGHT — exiting now may resend it on the next "
+               "run" if _nq_inflight else "")
+            + ". They stay on disk and go out on the next run.")
+    return left
 
 
 def _nq_mark(outcome: str) -> None:
@@ -111,8 +278,11 @@ def _nq_enqueue(text: str, chat_id: str, parse_mode: str) -> bool:
     try:
         with _nq_lock:
             os.makedirs(os.path.dirname(_NQ_PATH) or ".", exist_ok=True)
-            with open(_NQ_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
+            # v6.18: also take the CROSS-PROCESS lock. main.py and x_watcher.py append to
+            # the same file from separate interpreters, sharing no thread lock.
+            with _nq_xlock(_NQ_PATH):
+                with open(_NQ_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec) + "\n")
     except Exception as e:
         # Last resort: the queue file is unwritable. Try the wire directly rather than
         # lose the message, which is the whole point of this machinery.
@@ -122,13 +292,34 @@ def _nq_enqueue(text: str, chat_id: str, parse_mode: str) -> bool:
     return True
 
 
+def _nq_thread_name(path: str) -> str:
+    """One drainer per queue FILE, which is the invariant that actually matters."""
+    try:
+        return "notify-queue:" + os.path.abspath(path)
+    except Exception:
+        return "notify-queue:" + str(path)
+
+
 def _nq_start() -> None:
     global _nq_thread
     with _nq_lock:
         if _nq_thread is not None and _nq_thread.is_alive():
             return
-        _nq_thread = threading.Thread(target=_nq_drain, name="notify-queue",
-                                      daemon=True)
+        # v6.18: ONE DRAINER PER PROCESS, checked by thread name rather than by this
+        # module global alone. `importlib.reload` re-executes the module into the SAME
+        # globals dict, so it resets `_nq_thread` to None while the existing drainer
+        # thread keeps running against those very globals — and then reads the NEW
+        # _NQ_PATH. Trusting the global alone starts a second drainer on the same file,
+        # and two drainers popping the same queue is how a message gets sent twice or out
+        # of order. Reload only happens in tests today, but the invariant is the point:
+        # nothing else in the file enforces it.
+        _me = threading.current_thread()
+        _name = _nq_thread_name(_NQ_PATH)
+        for _t in threading.enumerate():
+            if _t.name == _name and _t.is_alive() and _t is not _me:
+                _nq_thread = _t
+                return
+        _nq_thread = threading.Thread(target=_nq_drain, name=_name, daemon=True)
         _nq_thread.start()
     log.info(f"notify queue drainer started (pace {_NQ_MIN_INTERVAL:.1f}s between sends)")
 
@@ -146,7 +337,14 @@ def _nq_load() -> list:
                 try:
                     out.append(json.loads(line))
                 except Exception:
-                    continue          # skip a torn line, keep the rest
+                    # v6.18: SAY SO. This was a bare continue, unlike the outer
+                    # handler below. Two os._exit watchdogs and a power-cut
+                    # history can kill the process mid-append, and a lost alert
+                    # with nothing to grep for is the exact failure class this
+                    # queue exists to prevent.
+                    log.error(f"notify queue: DISCARDING a torn line "
+                              f"({line[:80]!r}) - a message may have been lost")
+                    continue
         return out
     except Exception as e:
         log.error(f"notify queue unreadable: {e}")
@@ -168,9 +366,20 @@ def _nq_drain() -> None:
     """Send queued messages, oldest first, pacing and honouring Telegram's cooldown."""
     global _nq_cooldown_until, _nq_last_send_ts
     idle = 0
+    blocked = 0        # consecutive failures to take the transmission lock
+    my_path = _NQ_PATH
     while True:
         try:
-            with _nq_lock:
+            # v6.18: retire if the queue path has moved out from under us. `_nq_start`
+            # keys the one-drainer-per-file guard on the path, so a drainer left bound to
+            # a stale one must step aside rather than linger and pop a file it no longer
+            # owns. (importlib.reload re-executes into the SAME globals dict, so a running
+            # drainer really can find _NQ_PATH changed beneath it.)
+            if _NQ_PATH != my_path:
+                log.info(f"notify queue path changed ({my_path} -> {_NQ_PATH}) — "
+                         f"this drainer is retiring")
+                return
+            with _nq_lock, _nq_xlock(_NQ_PATH):
                 items = _nq_load()
             if not items:
                 idle += 1
@@ -182,59 +391,111 @@ def _nq_drain() -> None:
                 continue
             idle = 0
 
-            now = time.time()
-            if now < _nq_cooldown_until:
-                time.sleep(min(5.0, _nq_cooldown_until - now))
-                continue
-            gap = _NQ_MIN_INTERVAL - (now - _nq_last_send_ts)
-            if len(items) > 1 and gap > 0:
-                time.sleep(gap)
+            # v6.18: THE TRANSMISSION LOCK, and this is the one that closes the duplicate
+            # window. The file lock alone does NOT: it is released across the POST, so two
+            # drainers in two processes could each read the same head, each transmit it,
+            # and only the pop would be serialised. Held from here through the pop.
+            #
+            # Deliberately NOT wrapped around the idle branch above: main.py's drainer
+            # idles for up to 5 minutes before exiting, and holding this across that would
+            # lock x_watcher.py out of sending anything at all for those 5 minutes.
+            with _nq_xlock(_NQ_PATH, suffix=_NQ_SEND_SUFFIX, timeout=1.0,
+                           fail_open=False) as _sendlock:
+                if not _sendlock.acquired:
+                    # Another process is mid-transmission. Wait rather than race it.
+                    #
+                    # Normally this resolves in a second or two. But `acquired` is also
+                    # False when the sentinel file itself cannot be OPENED (a directory
+                    # ACL, an AV handle), and that state never resolves: the drainer would
+                    # loop here forever, and because the stale-BACKLOG alarm lives INSIDE
+                    # this lock it could not fire either — the one mechanism meant to say
+                    # a queue is stuck, disabled by the thing that stuck it. So count the
+                    # consecutive misses and escalate.
+                    blocked += 1
+                    if blocked in (30, 300) or (blocked and blocked % 900 == 0):
+                        log.error(
+                            f"notify queue: could not take the transmission lock "
+                            f"{blocked} times in a row (~{blocked}s). Either another "
+                            f"process is wedged mid-send, or "
+                            f"{os.path.basename(_NQ_PATH)}{_NQ_SEND_SUFFIX} cannot be "
+                            f"opened. NOTHING IS BEING SENT.")
+                    time.sleep(1.0)
+                    continue
+                blocked = 0
 
-            rec = items[0]
-            waited = time.time() - float(rec.get("queued_at") or 0)
-            if waited > _NQ_STALE_SEC and rec.get("attempts", 0) % 20 == 0:
-                log.error(
-                    f"notify queue BACKLOG: oldest message has waited {waited / 60:.0f}min "
-                    f"({len(items)} queued). NOT lost, still retrying. "
-                    f"preview: {str(rec.get('text'))[:70]}")
+                # Re-read under the lock: the other drainer may have just sent this record
+                # and popped it while we were queueing for the lock.
+                with _nq_lock, _nq_xlock(_NQ_PATH):
+                    items = _nq_load()
+                if not items:
+                    continue
 
-            global _nq_last_outcome
-            _nq_last_outcome = ""
-            _nq_last_send_ts = time.time()
-            ok = _send_now(rec["text"], rec.get("chat_id", ""),
-                           rec.get("parse_mode", "HTML"))
-            outcome = _nq_last_outcome
+                now = time.time()
+                _shared_last, _shared_cool = _nq_shared_pacing()
+                _nq_cooldown_until = max(_nq_cooldown_until, _shared_cool)
+                if now < _nq_cooldown_until:
+                    time.sleep(min(5.0, _nq_cooldown_until - now))
+                    continue
+                gap = _NQ_MIN_INTERVAL - (now - max(_nq_last_send_ts, _shared_last))
+                if len(items) > 1 and gap > 0:
+                    time.sleep(gap)
 
-            with _nq_lock:
-                cur = _nq_load()
-                # Only pop if the head is still the record we just sent: another process
-                # or an inline fallback could have rewritten the file underneath us.
-                if cur and cur[0].get("queued_at") == rec.get("queued_at") \
-                        and cur[0].get("text") == rec.get("text"):
-                    head, rest = cur[0], cur[1:]
-                else:
-                    head, rest = None, cur
-
-                if ok:
-                    _nq_save(rest if head is not None else cur)
-                elif outcome == "throttled":
-                    # Requeue at the FRONT: order matters for a bet log, and the message
-                    # is fine, only the timing was wrong.
-                    if head is not None:
-                        head["attempts"] = int(head.get("attempts", 0)) + 1
-                        _nq_save([head] + rest)
-                elif outcome == "uncertain":
-                    # A read timeout means the POST was TRANSMITTED and very likely
-                    # delivered. Resending duplicates it (the 2026-06-16 Turang/Olson
-                    # double-send). This is the ONE case we drop, and we say so loudly.
+                rec = items[0]
+                waited = time.time() - float(rec.get("queued_at") or 0)
+                if waited > _NQ_STALE_SEC and rec.get("attempts", 0) % 20 == 0:
                     log.error(
-                        f"notify DELIVERY-UNCERTAIN, dropping to avoid a duplicate "
-                        f"(chat={rec.get('chat_id')}): {str(rec.get('text'))[:80]}")
-                    _nq_save(rest if head is not None else cur)
-                else:
-                    # Permanent (400 chat-not-found, bot blocked, malformed): requeueing
-                    # would spin forever. _send_now already logged NOTIFY LOST.
-                    _nq_save(rest if head is not None else cur)
+                        f"notify queue BACKLOG: oldest message has waited "
+                        f"{waited / 60:.0f}min ({len(items)} queued). NOT lost, still "
+                        f"retrying. preview: {str(rec.get('text'))[:70]}")
+
+                global _nq_last_outcome, _nq_inflight
+                _nq_last_outcome = ""
+                _nq_last_send_ts = time.time()
+                _nq_inflight += 1
+                try:
+                    ok = _send_now(rec["text"], rec.get("chat_id", ""),
+                                   rec.get("parse_mode", "HTML"))
+                finally:
+                    _nq_inflight -= 1
+                outcome = _nq_last_outcome
+                # Publish pacing so the OTHER process honours the same gap and, more
+                # importantly, the same 429 cooldown (_send_now -> _nq_mark may have just
+                # extended it).
+                _nq_write_shared_pacing(_nq_last_send_ts, _nq_cooldown_until)
+
+                # The read-decide-write POP must be ONE atomic file operation, so every
+                # branch below stays inside this `with`.
+                with _nq_lock, _nq_xlock(_NQ_PATH):
+                    cur = _nq_load()
+                    # Only pop if the head is still the record we just sent: another
+                    # process or an inline fallback could have rewritten the file
+                    # underneath us.
+                    if cur and cur[0].get("queued_at") == rec.get("queued_at") \
+                            and cur[0].get("text") == rec.get("text"):
+                        head, rest = cur[0], cur[1:]
+                    else:
+                        head, rest = None, cur
+
+                    if ok:
+                        _nq_save(rest if head is not None else cur)
+                    elif outcome == "throttled":
+                        # Requeue at the FRONT: order matters for a bet log, and the
+                        # message is fine, only the timing was wrong.
+                        if head is not None:
+                            head["attempts"] = int(head.get("attempts", 0)) + 1
+                            _nq_save([head] + rest)
+                    elif outcome == "uncertain":
+                        # A read timeout means the POST was TRANSMITTED and very likely
+                        # delivered. Resending duplicates it (the 2026-06-16 Turang/Olson
+                        # double-send). This is the ONE case we drop, and we say so loudly.
+                        log.error(
+                            f"notify DELIVERY-UNCERTAIN, dropping to avoid a duplicate "
+                            f"(chat={rec.get('chat_id')}): {str(rec.get('text'))[:80]}")
+                        _nq_save(rest if head is not None else cur)
+                    else:
+                        # Permanent (400 chat-not-found, bot blocked, malformed):
+                        # requeueing would spin forever; _send_now logged NOTIFY LOST.
+                        _nq_save(rest if head is not None else cur)
         except Exception as e:
             log.error(f"notify queue drainer error: {e}")
             time.sleep(5)
@@ -432,6 +693,24 @@ def _send_now(text: str, chat_id: str = "", parse_mode: str = "HTML") -> bool:
                _nq_last_outcome to tell "throttled, try again" from
                "delivery uncertain, must NOT resend" from "permanently rejected".
     """
+    # v6.18: THE GUARD BELONGS HERE, and until now it was only on `_send`.
+    #
+    # v6.14 put the pytest/TIPBOT_TESTING check on the enqueue side and its comment claims
+    # to be "at the single transport choke point". It was not: `_send_now` is. Since v6.13
+    # split enqueue from transport, ANY record that reaches the drainer bypassed the guard
+    # completely, and the drainer reads a FILE — so a leftover production
+    # logs/notify_queue.jsonl, or a test that repoints _NQ_PATH while an earlier test's
+    # daemon drainer is still running, POSTs real Telegrams from the suite.
+    #
+    # MEASURED: a `requests.post` spy over the full suite caught a live send to
+    # api.telegram.org. Third time this class of bug has shipped (2026-08-10 fake top-up
+    # queue items, v6.14's 13 real sends per run), so the check now sits on the call that
+    # actually touches the wire. `_ALLOW_TEST_TRANSPORT` stays the opt-in for the tests
+    # that deliberately exercise this function against a stubbed `requests`.
+    if _blocked_by_test_guard():
+        log.info(f"[test guard] transport suppressed: {str(text)[:160]}")
+        return True
+
     target = chat_id or NOTIFY_CHAT_ID
     if not NOTIFY_BOT_TOKEN or not target:
         log.warning("Notification bot not configured, skipping")

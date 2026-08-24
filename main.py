@@ -3013,6 +3013,7 @@ def _disposals_claim(row: dict, outside: float = 0.0,
         # against the ceiling in "block" mode. In "alert" mode it is recorded and
         # alerted but does not reduce the stake, preserving the handover's relaxed
         # stance on cross-tipster collisions while making them visible.
+        _committed = float(sel.get("committed") or 0)
         _outside = 0.0
         if DISPOSALS_MODEL_RECONCILE_ENABLED and DISPOSALS_MODEL_RECONCILE_MODE == "block":
             if outside_status == "unknown":
@@ -3020,8 +3021,57 @@ def _disposals_claim(row: dict, outside: float = 0.0,
                     "the book-exposure sweep FAILED or produced an ambiguous player "
                     "match, so how much is already on this selection is UNKNOWN — "
                     "refusing (reading a failed sweep as $0 is how you double-stake)")
-            _outside = round(float(outside or 0), 2)
-        headroom = round(ceiling - float(sel.get("committed") or 0) - inflight - _outside, 2)
+            # v6.18: SUBTRACT OUR OWN MONEY FIRST. `outside` is a whole-book sweep of
+            # /api/pending_bets for this (player, line, side), so it already CONTAINS
+            # `committed` (the invariant is committed = placed + ambiguous, so committed
+            # covers every dollar of ours the book can show). Feeding the raw sweep into
+            # the line below subtracted our stake twice.
+            #
+            # MEASURED on Nick Daicos 34.5: sweep $436.00, committed $436.00, ceiling
+            # $500.00, so the old arithmetic was 500 - 436 - 436 = -372 and every retry
+            # would have been refused while only $436 was actually on. Harmless until now
+            # ONLY because the live mode is "alert"; config.py sends any UNRECOGNISED mode
+            # value to "block" as a fail-safe, so a single typo in .env (alertt, a stray
+            # space) landed on the broken branch silently at startup. That is why this is
+            # fixed rather than left dormant: the fail-safe was pointing at the bug.
+            #
+            # Clamped at zero: the book can legitimately read LESS than our ledger when an
+            # ambiguous bet never landed or a bet has settled out of the pending window,
+            # and a negative would INFLATE headroom, which is the double-stake direction.
+            #
+            # BUT the subtraction alone is NOT safe on its own, and this is the subtle part.
+            # It assumes the sweep contains ALL of `committed`. When part of ours has aged
+            # out of the pending window, it does not, and the subtraction then eats a real
+            # third party's money: ceiling $500, committed $400 with only $100 of it still
+            # visible, another tipster live for $150 -> sweep $250, `250 - 400` clamps to
+            # $0, headroom reads $100 and we OVER-STAKE past the ceiling to $550. The old
+            # double-subtracting code was accidentally safe there (it only ever made
+            # headroom too small), so a naive fix trades a refusal bug for an over-stake.
+            #
+            # So take the LARGER of two independent estimates of other-tipster money:
+            #   1. what is left of the sweep after our committed (sees hand-placed money,
+            #      blind when part of ours has left the pending window)
+            #   2. what our own bet ledger says OTHER tipsters put on this selection today
+            #      (survives settlement, blind to hand-placed money)
+            # Neither dominates; the max is >= both and is never below the truth for money
+            # either instrument can see. What remains uncovered is a HAND-PLACED bet at the
+            # same moment part of ours has settled, which needs per-bet attribution from the
+            # book that /api/pending_bets does not give us.
+            _outside_ledger = 0.0
+            try:
+                _by = _disposals_exposure_by_tipster(
+                    row.get("player", ""), row.get("line"), row.get("side", ""))
+                _outside_ledger = round(
+                    sum(v for t, v in _by.items() if t != DISPOSALS_MODEL_TIPSTER), 2)
+            except Exception as _e:
+                # Never fatal: this only TIGHTENS the estimate. Losing it falls back to
+                # the sweep-minus-committed figure, which is what we had a line ago.
+                log.warning(f"[disposals_model] tipster attribution failed ({_e}) — "
+                            f"falling back to the sweep figure alone")
+            _outside = max(0.0,
+                           round(float(outside or 0) - _committed, 2),
+                           _outside_ledger)
+        headroom = round(ceiling - _committed - inflight - _outside, 2)
         if _outside > 0:
             log.info(
                 f"[disposals_model] {sel_id}: ${_outside:.2f} already ON from OUTSIDE "
@@ -3030,6 +3080,11 @@ def _disposals_claim(row: dict, outside: float = 0.0,
             return 0.0, (f"selection {sel_id} already has "
                          f"${sel['committed']:.2f} committed"
                          + (f" + ${inflight:.2f} in flight" if inflight > 0 else "")
+                         # v6.18: name the outside money too. Without it a refusal caused
+                         # by ANOTHER tipster's stake read as though our own ledger were
+                         # full, which is how the double-count above stayed invisible.
+                         + (f" + ${_outside:.2f} on from other tipsters"
+                            if _outside > 0 else "")
                          + f" of a ${ceiling:.2f} ceiling — nothing left to place")
         allowed = round(min(requested, headroom), 2)
         # Claim + reserve NOW, before placement, so neither a crash nor a concurrent
@@ -18236,6 +18291,15 @@ def _arm_startup_watchdog() -> None:
     if STARTUP_WATCHDOG_SEC <= 0:
         log.info("startup watchdog DISABLED (STARTUP_WATCHDOG_SEC<=0)")
         return
+
+    # v6.18: RE-ARM on every start, not just the first. `main()` runs inside
+    # `while True: asyncio.run(main())`, so a telethon reconnect re-enters startup with the
+    # Event already SET from last time; the freshly spawned watcher's wait() then returned
+    # instantly and the process was unguarded for the rest of its life. The 88-minute
+    # silent wedge on 2026-08-22 that this watchdog exists to catch happened during exactly
+    # that kind of re-entry, so leaving it one-shot protected only the very first boot.
+    # MUST be before the watcher starts, or the watcher can observe the stale SET flag.
+    _startup_done.clear()
 
     def _watch():
         if _startup_done.wait(STARTUP_WATCHDOG_SEC):
