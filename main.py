@@ -1012,6 +1012,61 @@ def _afl_event_name_candidates(event: str, bookie: str, sport: str) -> list:
     return out
 
 
+def _afl_wrong_fixture_reason(pc, event: str) -> str:
+    """Post-hoc check that a catalog response is the fixture we asked for. "" == fine.
+
+    v6.17. `_price_check_afl_verified` (below) has exactly ONE call site, on the
+    player-prop branch. Every AFL TEAM market resolves and POSTs through the plain
+    unverified path, so the AFL/AFLW/44839 collision that cost $1,000 on player props on
+    2026-08-15 was completely unguarded on team markets. MEASURED: 21 team-market bets
+    worth $2,472.92 landed that way since the guard shipped, including 5 on 08-23. None
+    hit a wrong board, which is luck, not a check.
+
+    Deliberately NOT a second call to `_price_check_afl_verified`. That walks up to
+    AFL_EVENT_MAX_CANDIDATES name forms, so on a 5-session fan-out it multiplies API calls,
+    and when no form matches it refuses outright: four such refusals on 2026-08-15 are the
+    $2,300 that never got POSTed at all. This instead inspects the response the caller
+    ALREADY holds. Zero extra API calls, and it can never refuse by exhausting name forms.
+
+    Rejects ONLY on positive evidence of the wrong fixture:
+      * competition_external_id on the blocklist (AFLW), which is decisive on its own; or
+      * start_time_iso more than AFL_EVENT_START_TOLERANCE_SEC from the real bounce.
+    With no Squiggle ground truth, or no start time on the envelope, it returns "" and the
+    caller behaves exactly as before. Never raises.
+    """
+    try:
+        if not AFL_EVENT_VERIFY or not isinstance(pc, dict):
+            return ""
+        comp = str(pc.get("competition_external_id") or "").strip()
+        if comp and comp in AFL_BLOCKED_COMPETITION_IDS:
+            return f"competition {comp} is AFLW, not men's AFL"
+        expected = _afl_expected_bounce(event)
+        if expected is None:
+            return ""                     # no ground truth -> previous behaviour
+        st = pc.get("start_time_iso")
+        try:
+            drift = abs(float(st) - expected)
+        except (TypeError, ValueError):
+            return ""                     # cannot verify -> do not tighten
+        if drift > AFL_EVENT_START_TOLERANCE_SEC:
+            return (f"matched an event starting {int(drift) // 3600}h from the real "
+                    f"bounce (comp_id={comp or '?'})")
+    except Exception as e:
+        log.debug(f"AFL fixture post-check skipped: {e}")
+    return ""
+
+
+def _afl_catalog_ok(pc, event: str, bookie: str, sid, what: str) -> bool:
+    """True when `pc` may be used. Logs and returns False on a proven wrong fixture."""
+    reason = _afl_wrong_fixture_reason(pc, event)
+    if not reason:
+        return True
+    log.error(f"AFL {what}: catalog for {event!r} on {bookie}:{sid} {reason} — REFUSING "
+              f"to match against it (routing to manual rather than betting another "
+              f"competition's board)")
+    return False
+
+
 def _price_check_afl_verified(*, session_id, sport, event, bookie, markets_filter=None):
     """price_check_sports for AFL, but PROVING the response is the fixture we asked for.
 
@@ -13683,7 +13738,8 @@ def _resolve_single_for_placement(
                     _event_pc = _bookie_event(tip.event, bookie, tip.sport)
                     price_resp = hb.price_check_sports(
                         session_id=sid, sport=tip.sport, event=_event_pc)
-                    if price_resp.get("success"):
+                    if price_resp.get("success") and _afl_catalog_ok(
+                            price_resp, tip.event, bookie, sid, "period handicap"):
                         _pm = _resolve_afl_period_prop(
                             price_resp.get("markets") or {}, _pcode, selection, line)
                 except Exception as e:
@@ -13716,7 +13772,8 @@ def _resolve_single_for_placement(
                 price_resp = hb.price_check_sports(
                     session_id=sid, sport=tip.sport, event=_event_pc,
                 )
-                if price_resp.get("success"):
+                if price_resp.get("success") and _afl_catalog_ok(
+                        price_resp, tip.event, bookie, sid, "team handicap"):
                     _hm = _match_handicap_in_catalog(
                         selection, line, price_resp.get("markets") or {},
                     )
@@ -13772,7 +13829,8 @@ def _resolve_single_for_placement(
                     _event_pc = _bookie_event(tip.event, bookie, tip.sport)
                     price_resp = hb.price_check_sports(
                         session_id=sid, sport=tip.sport, event=_event_pc)
-                    if price_resp.get("success"):
+                    if price_resp.get("success") and _afl_catalog_ok(
+                            price_resp, tip.event, bookie, sid, "period total"):
                         _ptm = _resolve_afl_period_total(
                             price_resp.get("markets") or {}, _pcode_to, selection, line)
                 except Exception as e:
@@ -13807,10 +13865,19 @@ def _resolve_single_for_placement(
             # EXACT alt line instead of snapping to the wrong line / dying. A catalog
             # miss leaves the leg as-is -> placement fails -> manual. 2026-06-03.
             try:
+                # v6.17: run the bookie alias here too. This was the ONLY AFL catalog
+                # lookup passing raw `tip.event`, so a Greater Western Sydney total never
+                # matched: measured 2026-08-22, the verified path resolved
+                # "Adelaide v GWS Giants" from a tip of "Adelaide v Greater Western
+                # Sydney", so the alias demonstrably matters. The POST already aliased,
+                # only this catalog match did not, which shows up as a missed alt-line
+                # rather than a wrong bet.
                 price_resp = hb.price_check_sports(
-                    session_id=sid, sport=tip.sport, event=tip.event,
+                    session_id=sid, sport=tip.sport,
+                    event=_bookie_event(tip.event, bookie, tip.sport),
                 )
-                if price_resp.get("success"):
+                if price_resp.get("success") and _afl_catalog_ok(
+                        price_resp, tip.event, bookie, sid, "team total"):
                     _tm = _match_total_in_catalog(
                         selection, line, price_resp.get("markets") or {},
                     )
