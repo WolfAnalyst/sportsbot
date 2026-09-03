@@ -17,7 +17,7 @@ import csv
 import os
 import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta   # v6.19: timedelta for the runner lookback
 from threading import Lock
 
 log = logging.getLogger("tipbot")
@@ -448,3 +448,105 @@ def log_racing_bet(parsed: dict, placement: dict, account: str = "") -> None:
         })
     except Exception as e:
         log.error(f"bet_ledger.log_racing_bet failed: {e}")
+
+
+# ── v6.19: "has this runner already been backed?" ────────────────────
+#
+# Wilson, 2026-09-03: "can we add a checker for our racing bets that if the runner has
+# been fully placed before, a duplicate bet is sent to manual?" ... "it needs to be exact
+# same horse + tip type (win or place). if its same horse for win and place in sperate
+# tips, they should go through correctly."
+#
+# THE INCIDENT: Zak re-posted the same image tips hours later and they placed a SECOND
+# time, doubling the loss. MEASURED across 1,478 racing tips in apiracing.log, only 10
+# (day, track, race, runner, market) keys ever fired twice; 8 were true duplicates and 3
+# of those are past every existing window:
+#     img-zak_racing-2-7-0  Brazen Queen    $400    re-delivered +219 min
+#     img-zak_racing-3-6-0  Just Like Lisa  $1,125  re-delivered +142 min
+#     img-zak_racing-3-3-0  Tour De Moon    $1,000  re-delivered +154 min
+# All three arrived with the SAME tip id, so this is a re-delivery, not a new tip.
+# The three in-memory dedup layers cannot see them: 30 min / 10 min / process-local.
+#
+# WHY THE KEY IS (runner, market) AND DELIBERATELY NOT (track, race, date):
+#   * place_racing_tip MUTATES parsed["track"] and parsed["date"] IN PLACE (the undated
+#     lookahead, the alias resolver, the SA live probe, the web-search resolver). The
+#     ledger stores the POST-mutation values while a pre-placement check holds the
+#     tipster's ORIGINALS, so a track-keyed lookup silently misses. Proven on 2026-08-30:
+#     'Morphettville' resolved to 'Strathalbyn' mid-placement -- that is the Tour De Moon
+#     case above, i.e. keying on track would miss one of the three bets this exists for.
+#   * the same track appears under two spellings ('Kembla' / 'Kembla Grange').
+#   * MEASURED: across all 2,572 racing rows there are ZERO genuine cross-race collisions
+#     on (runner, market) within 24h. A horse runs once a day, so the name plus win/place
+#     is already unique in practice, and it is immune to both mutations above.
+# `market` is in the key because Wilson said so explicitly and the data agrees: 2,142 win
+# vs 430 place rows, and a win and a place bet on one horse are DIFFERENT bets (Saifa on
+# 2026-06-08 was tipped as both, and each was separately duplicated).
+
+
+def _norm_runner(selection: str, runner_match: str = "") -> str:
+    """Normalise a runner for comparison: drop the saddle prefix, fold case, drop
+    punctuation. `runner_match` (the bookie's own name) wins when present, but it is
+    BLANK on 1,991 of 2,572 rows (added v6.08r) so `selection` must remain the fallback
+    or nothing older than 2026-08-11 ever matches."""
+    s = str(runner_match or selection or "")
+    s = re.sub(r"^\s*\d+\s*[.\-]\s*", "", s)          # "7. Alchemistic" -> "Alchemistic"
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def racing_runner_exposure(runner: str, market: str, within_hours: float = 24.0,
+                           now: datetime = None) -> dict:
+    """How much is already ON this horse for this market, from the durable ledger.
+
+    Returns {"total", "rows", "bookies", "events", "last_placed_at", "readable"}.
+
+    `readable` is False when the ledger could not be read at all. The caller MUST NOT
+    treat that as "nothing on": this guard BLOCKS a bet, so an unreadable ledger has to
+    fail OPEN (place as before) rather than route a whole race day to manual. The CSV is
+    deliberately Excel-attachable, and a locked log file has bitten this repo before.
+
+    Bounded by placed_at rather than by the ledger's `date` column, because `date` is the
+    RACE date and mutates during placement; placed_at is stamped at write time and never
+    moves. Never raises.
+    """
+    out = {"total": 0.0, "rows": 0, "bookies": set(), "events": set(),
+           "last_placed_at": None, "readable": True}
+    want = _norm_runner(runner)
+    want_market = str(market or "win").strip().lower()
+    if not want:
+        return out
+    try:
+        path = _default_ledger_path()          # call-time, per the _audit_log_path rule
+        if not os.path.exists(path):
+            return out
+        now = now or datetime.now()
+        cutoff = now - timedelta(hours=float(within_hours))
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                if (r.get("sport") or "") != "racing":
+                    continue
+                if (r.get("market") or "win").strip().lower() != want_market:
+                    continue
+                if _norm_runner(r.get("selection"), r.get("runner_match")) != want:
+                    continue
+                try:
+                    when = datetime.fromisoformat((r.get("placed_at") or "").strip())
+                except (TypeError, ValueError):
+                    continue                    # unparseable stamp: cannot age it, skip
+                if when < cutoff:
+                    continue
+                try:
+                    out["total"] = round(out["total"] + float(r.get("stake") or 0), 2)
+                except (TypeError, ValueError):
+                    pass
+                out["rows"] += 1
+                if r.get("bookie"):
+                    out["bookies"].add(r["bookie"])
+                if r.get("event"):
+                    out["events"].add(r["event"])
+                if out["last_placed_at"] is None or when > out["last_placed_at"]:
+                    out["last_placed_at"] = when
+    except Exception as e:
+        log.error(f"bet_ledger.racing_runner_exposure failed ({e}) — reporting UNREADABLE "
+                  f"so the caller fails OPEN rather than blocking a race day")
+        out["readable"] = False
+    return out
