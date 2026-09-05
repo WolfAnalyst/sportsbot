@@ -448,6 +448,19 @@ def _nq_drain() -> None:
                         f"{waited / 60:.0f}min ({len(items)} queued). NOT lost, still "
                         f"retrying. preview: {str(rec.get('text'))[:70]}")
 
+                # v6.19a: RE-VERIFY OWNERSHIP IMMEDIATELY BEFORE TRANSMITTING. The
+                # top-of-loop check is up to ~9 s stale by now (a 4 s pacing gap plus a
+                # 5 s cooldown sleep both sit between them), and in that window another
+                # drainer can take over this queue. In production there is only ever one
+                # path so this never fires; under test, importlib.reload swaps _NQ_PATH
+                # underneath a running drainer, which is the residual cause of the
+                # intermittent test_order_is_preserved failure that v6.18's per-file
+                # thread naming reduced but did not eliminate (~1 run in 4).
+                if _NQ_PATH != my_path:
+                    log.info(f"notify queue path changed to {_NQ_PATH} while holding the "
+                             f"send lock - retiring WITHOUT sending")
+                    return
+
                 global _nq_last_outcome, _nq_inflight
                 _nq_last_outcome = ""
                 _nq_last_send_ts = time.time()

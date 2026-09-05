@@ -14,6 +14,7 @@ Design guarantees:
     wrote no machine-readable placement record).
 """
 import csv
+import math          # v6.19a: isfinite, so NaN units cannot masquerade as a value
 import os
 import re
 import logging
@@ -493,11 +494,51 @@ def _norm_runner(selection: str, runner_match: str = "") -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def racing_runner_exposure(runner: str, market: str, within_hours: float = 24.0,
-                           now: datetime = None) -> dict:
-    """How much is already ON this horse for this market, from the durable ledger.
+def _norm_units(u):
+    """Units as a comparable number, or None when absent/unparseable.
 
-    Returns {"total", "rows", "bookies", "events", "last_placed_at", "readable"}.
+    v6.19a: units is the tip's OWN sizing (1.0u, 0.5u, ...) replicated onto every
+    fan-out leg, so it identifies the TIP rather than the leg. Populated on all 2,669
+    racing rows. Rounded to 3 dp so 0.5 and 0.500 compare equal.
+    """
+    try:
+        v = float(u)
+    except (TypeError, ValueError):
+        return None
+    # v6.19a: NaN and inf survive float() but NaN != NaN, so such a row would become
+    # permanently non-matching and vanish from every units-keyed query instead of being
+    # treated as unusable. Fail it into the "unparseable" bucket where it belongs.
+    if not math.isfinite(v):
+        return None
+    return round(v, 3)
+
+
+def _event_race_number(event):
+    """The race number in a ledger `event` cell ("Morphettville R5" -> 5), else None.
+
+    Lives here so the reader can tell the caller how many prior events it could NOT
+    interpret; the caller uses that to refuse to relax.
+    """
+    m = re.match(r"^(.*?)\s*R(\d+)\s*$", str(event or "").strip(), re.I)
+    try:
+        return int(m.group(2)) if m else None
+    except (TypeError, ValueError):
+        return None
+
+
+def racing_runner_exposure(runner: str, market: str, within_hours: float = 24.0,
+                           now: datetime = None, units=None) -> dict:
+    """What is already ON this horse for this market, from the durable ledger.
+
+    Returns {"total", "rows", "bookies", "events", "race_dates", "units_seen",
+             "last_placed_at", "readable"}.
+
+    `units`, when given, restricts the match to bets of the SAME unit size. That is
+    Wilson's rule, and the data backs it: "same horse, same units and same win type" is a
+    re-sent duplicate, whereas "same horse different units then it is a readd/extra bet
+    that should be executed". Measured over the whole ledger, keying on units correctly
+    ALLOWS 20 legitimate re-adds (e.g. Babayka 0.25u then 1.0u on the same race 18h
+    apart) that a stake-only comparison would have blocked.
 
     `readable` is False when the ledger could not be read at all. The caller MUST NOT
     treat that as "nothing on": this guard BLOCKS a bet, so an unreadable ledger has to
@@ -509,9 +550,19 @@ def racing_runner_exposure(runner: str, market: str, within_hours: float = 24.0,
     moves. Never raises.
     """
     out = {"total": 0.0, "rows": 0, "bookies": set(), "events": set(),
+           "race_dates": set(), "units_seen": set(),
+           # v6.19a: the caller RELAXES on prior events, so it must know when a prior
+           # event could not be interpreted. Dropping unparseable ones silently means the
+           # relaxer only ever sees the tidy subset and can wave a duplicate through that
+           # is hiding in the row it could not read.
+           "unparsed_events": 0,
+           # ...and how many rows in this horse+market had no usable unit size at all,
+           # which a units-filtered query would otherwise make invisible.
+           "unknown_units_rows": 0,
            "last_placed_at": None, "readable": True}
     want = _norm_runner(runner)
     want_market = str(market or "win").strip().lower()
+    want_units = _norm_units(units)
     if not want:
         return out
     try:
@@ -528,11 +579,22 @@ def racing_runner_exposure(runner: str, market: str, within_hours: float = 24.0,
                     continue
                 if _norm_runner(r.get("selection"), r.get("runner_match")) != want:
                     continue
+                row_units = _norm_units(r.get("units"))
+                if row_units is None:
+                    # Cannot tell whether this row shares the tip's unit size. Count it so
+                    # the caller can refuse to relax rather than never seeing it.
+                    out["unknown_units_rows"] += 1
+                if want_units is not None and row_units != want_units:
+                    continue        # a DIFFERENT unit size is a re-add, not a duplicate
                 try:
                     when = datetime.fromisoformat((r.get("placed_at") or "").strip())
                 except (TypeError, ValueError):
                     continue                    # unparseable stamp: cannot age it, skip
-                if when < cutoff:
+                if when < cutoff or when > now:
+                    # v6.19a: BOTH bounds. In production `now` is the present so nothing
+                    # is in the future, but without the upper bound a replay/backtest
+                    # counts the very rows the tip being judged is about to write, and
+                    # then reports that every bet duplicates itself.
                     continue
                 try:
                     out["total"] = round(out["total"] + float(r.get("stake") or 0), 2)
@@ -543,6 +605,14 @@ def racing_runner_exposure(runner: str, market: str, within_hours: float = 24.0,
                     out["bookies"].add(r["bookie"])
                 if r.get("event"):
                     out["events"].add(r["event"])
+                    if _event_race_number(r["event"]) is None:
+                        out["unparsed_events"] += 1
+                else:
+                    out["unparsed_events"] += 1
+                if (r.get("date") or "").strip():
+                    out["race_dates"].add(r["date"].strip()[:10])
+                if row_units is not None:
+                    out["units_seen"].add(row_units)
                 if out["last_placed_at"] is None or when > out["last_placed_at"]:
                     out["last_placed_at"] = when
     except Exception as e:
