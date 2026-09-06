@@ -1246,6 +1246,26 @@ _CID_UNRESOLVED_MARKERS = (
 )
 
 
+def _resolve_spill_decision(action: str, cid_unresolved: bool) -> str:
+    """What a reconcile verdict becomes once the unresolved-cid rule is applied.
+
+    v6.19d. PURE and total, so the polarity can be tested exhaustively. It exists because
+    an adversarial review PROVED the AST test guarding this was blind to polarity: with
+    `if A: ... elif B: break`, ast.walk() from the outer node finds the Break in EITHER
+    arm, so inverting the two conditions -- making the spill fire exactly when the cid is
+    UNRESOLVED, i.e. reproducing the $500 incident this guard prevents -- still passed.
+    A function returning a value cannot hide that; `assert f("spill", True) ==
+    "conservative"` fails immediately on a flip.
+
+    Only "spill" is dangerous. "placed" is verified information and passes through, and
+    everything else already lands on the conservative path (debit-as-placed + blocklist +
+    the ambiguous CRITICAL), which is exactly what a maybe-landed bet needs.
+    """
+    if action == "spill" and cid_unresolved:
+        return "conservative"
+    return action
+
+
 def _err_is_cid_unresolved(err) -> bool:
     """True if an error string is one of HyperBot's unresolved-cid envelopes."""
     e = str(err or "").lower()
@@ -8635,7 +8655,47 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                                or original_player or ""),
                     submit_ts=_time_mod.time() - _elapsed,
                 )
-                if _recon_b["action"] == "spill":
+                # v6.19d: NEVER SPILL AN UNRESOLVED CID. This is the sports twin of
+                # racing_placer's guard (racing_placer.py ~2405) and it was the one
+                # sports path still missing it: the other three decide_ambiguous call
+                # sites hardcode spill_enabled=False, but _reconcile_ambiguous passes
+                # the GLOBAL RECONCILE_SPILL, so this branch was held shut only by
+                # .env:259 RECONCILE_SPILL=false. Flipping that flag would have armed
+                # a real double-stake here.
+                #
+                # An unresolved cid means HyperBot never learned the outcome, so the
+                # bet MAY still land after the ~30s reconcile window. Absence from that
+                # poll is not proof. Spilling on it puts the same stake on a second
+                # bookie while the first may still register - the exact $500 Sportsbet
+                # incident recorded in _CID_UNRESOLVED_MARKERS (2026-08-11, a lost POST
+                # where the bookie said it MAY hold the coupon).
+                #
+                # Falling through is SAFE by construction: every action other than
+                # "spill" and "placed" lands on the conservative path below
+                # (debit-as-placed + blocklist + the ambiguous CRITICAL), which is
+                # exactly what we want for a maybe-landed bet. So there is nothing to
+                # coerce, only a branch to refuse.
+                _cid_unresolved = (bool(getattr(result, "cid_unresolved", False))
+                                   or _err_is_cid_unresolved(err))
+                # The decision itself lives in a pure function so its POLARITY is
+                # exhaustively testable; see _resolve_spill_decision.
+                _spill_action = _resolve_spill_decision(
+                    _recon_b["action"], _cid_unresolved)
+                if _recon_b["action"] == "spill" and _spill_action != "spill":
+                    log.error(
+                        f"v4: UNRESOLVED CID on {chosen_bookie}:{sid} "
+                        f"stake=${_eff_stake:.2f} — reconcile said 'spill' but a ~30s "
+                        f"pending_bets miss does NOT prove a never-resolved cid did not "
+                        f"land. REFUSING to spill; falling through to conservative "
+                        f"(debit-as-placed + blocklist + critical). err='{err[:120]}'"
+                    )
+                elif _spill_action == "spill":
+                    # `and not _cid_unresolved` is redundant with the branch above and
+                    # is kept DELIBERATELY: it puts the safety condition on the branch
+                    # that actually moves money, so the guarantee survives someone later
+                    # reordering these arms. A test asserts the break's own condition
+                    # mentions it, and that test caught this exact weakness when the
+                    # check lived only in the preceding `if`.
                     log.warning(
                         f"v4: reconcile confirmed NOT placed on {chosen_bookie}:"
                         f"{sid} — recovering ${step_stake:.2f} to spill "

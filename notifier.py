@@ -1740,6 +1740,32 @@ def notify_tiptitans_placed(
         )
     placements_str = "\n".join(placement_lines)
 
+    # v6.19d: SURFACE A SADDLE-ONLY MATCH. Pass 3 binds by saddle NUMBER when neither
+    # name pass matched, which is a POSITIONAL guess, not a name match. It is already
+    # well guarded (skipped on a Claude-resolved or forward-filled track, and on no-odds
+    # tips) and only 9 placements in 3 weeks used it, both runners bound correctly - an
+    # exact name Pass 1/2 somehow missed, and a tipster typo (SANCHEULO -> Sanchuelo).
+    # But when it IS wrong it is expensive: 2026-08-11 "RUBY RHAYNE BOW" bound saddle #5
+    # to "Rebecca Rhayne Bow" and $700 went on the wrong horse.
+    #
+    # A name-similarity gate was MEASURED and REJECTED: it would have to sit between 0.79
+    # (that wrong-horse case) and 0.89 (the legitimate typo). A 0.10 window is far too
+    # tight - at 0.85 it blocks real typos, at 0.75 it lets the $700 case through. So do
+    # not block, SHOW it, and let Wilson eyeball a positional guess at roughly 3 a week.
+    _saddle_legs = [p for p in placed
+                    if str(p.get("match_method") or "").startswith("saddle_")]
+    saddle_tag = ""
+    if _saddle_legs:
+        _shown = ", ".join(
+            f"{p.get('bookie', '?')} -> '{_escape_html(str(p.get('runner_match') or '?'))}'"
+            for p in _saddle_legs[:4])
+        saddle_tag = (
+            f"\n<b>⚠️ SADDLE-ONLY MATCH</b> on {len(_saddle_legs)} leg(s): the "
+            f"bookie's name did not match, so the runner was bound by SADDLE NUMBER "
+            f"({_escape_html(str(_saddle_legs[0].get('match_method') or '?'))}). That is a "
+            f"positional guess: {_shown}. Worth a glance that it is the right horse.")
+
+
     unfilled_tag = ""
     if unfilled >= 1:
         unfilled_tag = f"\n<b>⚠️ Unfilled:</b> ${unfilled:.2f}"
@@ -1767,6 +1793,7 @@ def notify_tiptitans_placed(
         f"<b>Total:</b> ${total_placed:.2f} of ${intended_stake:.2f} "
         f"@ avg {weighted_odds:.3f}"
         f"{unfilled_tag}"
+        f"{saddle_tag}"
         f"{elapsed_tag}\n"
         f"<b>Placements:</b>\n<pre>{_escape_html(placements_str)}</pre>"
     )
