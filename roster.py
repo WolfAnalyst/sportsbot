@@ -25,6 +25,7 @@ NBA_ROSTER_FILE = ROSTER_DIR / "roster_nba.json"
 NBL_ROSTER_FILE = ROSTER_DIR / "roster_nbl.json"
 AFL_ROSTER_FILE = ROSTER_DIR / "roster_afl.json"
 MLB_ROSTER_FILE = ROSTER_DIR / "roster_mlb.json"
+NFL_ROSTER_FILE = ROSTER_DIR / "roster_nfl.json"
 # Curated roster-spelling -> Sportsbet-spelling overrides for AFL player names
 # (see afl_name_overrides.json). Applied at load so the resolved `player` field
 # sent to HyperBot matches what Sportsbet lists in its player-prop markets, even
@@ -36,11 +37,16 @@ _nba_roster: dict = {}
 _nbl_roster: dict = {}
 _afl_roster: dict = {}
 _mlb_roster: dict = {}
+_nfl_roster: dict = {}
 # MLB same-full-name collisions {name_lower: [teams]} — two different players
 # (e.g. a star and a minor-leaguer) sharing an exact full name on different teams.
 # Populated from roster_mlb.json's "__collisions__" block; consulted by the resolver
 # to refuse a blind team-override/inference (2026-06-25 Pete Alonso/Max Muncy fix).
 _mlb_collisions: dict = {}
+# NFL same-full-name collisions, same shape/purpose as _mlb_collisions — built
+# from day one (2026-09-10) rather than waiting for the MLB incident to repeat
+# on a new sport. Populated from roster_nfl.json's "__collisions__" block.
+_nfl_collisions: dict = {}
 # AFL placement-time alias map {roster_name_lower: [alt_spelling, ...]} from
 # afl_name_overrides.json['aliases'] — alternate Sportsbet spellings tried against
 # the LIVE catalog by main._afl_canonical_catalog_player (see afl_name_aliases()).
@@ -149,15 +155,26 @@ MLB_KNOWN_COLLISIONS = {
     "Max Muncy": ["Athletics", "Los Angeles Dodgers"],
 }
 
+# NFL mirror of MLB_KNOWN_COLLISIONS, empty seed: a single weekly Sleeper
+# snapshot can under-report a collision (e.g. one of the two players is
+# mid-transaction and briefly has no `team`, so update_nfl_roster_from_api's
+# `if not (name and team): continue` skips it that week, leaving only one
+# team on record). Add a pair here ONLY once two genuinely different NFL
+# players sharing a full name are found (as MLB_KNOWN_COLLISIONS was seeded
+# after the Pete Alonso/Max Muncy incident) -- do not pre-guess entries.
+NFL_KNOWN_COLLISIONS: dict = {}
+
 
 def _load_rosters():
     """Load roster JSON files into memory."""
-    global _nba_roster, _nbl_roster, _afl_roster, _mlb_roster, _mlb_collisions, _loaded
+    global _nba_roster, _nbl_roster, _afl_roster, _mlb_roster, _mlb_collisions
+    global _nfl_roster, _nfl_collisions, _loaded
     if _loaded:
         return
 
     for path, cache in [(NBA_ROSTER_FILE, "_nba"), (NBL_ROSTER_FILE, "_nbl"),
-                        (AFL_ROSTER_FILE, "_afl"), (MLB_ROSTER_FILE, "_mlb")]:
+                        (AFL_ROSTER_FILE, "_afl"), (MLB_ROSTER_FILE, "_mlb"),
+                        (NFL_ROSTER_FILE, "_nfl")]:
         roster = {}
         collisions = {}
         if path.exists():
@@ -188,8 +205,8 @@ def _load_rosters():
                           f"for this process; every lookup for that sport will MISS "
                           f"and route to manual until restart")
 
-        _prev = {"_nba": _nba_roster, "_nbl": _nbl_roster,
-                 "_afl": _afl_roster, "_mlb": _mlb_roster}[cache]
+        _prev = {"_nba": _nba_roster, "_nbl": _nbl_roster, "_afl": _afl_roster,
+                 "_mlb": _mlb_roster, "_nfl": _nfl_roster}[cache]
         if not roster and _prev:
             # Never swap a POPULATED cache for an empty one (only reachable on a
             # re-load; harmless but correct).
@@ -201,9 +218,12 @@ def _load_rosters():
             _nbl_roster = roster
         elif cache == "_afl":
             _afl_roster = roster
-        else:
+        elif cache == "_mlb":
             _mlb_roster = roster
             _mlb_collisions = collisions
+        else:
+            _nfl_roster = roster
+            _nfl_collisions = collisions
 
     _apply_afl_name_overrides()
     _loaded = True
@@ -370,6 +390,8 @@ def _upgrade_to_full_name(match: dict, sport: str) -> dict:
         roster = _afl_roster
     elif sport == "mlb":
         roster = _mlb_roster
+    elif sport == "nfl":
+        roster = _nfl_roster
     else:
         return match
     full_name_candidates: list[str] = []
@@ -450,6 +472,20 @@ def _team_matches(roster_team: str, query_team: str) -> bool:
     global match. Now expand 2-letter and 3-letter codes through the
     config's AFL_TEAMS dict before comparison so 'GC' becomes 'Gold Coast'
     and matches 'Gold Coast Suns' via substring.
+
+    NFL FOLLOW-UP (v6.20, code review): there is no NFL equivalent of the
+    AFL_TEAMS expansion below. roster_nfl.json stores full names ('Buffalo
+    Bills') built from NFL_TEAM_ABBR_TO_FULL, but IMAGE_PROMPT_NFL's vision
+    schema asks for `team` as printed on the image, which is very likely to
+    be a bare code ('BUF') the way AFL's Groq/vision output was before the
+    2026-05-03 fix above -- so team='BUF' would currently fail to substring-
+    match roster entry 'Buffalo Bills' and empty the candidate set. NOT fixed
+    yet because NFL Stage 1 (main._route_image_nfl_tips) never calls
+    exact_match_player/fuzzy_match_player with a team filter -- nothing
+    reaches this function for NFL today. MUST be fixed (expand via
+    roster.NFL_TEAM_ABBR_TO_FULL, same pattern as AFL_TEAMS below) before
+    NFL Stage 2 (auto-placement, which will need team-scoped resolution) is
+    built, or every team-filtered NFL lookup will silently miss.
     """
     if not roster_team or not query_team:
         return False
@@ -716,14 +752,16 @@ def exact_match_player(query: str, sport: str = "nba", team: str = "") -> dict:
         roster = _afl_roster
     elif sport == "mlb":
         roster = _mlb_roster
+    elif sport == "nfl":
+        roster = _nfl_roster
     else:
         return {}
 
     info = roster.get(query.strip().lower())
-    if not info and sport == "mlb":
-        # Accent-insensitive retry for MLB (v5.34): the MLB Stats API stores
-        # accented names ('José Alvarado', 'Yandy Díaz'), but Shook tips them
-        # ASCII ('Jose Alvarado'), so the direct lookup misses. Fold accents on
+    if not info and sport in ("mlb", "nfl"):
+        # Accent-insensitive retry for MLB (v5.34) and NFL (v6.20). Both APIs
+        # (statsapi.mlb.com, Sleeper) store accented names, but a tipster
+        # types them ASCII, so the direct lookup misses. Fold accents on
         # BOTH sides and match exact-on-the-folded-form. This is still an EXACT
         # match (no fuzzy/partial), so it cannot drift to a different player; an
         # accent-only collision across DIFFERENT teams (essentially impossible)
@@ -758,6 +796,25 @@ def is_mlb_name_collision(name: str) -> list:
     # Belt-and-braces: honour the curated list even if the loaded roster_mlb.json
     # predates the seed (a stale JSON must NOT silently reopen the wrong-game fault).
     for _cn, _ct in MLB_KNOWN_COLLISIONS.items():
+        if _cn.strip().lower() == key:
+            return list(_ct)
+    return []
+
+
+def is_nfl_name_collision(name: str) -> list:
+    """NFL mirror of is_mlb_name_collision — return the list of teams an NFL
+    same-full-name collision spans, or [] if unambiguous. See
+    update_nfl_roster_from_api's "__collisions__" build guard."""
+    if not name:
+        return []
+    _load_rosters()
+    key = name.strip().lower()
+    teams = _nfl_collisions.get(key)
+    if teams:
+        return list(teams)
+    # Belt-and-braces: honour the curated list even if the loaded roster_nfl.json
+    # predates the seed (a stale JSON must NOT silently reopen the wrong-game fault).
+    for _cn, _ct in NFL_KNOWN_COLLISIONS.items():
         if _cn.strip().lower() == key:
             return list(_ct)
     return []
@@ -812,6 +869,8 @@ def fuzzy_match_player(
         roster = _afl_roster
     elif sport == "mlb":
         roster = _mlb_roster
+    elif sport == "nfl":
+        roster = _nfl_roster
     else:
         roster = {}
 
@@ -1078,6 +1137,8 @@ def fuzzy_match_all(
         roster = _afl_roster
     elif sport == "mlb":
         roster = _mlb_roster
+    elif sport == "nfl":
+        roster = _nfl_roster
     else:
         roster = {}
 
@@ -1529,6 +1590,160 @@ def update_mlb_roster_from_api(season: int = 2026):
     return roster
 
 
+# NFL team abbreviation -> full name, as Sleeper's API returns rosters keyed by
+# abbreviation only. Static (franchise relocations/renames are rare enough to
+# hand-edit) — the 32 current teams (2026 season). Full names match the
+# bookmaker-facing convention used elsewhere in this file (roster_afl.json /
+# roster_mlb.json store full names, not abbreviations).
+NFL_TEAM_ABBR_TO_FULL = {
+    "ARI": "Arizona Cardinals", "ATL": "Atlanta Falcons", "BAL": "Baltimore Ravens",
+    "BUF": "Buffalo Bills", "CAR": "Carolina Panthers", "CHI": "Chicago Bears",
+    "CIN": "Cincinnati Bengals", "CLE": "Cleveland Browns", "DAL": "Dallas Cowboys",
+    "DEN": "Denver Broncos", "DET": "Detroit Lions", "GB": "Green Bay Packers",
+    "HOU": "Houston Texans", "IND": "Indianapolis Colts", "JAX": "Jacksonville Jaguars",
+    "KC": "Kansas City Chiefs", "LAC": "Los Angeles Chargers", "LAR": "Los Angeles Rams",
+    "LV": "Las Vegas Raiders", "MIA": "Miami Dolphins", "MIN": "Minnesota Vikings",
+    "NE": "New England Patriots", "NO": "New Orleans Saints", "NYG": "New York Giants",
+    "NYJ": "New York Jets", "PHI": "Philadelphia Eagles", "PIT": "Pittsburgh Steelers",
+    "SEA": "Seattle Seahawks", "SF": "San Francisco 49ers", "TB": "Tampa Bay Buccaneers",
+    "TEN": "Tennessee Titans", "WAS": "Washington Commanders",
+}
+
+# Player-prop-relevant positions only (v6.20). Sleeper's /players/nfl dump
+# includes every practice-squad body, long snapper and IR entry (~12k rows);
+# filtering to skill positions that actually carry rushing/receiving/passing/
+# TD/sack props keeps the roster small and keeps a punter's name from ever
+# fuzzy-matching a skill player. Widen this set if A1 posts a prop type outside
+# it (e.g. a kicker FG-made prop) once we've actually seen one.
+NFL_PROP_POSITIONS = {"QB", "RB", "WR", "TE", "FB", "DL", "LB", "DB", "K"}
+
+
+def update_nfl_roster_from_api():
+    """Fetch current NFL rosters from the Sleeper API (api.sleeper.app).
+    No API key needed. Run locally: python roster.py --update-nfl
+
+    Sleeper's /v1/players/nfl is a single ~12k-entry dump of every player it has
+    ever tracked (active, practice squad, retired, IR). Filters to `active: true`
+    with a real `team` + a prop-relevant `position` (NFL_PROP_POSITIONS), unlike
+    MLB/AFL's team-by-team pull, because Sleeper returns the whole league in one
+    call with `active` already flagged.
+
+    Builds {full_name: team_full_name} via NFL_TEAM_ABBR_TO_FULL, so the full
+    names read the same way roster_afl.json / roster_mlb.json do. Adds a
+    surname-only alias for fuzzy matching, skipped when the surname is
+    ambiguous across players — mirrors update_mlb_roster_from_api's
+    same-full-name collision guard exactly (built from day one here rather
+    than waiting for the MLB incident, 2026-06-25 Pete Alonso, to repeat)."""
+    import urllib.request
+
+    log.info("Fetching NFL roster from api.sleeper.app...")
+    roster: dict = {}
+    try:
+        req = urllib.request.Request(
+            "https://api.sleeper.app/v1/players/nfl",
+            headers={"User-Agent": "tipbot/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            people = json.load(r)
+        if not isinstance(people, dict):
+            log.error("NFL roster update failed: unexpected response shape (not a dict)")
+            return {}
+
+        def _surnorm(s: str) -> str:
+            s = unicodedata.normalize("NFD", s or "")
+            return "".join(c for c in s if not unicodedata.combining(c)).lower()
+
+        surname_count: dict = {}
+        fullname_teams: dict = {}  # fullName -> set of distinct teams (collision detector)
+        unmapped_abbrs: set = set()  # team codes Sleeper returned that we don't know
+        for p in (people or {}).values():
+            if not isinstance(p, dict) or not p.get("active"):
+                continue
+            if (p.get("position") or "") not in NFL_PROP_POSITIONS:
+                continue
+            name = (p.get("full_name") or "").strip()
+            team_abbr = p.get("team")
+            team = NFL_TEAM_ABBR_TO_FULL.get(team_abbr or "")
+            if not (name and team):
+                # v6.07 "loud on partial data loss" principle: distinguish "no
+                # current team" (team_abbr falsy -- legitimate, e.g. between
+                # rosters) from "team code we don't recognise" (a franchise
+                # rename/relocation NFL_TEAM_ABBR_TO_FULL hasn't been updated
+                # for) -- the latter silently drops every player on that team
+                # with zero signal unless flagged here.
+                if name and team_abbr and team_abbr not in NFL_TEAM_ABBR_TO_FULL:
+                    unmapped_abbrs.add(team_abbr)
+                continue
+            fullname_teams.setdefault(name, set()).add(team)
+            parts = name.split()
+            if len(parts) >= 2:
+                key = _surnorm(parts[-1])
+                surname_count[key] = surname_count.get(key, 0) + 1
+        if unmapped_abbrs:
+            log.warning(
+                f"NFL roster update: unrecognised team code(s) from Sleeper "
+                f"{sorted(unmapped_abbrs)} -- every player on that team was "
+                f"DROPPED from roster_nfl.json this run. Add to "
+                f"NFL_TEAM_ABBR_TO_FULL if this is a real team (relocation/"
+                f"rename), not a Sleeper data glitch."
+            )
+
+        # Same-full-name collision guard, identical logic to MLB's: a name on
+        # exactly one team gets a normal mapping; a name spanning >1 team gets
+        # NO bare name->team key (recorded under "__collisions__" instead) so
+        # the resolver refuses to guess between them.
+        collisions = {n: sorted(ts) for n, ts in fullname_teams.items() if len(ts) > 1}
+        # Merge CURATED known collisions (see NFL_KNOWN_COLLISIONS) so a
+        # single-pull snapshot missing one of a colliding pair's `team` cannot
+        # silently write a confident WRONG single mapping -- same reasoning as
+        # MLB's Pete Alonso guard.
+        for _cn, _ct in NFL_KNOWN_COLLISIONS.items():
+            _seen = set(collisions.get(_cn, [])) | set(_ct) | set(fullname_teams.get(_cn, set()))
+            collisions[_cn] = sorted(_seen)
+        for name, teams in fullname_teams.items():
+            if len(teams) == 1 and name not in collisions:
+                roster[name] = next(iter(teams))
+        if collisions:
+            roster["__collisions__"] = collisions
+            log.warning(
+                f"NFL same-name collisions dropped from name->team (disambiguate by "
+                f"slate, else manual): {collisions}"
+            )
+
+        _collision_surnames = {_surnorm(n.split()[-1]) for n in collisions if n.split()}
+        for p in (people or {}).values():
+            if not isinstance(p, dict) or not p.get("active"):
+                continue
+            if (p.get("position") or "") not in NFL_PROP_POSITIONS:
+                continue
+            name = (p.get("full_name") or "").strip()
+            team_abbr = p.get("team")
+            team = NFL_TEAM_ABBR_TO_FULL.get(team_abbr or "")
+            if not (name and team):
+                continue
+            parts = name.split()
+            if len(parts) >= 2:
+                last = parts[-1]
+                if (surname_count.get(_surnorm(last)) == 1 and last not in roster
+                        and _surnorm(last) not in _collision_surnames):
+                    roster[last] = team
+
+        log.info(f"Got {len(fullname_teams)} active NFL prop-position players "
+                 f"across {len(NFL_TEAM_ABBR_TO_FULL)} teams")
+    except Exception as e:
+        log.error(f"NFL roster update failed: {e}")
+        return {}
+
+    if roster:
+        _tmp = NFL_ROSTER_FILE.with_suffix(".json.tmp")
+        with open(_tmp, "w", encoding="utf-8") as f:
+            json.dump(roster, f, indent=2, ensure_ascii=False)
+        os.replace(_tmp, NFL_ROSTER_FILE)
+        log.info(f"Saved {len(roster)} entries to {NFL_ROSTER_FILE}")
+
+    return roster
+
+
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO)
@@ -1537,6 +1752,8 @@ if __name__ == "__main__":
         update_roster_from_api()
     elif "--update-mlb" in sys.argv:
         update_mlb_roster_from_api()
+    elif "--update-nfl" in sys.argv:
+        update_nfl_roster_from_api()
     else:
         # Quick test
         _load_rosters()

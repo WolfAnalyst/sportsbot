@@ -1111,6 +1111,67 @@ IMAGE_PROMPT_AFL = (
 )
 
 
+IMAGE_PROMPT_NFL = (
+    "You are an OCR + extraction tool for NFL betting-tip images. Respond with "
+    "ONLY valid JSON, no markdown fences, in this shape: "
+    '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
+    '"side": "over"|"under"|null, "line": number|null, "odds": number|null, '
+    '"bookie": str|null, "units": number|null, '
+    '"market_type": "player_prop"|"h2h"|"spread"|"total"|"other", '
+    '"description": str|null} ]}. '
+    "EXTRACT ONLY THE TIPSTER'S ACTUAL SELECTION(S) — the bet(s) they are "
+    "backing. This is the HIGHLIGHTED / boxed / bold / centred / largest "
+    "selection, or the one added to a betslip/bet-card (the one shown with the "
+    "stake or 'BET' button). DO NOT extract the surrounding odds board, market "
+    "grid, or other available options shown in the background — those are NOT "
+    "the tip. An image OFTEN contains MULTIPLE bets — extract EVERY distinct "
+    "selection the tipster is backing as its OWN separate tip; do NOT stop after "
+    "the first and do NOT collapse the list. The SAME player can appear on "
+    "SEVERAL lines with DIFFERENT lines/thresholds — output a SEPARATE tip for "
+    "EACH such line, and read the units/stake AND odds from THAT line ONLY. "
+    "NEVER merge two lines into one tip, and NEVER output both the OVER and the "
+    "UNDER of the same line (only one side can be the tip). "
+    "Rules: for a player statistic bet set market_type=\"player_prop\", "
+    "`player`= the player's name EXACTLY as printed: the FULL name (BOTH first "
+    "AND last, e.g. \"Josh Allen\") when both are shown — do NOT drop a printed "
+    "first name. If ONLY a surname is printed, output THAT surname alone and do "
+    "NOT invent or guess a first name — the bot resolves it from the roster. "
+    "ALSO set `team` to the player's NFL team if it appears ANYWHERE on the "
+    "image (it disambiguates a shared surname). `stat` to ONE lowercase word "
+    "from: rushing_yards, receiving_yards, passing_yards, receptions, "
+    "touchdowns, passing_touchdowns, rushing_touchdowns, receiving_touchdowns, "
+    "interceptions, completions, passing_attempts, sacks, tackles, "
+    "longest_reception, longest_rush. `side` is \"over\" for 'over'/'more'/'o' "
+    "lines and \"under\" for 'under'/'less'/'u'. `line` is the number (74.5). "
+    "ANYTIME TOUCHDOWN: 'anytime TD' / 'ATD' / 'anytime touchdown scorer' means "
+    "market_type=\"player_prop\", stat=\"touchdowns\", side=\"over\", line=0.5. "
+    "Convert prices to decimal numbers ($1.87 -> 1.87; if the image shows "
+    "American odds like -110 or +150 instead of decimal, still output the "
+    "number EXACTLY as printed in `odds` and note it in `description` so the "
+    "caller knows it was American, not decimal — do NOT silently convert "
+    "American odds yourself). Convert stake to a number (1u -> 1, 2.5u -> 2.5). "
+    "SPREAD/HANDICAP: a TEAM with a signed number (e.g. 'Bills -3.5', 'Jets "
+    "+6.5') is market_type=\"spread\", `team`=the team, `line`=the number WITH "
+    "its sign exactly as printed (negative if favourite/giving points, positive "
+    "if receiving). TOTAL (game total points, e.g. 'Over 47.5'): "
+    "market_type=\"total\", `side`=over/under, `line`=the number, `team`=null "
+    "unless the image shows one team's own team-total (then set `team`). "
+    "MONEYLINE / head-to-head (a SINGLE team to win outright, e.g. 'Chiefs ML', "
+    "'Chiefs to win'): market_type=\"h2h\", `team`=the ONE team backed, "
+    "`odds`=the price, `units`=the stake if shown, player/stat/line/side null. "
+    "PARLAY (two or more legs combined at ONE price): return a SINGLE tip with "
+    "market_type=\"other\", player/team/stat/line/odds null, and `description` "
+    "= a short plain-English transcription of every leg plus the combined "
+    "odds/stake, e.g. \"PARLAY: Chiefs ML + Bills -3.5 @ 3.10, 1u\". Any OTHER "
+    "bettable selection fitting none of the market_types above also uses "
+    "market_type=\"other\" with a `description`. Do NOT silently omit any bet. "
+    "Set `description` ONLY for a real bettable selection the tipster is "
+    "backing — NEVER for a results/recap/commentary graphic (those stay an "
+    "empty tips list). Use null for ANY field not printed. "
+    "JSON only."
+)
+
+
 def _image_mime(image_bytes: bytes) -> str:
     """Sniff the image mime from magic bytes (default jpeg)."""
     if image_bytes[:8].startswith(b"\x89PNG"):
@@ -1145,7 +1206,13 @@ def parse_tip_image(
         log.warning("parse_tip_image: empty image bytes")
         return [], 0.0
 
-    prompt = IMAGE_PROMPT_RACING if (sport or "").lower() == "racing" else IMAGE_PROMPT_AFL
+    _sport_l = (sport or "").lower()
+    if _sport_l == "racing":
+        prompt = IMAGE_PROMPT_RACING
+    elif _sport_l == "nfl":
+        prompt = IMAGE_PROMPT_NFL
+    else:
+        prompt = IMAGE_PROMPT_AFL
     b64 = base64.b64encode(image_bytes).decode()
     mime = _image_mime(image_bytes)
     body = {

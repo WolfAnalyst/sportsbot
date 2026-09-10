@@ -16625,6 +16625,93 @@ async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                 pass
 
 
+def _describe_nfl_image_tip(raw: dict) -> str:
+    """Render one vision-extracted NFL raw tip dict as a readable one-block
+    description for the manual alert. Never raises — a malformed field just
+    prints as-is or is skipped, since this is display-only (no placement
+    reads this)."""
+    mt = (raw.get("market_type") or "other").strip().lower()
+
+    def _or_q(v):
+        return v if v is not None else "?"
+
+    lines = []
+    if mt == "player_prop":
+        player = raw.get("player") or "?"
+        team = raw.get("team")
+        stat = raw.get("stat") or "?"
+        side = raw.get("side") or "?"
+        line = raw.get("line")
+        lines.append(
+            f"{player}" + (f" ({team})" if team else "")
+            + f": {side} {_or_q(line)} {stat}"
+        )
+    elif mt == "h2h":
+        lines.append(f"{raw.get('team') or '?'}: moneyline/H2H")
+    elif mt == "spread":
+        lines.append(f"{raw.get('team') or '?'}: spread {_or_q(raw.get('line'))}")
+    elif mt == "total":
+        team = raw.get("team")
+        lines.append(
+            f"Total{f' ({team})' if team else ''}: {raw.get('side') or '?'} "
+            f"{_or_q(raw.get('line'))}"
+        )
+    else:
+        lines.append(raw.get("description") or "(unschematic bet, see raw below)")
+    odds = raw.get("odds")
+    units = raw.get("units")
+    bookie = raw.get("bookie")
+    tail = []
+    if odds is not None:
+        tail.append(f"@ {odds}")
+    if units is not None:
+        tail.append(f"{units}u")
+    if bookie:
+        tail.append(str(bookie))
+    if tail:
+        lines.append("  " + " / ".join(tail))
+    return "\n".join(lines)
+
+
+async def _route_image_nfl_tips(raw_tips: list, tipster: str, channel_name: str,
+                                 pipeline_start: float = None,
+                                 parse_sec: float = None) -> None:
+    """Route vision-extracted NFL tips to a MANUAL alert: NEVER auto-places.
+
+    v6.20 (2026-09-10, Wilson: onboarding A1 NFL, "NFL Tips from 4thandEV").
+    Mirrors the shape of _route_image_afl_tips/_route_image_racing_tips (same
+    call site, same per-tip loop) but deliberately does NOT call place_tip or
+    any placement pipeline — this is the Eddie/Zak/Trial bootstrap pattern:
+    ingest + parse + alert first, validate the vision prompt and market
+    mapping against REAL A1 images, THEN build auto-placement once Wilson has
+    confirmed the parse is accurate. There is no NFL market catalog / event
+    resolver / bookie routing wired yet, so attempting to auto-place here
+    would be placing blind against markets we have never verified exist in
+    the shape IMAGE_PROMPT_NFL assumes.
+
+    Each raw tip gets ONE notify_image_alert so a multi-leg image never
+    collapses into a single message that's easy to half-read."""
+    for idx, raw in enumerate(raw_tips):
+        try:
+            desc = _describe_nfl_image_tip(raw)
+        except Exception as e:
+            desc = f"(description render failed: {e}; raw={raw!r})"
+        log.info(f"[{channel_name}] NFL image tip {idx}: {desc!r} -> manual "
+                 f"(auto-placement not yet wired for NFL)")
+        try:
+            notifier.notify_image_alert(
+                channel_name,
+                f"(NFL, manual: auto-placement not yet enabled)\n{desc}",
+            )
+        except Exception as e:
+            log.error(f"[{channel_name}] NFL image tip {idx} alert failed: {e}")
+    if pipeline_start is not None:
+        log.info(
+            f"[{channel_name}] NFL image batch: {len(raw_tips)} tip(s), "
+            f"parse={parse_sec}s, total={round(time.time() - pipeline_start, 3)}s"
+        )
+
+
 async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
                              unit_size: float, default_units: float,
                              msg_time, channel_name: str, raw_caption: str = ""):
@@ -16758,6 +16845,11 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
     if sport_l == "racing":
         await _route_image_racing_tips(
             raw_tips, tipster, channel_name, unit_size, default_units, msg_time,
+            pipeline_start=_t0, parse_sec=round(elapsed, 3),
+        )
+    elif sport_l == "nfl":
+        await _route_image_nfl_tips(
+            raw_tips, tipster, channel_name,
             pipeline_start=_t0, parse_sec=round(elapsed, 3),
         )
     else:

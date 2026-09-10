@@ -183,11 +183,13 @@ def parse_tip_image_claude(image_bytes, tipster, sport, max_retries=4, model=Non
         return [], 0.0
     model = model or CLAUDE_PARSER_MODEL
 
-    prompt = (
-        groq_parser.IMAGE_PROMPT_RACING
-        if (sport or "").lower() == "racing"
-        else groq_parser.IMAGE_PROMPT_AFL
-    )
+    _sport_l = (sport or "").lower()
+    if _sport_l == "racing":
+        prompt = groq_parser.IMAGE_PROMPT_RACING
+    elif _sport_l == "nfl":
+        prompt = groq_parser.IMAGE_PROMPT_NFL
+    else:
+        prompt = groq_parser.IMAGE_PROMPT_AFL
     # NOTE: a request exception PROPAGATES (do NOT swallow) so the caller routes
     # the tip to manual rather than silently dropping it (v5.87).
     content = _complete_vision(prompt, image_bytes, model)
