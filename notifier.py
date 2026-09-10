@@ -1285,6 +1285,37 @@ def notify_image_alert(tipster: str, raw_message: str) -> bool:
     return _send_alert(text)
 
 
+def notify_text_manual_alert(tipster: str, raw_message: str, header: str = "MANUAL BET") -> bool:
+    """Generic manual-bet alert for a TEXT source with no auto-placement path
+    (v6.21, A1 NFL onboarding). Mirrors notify_image_alert's shape but with a
+    parameterised header instead of the hardcoded 'IMAGE TIP'/'Image bet
+    detected' wording, which would be factually wrong for a pure-text
+    source. Keeps a much longer preview than notify_image_alert's 200 chars
+    -- the whole point of this alert is to surface a tipster's FULL prose
+    (alt-lines, price flexibility, fallback markets) that a structured
+    summary would lose.
+
+    Truncates the ESCAPED message, not the raw one (v6.21 code review):
+    _escape_html can expand '&'/'<'/'>' into 4-5 chars each, so truncating
+    3000 RAW chars first could still exceed Telegram's 4096 cap after
+    escaping and get the whole alert silently dropped by _send_now. Escaping
+    first and truncating the result guarantees the cap holds regardless of
+    character mix."""
+    body = _escape_html(raw_message) if raw_message else "(no text)"
+    # Budget: 4096 total, minus the header/tipster/labels/footer overhead
+    # (a few hundred chars, generous margin) -- 3000 for the escaped body.
+    _BODY_BUDGET = 3000
+    if len(body) > _BODY_BUDGET:
+        body = body[:_BODY_BUDGET] + "\n...[truncated]"
+    text = (
+        f"<b>{_escape_html(header)}</b>\n"
+        f"<b>Tipster:</b> {_escape_html(tipster)}\n"
+        f"<b>Message:</b>\n<pre>{body}</pre>\n"
+        f"Not auto-placed. Check and place manually."
+    )
+    return _send_alert(text)
+
+
 def notify_image_no_tip(tipster: str, caption: str = "") -> bool:
     """An image was received but the vision parser found NO bettable tip (a
     recap/results graphic, or a tip the model couldn't read). Distinct from

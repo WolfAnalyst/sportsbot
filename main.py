@@ -97,7 +97,7 @@ from config import (
     DISPOSALS_MODEL_SEQ_RESET_TOLERANCE,
     DISPOSALS_MODEL_LIVENESS_CRITICAL,
 )
-from groq_parser import parse_tip_image
+from groq_parser import parse_tip_image, parse_a1_nfl_text
 from models import ParsedTip, ParsedLeg, BetResult
 from parsers.saiyan_afl import parse_saiyan_message
 try:
@@ -16675,22 +16675,33 @@ def _describe_nfl_image_tip(raw: dict) -> str:
 
 async def _route_image_nfl_tips(raw_tips: list, tipster: str, channel_name: str,
                                  pipeline_start: float = None,
-                                 parse_sec: float = None) -> None:
+                                 parse_sec: float = None,
+                                 raw_caption: str = "") -> None:
     """Route vision-extracted NFL tips to a MANUAL alert: NEVER auto-places.
 
-    v6.20 (2026-09-10, Wilson: onboarding A1 NFL, "NFL Tips from 4thandEV").
-    Mirrors the shape of _route_image_afl_tips/_route_image_racing_tips (same
-    call site, same per-tip loop) but deliberately does NOT call place_tip or
-    any placement pipeline — this is the Eddie/Zak/Trial bootstrap pattern:
-    ingest + parse + alert first, validate the vision prompt and market
-    mapping against REAL A1 images, THEN build auto-placement once Wilson has
-    confirmed the parse is accurate. There is no NFL market catalog / event
-    resolver / bookie routing wired yet, so attempting to auto-place here
-    would be placing blind against markets we have never verified exist in
-    the shape IMAGE_PROMPT_NFL assumes.
+    v6.20 (2026-09-10, Wilson: onboarding 4th and +EV NFL, "NFL Tips from
+    4thandEV"). Mirrors the shape of _route_image_afl_tips/
+    _route_image_racing_tips (same call site, same per-tip loop) but
+    deliberately does NOT call place_tip or any placement pipeline — this is
+    the Eddie/Zak/Trial bootstrap pattern: ingest + parse + alert first,
+    validate the vision prompt and market mapping against REAL 4th&EV
+    images, THEN build auto-placement once Wilson has confirmed the parse is
+    accurate. There is no NFL market catalog / event resolver / bookie
+    routing wired yet, so attempting to auto-place here would be placing
+    blind against markets we have never verified exist in the shape
+    IMAGE_PROMPT_NFL assumes.
 
-    Each raw tip gets ONE notify_image_alert so a multi-leg image never
-    collapses into a single message that's easy to half-read."""
+    v6.21 (code review, real 4th&EV sample): raw_caption is threaded through
+    and always appended to the alert. The card image only carries the
+    single headline bet; the Telegram CAPTION under it is where 4th&EV puts
+    price flexibility ('Happy to take down to $1.80') and multi-leg unit
+    budgets ('4 units for this game in total, with the Patriots picks
+    above') -- context a structured summary alone would silently drop.
+
+    Each raw tip gets ONE notify_text_manual_alert (not notify_image_alert --
+    that truncates to 200 chars, too short to carry the caption) so a
+    multi-leg image never collapses into a single message that's easy to
+    half-read."""
     for idx, raw in enumerate(raw_tips):
         try:
             desc = _describe_nfl_image_tip(raw)
@@ -16698,10 +16709,16 @@ async def _route_image_nfl_tips(raw_tips: list, tipster: str, channel_name: str,
             desc = f"(description render failed: {e}; raw={raw!r})"
         log.info(f"[{channel_name}] NFL image tip {idx}: {desc!r} -> manual "
                  f"(auto-placement not yet wired for NFL)")
+        alert_text = f"(auto-placement not yet enabled)\n{desc}"
+        if raw_caption:
+            alert_text += f"\n\n---- caption ----\n{raw_caption}"
         try:
-            notifier.notify_image_alert(
-                channel_name,
-                f"(NFL, manual: auto-placement not yet enabled)\n{desc}",
+            # notify_image_alert truncates to 200 chars, too short to carry
+            # a caption (4th&EV's captions routinely run several hundred
+            # chars of price-flexibility/multi-leg context) -- use the
+            # longer-preview generic manual alert instead (v6.21).
+            notifier.notify_text_manual_alert(
+                channel_name, alert_text, header="NFL IMAGE TIP, MANUAL"
             )
         except Exception as e:
             log.error(f"[{channel_name}] NFL image tip {idx} alert failed: {e}")
@@ -16710,6 +16727,139 @@ async def _route_image_nfl_tips(raw_tips: list, tipster: str, channel_name: str,
             f"[{channel_name}] NFL image batch: {len(raw_tips)} tip(s), "
             f"parse={parse_sec}s, total={round(time.time() - pipeline_start, 3)}s"
         )
+
+
+# A1 posts a short ANNOUNCEMENT before every real play ('0.65u play coming,
+# IND vs BAL'). A cheap fast-path regex so the common case never spends a
+# Groq/Claude call on a message with zero selection info; the parser prompt
+# (TEXT_PROMPT_A1_NFL) ALSO recognises this shape as a correctness backstop
+# in case the wording ever drifts from this exact pattern.
+#
+# fullmatch, not match/prefix (v6.21 code review): every real sample is a
+# SEPARATE Telegram message, but if an announcement and the real play were
+# EVER combined into one message, a prefix match would drop the whole thing
+# -- including the real play -- before the prompt's own backstop ever saw
+# it. Requiring the WHOLE (stripped) message to be just the announcement,
+# with only trailing punctuation/whitespace allowed, means anything with
+# real content after it falls through to the LLM instead.
+_A1_ANNOUNCEMENT_RE = re.compile(
+    r"^[\d.]+u\s+(nfl\s+)?play coming,?\s*[A-Za-z .]+\s*(vs\.?|v\.?)\s*[A-Za-z .]+[.!]?$",
+    re.IGNORECASE,
+)
+
+
+def _describe_a1_nfl_tip(raw: dict) -> str:
+    """Render one text-extracted A1 NFL raw tip dict as a short headline for
+    the manual alert. Never raises. Mirrors _describe_nfl_image_tip's
+    player_prop rendering; A1's parser only ever emits player_prop/h2h/other
+    (see TEXT_PROMPT_A1_NFL), so this is intentionally smaller than the
+    image-side renderer."""
+    mt = (raw.get("market_type") or "other").strip().lower()
+    if mt == "player_prop":
+        player = raw.get("player") or "?"
+        team = raw.get("team")
+        stat = raw.get("stat") or "?"
+        side = raw.get("side") or "?"
+        line = raw.get("line")
+        units = raw.get("units")
+        headline = (
+            f"{player}" + (f" ({team})" if team else "")
+            + f": {side} {line if line is not None else '?'} {stat}"
+        )
+        if units is not None:
+            headline += f" ({units}u)"
+        return headline
+    if mt == "h2h":
+        return f"{raw.get('team') or '?'}: moneyline/H2H"
+    return raw.get("description") or "(see raw message below)"
+
+
+async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str) -> None:
+    """Route an A1 Fantasy Sports NFL text message to a MANUAL alert: NEVER
+    auto-places, mirrors _route_image_nfl_tips's money-safety philosophy
+    exactly (see that function's docstring for the full rationale -- no NFL
+    market catalog/event resolver/bookie routing exists yet).
+
+    v6.21 (2026-09-10, Wilson: "A1 is text ... please check if we have
+    automated his tips before?" -- confirmed never automated). A1's real
+    format (announcement message, then a play message carrying alt-book
+    line variants and conditional fallback markets in prose) is genuinely
+    harder to model structurally than 4th&EV's labelled image card, so the
+    manual alert ALWAYS carries the full raw text verbatim alongside a
+    best-effort one-line headline -- see notify_text_manual_alert. Chatter
+    (announcement messages, and anything else the parser reads as carrying
+    no real selection) is dropped silently, matching the rest of this
+    codebase's convention for non-bet-like text on a monitored channel."""
+    if _A1_ANNOUNCEMENT_RE.fullmatch((text or "").strip()):
+        log.info(f"[{channel_name}] A1 announcement (no selection) -> dropped: {text[:80]}")
+        return
+
+    loop = asyncio.get_event_loop()
+    # v6.21 (code review): the live .env runs CLAUDE_PRIMARY=true. The naive
+    # "if _claude_fallback_enabled() and not _claude_primary_enabled()"
+    # guard used by the racing-text path (which ALWAYS calls Groq first,
+    # regardless of CLAUDE_PRIMARY) is WRONG here, because THIS function
+    # branches its PRIMARY choice on _claude_primary_enabled() itself -- with
+    # that guard, a Claude-primary failure could never fall back to Groq, and
+    # fell straight through to raw_tips=[] with NO alert, silently losing a
+    # real tip. Explicitly try "the OTHER provider" instead.
+    _primary_claude = tip_parser._claude_primary_enabled()
+    try:
+        if _primary_claude:
+            raw_tips, elapsed = await loop.run_in_executor(
+                None, tip_parser.parse_a1_nfl_text_fallback, text, tipster
+            )
+        else:
+            raw_tips, elapsed = await loop.run_in_executor(
+                None, parse_a1_nfl_text, text, tipster
+            )
+    except Exception as e:
+        # HARD failure (no key, request error, bad JSON) -- parse_a1_nfl_text/
+        # parse_a1_nfl_text_claude both RAISE for this (never lose a real tip
+        # to a silent 'chatter' misclassification).
+        log.warning(f"[{channel_name}] A1 NFL text parse failed ({e}); trying the other provider")
+        raw_tips = None
+        try:
+            if _primary_claude:
+                raw_tips, elapsed = await loop.run_in_executor(
+                    None, parse_a1_nfl_text, text, tipster
+                )
+            elif tip_parser._claude_fallback_enabled():
+                raw_tips, elapsed = await loop.run_in_executor(
+                    None, tip_parser.parse_a1_nfl_text_fallback, text, tipster
+                )
+        except Exception as e2:
+            log.error(f"[{channel_name}] A1 NFL text parse failed on both providers: {e2}")
+        if raw_tips is None:
+            # Both providers failed, or no fallback provider was available --
+            # NEVER lose a real tip silently: alert with the raw text so
+            # Wilson can still place it by hand without a structured summary.
+            try:
+                notifier.notify_text_manual_alert(
+                    channel_name, text, header="A1 NFL PARSE FAILED"
+                )
+            except Exception as e3:
+                log.error(f"[{channel_name}] A1 NFL parse-failure alert failed: {e3}")
+            return
+
+    if not raw_tips:
+        log.info(f"[{channel_name}] A1 NFL text parsed to 0 tips (chatter): {text[:80]}")
+        return
+
+    log.info(f"[{channel_name}] A1 NFL text extracted {len(raw_tips)} tip(s) in {elapsed:.2f}s")
+    for idx, raw in enumerate(raw_tips):
+        try:
+            headline = _describe_a1_nfl_tip(raw)
+        except Exception as e:
+            headline = f"(headline render failed: {e})"
+        try:
+            notifier.notify_text_manual_alert(
+                channel_name,
+                f"{headline}\n\n---- full message ----\n{text}",
+                header="A1 NFL, MANUAL",
+            )
+        except Exception as e:
+            log.error(f"[{channel_name}] A1 NFL tip {idx} alert failed: {e}")
 
 
 async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
@@ -16851,6 +17001,7 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
         await _route_image_nfl_tips(
             raw_tips, tipster, channel_name,
             pipeline_start=_t0, parse_sec=round(elapsed, 3),
+            raw_caption=raw_caption,
         )
     else:
         await _route_image_afl_tips(
@@ -18886,6 +19037,41 @@ async def main():
                         notifier.notify_image_alert(channel_name, text)
                 else:
                     log.info(f"[{channel_name}] text-only chatter on image channel -> dropped (not bet-like): {text[:80]}")
+            return
+
+        # A1 Fantasy Sports NFL (v6.21, 2026-09-10): a plain TEXT channel, but
+        # routed to its OWN manual-only pipeline instead of the generic
+        # _process_tip catch-all below -- see _route_a1_nfl_text's docstring.
+        # Reusing _process_tip would reach place_tip/_place_singles_v4, which
+        # IS already safe for an unconfigured sport (verified: NFL has no
+        # *_SESSION_PRIORITY entry, so get_priority_for("nfl") returns [] and
+        # _place_singles_v4 short-circuits to manual, same mechanism MLB
+        # relies on) -- but notify_bet_failed's structured legs-only alert
+        # would lose the prose nuance (alt-book line variants, price
+        # flexibility, conditional fallback markets) A1's real messages carry,
+        # which this bespoke router preserves by always including the full
+        # raw text.
+        #
+        # Checked BEFORE the generic media-alert block below (v6.21 code
+        # review): A1's rare photo+caption post (an SGP) has `text` (the
+        # caption) populated same as any other message, so without this
+        # early intercept it would ALSO hit "if event.media and text:" a few
+        # lines down (no `return` there) and double-alert on the same
+        # message -- one generic 'IMAGE TIP', one from _route_a1_nfl_text.
+        if channel_cfg.get("parser") == "a1_fantasy_nfl":
+            if text:
+                asyncio.create_task(
+                    _route_a1_nfl_text(text, "a1_fantasy_nfl", channel_name)
+                )
+            elif event.media:
+                log.info(f"[{channel_name}] A1 image/media with no caption -> manual alert")
+                try:
+                    notifier.notify_text_manual_alert(
+                        channel_name, "(image/media, no caption)",
+                        header="A1 NFL, MANUAL",
+                    )
+                except Exception as e:
+                    log.error(f"[{channel_name}] A1 no-caption media alert failed: {e}")
             return
 
         # Detect image/media - alert only.

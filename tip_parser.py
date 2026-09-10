@@ -138,6 +138,12 @@ def parse_racing_text_fallback(text, tipster):
     return claude_parser.parse_racing_text_claude(text, tipster=tipster, model=CLAUDE_FALLBACK_MODEL)
 
 
+def parse_a1_nfl_text_fallback(text, tipster="a1_fantasy_nfl"):
+    import claude_parser
+    from config import CLAUDE_FALLBACK_MODEL
+    return claude_parser.parse_a1_nfl_text_claude(text, tipster=tipster, model=CLAUDE_FALLBACK_MODEL)
+
+
 def active_provider() -> str:
     """Resolve the active provider. Fails SAFE to 'groq' if 'claude' is
     selected but not usable (missing ANTHROPIC_API_KEY or `anthropic`), so a

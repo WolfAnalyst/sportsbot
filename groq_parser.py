@@ -1119,6 +1119,20 @@ IMAGE_PROMPT_NFL = (
     '"bookie": str|null, "units": number|null, '
     '"market_type": "player_prop"|"h2h"|"spread"|"total"|"other", '
     '"description": str|null} ]}. '
+    "4th AND +EV BRANDED CARD FORMAT: this tipster posts a black-and-gold "
+    "graphic card headed '4TH AND +EV BETTING PICKS' with EXPLICIT labelled "
+    "fields: a 'BET:' line naming the player and the exact market (e.g. 'BET: "
+    "RASHID SHAHEED' / 'OVER 31.5 RECEIVING YARDS'), an 'ODDS' figure already "
+    "in AU DECIMAL format (e.g. '$1.88' -> odds=1.88, NOT American odds), and "
+    "'UNITS: <N>' plus 'BOOKIE: <name>' printed together near the bottom of "
+    "the card (e.g. 'UNITS: 2 | BOOKIE: SPORTSBET'). When these labels are "
+    "present, TRUST THEM DIRECTLY over any generic slip-reading heuristics "
+    "below: `player`/`stat`/`side`/`line` come straight from the 'BET:' "
+    "line, `odds` from the 'ODDS' figure (already decimal, use as printed), "
+    "`units` from 'UNITS:', `bookie` from 'BOOKIE:' (lowercase it, e.g. "
+    "'SPORTSBET' -> 'sportsbet'). A long paragraph of reasoning/analysis "
+    "text elsewhere on the card is NOT the bet, ignore it for extraction "
+    "(it is not needed downstream). "
     "EXTRACT ONLY THE TIPSTER'S ACTUAL SELECTION(S) — the bet(s) they are "
     "backing. This is the HIGHLIGHTED / boxed / bold / centred / largest "
     "selection, or the one added to a betslip/bet-card (the one shown with the "
@@ -1139,7 +1153,8 @@ IMAGE_PROMPT_NFL = (
     "ALSO set `team` to the player's NFL team if it appears ANYWHERE on the "
     "image (it disambiguates a shared surname). `stat` to ONE lowercase word "
     "from: rushing_yards, receiving_yards, passing_yards, receptions, "
-    "touchdowns, passing_touchdowns, rushing_touchdowns, receiving_touchdowns, "
+    "rush_attempts, pass_attempts, touchdowns, passing_touchdowns, "
+    "rushing_touchdowns, receiving_touchdowns, "
     "interceptions, completions, passing_attempts, sacks, tackles, "
     "longest_reception, longest_rush. `side` is \"over\" for 'over'/'more'/'o' "
     "lines and \"under\" for 'under'/'less'/'u'. `line` is the number (74.5). "
@@ -1399,6 +1414,155 @@ def parse_racing_text(
     tips = [t for t in tips if isinstance(t, dict) and (t.get("runner") or "").strip()]
     log.info(
         f"parse_racing_text: {tipster} extracted {len(tips)} raw tip(s) "
+        f"in {elapsed:.2f}s"
+    )
+    return tips, elapsed
+
+
+TEXT_PROMPT_A1_NFL = (
+    "You are an extraction tool for NFL betting-tip TEXT MESSAGES from the A1 Fantasy "
+    "Sports tipster channel. Read the message and extract the ONE headline bet A1 is "
+    "BACKING. Respond with ONLY valid JSON, no markdown fences, in this shape: "
+    '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
+    '"side": "over"|"under"|null, "line": number|null, "units": number|null, '
+    '"market_type": "player_prop"|"h2h"|"other", "description": str|null} ]}. '
+    "CRITICAL: A1 posts a short ANNOUNCEMENT message before every real play, in the "
+    "shape '<N>u play coming, <TEAM> vs <TEAM>' or '<N>u NFL play coming, <TEAM> vs "
+    "<TEAM>' (e.g. '0.65u play coming, IND vs BAL', '0.75u NFL play coming, MIA vs "
+    "LV'). This is PURE CHATTER with no selection in it. Return {\"tips\": []} for "
+    "any message matching that shape. NEVER invent a player or bet from an "
+    "announcement just because it names two teams. "
+    "A REAL play message starts with the SAME '<N>u ' unit-size token but is "
+    "immediately followed by an actual PLAYER NAME and a market, e.g. '0.65u Josh "
+    "Downs o42.5 receiving (-114 FD) ...' or '1u Jake Ferguson u14.5 longest "
+    "reception (-118 FD/-120 365) ...'. Extract from THAT: "
+    "`units` = the number before the leading 'u' (0.65u -> 0.65, 1u -> 1). "
+    "`player` = the player's full name, exactly as printed. "
+    "`side` = 'over' for a lowercase 'o' immediately before the line number, "
+    "'under' for a lowercase 'u' immediately before the line number (o42.5 -> over; "
+    "u14.5 -> under) -- do not confuse this per-bet o/u with the leading units 'u'. "
+    "`line` = the number right after that o/u (42.5, 14.5, 17.5). "
+    "`stat` -> ONE lowercase word from: receiving_yards, rushing_yards, "
+    "passing_yards, receptions, rush_attempts, pass_attempts, completions, "
+    "longest_reception, longest_rush, touchdowns, passing_touchdowns, "
+    "rushing_touchdowns, receiving_touchdowns, interceptions, sacks. Map printed "
+    "phrases directly: 'receiving' -> receiving_yards, 'rush attempts' -> "
+    "rush_attempts, 'longest reception' -> longest_reception. "
+    "`team` = a team name ONLY if EXPLICITLY stated as its own short "
+    "line/sentence near the end of the message (e.g. a lone 'Dallas Cowboys.' or "
+    "'Dolphins.' line) -- else null; the caller resolves the team from the roster, "
+    "do NOT guess a team from the announcement message's 'TEAM vs TEAM' (that was a "
+    "separate, earlier message about a different game slate context). "
+    "IGNORE every American odds figure (-114, -127, +1273 etc.) and every bookie "
+    "code (FD, 365, Fliff, HR, Kalshi, DK, CZR, NVG, TS, NVG) -- these are US-only "
+    "books, irrelevant to AU placement. There is deliberately no `odds` field in "
+    "the schema; do not add one. "
+    "ONE MESSAGE OFTEN CARRIES MORE THAN THE HEADLINE PLAY: an alternate line/book "
+    "at reduced stake for the SAME pick (e.g. '0.85u 13.5 on HR, etc.') and a "
+    "conditional fallback market (e.g. 'u30.5 yards 0.5u if no longest for you') "
+    "are real nuance meant for a HUMAN to read in the full raw message -- do NOT "
+    "try to model these as separate tips or fold them into your one tip's numbers. "
+    "Extract ONLY the single PRIMARY/headline play (the first player+market+line+"
+    "units combination in the message) as your one tip object; the caller keeps "
+    "the full raw text alongside your summary so nothing is lost. "
+    "SGP / same-game-parlay posts (e.g. '0.1u SGP ...') are not a standard single "
+    "bet: market_type=\"other\", player/team/stat/line/units null, "
+    "`description`=\"SGP, see raw text\". "
+    "Use null for ANY field not covered above. JSON only."
+)
+
+
+def parse_a1_nfl_text(
+    text: str,
+    tipster: str = "a1_fantasy_nfl",
+    max_retries: int = 4,
+) -> tuple[list[dict], float]:
+    """Parse an A1 Fantasy Sports NFL text message into RAW tip dicts. Mirrors
+    parse_racing_text's structure/failure semantics exactly: a VALID-but-empty
+    parse (an announcement / chatter message) returns ([], elapsed) so the
+    caller drops it silently; a HARD failure (no key, request error after
+    retries, bad JSON) RAISES so the caller routes to MANUAL rather than
+    silently losing a real tip. Uses GROQ_TEXT_MODEL, one text call.
+
+    v6.21 (2026-09-10): only ever produces ONE raw tip dict (the headline
+    play) even when the source message carries alt-book/fallback nuance --
+    see TEXT_PROMPT_A1_NFL. The caller (main._route_a1_nfl_text) attaches
+    the full raw message text to the manual alert so that nuance is never
+    lost, it just isn't modelled structurally."""
+    start = time.time()
+    if not GROQ_API_KEY:
+        raise RuntimeError("parse_a1_nfl_text: GROQ_API_KEY not set")
+    if not (text or "").strip():
+        return [], 0.0
+    body = {
+        "model": GROQ_TEXT_MODEL,
+        "temperature": 0,
+        "max_tokens": 1000,
+        "messages": [
+            {"role": "system", "content": TEXT_PROMPT_A1_NFL},
+            {"role": "user", "content": text.strip()},
+        ],
+    }
+    content = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=30,
+            )
+            if resp.status_code == 429 and attempt < max_retries:
+                ra = resp.headers.get("retry-after")
+                wait = float(ra) if (ra and ra.replace(".", "", 1).isdigit()) \
+                    else 6.0 * (attempt + 1)
+                log.warning(
+                    f"parse_a1_nfl_text: 429 for {tipster}, backing off "
+                    f"{wait:.0f}s (attempt {attempt + 1})"
+                )
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            break
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                time.sleep(4.0 * (attempt + 1))
+                continue
+            log.error(f"parse_a1_nfl_text: Groq request failed for {tipster}: {e}")
+            raise
+        except Exception as e:
+            log.error(f"parse_a1_nfl_text: unexpected error for {tipster}: {e}")
+            raise
+
+    elapsed = time.time() - start
+    if not content:
+        raise RuntimeError("parse_a1_nfl_text: no content returned")
+    content = content.replace("```json", "").replace("```", "").strip()
+    parsed = _parse_json_with_repair(content)
+    if parsed is None:
+        log.error(f"parse_a1_nfl_text: invalid JSON (repair failed) for {tipster}; raw: {content[:300]}")
+        raise RuntimeError("parse_a1_nfl_text: invalid JSON")
+    tips = parsed.get("tips", [])
+    if not isinstance(tips, list):
+        raise RuntimeError("parse_a1_nfl_text: 'tips' not a list")
+    # Strip rows with no player, no team AND no description (chatter/
+    # placeholder rows). `team` covers an h2h/moneyline tip, which carries
+    # neither player nor description by design -- see TEXT_PROMPT_A1_NFL's
+    # market_type="h2h" shape and _describe_a1_nfl_tip's h2h branch.
+    tips = [
+        t for t in tips
+        if isinstance(t, dict) and (
+            (t.get("player") or "").strip()
+            or (t.get("team") or "").strip()
+            or (t.get("description") or "").strip()
+        )
+    ]
+    log.info(
+        f"parse_a1_nfl_text: {tipster} extracted {len(tips)} raw tip(s) "
         f"in {elapsed:.2f}s"
     )
     return tips, elapsed
