@@ -39,7 +39,7 @@ log = logging.getLogger("tipbot.session_priority")
 # MLB added 2026-06-01 (v5.0): only MLB SGMs auto-place (the Shook HRRBI 2+
 # -> 2-leg same-player SGM edge). MLB singles have NO priority list, so
 # for_sport("mlb", is_sgm=False) returns [] and they route to manual.
-ALLOWED_SPORTS = {"nba", "nbl", "afl", "mlb", "racing"}
+ALLOWED_SPORTS = {"nba", "nbl", "afl", "mlb", "racing", "nfl"}
 
 # Markets that may appear in a per-sport liability block (excluding racing,
 # which is structured per-track). Any market not listed here is allowed
@@ -93,6 +93,16 @@ KNOWN_MLB_MARKETS = {
     "player_stats",
 }
 
+# NFL markets (v6.22, 2026-09-11). Only the four stats
+# main._NFL_AUTOPLACE_STAT_SUFFIX actually auto-places on are meaningful cap
+# keys today (Sportsbet doesn't carry rush_attempts/pass_attempts/completions/
+# longest_reception/longest_rush/interceptions/sacks/tackles as markets at
+# all, verified live); h2h/line/total listed for when team markets are added.
+KNOWN_NFL_MARKETS = {
+    "receiving_yards", "rushing_yards", "passing_yards", "receptions",
+    "h2h", "line", "total",
+}
+
 # Racing bet types we expect under per-track caps. AGS covered separately
 # under sports above (player_goals).
 KNOWN_RACING_BET_TYPES = {"win", "place"}
@@ -123,18 +133,24 @@ class PriorityConfig:
     mlb_singles: list[str] = field(default_factory=list)
     mlb_sgm: list[str] = field(default_factory=list)
     racing: list[str] = field(default_factory=list)
+    nfl_singles: list[str] = field(default_factory=list)
 
     def for_sport(self, sport: str, is_sgm: bool = False) -> list[str]:
         """
         Return priority list for a (sport, is_sgm) combo.
 
-        Sport keys: 'nba', 'nbl', 'afl', 'mlb', 'racing'. NBL falls back to NBA
-        priority (no separate list — same bookmakers, same accounts).
-        Anything else returns [] (no auto-placement).
+        Sport keys: 'nba', 'nbl', 'afl', 'mlb', 'racing', 'nfl'. NBL falls
+        back to NBA priority (no separate list: same bookmakers, same
+        accounts). Anything else returns [] (no auto-placement).
 
         MLB (2026-06-01): mlb_singles is intentionally left EMPTY in .env so
         MLB singles return [] -> manual. Only mlb_sgm is populated, so the
         HRRBI 2-leg SGM auto-places while every other MLB tip goes to manual.
+
+        NFL (2026-09-11, v6.22, Wilson: real stakes from day one, $600/u A1,
+        $400/u 4th&EV: "make sure we auto place if line is within 2"). No
+        SGM concept for NFL yet, so is_sgm is ignored here (same list either
+        way) -- matches racing's shape, not nba/afl/mlb's separate sgm list.
         """
         s = (sport or "").lower()
         if s in ("nba", "nbl"):
@@ -145,6 +161,8 @@ class PriorityConfig:
             return self.mlb_sgm if is_sgm else self.mlb_singles
         if s == "racing":
             return self.racing
+        if s == "nfl":
+            return self.nfl_singles
         return []
 
 
@@ -226,6 +244,8 @@ def load_sessions_yaml(path: str | Path) -> dict[str, SessionMeta]:
                 known = KNOWN_AFL_MARKETS
             elif sport_key == "mlb":
                 known = KNOWN_MLB_MARKETS
+            elif sport_key == "nfl":
+                known = KNOWN_NFL_MARKETS
             else:
                 known = None  # racing validated separately
 
@@ -381,6 +401,8 @@ def load_priority_from_env() -> PriorityConfig:
       MLB_SESSION_PRIORITY        (leave EMPTY -> MLB singles route to manual)
       MLB_SGM_SESSION_PRIORITY    (the HRRBI 2-leg SGM session(s))
       RACING_SESSION_PRIORITY
+      NFL_SESSION_PRIORITY        (v6.22 -- 4th&EV image + A1 text auto-place,
+                                    line-within-2 match only)
 
     Sessions not in the relevant list are excluded from auto-placement
     for that (sport, kind) — manual alert only.
@@ -394,6 +416,7 @@ def load_priority_from_env() -> PriorityConfig:
         mlb_singles=_parse_priority_env("MLB_SESSION_PRIORITY"),
         mlb_sgm=_parse_priority_env("MLB_SGM_SESSION_PRIORITY"),
         racing=_parse_priority_env("RACING_SESSION_PRIORITY"),
+        nfl_singles=_parse_priority_env("NFL_SESSION_PRIORITY"),
     )
     _priority_config = cfg
     return cfg
@@ -466,6 +489,7 @@ def all_priority_session_ids() -> set[str]:
     return set(
         cfg.nba_singles + cfg.nba_sgm + cfg.afl_singles
         + cfg.afl_sgm + cfg.mlb_singles + cfg.mlb_sgm + cfg.racing
+        + cfg.nfl_singles
     )
 
 
@@ -1087,6 +1111,7 @@ def log_startup_summary() -> None:
     log.info(f"  MLB singles : {cfg.mlb_singles or '(empty -> manual)'}")
     log.info(f"  MLB SGM     : {cfg.mlb_sgm or '(empty)'}")
     log.info(f"  Racing      : {cfg.racing or '(empty)'}")
+    log.info(f"  NFL singles : {cfg.nfl_singles or '(empty)'}")
 
     # MLB design (2026-06-01): only the HRRBI 2-leg SGM auto-places; MLB
     # singles route to manual. MLB_SESSION_PRIORITY is meant to stay EMPTY.

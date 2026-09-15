@@ -129,8 +129,10 @@ except ImportError:
 from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
 from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
-from nba_resolver import resolve_nba_event, resolve_mlb_event
+from nba_resolver import resolve_nba_event, resolve_mlb_event, resolve_nfl_event
 from roster import resolve_player_name, get_player_team, afl_surname_candidates, afl_fuzzy_surname_candidates
+from roster import is_nfl_name_collision
+from roster import _GEN_SUFFIXES as _ROSTER_GEN_SUFFIXES, _fold_accents as _roster_fold_accents
 from roster import _team_matches as _roster_team_matches
 import notifier
 import session_priority
@@ -2199,6 +2201,29 @@ _racing_recent_fps: dict = {}  # {racing fingerprint tuple: timestamp}
 # _leroy_place_race.
 _leroy_recent_fps: dict = {}  # {leroy fingerprint tuple: timestamp}
 LEROY_DEDUP_TTL_SEC = 18 * 3600  # 18h — spans a whole race day; prunes stale keys
+
+# v6.22 code review (Angle B): _route_image_nfl_tips/_route_a1_nfl_text
+# deliberately bypass _process_tip (to preserve the tipster's full raw text
+# -- see those functions' docstrings) but in doing so also lost the dedup
+# guard _process_tip provides every other tipster. Telethon reconnect can
+# redeliver a missed post, and both 4th&EV/A1 have already been observed
+# re-sending/caption-updating a play (per this file's own comments on those
+# channels) -- without a guard, a redelivery would auto-place TWICE. Mirrors
+# Leroy's pattern exactly: fingerprint registered BEFORE the placement
+# attempt, 18h TTL (a tip posted well ahead of a Sunday game and its
+# same-content redelivery hours later must still be caught).
+#
+# v6.23 (third review): UNLIKE Leroy's guard (which runs single-threaded on
+# the asyncio event loop -- only the HTTP call itself is offloaded), the NFL
+# guard lives INSIDE _attempt_nfl_auto_place, which both routers dispatch
+# via _run_in_placement_executor onto the shared 8-worker _PLACEMENT_EXECUTOR
+# thread pool. A Telethon redelivery / tipster re-post landing on two
+# different worker threads at nearly the same time could TOCTOU-race the
+# plain check-then-set below. _nfl_dedup_lock makes the check+register one
+# atomic step.
+_nfl_recent_fps: dict = {}  # {nfl fingerprint tuple: timestamp}
+_nfl_dedup_lock = threading.Lock()
+NFL_DEDUP_TTL_SEC = 18 * 3600
 
 
 def _tip_fingerprint(tip: ParsedTip) -> str:
@@ -14601,6 +14626,34 @@ async def _process_tip(text: str, tipster: str, sport: str,
     as many times as he likes. Default False (every real tipster keeps dedup)."""
     pipeline_start = time.time()
 
+    # v6.22 code review (Angle B): NFL has its OWN dedicated pipeline
+    # (_route_image_nfl_tips / _route_a1_nfl_text -> _attempt_nfl_auto_place)
+    # with safeguards this generic path does not have -- live-market
+    # line-within-2 tolerance, roster collision refusal, a stat-suffix
+    # allowlist (only the 4 stats Sportsbet actually carries), and its own
+    # dedup. Both real NFL channels are wired to bypass this function
+    # entirely (see config.py's channel dicts). If a future NFL channel is
+    # EVER added without that same wiring, it must not silently fall
+    # through here and auto-place via the generic singles path with none
+    # of those checks -- refuse loudly instead, now that
+    # NFL_SESSION_PRIORITY being populated means place_tip would otherwise
+    # actually place it.
+    if sport == "nfl":
+        log.error(
+            f"[{channel_name}] NFL tip reached the generic _process_tip pipeline "
+            f"(tipster={tipster!r}) -- this sport must route through "
+            f"_route_image_nfl_tips/_route_a1_nfl_text instead. Refusing to "
+            f"place; check this channel's config.py wiring."
+        )
+        try:
+            notifier.notify_text_manual_alert(
+                channel_name, text,
+                header="NFL MISCONFIGURED CHANNEL, MANUAL (review config.py)",
+            )
+        except Exception as e:
+            log.error(f"NFL misconfigured-channel alert failed: {e}")
+        return 0
+
     try:
         tips, timing = route_message(text, tipster, sport, unit_size, default_units)
     except Exception as e:
@@ -16625,6 +16678,601 @@ async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                 pass
 
 
+# ── NFL auto-placement (v6.22, 2026-09-11) ──────────────────────────
+#
+# Wilson, after seeing 4th&EV's parse match a real market exactly: "make sure
+# we auto place if line is within 2 for NFL". Real stakes from day one --
+# $600/u A1 Fantasy Sports, $400/u 4th&EV -- confirmed explicitly, no
+# test-cap step requested.
+#
+# Sportsbet's ACTUAL NFL market vocabulary was verified LIVE (2026-09-10)
+# against a real game (49ers v Rams): only these four stats have a genuine
+# full-game Over/Under LINE market. rush_attempts, pass_attempts,
+# completions, longest_reception, longest_rush, interceptions, sacks and
+# tackles do NOT exist as Sportsbet markets at all -- confirmed by listing
+# every market on a real game's board, not assumed. touchdowns/
+# passing_touchdowns exist only as scorer/count markets, not a line, so
+# "within 2" doesn't apply to them -- out of scope for THIS auto-place path
+# (they stay manual, same as today). A tip on any unmapped stat is not a
+# code gap; the market genuinely isn't there.
+_NFL_AUTOPLACE_STAT_SUFFIX = {
+    "receiving_yards": "receiving_yds",
+    "rushing_yards": "rushing_yds",
+    "passing_yards": "passing_yds",
+    "receptions": "total_receptions",
+}
+_NFL_LINE_TOLERANCE = 2.0
+
+
+def _nfl_slug_tokens(s: str) -> set:
+    """Lowercase alnum-only tokens, accent-folded and generational-suffix-
+    stripped. Used to match a player name against a HyperBot market-key
+    slug without needing to guess its exact punctuation rule.
+
+    v6.22 code review: the first version tokenized raw with no suffix/accent
+    handling, silently refusing to auto-place for any Jr./Sr./II/III/etc
+    player whenever the tipster's parse and Sportsbet's market key disagree
+    on whether to include the suffix (NFL has FAR more of these than the
+    sports this pattern was first built for -- Michael Pittman Jr., Kenneth
+    Walker III, Brian Robinson Jr. are all active, commonly-tipped players).
+    Reuses roster.py's OWN _GEN_SUFFIXES set and _fold_accents function
+    (the exact fix a 2026-07-31 audit already had to make once, after it
+    caused 4 wrong-player swaps for AFL/NBA) rather than re-deriving the
+    same lesson from scratch for a third sport."""
+    folded = _roster_fold_accents((s or "").lower())
+    toks = re.findall(r"[a-z0-9]+", folded)
+    core = [t for t in toks if t.rstrip(".") not in _ROSTER_GEN_SUFFIXES]
+    return set(core or toks)
+
+
+def _find_nfl_market(markets: dict, player: str, suffix: str):
+    """Find (key, market_dict) for player's FULL-GAME `suffix` market.
+
+    Exact suffix match only -- a key must end with '_-_{suffix}' literally,
+    NOT '_-_alt_{suffix}' or '_-_1st_qtr_{suffix}' etc, which are DIFFERENT
+    markets (alt-threshold ladder / quarter-scoped) with different
+    semantics the line-tolerance comparison assumes is a plain full-game
+    Over/Under.
+
+    Player match is EXACT token-SET equality (v6.22 code review; was a
+    superset test, which let a partial/surname-only parsed name silently
+    match a DIFFERENT, longer full name's market -- e.g. a botched "Brown"
+    parse superset-matching "Marquise Brown"). Two distinct full names
+    essentially never tokenize identically, so exact equality both fixes
+    that AND correctly REFUSES a bare-surname parse (its token set can
+    never equal a two-token full-name market key) rather than guessing.
+    A genuine same-full-name collision within one game is separately
+    guarded by roster.is_nfl_name_collision, checked by the caller before
+    this is ever reached. Returns (None, None) if nothing matches, or if
+    MORE than one market key matches exactly (an unresolved ambiguity --
+    refuse rather than pick one)."""
+    want = _nfl_slug_tokens(player)
+    if not want:
+        return None, None
+    target_end = f"_-_{suffix}"
+    hits = []
+    for key, m in (markets or {}).items():
+        if not key.endswith(target_end):
+            continue
+        name_part = key[: -len(target_end)].replace("_", " ")
+        if _nfl_slug_tokens(name_part) == want:
+            hits.append((key, m))
+    if len(hits) != 1:
+        return None, None
+    return hits[0]
+
+
+def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
+                         tipster_line, priority_sessions: list, tipster: str = "",
+                         tipster_odds=None):
+    """Read-only: resolve one NFL tip against the LIVE Sportsbet board and
+    check the line-within-_NFL_LINE_TOLERANCE match. Returns a dict ready
+    for placement ({event, market, selection, line, odds, proposition_id,
+    direction, team, probe_session_id}), or None if not auto-placeable --
+    the caller falls back to the existing (unchanged) manual alert. NEVER
+    raises -- any failure is logged and treated as no-match, same
+    fail-safe-to-manual philosophy as every other resolver in this file.
+
+    v6.22 code review fixes: refuses upfront on a roster-known same-full-
+    name collision (mirrors the MLB Pete Alonso guard -- betting on the
+    WRONG same-named player is a real, already-measured risk in this exact
+    roster: Justin Jefferson collided on the very first live pull); tries
+    EVERY configured priority session for the price-check (not just the
+    first) so one logged-out/unhealthy account doesn't sink every NFL tip.
+
+    v6.23 (third review, before this ever deployed): NFL had NO odds-based
+    sanity check at all, only the line-within-2 tolerance -- unlike every
+    other sport's singles path, which runs _exceeds_odds_ceiling/
+    _below_odds_floor as a client-side 'wrong selection / price moved too
+    far' gate BEFORE ever placing. Worse, the one backstop NFL did have,
+    _bookie_max_odds, silently OMITS max_odds (no ceiling at all) exactly
+    when live odds have drifted far enough above the tipster's price to need
+    one -- it's a bookie-side ceiling, not a placement refusal, so with
+    nothing gating placement itself a large adverse drift would place
+    anyway, uncapped. Now applies the SAME two checks every other sport
+    uses, in the SAME place (resolve time, before a match is ever returned
+    for placement) -- a market that line-matches but has drifted >MAX_ODDS_
+    MULT above, or >10% below, the tipster's stated price refuses here,
+    same as AFL/NBA/MLB. Both checks are no-ops (never block) when
+    tipster_odds is missing/unusable, matching every other caller's
+    behaviour: a missing price never blocks a bet, it just can't be
+    sanity-checked."""
+    try:
+        suffix = _NFL_AUTOPLACE_STAT_SUFFIX.get((stat or "").strip().lower())
+        if not suffix:
+            log.info(f"NFL auto-place: stat {stat!r} has no live-market mapping -> manual")
+            return None
+        side = (side or "").strip().lower()
+        if side not in ("over", "under"):
+            return None
+        if tipster_line is None:
+            return None
+        if not priority_sessions:
+            return None
+
+        if player:
+            collision_teams = is_nfl_name_collision(player)
+            if collision_teams:
+                log.warning(
+                    f"NFL auto-place: {player!r} is a roster-known same-name "
+                    f"collision {collision_teams} -> manual (never guess)"
+                )
+                return None
+
+        resolve_team = (team or "").strip()
+        if not resolve_team and player:
+            resolve_team = get_player_team(player, "nfl")
+        if not resolve_team:
+            log.info(f"NFL auto-place: no team resolved for {player!r} -> manual")
+            return None
+
+        event = resolve_nfl_event(resolve_team)
+        if not event:
+            log.info(f"NFL auto-place: no event found for {resolve_team!r} -> manual")
+            return None
+
+        pc = None
+        probe_sid = None
+        for _sid in priority_sessions:
+            _pc = hb.price_check_sports(session_id=str(_sid), sport="nfl", event=event)
+            if _pc.get("success"):
+                pc, probe_sid = _pc, str(_sid)
+                break
+            log.info(
+                f"NFL auto-place: price-check failed on session {_sid} for "
+                f"{event!r} ({_pc.get('error', 'unknown')}) -- trying next session"
+            )
+        if pc is None:
+            log.info(f"NFL auto-place: price-check failed on every priority session for {event!r} -> manual")
+            return None
+
+        key, market = _find_nfl_market(pc.get("markets") or {}, player, suffix)
+        if not market:
+            log.info(
+                f"NFL auto-place: no unambiguous live '{suffix}' market for "
+                f"{player!r} on {event!r} -> manual"
+            )
+            return None
+
+        sel = None
+        for s in market.get("selections", []) or []:
+            if (s.get("direction") or "").strip().lower() == side:
+                sel = s
+                break
+        if not sel or sel.get("line") is None:
+            log.info(
+                f"NFL auto-place: no {side!r} selection with a line for "
+                f"{player!r} {suffix} -> manual"
+            )
+            return None
+
+        live_line = float(sel["line"])
+        if abs(float(tipster_line) - live_line) > _NFL_LINE_TOLERANCE + 1e-9:
+            log.info(
+                f"NFL auto-place: {player!r} {suffix} tipster line {tipster_line} vs "
+                f"live {live_line} -- outside {_NFL_LINE_TOLERANCE} tolerance -> manual"
+            )
+            return None
+
+        live_odds = sel.get("odds")
+        if _exceeds_odds_ceiling(tipster, tipster_odds, live_odds):
+            log.info(
+                f"NFL auto-place: {player!r} {suffix} live odds {live_odds} exceed "
+                f"the ceiling over tipster odds {tipster_odds} -> manual (wrong-"
+                f"selection / drift guard, same check every other sport applies)"
+            )
+            return None
+        if _below_odds_floor(tipster_odds, live_odds):
+            log.info(
+                f"NFL auto-place: {player!r} {suffix} live odds {live_odds} more "
+                f"than 10% below tipster odds {tipster_odds} -> manual (price-"
+                f"moved / wrong-selection guard)"
+            )
+            return None
+
+        probe_meta = session_priority.get_session_meta(probe_sid)
+        # v6.23 (third review): do NOT fall back to "sportsbet" when metadata
+        # is missing -- that convenience default silently defeated the
+        # cross-bookie proposition_id guard below whenever a session's
+        # sessions.yaml entry was missing/typo'd (both sides of the
+        # comparison would agree on the same wrong default). An empty string
+        # here can never equal a real bookie name, so a missing-metadata
+        # probe now fails CLOSED (every placement session mismatches ->
+        # falls to manual) instead of silently assuming Sportsbet.
+        probe_bookie = probe_meta.bookmaker if probe_meta else ""
+        if not probe_bookie:
+            log.warning(
+                f"NFL auto-place: no sessions.yaml metadata for probe session "
+                f"{probe_sid!r} -- cannot verify its bookie, refusing to guess"
+            )
+        return {
+            "event": event, "market": key, "selection": sel.get("selection") or "",
+            "line": live_line, "odds": sel.get("odds"),
+            "proposition_id": sel.get("proposition_id"), "direction": side,
+            "team": resolve_team, "probe_session_id": probe_sid, "bookie": probe_bookie,
+        }
+    except Exception as e:
+        log.error(f"NFL auto-place: resolve crashed for {player!r} {stat!r}: {e}")
+        return None
+
+
+def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: str,
+                             stat: str, side: str, tipster_line, units, unit_size,
+                             raw_message: str, tipster_odds=None, telegram_msg_id=None) -> bool:
+    """Attempt to auto-place an NFL tip against the live Sportsbet market.
+    SYNCHRONOUS (plain def) by design -- the caller MUST run this via
+    _run_in_placement_executor, never awaited/called bare on the event loop
+    (v6.22 code review: the HyperBot calls inside are genuinely blocking,
+    same class of bug that caused the 2026-07-17 6.5h freeze).
+
+    Returns True if this function fully handled the tip (placed, or
+    explicitly alerted about the outcome) -- the caller must NOT also send
+    its own manual alert in that case, or Wilson gets a confusing
+    double-alert. Returns False if no match was found / NFL_SESSION_PRIORITY
+    is empty / units couldn't be trusted -- the caller falls through to its
+    EXISTING, unchanged manual alert path (today's Stage 1 behaviour), so
+    every non-matching tip is exactly as safe as it was before this
+    function existed.
+
+    NEVER raises -- any crash logs an error and returns False, which is the
+    fail-SAFE direction here (falls back to a human reading the raw tip,
+    never to an unattempted bet silently vanishing).
+
+    v6.22 code review fixes, all verified against a real production
+    incident class already documented in this codebase's own history:
+      - units<=0/unparseable no longer silently defaults to a full 1u bet
+        (mirrors the AFL image no-units sentinel: "<=0 means no unit size
+        given", not "assume 1").
+      - stake ceiling from session_priority.lookup_liability_cap, same
+        mechanism NBA/AFL/MLB singles already use (a missing yaml entry
+        still falls back to intended_stake -- the SAME safe default those
+        sports already rely on, just now actually consulted here too).
+      - max_odds sent to HyperBot via the shared _bookie_max_odds ceiling,
+        so a price that drifted worse between price-check and placement is
+        rejected at the bookie, not just judged against a stale catalog
+        price.
+      - tries EVERY configured priority session in order on a DEFINITE
+        (non-ambiguous) rejection, not just the first.
+      - an ambiguous/cid_unresolved outcome is handed to
+        _reconcile_fanout_ambiguous -- the SAME battle-tested /api/
+        pending_bets reconciliation every other real-money sports path
+        uses -- instead of being reported as a plain, retryable FAILED
+        (which risks Wilson manually re-placing a bet that already landed:
+        the exact $500 2026-08-11 incident this project's own memory
+        documents for a different sport).
+      - the ledger write happens exactly once, via notify_bet_placed's own
+        internal log_sports_bet call (the previous version's OWN extra
+        manual write raced it and, because bet_ledger dedupes on bet_id
+        keeping the FIRST write, permanently blanked the account column on
+        every auto-placed NFL row).
+
+    Second code review pass (v6.22, after the first rewrite) fixed four more:
+      - a duplicate-tip fingerprint guard (mirrors Leroy's _leroy_recent_fps
+        exactly) -- this whole path bypasses _process_tip's own dedup by
+        design (to preserve the raw text), which had silently also dropped
+        dedup entirely; a Telethon reconnect redelivery or a tipster re-post
+        would have auto-placed twice.
+      - the liability cap is now resolved PER SESSION inside the retry loop
+        (was: resolved once against priority[0] and reused for whichever
+        session actually placed -- the exact "size against the wrong
+        account's cap" bug class this codebase's fan-out weighting code
+        already guards against elsewhere).
+      - _bookie_max_odds was being called with the LIVE matched odds as its
+        OWN baseline (tautological -- comparing a price to a multiple of
+        itself catches nothing) instead of the tipster's ORIGINAL stated
+        price as every other caller does (main.py's singles path:
+        _bookie_max_odds(tip.tipster, tip.suggested_odds, target_odds)).
+        Fixed to the same shape; tipster_odds is now a real parameter."""
+    try:
+        priority = session_priority.get_priority_for("nfl", is_sgm=False)
+        if not priority:
+            return False  # NFL_SESSION_PRIORITY empty -> unchanged manual-only behaviour
+
+        try:
+            units_f = float(units)
+        except (TypeError, ValueError):
+            units_f = 0.0
+        if units_f <= 0:
+            log.info(f"NFL auto-place: units {units!r} <= 0 or unparseable -> manual "
+                      f"(not treated as '1u', same as the AFL no-units sentinel)")
+            return False
+
+        # v6.23: coerce the line into the fingerprint the same way units_f
+        # already is -- a redelivered/reparsed copy of the SAME message can
+        # have the LLM emit the line as a JSON string ("39.5") on one pass
+        # and a JSON number (39.5) on another (no enforced schema on the
+        # free-text parse), which would otherwise make two fingerprints for
+        # the identical tip compare unequal and miss the duplicate entirely.
+        try:
+            _fp_line = round(float(tipster_line), 4)
+        except (TypeError, ValueError):
+            _fp_line = str(tipster_line)
+        fp = ("NFL", tipster, (player or "").strip().lower(), (team or "").strip().lower(),
+              (stat or "").strip().lower(), (side or "").strip().lower(),
+              _fp_line, units_f)
+
+        # v6.23: check-only here (lock-protected against the TOCTOU race
+        # explained on _nfl_dedup_lock's declaration); registration is
+        # deferred until AFTER _resolve_nfl_market actually finds a
+        # placeable match, below. Registering here (before resolution is
+        # even attempted) would poison the fingerprint for 18h on a purely
+        # TRANSIENT resolution failure (a logged-out session, an ESPN blip)
+        # -- if the tipster/Telethon legitimately redelivers the identical
+        # tip later once the transient issue clears (exactly the case this
+        # guard exists to handle), it would hit the dedup branch and vanish
+        # with neither a placement attempt nor a manual alert.
+        with _nfl_dedup_lock:
+            _now = datetime.now()
+            for _k in [k for k, t in _nfl_recent_fps.items()
+                       if (_now - t).total_seconds() > NFL_DEDUP_TTL_SEC]:
+                del _nfl_recent_fps[_k]
+            if fp in _nfl_recent_fps:
+                log.warning(f"[{channel_name}] NFL DUPLICATE (already placed/attempted "
+                            f"within {NFL_DEDUP_TTL_SEC // 3600}h): {player} {side} "
+                            f"{tipster_line} {stat} -> skipped (no double-bet)")
+                return True  # fully handled (as "already handled"): no manual alert either
+
+        match = _resolve_nfl_market(player, team, stat, side, tipster_line, priority,
+                                     tipster, tipster_odds)
+        if not match:
+            return False
+
+        # Register only now that a real placement attempt is about to be
+        # made. Re-check under the lock: two concurrent redeliveries of the
+        # same tip can both pass the check above and both resolve a match
+        # (resolution does no writing, so that's safe but redundant); the
+        # second one to reach here must still be caught before it places.
+        with _nfl_dedup_lock:
+            if fp in _nfl_recent_fps:
+                log.warning(f"[{channel_name}] NFL DUPLICATE (registered by a "
+                            f"concurrent attempt while this one was resolving): "
+                            f"{player} {side} {tipster_line} {stat} -> skipped")
+                return True
+            _nfl_recent_fps[fp] = datetime.now()
+
+        intended_stake = round(units_f * float(unit_size or 0), 2)
+        if intended_stake <= 0:
+            return False
+
+        max_odds = _bookie_max_odds(tipster, tipster_odds, target_odds=match.get("odds"))
+
+        leg = ParsedLeg(
+            market="player_prop", player=player or "", stat=stat or "",
+            line=match["line"], selection=match["direction"],
+            team_full=match["team"], raw_text=raw_message,
+        )
+        tip = ParsedTip(
+            tipster=tipster, sport="nfl", is_sgm=False, legs=[leg],
+            units=units_f, unit_size=unit_size or 0.0, raw_message=raw_message,
+            timestamp=datetime.now(), event=match["event"],
+            telegram_msg_id=telegram_msg_id,
+            suggested_bookie="sportsbet", suggested_odds=tipster_odds or match.get("odds") or 0.0,
+        )
+
+        # v6.22 code review: proposition_id/market/line/odds were resolved
+        # against ONE session's (match["bookie"]) catalog -- HyperBot's
+        # catalog is bookie-scoped, not universal, so sending that SAME
+        # payload to a session on a DIFFERENT bookie would be wrong (a
+        # mismatched proposition_id). NFL_SESSION_PRIORITY is documented as
+        # an all-Sportsbet list today, so this is latent, not live -- but
+        # nothing enforced it, so enforce it here: skip any priority session
+        # whose sessions.yaml bookie doesn't match the one actually priced.
+        result = None
+        for sid in priority:
+            sid = str(sid)
+            meta = session_priority.get_session_meta(sid)
+            # v6.23 (third review): no "or sportsbet" fallback here either --
+            # see the matching fix on probe_bookie in _resolve_nfl_market.
+            # An empty string can never equal a real bookie name, so a
+            # session with missing/typo'd sessions.yaml metadata now fails
+            # CLOSED (skipped below) instead of silently assuming Sportsbet
+            # and potentially matching a proposition_id priced for a
+            # different bookie entirely.
+            sess_bookie = meta.bookmaker if meta else ""
+            if not sess_bookie:
+                log.warning(f"[{channel_name}] NFL auto-place: no sessions.yaml "
+                            f"metadata for session {sid!r} -- cannot verify its "
+                            f"bookie, skipping rather than guess")
+            if sess_bookie != match["bookie"]:
+                log.info(f"[{channel_name}] NFL auto-place: skipping session {sid} "
+                          f"({sess_bookie}) -- priced against {match['bookie']}'s "
+                          f"catalog, proposition_id would not apply")
+                continue
+
+            # v6.22 code review: liability cap resolved PER SESSION, inside
+            # the retry loop -- an earlier version resolved this once against
+            # priority[0] and reused it for whichever session actually
+            # placed, sizing against the wrong account's cap on any fallback.
+            try:
+                stake, cap_reason = session_priority.resolve_max_stake(
+                    sid, "nfl", (stat or "").strip().lower(),
+                    match.get("odds") or 0, intended_stake,
+                )
+            except Exception as e:
+                # v6.23 (third review): this fallback (full intended_stake,
+                # "no-cap") is the SAME one every other sport's equivalent
+                # try/except uses on a missing yaml entry -- kept identical
+                # on purpose, not weakened further. What was missing was
+                # visibility: an actual CRASH here (a malformed yaml entry, a
+                # bug in the brand-new NFL liability-cap path) was
+                # indistinguishable in the logs from the legitimate
+                # "no cap configured" case. Now logged so a real bug doesn't
+                # look like routine, intended behaviour.
+                log.error(f"[{channel_name}] NFL auto-place: resolve_max_stake "
+                          f"crashed for session {sid} ({e}) -- falling back to "
+                          f"the full intended stake, uncapped")
+                stake = intended_stake
+                cap_reason = "no-cap"
+            if stake <= 0:
+                log.info(f"[{channel_name}] NFL auto-place: skipping session {sid} "
+                          f"-- liability cap resolved to $0 ({cap_reason})")
+                continue
+            log.info(f"[{channel_name}] NFL auto-place: {sid} stake=${stake:.2f} "
+                      f"(intended=${intended_stake:.2f}, {cap_reason})")
+
+            _t0 = time.time()
+            resp = hb.place_single_sports_bet(
+                session_id=sid, sport="nfl", event=match["event"],
+                market=match["market"], selection=match["selection"], stake=stake,
+                player=player, stat=stat, line=match["line"],
+                target_odds=match.get("odds"), proposition_id=match.get("proposition_id"),
+                direction=match["direction"], max_odds=max_odds,
+            )
+            _elapsed = time.time() - _t0
+            cid_unresolved = bool(resp.get("cid_unresolved", False))
+            err_str = resp.get("error") or ""
+            # v6.22 code review: mirrors _execute_bet's Erasmus-safety rule
+            # (main.py ~1349-1360) -- a SLOW rejection may have actually
+            # landed at the bookie despite the "failure" response (the bookie
+            # can take 10+s and still have placed it), so it must be treated
+            # as ambiguous too, not just an explicit ambiguous/cid_unresolved
+            # flag. Only a definitely-pre-placement error (never reached the
+            # bookie) is exempt. This is the exact gap that cost $525 on a
+            # $400 tip (Erasmus 2026-05-03) and again on AFL (Dawson,
+            # 2026-05-21) for other sports before this rule existed.
+            _slow = _elapsed >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
+            is_ambiguous = (
+                bool(resp.get("ambiguous", False)) or cid_unresolved
+                or (_slow and not _is_definitely_pre_placement(err_str))
+            )
+
+            result = BetResult(
+                success=bool(resp.get("success")), tip=tip,
+                session_id=sid, bookie=sess_bookie,
+                bet_id=resp.get("bet_id"),
+                odds=resp.get("odds") if "odds" in resp else match.get("odds"),
+                stake=resp.get("stake") if "stake" in resp else stake,
+                error=resp.get("error"), timestamp=datetime.now(),
+                is_ambiguous=is_ambiguous, cid_unresolved=cid_unresolved,
+                elapsed_sec=_elapsed,
+                placed_market=match["market"], placed_player=player, placed_stat=stat,
+                placed_line=match["line"], placed_selection=match["selection"],
+            )
+
+            if result.success:
+                break
+            if is_ambiguous:
+                # NEVER try another session after an ambiguous outcome -- the
+                # bet may already be on the books; placing again elsewhere
+                # would be a real double-stake. Reconcile via the SAME
+                # battle-tested /api/pending_bets check every other
+                # real-money sports path relies on. get_sessions() (needed
+                # for account_id) is fetched here, lazily, ONLY on this rare
+                # path -- not on every call (v6.22 code review: two
+                # independent findings caught the earlier unconditional
+                # fetch wasting a full HyperBot round-trip on every clean
+                # success/reject for data only this branch ever uses).
+                all_sessions = hb.get_sessions() or []
+                by_sid = {str(s.get("session_id", "")): s for s in all_sessions}
+                sess = by_sid.get(sid) or {"session_id": sid, "bookie": sess_bookie}
+                try:
+                    result = _reconcile_fanout_ambiguous(
+                        tip, sess, result, stake, f"NFL auto-place {sid}")
+                except Exception as e:
+                    log.error(f"NFL auto-place: reconcile crashed ({e}) -- staying "
+                              f"conservative (debit-as-placed)")
+                break
+            log.info(f"[{channel_name}] NFL auto-place: {sid} rejected "
+                      f"({result.error}) -- trying next priority session")
+
+        if result is None:
+            return False
+
+        # v6.22 code review (Angle D): from THIS point on, a real placement
+        # has been ATTEMPTED (result is a real BetResult, possibly success,
+        # possibly a clean/ambiguous failure) -- the function MUST return
+        # True no matter what happens in the logging/alerting below. The
+        # earlier version let this whole block share the outer try/except,
+        # so a crash in an f-string or a raised notify_* call would flip an
+        # ALREADY-PLACED bet to handled=False, and the caller would then
+        # fire its OWN "not matched" manual alert on top of a bet that had
+        # already landed -- the same double-stake risk class the ambiguous
+        # handling above exists to prevent, just via a different path.
+        try:
+            if result.success:
+                log.warning(
+                    f"[{channel_name}] NFL AUTO-PLACED: {player} {match['direction']} "
+                    f"{match['line']} {stat} @ {result.odds} ${result.stake} on "
+                    f"{result.bookie}:{result.session_id} (tipster line {tipster_line}, "
+                    f"bet_id={result.bet_id})"
+                )
+                try:
+                    notifier.notify_bet_placed(result)
+                except Exception as e:
+                    log.error(f"NFL auto-place: placed-alert failed: {e}")
+                    # notify_bet_placed also owns the ONE ledger write for
+                    # this path (see the docstring); if it raised, both the
+                    # alert AND the ledger row may be missing. A real bet
+                    # landed with only a log line otherwise -- one more
+                    # attempt at SOME user-facing signal.
+                    try:
+                        notifier.notify_critical(
+                            f"NFL bet PLACED but the placed-alert failed on "
+                            f"{channel_name}: {player} {match['direction']} "
+                            f"{match['line']} {stat} ${result.stake} on "
+                            f"{result.bookie}:{result.session_id}, bet_id={result.bet_id} "
+                            f"-- verify the ledger row exists ({e})"
+                        )
+                    except Exception:
+                        pass
+            elif result.is_ambiguous:
+                log.error(f"[{channel_name}] NFL auto-place AMBIGUOUS: {result.error}")
+                try:
+                    notifier.notify_critical(
+                        f"NFL AUTO-PLACE AMBIGUOUS on {channel_name}: {player} "
+                        f"{match['direction']} {match['line']} {stat} ${stake} -- "
+                        f"the bet MAY have landed at {result.bookie}:{result.session_id}. "
+                        f"Check HyperBot pending_bets before placing this again by "
+                        f"hand -- do NOT re-place blindly.\n\n{raw_message}"
+                    )
+                except Exception as e:
+                    log.error(f"NFL auto-place: ambiguous-alert failed: {e}")
+            else:
+                log.error(f"[{channel_name}] NFL auto-place FAILED: {result.error}")
+                try:
+                    notifier.notify_bet_failed(result)
+                except Exception as e:
+                    log.error(f"NFL auto-place: failed-alert failed: {e}")
+                # notify_bet_failed's alert is structured (legs only) -- also
+                # send the full raw text so nothing about the original A1/
+                # 4th&EV message is lost, same reasoning as the manual path.
+                try:
+                    notifier.notify_text_manual_alert(
+                        channel_name, raw_message, header="NFL AUTO-PLACE FAILED, review",
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            log.error(f"[{channel_name}] NFL auto-place: post-placement alerting "
+                      f"crashed ({e}) -- a placement was still ATTEMPTED, so "
+                      f"returning handled=True regardless (never re-attempt)")
+        return True
+    except Exception as e:
+        log.error(f"[{channel_name}] NFL auto-place crashed for {player!r}: {e} "
+                  f"-> falling back to manual")
+        return False
+
+
 def _describe_nfl_image_tip(raw: dict) -> str:
     """Render one vision-extracted NFL raw tip dict as a readable one-block
     description for the manual alert. Never raises — a malformed field just
@@ -16676,40 +17324,61 @@ def _describe_nfl_image_tip(raw: dict) -> str:
 async def _route_image_nfl_tips(raw_tips: list, tipster: str, channel_name: str,
                                  pipeline_start: float = None,
                                  parse_sec: float = None,
-                                 raw_caption: str = "") -> None:
-    """Route vision-extracted NFL tips to a MANUAL alert: NEVER auto-places.
+                                 raw_caption: str = "",
+                                 unit_size: float = 0.0) -> None:
+    """Route vision-extracted NFL tips: AUTO-PLACES when the tip matches a
+    live Sportsbet market within _NFL_LINE_TOLERANCE (see
+    _attempt_nfl_auto_place); otherwise falls to a MANUAL alert, exactly as
+    Stage 1 always has.
 
     v6.20 (2026-09-10, Wilson: onboarding 4th and +EV NFL, "NFL Tips from
-    4thandEV"). Mirrors the shape of _route_image_afl_tips/
-    _route_image_racing_tips (same call site, same per-tip loop) but
-    deliberately does NOT call place_tip or any placement pipeline — this is
-    the Eddie/Zak/Trial bootstrap pattern: ingest + parse + alert first,
-    validate the vision prompt and market mapping against REAL 4th&EV
-    images, THEN build auto-placement once Wilson has confirmed the parse is
-    accurate. There is no NFL market catalog / event resolver / bookie
-    routing wired yet, so attempting to auto-place here would be placing
-    blind against markets we have never verified exist in the shape
-    IMAGE_PROMPT_NFL assumes.
+    4thandEV"). Originally shipped manual-only (Eddie/Zak/Trial bootstrap
+    pattern: ingest + parse + alert first, validate against real images).
+
+    v6.22 (2026-09-11, Wilson, after 4th&EV's first real tip matched a live
+    market exactly: "make sure we auto place if line is within 2"). Real
+    stakes from day one, $400/u. Only the four stats Sportsbet actually
+    carries as a full-game Over/Under (receiving_yards, rushing_yards,
+    passing_yards, receptions) can match; anything else -- and anything
+    outside the 2-point tolerance -- still lands on the manual alert below,
+    unchanged.
 
     v6.21 (code review, real 4th&EV sample): raw_caption is threaded through
-    and always appended to the alert. The card image only carries the
+    and always appended to the manual alert. The card image only carries the
     single headline bet; the Telegram CAPTION under it is where 4th&EV puts
     price flexibility ('Happy to take down to $1.80') and multi-leg unit
     budgets ('4 units for this game in total, with the Patriots picks
     above') -- context a structured summary alone would silently drop.
 
-    Each raw tip gets ONE notify_text_manual_alert (not notify_image_alert --
-    that truncates to 200 chars, too short to carry the caption) so a
-    multi-leg image never collapses into a single message that's easy to
-    half-read."""
+    Each raw tip that doesn't auto-place gets ONE notify_text_manual_alert
+    (not notify_image_alert -- that truncates to 200 chars, too short to
+    carry the caption) so a multi-leg image never collapses into a single
+    message that's easy to half-read."""
     for idx, raw in enumerate(raw_tips):
         try:
             desc = _describe_nfl_image_tip(raw)
         except Exception as e:
             desc = f"(description render failed: {e}; raw={raw!r})"
+
+        if (raw.get("market_type") or "").strip().lower() == "player_prop":
+            raw_text_for_alert = desc + (f"\n\n---- caption ----\n{raw_caption}" if raw_caption else "")
+            # v6.22 code review: _attempt_nfl_auto_place makes genuinely
+            # blocking HyperBot HTTP calls -- MUST run off the event loop,
+            # same offload every other real-money placement path uses
+            # (built after the 2026-07-17 6.5h freeze).
+            handled = await _run_in_placement_executor(
+                _attempt_nfl_auto_place,
+                tipster, channel_name, raw.get("player"), raw.get("team"),
+                raw.get("stat"), raw.get("side"), raw.get("line"),
+                raw.get("units"), unit_size, raw_text_for_alert,
+                raw.get("odds"),
+            )
+            if handled:
+                continue
+
         log.info(f"[{channel_name}] NFL image tip {idx}: {desc!r} -> manual "
-                 f"(auto-placement not yet wired for NFL)")
-        alert_text = f"(auto-placement not yet enabled)\n{desc}"
+                 f"(no live-market match / unsupported stat)")
+        alert_text = f"(auto-placement not matched -- see log for why)\n{desc}"
         if raw_caption:
             alert_text += f"\n\n---- caption ----\n{raw_caption}"
         try:
@@ -16774,11 +17443,12 @@ def _describe_a1_nfl_tip(raw: dict) -> str:
     return raw.get("description") or "(see raw message below)"
 
 
-async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str) -> None:
-    """Route an A1 Fantasy Sports NFL text message to a MANUAL alert: NEVER
-    auto-places, mirrors _route_image_nfl_tips's money-safety philosophy
-    exactly (see that function's docstring for the full rationale -- no NFL
-    market catalog/event resolver/bookie routing exists yet).
+async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
+                              unit_size: float = 0.0) -> None:
+    """Route an A1 Fantasy Sports NFL text message: AUTO-PLACES when the tip
+    matches a live Sportsbet market within _NFL_LINE_TOLERANCE (see
+    _attempt_nfl_auto_place), otherwise falls to a MANUAL alert exactly as
+    Stage 1 always has.
 
     v6.21 (2026-09-10, Wilson: "A1 is text ... please check if we have
     automated his tips before?" -- confirmed never automated). A1's real
@@ -16852,6 +17522,21 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str) -> None
             headline = _describe_a1_nfl_tip(raw)
         except Exception as e:
             headline = f"(headline render failed: {e})"
+
+        if (raw.get("market_type") or "").strip().lower() == "player_prop":
+            # v6.22 code review: run off the event loop, same as the 4th&EV
+            # image path -- see that call site's comment for why.
+            handled = await _run_in_placement_executor(
+                _attempt_nfl_auto_place,
+                tipster, channel_name, raw.get("player"), raw.get("team"),
+                raw.get("stat"), raw.get("side"), raw.get("line"),
+                raw.get("units"), unit_size,
+                f"{headline}\n\n---- full message ----\n{text}",
+                raw.get("odds"),
+            )
+            if handled:
+                continue
+
         try:
             notifier.notify_text_manual_alert(
                 channel_name,
@@ -17001,7 +17686,7 @@ async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
         await _route_image_nfl_tips(
             raw_tips, tipster, channel_name,
             pipeline_start=_t0, parse_sec=round(elapsed, 3),
-            raw_caption=raw_caption,
+            raw_caption=raw_caption, unit_size=unit_size,
         )
     else:
         await _route_image_afl_tips(
@@ -19043,14 +19728,18 @@ async def main():
         # routed to its OWN manual-only pipeline instead of the generic
         # _process_tip catch-all below -- see _route_a1_nfl_text's docstring.
         # Reusing _process_tip would reach place_tip/_place_singles_v4, which
-        # IS already safe for an unconfigured sport (verified: NFL has no
-        # *_SESSION_PRIORITY entry, so get_priority_for("nfl") returns [] and
-        # _place_singles_v4 short-circuits to manual, same mechanism MLB
-        # relies on) -- but notify_bet_failed's structured legs-only alert
-        # would lose the prose nuance (alt-book line variants, price
-        # flexibility, conditional fallback markets) A1's real messages carry,
-        # which this bespoke router preserves by always including the full
-        # raw text.
+        # WAS safe-by-construction for an unconfigured sport (verified when
+        # NFL_SESSION_PRIORITY was still empty: get_priority_for("nfl")
+        # returned [] and _place_singles_v4 short-circuited to manual, same
+        # mechanism MLB relies on) -- but notify_bet_failed's structured
+        # legs-only alert would still lose the prose nuance (alt-book line
+        # variants, price flexibility, conditional fallback markets) A1's
+        # real messages carry, so this bespoke router was kept even after
+        # v6.22 turned NFL_SESSION_PRIORITY on: it preserves the full raw
+        # text on every manual fallback AND does its own live-market
+        # resolution before ever calling place_single_sports_bet directly
+        # (see _attempt_nfl_auto_place) -- it does not route through
+        # _process_tip/place_tip at all.
         #
         # Checked BEFORE the generic media-alert block below (v6.21 code
         # review): A1's rare photo+caption post (an SGP) has `text` (the
@@ -19061,7 +19750,10 @@ async def main():
         if channel_cfg.get("parser") == "a1_fantasy_nfl":
             if text:
                 asyncio.create_task(
-                    _route_a1_nfl_text(text, "a1_fantasy_nfl", channel_name)
+                    _route_a1_nfl_text(
+                        text, "a1_fantasy_nfl", channel_name,
+                        unit_size=channel_cfg.get("unit_size", 1.0),
+                    )
                 )
             elif event.media:
                 log.info(f"[{channel_name}] A1 image/media with no caption -> manual alert")

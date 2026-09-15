@@ -22,7 +22,8 @@ CACHE_EXPIRY_MINUTES = 30
 ESPN_NBA_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 ESPN_NBL_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nbl/scoreboard"
 ESPN_MLB_URL = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
-_ESPN_URLS = {"nba": ESPN_NBA_URL, "nbl": ESPN_NBL_URL, "mlb": ESPN_MLB_URL}
+ESPN_NFL_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+_ESPN_URLS = {"nba": ESPN_NBA_URL, "nbl": ESPN_NBL_URL, "mlb": ESPN_MLB_URL, "nfl": ESPN_NFL_URL}
 
 # Common team name aliases for matching. All 30 NBA teams covered.
 # Keys are lowercased — match via .lower() lookup. Includes:
@@ -123,6 +124,30 @@ MLB_TEAM_ALIASES = {
     "giants": "San Francisco Giants", "san francisco": "San Francisco Giants", "sf": "San Francisco Giants", "sfg": "San Francisco Giants",
 }
 
+# NFL: built from roster.NFL_TEAM_ABBR_TO_FULL (single source of truth,
+# avoids a hand-typed 32-team list drifting out of sync with the roster
+# module) plus each full name's own mascot word as an extra key (so
+# "49ers"/"Cowboys"/"Rams" alone resolve, not just the abbreviation or the
+# full "City Mascot" string) and a handful of common nicknames ESPN/tipsters
+# use that aren't a plain substring of the full name.
+def _build_nfl_team_aliases() -> dict:
+    import roster as _roster
+    aliases: dict = {}
+    for abbr, full in _roster.NFL_TEAM_ABBR_TO_FULL.items():
+        aliases[abbr.lower()] = full
+        mascot = full.rsplit(" ", 1)[-1].lower()
+        aliases.setdefault(mascot, full)
+    aliases.update({
+        "niners": "San Francisco 49ers", "9ers": "San Francisco 49ers",
+        "pats": "New England Patriots", "skins": "Washington Commanders",
+        "bucs": "Tampa Bay Buccaneers", "cards": "Arizona Cardinals",
+        "hawks": "Seattle Seahawks", "big blue": "New York Giants",
+    })
+    return aliases
+
+
+NFL_TEAM_ALIASES = _build_nfl_team_aliases()
+
 
 def _fetch_schedule(sport: str, date: str) -> list[dict]:
     """Fetch games for a date. Returns list of {"home": name, "away": name}."""
@@ -141,10 +166,19 @@ def _fetch_schedule(sport: str, date: str) -> list[dict]:
     url = _ESPN_URLS.get(sport, ESPN_NBA_URL)
 
     try:
+        # v6.22 (2026-09-10): Akamai (ESPN's CDN) started 403-blocking the bare
+        # "tipbot/1.0" UA specifically -- verified live, back-to-back same
+        # request: "tipbot/1.0" -> 403, a browser-style UA -> 200. Zero prior
+        # occurrences in tipbot.log (this path is rarely exercised: MLB has no
+        # priority list, NBA is out of season in September), so it was dormant
+        # rather than actively broken, but it would have silently degraded
+        # MLB/NBA/NFL event resolution the next time any of them needed it.
         resp = requests.get(
             url,
             params={"dates": date.replace("-", "")},
-            headers={"User-Agent": "tipbot/1.0"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                    "Chrome/120.0.0.0 Safari/537.36"},
             timeout=10,
         )
         resp.raise_for_status()
@@ -301,4 +335,37 @@ def resolve_mlb_event(team: str = "") -> Optional[str]:
                 log.info(f"Resolved MLB '{team}' -> '{event}' on {check_date}")
                 return event
     log.warning(f"No MLB game found for '{team}'")
+    return None
+
+
+def resolve_nfl_event(team: str = "") -> Optional[str]:
+    """Resolve an NFL team name to a 'Home v Away' event string via ESPN's NFL
+    scoreboard (football/nfl). Resolves via NFL_TEAM_ALIASES (abbreviation/
+    mascot/nickname table, built from roster.NFL_TEAM_ABBR_TO_FULL) then falls
+    back to substring, same pattern as resolve_mlb_event.
+
+    WIDER window than MLB/NBA's +-1 day (v6.22, 2026-09-10, widened again in
+    code review): NFL plays weekly, not daily, and a tipster can post a play
+    days ahead of kickoff (A1/4th&EV both do) -- checks today through +6 days
+    (a FULL week ahead, so a Tuesday tip about that week's Sunday game still
+    resolves; the original +4 day window missed exactly that case), then
+    yesterday as a low-priority catch-all (a very late tip on an
+    already-live/just-finished game)."""
+    if not (team or "").strip():
+        log.warning("Cannot resolve NFL event: no team given")
+        return None
+    now = datetime.now()
+    check_order = [
+        (now + timedelta(days=d)).strftime("%Y-%m-%d") for d in range(0, 7)
+    ] + [(now - timedelta(days=1)).strftime("%Y-%m-%d")]
+    teams_to_try = [team] if "/" not in team else [t.strip() for t in team.split("/")]
+    for check_date in check_order:
+        games = _fetch_schedule("nfl", check_date)
+        for try_team in teams_to_try:
+            game = _match_team(try_team, games, NFL_TEAM_ALIASES)
+            if game:
+                event = f"{game['home']} v {game['away']}"
+                log.info(f"Resolved NFL '{team}' -> '{event}' on {check_date}")
+                return event
+    log.warning(f"No NFL game found for '{team}' within the next 7 days or yesterday")
     return None

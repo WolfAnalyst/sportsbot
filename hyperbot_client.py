@@ -17,6 +17,7 @@ v4.1 (2026-05-15): /v3/price_check + /v3/place_bet + /v3/start_session
 
 import json
 import os
+import sys
 import threading
 import time
 import requests
@@ -28,6 +29,28 @@ from config import (
 )
 
 log = logging.getLogger(__name__)
+
+# ── v6.22 UN-POPPABLE TEST GUARD, mirrors notifier.py's v6.14/v6.18 one ──
+# Set True ONLY by a test that deliberately exercises the transport with
+# `requests` stubbed, so nothing can leave the machine. Everything else is
+# blocked under pytest by default. Added after a code review found the NFL
+# auto-place tests were hermetic only BY ACCIDENT (an incidental zero
+# unit_size, not an actual guard) -- this closes that for every HyperBot
+# call, not just NFL's, the same way notifier.py closed it for Telegram.
+_ALLOW_TEST_TRANSPORT = False
+
+
+def _blocked_by_test_guard() -> bool:
+    """True when this process must not make a real HyperBot API call
+    (real money placement or a real balance/session read). Checks
+    `"pytest" in sys.modules`, which no test can accidentally unset (unlike
+    an env var a module-level `os.environ.pop` could clear for the whole
+    remaining suite -- notifier.py's own v6.14 lesson). Fails CLOSED."""
+    if _ALLOW_TEST_TRANSPORT:
+        return False
+    if "pytest" in sys.modules:
+        return True
+    return os.getenv("TIPBOT_TESTING", "").strip().lower() in ("1", "true", "yes")
 
 # ── SAFE-MODE placement governor (Wilson 2026-07-17) ───────────────────
 # Hard money bounds applied to REAL PLACEMENTS ONLY (place_* methods). Price checks
@@ -148,6 +171,9 @@ class HyperBotClient:
 
     def _post(self, path: str, payload: dict, timeout: int = 30,
               max_attempts: int | None = None) -> dict:
+        if _blocked_by_test_guard():
+            log.info(f"[test guard] HyperBot call suppressed: {path}")
+            return {"success": False, "error": "[test guard] blocked under pytest"}
         url = f"{self.base_url}{path}"
         last_err = None
         # Caller can override _RETRY_ATTEMPTS for time-sensitive endpoints
@@ -786,6 +812,9 @@ class HyperBotClient:
         bookie_bet_id}. Idempotent read — normal retries are safe (no Erasmus
         risk; this never places).
         """
+        if _blocked_by_test_guard():
+            log.info("[test guard] HyperBot call suppressed: /api/pending_bets")
+            return {"success": False, "error": "[test guard] blocked under pytest"}
         if not account_id:
             return {"success": False, "error": "no account_id"}
         url = f"{self.base_url}/api/pending_bets"
