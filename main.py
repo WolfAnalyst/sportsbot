@@ -2221,9 +2221,25 @@ LEROY_DEDUP_TTL_SEC = 18 * 3600  # 18h — spans a whole race day; prunes stale 
 # different worker threads at nearly the same time could TOCTOU-race the
 # plain check-then-set below. _nfl_dedup_lock makes the check+register one
 # atomic step.
-_nfl_recent_fps: dict = {}  # {nfl fingerprint tuple: timestamp}
+#
+# v6.25 (Wilson: "make sure we have a dupe guard... to not replace tips
+# that were already set within the last 3 days", then an xhigh-effort audit
+# BEFORE just widening the number): the fingerprint now includes the
+# RESOLVED EVENT, not just player/stat/line/side/units. Without it, a
+# 3-day window would have silently swallowed a LEGITIMATE tip -- the same
+# player/stat/line recurring on a DIFFERENT week's game (NFL prop lines
+# repeat the same round numbers week to week, and Thu/Sun/Mon posting
+# cadence makes a 3-day gap between two different games on the same player
+# routine). With the event folded in, two different games can never
+# collide, so the window can safely be as wide as Wilson wants. Mirrors
+# racing's own dup-runner guard's use of a wide window (7 days) made safe
+# by scoping to the specific meeting (see [[racing-dup-runner-guard]]).
+# Blocking now sends Wilson an actual alert (see _attempt_nfl_auto_place)
+# instead of only a log.warning -- a suppressed $400-600 real-money tip
+# must never be invisible.
+_nfl_recent_fps: dict = {}  # {nfl fingerprint tuple (event-scoped): timestamp}
 _nfl_dedup_lock = threading.Lock()
-NFL_DEDUP_TTL_SEC = 18 * 3600
+NFL_DEDUP_TTL_SEC = 3 * 24 * 3600
 
 
 def _tip_fingerprint(tip: ParsedTip) -> str:
@@ -16701,7 +16717,43 @@ _NFL_AUTOPLACE_STAT_SUFFIX = {
     "passing_yards": "passing_yds",
     "receptions": "total_receptions",
 }
-_NFL_LINE_TOLERANCE = 2.0
+# v6.25 code review (xhigh audit, Wilson's explicit correction): "within 2"
+# only ever made sense for YARDAGE -- 2 receiving/rushing/passing yards is
+# noise. It does NOT extend to count stats, where a "2" swing is a
+# completely different bet (4.5 -> 6.5 receptions is roughly a coin-flip
+# turned into a longshot). Wilson: "+2 tolerance for rushing receiving
+# yards/passing yards[;] for receptions/rushing attempts/touchdown
+# passes/touchdowns are only same line." The earlier single
+# _NFL_LINE_TOLERANCE=2.0 constant applied uniformly and would have let a
+# receptions tip auto-place 2 whole receptions off the tipster's actual
+# selection with the odds ceiling/floor unable to catch it (see
+# _resolve_nfl_market: A1's real messages carry no comparable AU odds at
+# all, so the line check is the ONLY gate for his tips). Default (any stat
+# not listed here, including future additions like rush_attempts/
+# touchdowns if Sportsbet ever adds those markets) is EXACT match (0.0) --
+# fail-safe direction, matching Wilson's stated rule rather than assuming
+# a new stat behaves like yardage.
+_NFL_LINE_TOLERANCE_BY_STAT = {
+    "receiving_yards": 2.0,
+    "rushing_yards": 2.0,
+    "passing_yards": 2.0,
+    "receptions": 0.0,
+    "rush_attempts": 0.0,
+    "pass_attempts": 0.0,
+    "completions": 0.0,
+    "touchdowns": 0.0,
+    "passing_touchdowns": 0.0,
+    "rushing_touchdowns": 0.0,
+    "receiving_touchdowns": 0.0,
+    "interceptions": 0.0,
+    "sacks": 0.0,
+    "tackles": 0.0,
+}
+_NFL_LINE_TOLERANCE_DEFAULT = 0.0
+
+
+def _nfl_line_tolerance(stat: str) -> float:
+    return _NFL_LINE_TOLERANCE_BY_STAT.get((stat or "").strip().lower(), _NFL_LINE_TOLERANCE_DEFAULT)
 
 
 def _nfl_slug_tokens(s: str) -> set:
@@ -16766,7 +16818,8 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
                          tipster_line, priority_sessions: list, tipster: str = "",
                          tipster_odds=None):
     """Read-only: resolve one NFL tip against the LIVE Sportsbet board and
-    check the line-within-_NFL_LINE_TOLERANCE match. Returns a dict ready
+    check the line-within-tolerance match (see _nfl_line_tolerance --
+    yardage stats get +-2, everything else is exact). Returns a dict ready
     for placement ({event, market, selection, line, odds, proposition_id,
     direction, team, probe_session_id}), or None if not auto-placeable --
     the caller falls back to the existing (unchanged) manual alert. NEVER
@@ -16867,10 +16920,11 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             return None
 
         live_line = float(sel["line"])
-        if abs(float(tipster_line) - live_line) > _NFL_LINE_TOLERANCE + 1e-9:
+        _tol = _nfl_line_tolerance(stat)
+        if abs(float(tipster_line) - live_line) > _tol + 1e-9:
             log.info(
                 f"NFL auto-place: {player!r} {suffix} tipster line {tipster_line} vs "
-                f"live {live_line} -- outside {_NFL_LINE_TOLERANCE} tolerance -> manual"
+                f"live {live_line} -- outside {_tol} tolerance for {stat!r} -> manual"
             )
             return None
 
@@ -16895,16 +16949,25 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
         # is missing -- that convenience default silently defeated the
         # cross-bookie proposition_id guard below whenever a session's
         # sessions.yaml entry was missing/typo'd (both sides of the
-        # comparison would agree on the same wrong default). An empty string
-        # here can never equal a real bookie name, so a missing-metadata
-        # probe now fails CLOSED (every placement session mismatches ->
-        # falls to manual) instead of silently assuming Sportsbet.
+        # comparison would agree on the same wrong default).
+        #
+        # v6.25 code review (xhigh audit): the v6.23 fix was INCOMPLETE. An
+        # empty probe_bookie only "fails closed" if some OTHER session in
+        # the placement loop has REAL metadata to mismatch against -- if the
+        # SAME missing-metadata session is also in the placement priority
+        # list, its sess_bookie is ALSO "" there, "" == "" is True, the
+        # cross-bookie guard never fires, and the bet places anyway with an
+        # empty bookie label (which then blanks bet_ledger's account
+        # column). Refuse HERE, at the source, instead of relying on a
+        # downstream inequality that both sides can independently satisfy.
         probe_bookie = probe_meta.bookmaker if probe_meta else ""
         if not probe_bookie:
             log.warning(
                 f"NFL auto-place: no sessions.yaml metadata for probe session "
-                f"{probe_sid!r} -- cannot verify its bookie, refusing to guess"
+                f"{probe_sid!r} -- cannot verify its bookie, refusing to place "
+                f"against an unverified catalog"
             )
+            return None
         return {
             "event": event, "market": key, "selection": sel.get("selection") or "",
             "line": live_line, "odds": sel.get("odds"),
@@ -16982,11 +17045,44 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         itself catches nothing) instead of the tipster's ORIGINAL stated
         price as every other caller does (main.py's singles path:
         _bookie_max_odds(tip.tipster, tip.suggested_odds, target_odds)).
-        Fixed to the same shape; tipster_odds is now a real parameter."""
+        Fixed to the same shape; tipster_odds is now a real parameter.
+
+    v6.25 (Wilson: "make sure we have a dupe guard... to not replace tips
+    within the last 3 days", verified with an xhigh-effort multi-agent
+    audit before just widening a number): the dedup TTL widened 18h -> 3
+    days, but the fingerprint now folds in the resolved EVENT (not just
+    player/stat/line/side/units) so a 3-day window can never conflate the
+    same player's line recurring on a DIFFERENT week's game with a genuine
+    re-send of the SAME one -- see _nfl_recent_fps's declaration. A blocked
+    duplicate now sends Wilson an actual alert instead of only a log line
+    (mirrors racing's own dup guard: tell him what was suppressed and why,
+    let him place it by hand if it genuinely is new). Per-stat line
+    tolerance: yardage stats keep +-2, but count stats (receptions, and
+    any future rush_attempts/touchdowns addition) now require an EXACT
+    line match -- +-2 receptions is a fundamentally different bet, not
+    noise, and A1's tips in particular have no client-side odds check at
+    all to catch a mismatch (his real message format carries only
+    ignorable US bookie prices, never an AU-comparable one -- see
+    _resolve_nfl_market), so the line check is his ONLY gate. The bookie
+    fail-closed fix from v6.23 was incomplete: an empty probe_bookie was
+    logged as "refusing to guess" but the match was still returned and
+    placed anyway if a placement session ALSO had no sessions.yaml entry
+    (empty == empty). _resolve_nfl_market now genuinely refuses (returns
+    None) on a missing probe bookie, with the placement-loop check kept as
+    an independent second layer, not the only one."""
     try:
         priority = session_priority.get_priority_for("nfl", is_sgm=False)
         if not priority:
-            return False  # NFL_SESSION_PRIORITY empty -> unchanged manual-only behaviour
+            # v6.25 code review (xhigh audit): genuinely silent before --
+            # zero log output. Harmless noise during the old manual-only
+            # Stage 1 (this fired on every single tip), but NFL_SESSION_
+            # PRIORITY is populated in production now, so this path should
+            # be rare; if it fires unexpectedly (a misloaded .env, a typo),
+            # it would otherwise degrade every NFL tip to manual with
+            # nothing in the logs to explain why.
+            log.warning("NFL auto-place: NFL_SESSION_PRIORITY is empty -> manual "
+                        "(expected only if the env var is genuinely unset)")
+            return False
 
         try:
             units_f = float(units)
@@ -16997,61 +17093,88 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
                       f"(not treated as '1u', same as the AFL no-units sentinel)")
             return False
 
-        # v6.23: coerce the line into the fingerprint the same way units_f
-        # already is -- a redelivered/reparsed copy of the SAME message can
-        # have the LLM emit the line as a JSON string ("39.5") on one pass
-        # and a JSON number (39.5) on another (no enforced schema on the
-        # free-text parse), which would otherwise make two fingerprints for
-        # the identical tip compare unequal and miss the duplicate entirely.
+        # v6.23: coerce the line the same way units_f already is -- a
+        # redelivered/reparsed copy of the SAME message can have the LLM
+        # emit the line as a JSON string ("39.5") on one pass and a JSON
+        # number (39.5) on another (no enforced schema on the free-text
+        # parse), which would otherwise make two fingerprints for the
+        # identical tip compare unequal and miss the duplicate entirely.
         try:
             _fp_line = round(float(tipster_line), 4)
         except (TypeError, ValueError):
             _fp_line = str(tipster_line)
-        fp = ("NFL", tipster, (player or "").strip().lower(), (team or "").strip().lower(),
-              (stat or "").strip().lower(), (side or "").strip().lower(),
-              _fp_line, units_f)
 
-        # v6.23: check-only here (lock-protected against the TOCTOU race
-        # explained on _nfl_dedup_lock's declaration); registration is
-        # deferred until AFTER _resolve_nfl_market actually finds a
-        # placeable match, below. Registering here (before resolution is
-        # even attempted) would poison the fingerprint for 18h on a purely
-        # TRANSIENT resolution failure (a logged-out session, an ESPN blip)
-        # -- if the tipster/Telethon legitimately redelivers the identical
-        # tip later once the transient issue clears (exactly the case this
-        # guard exists to handle), it would hit the dedup branch and vanish
-        # with neither a placement attempt nor a manual alert.
-        with _nfl_dedup_lock:
-            _now = datetime.now()
-            for _k in [k for k, t in _nfl_recent_fps.items()
-                       if (_now - t).total_seconds() > NFL_DEDUP_TTL_SEC]:
-                del _nfl_recent_fps[_k]
-            if fp in _nfl_recent_fps:
-                log.warning(f"[{channel_name}] NFL DUPLICATE (already placed/attempted "
-                            f"within {NFL_DEDUP_TTL_SEC // 3600}h): {player} {side} "
-                            f"{tipster_line} {stat} -> skipped (no double-bet)")
-                return True  # fully handled (as "already handled"): no manual alert either
-
+        # v6.25 code review (xhigh audit): v6.23's fingerprint had NO event/
+        # game identity in it -- at an 18h TTL that was self-limiting, but
+        # widened to 3 days (below) it would have silently swallowed a
+        # LEGITIMATE tip: the same player/stat/line/side/units recurring on
+        # a DIFFERENT week's game (NFL prop lines sit on the same round
+        # numbers week to week, and a tipster posting Thu-Sun/Mon on a
+        # rolling basis makes a 3-day gap between two DIFFERENT games on
+        # the SAME player routine, not exotic). Resolution now happens
+        # FIRST (still never registers anything before a real match is
+        # found -- a transient resolve failure must not poison this for 3
+        # days), and match["event"] is folded into the fingerprint so two
+        # different games can never collide. The single check-then-register
+        # below, under the lock, is also what closes the TOCTOU race for a
+        # near-simultaneous redelivery (main.py:_nfl_dedup_lock's
+        # declaration) -- two threads resolving the SAME message concurrently
+        # both do the (redundant, harmless, read-only) price-check, then
+        # serialize on this lock; the second one in finds the fp already
+        # registered.
         match = _resolve_nfl_market(player, team, stat, side, tipster_line, priority,
                                      tipster, tipster_odds)
         if not match:
             return False
 
-        # Register only now that a real placement attempt is about to be
-        # made. Re-check under the lock: two concurrent redeliveries of the
-        # same tip can both pass the check above and both resolve a match
-        # (resolution does no writing, so that's safe but redundant); the
-        # second one to reach here must still be caught before it places.
+        fp = ("NFL", tipster, (player or "").strip().lower(), (team or "").strip().lower(),
+              (stat or "").strip().lower(), (side or "").strip().lower(),
+              match["event"], _fp_line, units_f)
+
         with _nfl_dedup_lock:
-            if fp in _nfl_recent_fps:
-                log.warning(f"[{channel_name}] NFL DUPLICATE (registered by a "
-                            f"concurrent attempt while this one was resolving): "
-                            f"{player} {side} {tipster_line} {stat} -> skipped")
-                return True
-            _nfl_recent_fps[fp] = datetime.now()
+            _now = datetime.now()
+            for _k in [k for k, t in _nfl_recent_fps.items()
+                       if (_now - t).total_seconds() > NFL_DEDUP_TTL_SEC]:
+                del _nfl_recent_fps[_k]
+            is_dup = fp in _nfl_recent_fps
+            if not is_dup:
+                _nfl_recent_fps[fp] = _now
+        if is_dup:
+            # v6.25 code review (xhigh audit): "blocking must alert, not
+            # vanish" -- the earlier version returned True with only a
+            # log.warning, identical in effect to a tip silently dropped on
+            # the floor. Racing's own duplicate guard always tells Wilson
+            # when it suppresses a real bet, with the reason, so he can
+            # place it by hand if it genuinely is a new one; NFL now does
+            # the same. Still returns True (fully handled -- the caller
+            # must NOT also fire its own manual alert), but "handled" now
+            # means "Wilson was told", not "nothing happened".
+            _dup_msg = (f"NFL DUPLICATE on {channel_name}: {player} {side} "
+                        f"{tipster_line} {stat} for {match['event']} -- already "
+                        f"placed/attempted within the last "
+                        f"{NFL_DEDUP_TTL_SEC // 86400} day(s). NOT re-placed. "
+                        f"If this genuinely is a new/different bet, place it by "
+                        f"hand.\n\n{raw_message}")
+            log.warning(f"[{channel_name}] {_dup_msg}")
+            try:
+                notifier.notify_text_manual_alert(
+                    channel_name, _dup_msg, header="NFL DUPLICATE, not re-placed",
+                )
+            except Exception as e:
+                log.error(f"NFL auto-place: duplicate-alert failed: {e}")
+            return True
 
         intended_stake = round(units_f * float(unit_size or 0), 2)
         if intended_stake <= 0:
+            # v6.25 code review (xhigh audit): was silent. units_f is
+            # already confirmed > 0 above, so this only fires on a
+            # misconfigured/zero unit_size -- worth a log line, and note
+            # the fp was already registered (a real match was found), so a
+            # redelivery of this exact tip within the TTL now correctly
+            # surfaces via the DUPLICATE alert above rather than vanishing
+            # a second time too.
+            log.error(f"NFL auto-place: intended_stake ${intended_stake} <= 0 "
+                      f"(unit_size={unit_size!r}) -> manual")
             return False
 
         max_odds = _bookie_max_odds(tipster, tipster_odds, target_odds=match.get("odds"))
@@ -17090,9 +17213,18 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
             # different bookie entirely.
             sess_bookie = meta.bookmaker if meta else ""
             if not sess_bookie:
+                # v6.25 code review (xhigh audit): the warning below used to
+                # claim "skipping" with no `continue` actually enforcing it
+                # -- if match["bookie"] were EVER also "" (now impossible,
+                # _resolve_nfl_market refuses that case at the source, but
+                # this is the second, independent layer, not a single point
+                # of failure), "" == "" would have silently passed the
+                # mismatch check two lines down and placed against an
+                # unverified bookie. Explicit continue here regardless.
                 log.warning(f"[{channel_name}] NFL auto-place: no sessions.yaml "
                             f"metadata for session {sid!r} -- cannot verify its "
                             f"bookie, skipping rather than guess")
+                continue
             if sess_bookie != match["bookie"]:
                 log.info(f"[{channel_name}] NFL auto-place: skipping session {sid} "
                           f"({sess_bookie}) -- priced against {match['bookie']}'s "
@@ -17327,7 +17459,7 @@ async def _route_image_nfl_tips(raw_tips: list, tipster: str, channel_name: str,
                                  raw_caption: str = "",
                                  unit_size: float = 0.0) -> None:
     """Route vision-extracted NFL tips: AUTO-PLACES when the tip matches a
-    live Sportsbet market within _NFL_LINE_TOLERANCE (see
+    live Sportsbet market within tolerance (see _nfl_line_tolerance --
     _attempt_nfl_auto_place); otherwise falls to a MANUAL alert, exactly as
     Stage 1 always has.
 
@@ -17446,7 +17578,7 @@ def _describe_a1_nfl_tip(raw: dict) -> str:
 async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
                               unit_size: float = 0.0) -> None:
     """Route an A1 Fantasy Sports NFL text message: AUTO-PLACES when the tip
-    matches a live Sportsbet market within _NFL_LINE_TOLERANCE (see
+    matches a live Sportsbet market within tolerance (see _nfl_line_tolerance --
     _attempt_nfl_auto_place), otherwise falls to a MANUAL alert exactly as
     Stage 1 always has.
 
@@ -19718,8 +19850,28 @@ async def main():
                                 )
                             )
                     else:
+                        # v6.25 code review (xhigh audit): this was calling
+                        # notify_image_alert, which truncates to 200 chars
+                        # AND is labelled "IMAGE TIP" -- for a genuinely
+                        # text-only post that's both factually wrong and,
+                        # for a multi-leg slate, information-destroying.
+                        # Measured against real 4th&EV history: his real
+                        # slates run 5-6 legs across 200-400+ chars (e.g. a
+                        # "Part 1"/"Part 2" post numbered 1-6 with per-leg
+                        # Units:/Bookie:/Take-up-to fields); at 200 chars
+                        # only leg 1 (and not even all of it) was ever
+                        # reaching this alert -- legs 2+ have been silently
+                        # invisible in Telegram since he switched to text
+                        # posting. notify_text_manual_alert (3000 chars,
+                        # correctly escaped) is the function built for
+                        # exactly this; it just wasn't wired to this path.
                         log.info(f"[{channel_name}] text-only post on image channel (actionable) -> manual alert: {text[:120]}")
-                        notifier.notify_image_alert(channel_name, text)
+                        try:
+                            notifier.notify_text_manual_alert(
+                                channel_name, text, header=f"{img_sport.upper()} TEXT, MANUAL",
+                            )
+                        except Exception as e:
+                            log.error(f"[{channel_name}] text manual alert failed: {e}")
                 else:
                     log.info(f"[{channel_name}] text-only chatter on image channel -> dropped (not bet-like): {text[:80]}")
             return
