@@ -1433,6 +1433,7 @@ TEXT_PROMPT_A1_NFL = (
     "BACKING. Respond with ONLY valid JSON, no markdown fences, in this shape: "
     '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
     '"side": "over"|"under"|null, "line": number|null, "units": number|null, '
+    '"fd_odds": number|null, '
     '"market_type": "player_prop"|"h2h"|"other", "description": str|null} ]}. '
     "CRITICAL: A1 posts a short ANNOUNCEMENT message before every real play, in the "
     "shape '<N>u play coming, <TEAM> vs <TEAM>' or '<N>u NFL play coming, <TEAM> vs "
@@ -1461,10 +1462,18 @@ TEXT_PROMPT_A1_NFL = (
     "'Dolphins.' line) -- else null; the caller resolves the team from the roster, "
     "do NOT guess a team from the announcement message's 'TEAM vs TEAM' (that was a "
     "separate, earlier message about a different game slate context). "
-    "IGNORE every American odds figure (-114, -127, +1273 etc.) and every bookie "
-    "code (FD, 365, Fliff, HR, Kalshi, DK, CZR, NVG, TS, NVG) -- these are US-only "
-    "books, irrelevant to AU placement. There is deliberately no `odds` field in "
-    "the schema; do not add one. "
+    "PRICES: A1 lists several US bookies' American odds in parentheses after the "
+    "play, e.g. '(-114 FD)', '(-118 FD/-120 365/-125 Fliff)', '(-127 NVG/-130 HR, "
+    "FD/-131 Kalshi)', '(-122 DK, FD/-125 TS)'. IGNORE every book except FD -- "
+    "find the number specifically attached to 'FD' (it may be listed alone, "
+    "first, last, or grouped with another book at the SAME price via a comma, "
+    "e.g. '-130 HR, FD' means FD's price is -130) and set `fd_odds` to THAT "
+    "number exactly as printed, sign included (a plain negative or positive "
+    "integer, e.g. -114, -130, +120 -- never convert it, the caller does that). "
+    "If FD is not listed at all for this play, `fd_odds`=null -- do not guess or "
+    "borrow another book's price. Every OTHER book's price (365, Fliff, HR, "
+    "Kalshi, DK, CZR, NVG, TS) is still irrelevant, ignore them entirely; there "
+    "is no generic `odds` field, only `fd_odds`. "
     "ONE MESSAGE OFTEN CARRIES MORE THAN THE HEADLINE PLAY: an alternate line/book "
     "at reduced stake for the SAME pick (e.g. '0.85u 13.5 on HR, etc.') and a "
     "conditional fallback market (e.g. 'u30.5 yards 0.5u if no longest for you') "

@@ -16757,6 +16757,113 @@ def _nfl_line_tolerance(stat: str) -> float:
     return _NFL_LINE_TOLERANCE_BY_STAT.get((stat or "").strip().lower(), _NFL_LINE_TOLERANCE_DEFAULT)
 
 
+# v6.28 (Wilson, 2026-09-16: "Sportsbet copies FD prices, so we can just
+# compare off of that, if there is not odds comparison available just place
+# it as long as odds above 1.6"). Closes the A1 gap the earlier review
+# rounds documented as "structural, no clean fix" -- A1's real message
+# format deliberately carries only US bookie prices (FD/365/Fliff/etc), so
+# _exceeds_odds_ceiling/_below_odds_floor were permanent no-ops for him
+# (both treat a missing/unusable tipped_odds as "can't sanity-check, don't
+# block"). Wilson's fix: FanDuel specifically tracks close enough to
+# Sportsbet's own AU price that its American odds, converted to decimal,
+# is a real comparison point -- so extract FD's price where A1 states it
+# (TEXT_PROMPT_A1_NFL, groq_parser.py) instead of ignoring all US odds.
+# When FD isn't listed for a given leg, there is genuinely nothing to
+# compare against; rather than skip the check entirely (the old behaviour),
+# require the LIVE odds to clear a flat floor (1.6) as a minimum sanity
+# check against an obviously-wrong-market bind (a near-certain outcome at
+# e.g. 1.05 is not what any of these tipsters are backing).
+_NFL_MIN_LIVE_ODDS_NO_COMPARISON = 1.6
+
+
+def _american_to_decimal_odds(american):
+    """Convert American odds (e.g. -114, +150) to AU decimal (e.g. 1.88,
+    2.50). Returns None for anything unusable -- NEVER raises.
+
+    v6.28 code review (workflow adversarial pass): the original version's
+    ONLY guard was `a == 0`, despite this docstring already claiming a
+    magnitude check existed. Reproduced live: `_american_to_decimal_odds
+    (0.5)` returned 1.005 instead of None (real American odds are ALWAYS
+    |a| >= 100 by convention -- there is no such thing as "-50" or "+30"
+    American odds), and the negative branch is worse: `_american_to_
+    decimal_odds(-0.5)` returned 201.0, a nonsense decimal from dividing
+    100 by a near-zero magnitude. TEXT_PROMPT_A1_NFL instructs the model to
+    emit fd_odds as "a plain negative or positive integer" (i.e. already
+    constrained to real American-odds shape), but LLM extraction doesn't
+    always follow instructions, and this function is the last line of
+    defense against whatever it actually emits -- it must enforce its own
+    documented contract itself, not assume the caller already did."""
+    try:
+        a = float(american)
+    except (TypeError, ValueError):
+        return None
+    if abs(a) < 100:
+        return None
+    if a > 0:
+        return round(1 + a / 100, 4)
+    return round(1 + 100 / abs(a), 4)
+
+
+def _nfl_odds_guard_refuses(tipster: str, tipster_odds, live_odds) -> tuple[bool, str]:
+    """The one odds sanity check every NFL auto-place resolver applies,
+    win or lose a real comparison price. Returns (refuse: bool, reason).
+
+    With a usable tipster_odds: defers to the SAME ceiling/floor guards
+    every other sport's singles path uses (_exceeds_odds_ceiling /
+    _below_odds_floor) -- unchanged behaviour, just centralised so both
+    _resolve_nfl_market and _resolve_nfl_team_market call one function.
+
+    Without a USABLE one (the common case for A1's non-FD legs, any tipster
+    whose format carries no odds at all, AND -- v6.28 code review, workflow
+    adversarial pass -- any tipster_odds that IS present but wouldn't
+    itself pass a sanity check, see below): refuses only if the LIVE odds
+    are at or below _NFL_MIN_LIVE_ODDS_NO_COMPARISON -- Wilson's explicit
+    floor for "no comparison available." This is deliberately much looser
+    than the 10%-below-tipped floor a real comparison gives; it exists to
+    catch an obviously-wrong-market bind (a resolver match landing on a
+    near-certain, oddly-short price), not to second-guess a legitimate
+    short-priced pick a tipster actually made.
+
+    v6.28 code review: the original version branched on `tipster_odds is
+    not None`, not on whether it was USABLE. _exceeds_odds_ceiling/
+    _below_odds_floor each independently no-op whenever their own internal
+    `t <= 1.0` guard fires -- so a non-None but garbage tipster_odds (e.g.
+    a bad LLM extraction that slipped past _american_to_decimal_odds, or
+    IMAGE_PROMPT_NFL's documented "output American odds verbatim, don't
+    convert" fallback landing a raw '-110' straight into this argument)
+    took the "I have a comparison" branch, BOTH checks silently no-op'd,
+    and the function returned (False, "") -- bypassing the very 1.6 floor
+    this function exists to guarantee. Reproduced live before this fix:
+    _nfl_odds_guard_refuses('t', 0.5, 1.2) -> (False, ''), i.e. ALLOWED a
+    live price of 1.2 (well under 1.6) purely because tipster_odds
+    happened to be a non-None float. Now checks usability explicitly and
+    falls through to the flat floor for anything that isn't."""
+    _usable_tipster_odds = None
+    if tipster_odds is not None:
+        try:
+            _t = float(tipster_odds)
+            if _t > 1.0:
+                _usable_tipster_odds = _t
+        except (TypeError, ValueError):
+            pass
+    if _usable_tipster_odds is not None:
+        if _exceeds_odds_ceiling(tipster, _usable_tipster_odds, live_odds):
+            return True, (f"live odds {live_odds} exceed the ceiling over "
+                           f"tipster odds {tipster_odds}")
+        if _below_odds_floor(_usable_tipster_odds, live_odds):
+            return True, (f"live odds {live_odds} more than 10% below "
+                           f"tipster odds {tipster_odds}")
+        return False, ""
+    try:
+        live = float(live_odds or 0)
+    except (TypeError, ValueError):
+        return True, f"live odds {live_odds!r} unusable"
+    if live <= _NFL_MIN_LIVE_ODDS_NO_COMPARISON:
+        return True, (f"no usable odds comparison available and live odds "
+                       f"{live_odds} <= the {_NFL_MIN_LIVE_ODDS_NO_COMPARISON} floor")
+    return False, ""
+
+
 def _nfl_slug_tokens(s: str) -> set:
     """Lowercase alnum-only tokens, accent-folded and generational-suffix-
     stripped. Used to match a player name against a HyperBot market-key
@@ -16847,10 +16954,16 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
     uses, in the SAME place (resolve time, before a match is ever returned
     for placement) -- a market that line-matches but has drifted >MAX_ODDS_
     MULT above, or >10% below, the tipster's stated price refuses here,
-    same as AFL/NBA/MLB. Both checks are no-ops (never block) when
-    tipster_odds is missing/unusable, matching every other caller's
-    behaviour: a missing price never blocks a bet, it just can't be
-    sanity-checked."""
+    same as AFL/NBA/MLB.
+
+    v6.28 (Wilson: "Sportsbet copies FD prices, so we can just compare off
+    of that, if there is not odds comparison available just place it as
+    long as odds above 1.6" -- see _nfl_odds_guard_refuses): with a usable
+    tipster_odds this is still exactly the ceiling/floor pair above. Without
+    one (previously a silent no-op -- "a missing price never blocks a bet"),
+    it now refuses if the live odds are at or below 1.6, a flat sanity
+    floor against an obviously-wrong-market bind when there is genuinely
+    nothing to compare against."""
     try:
         suffix = _NFL_AUTOPLACE_STAT_SUFFIX.get((stat or "").strip().lower())
         if not suffix:
@@ -16930,19 +17043,9 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             return None
 
         live_odds = sel.get("odds")
-        if _exceeds_odds_ceiling(tipster, tipster_odds, live_odds):
-            log.info(
-                f"NFL auto-place: {player!r} {suffix} live odds {live_odds} exceed "
-                f"the ceiling over tipster odds {tipster_odds} -> manual (wrong-"
-                f"selection / drift guard, same check every other sport applies)"
-            )
-            return None
-        if _below_odds_floor(tipster_odds, live_odds):
-            log.info(
-                f"NFL auto-place: {player!r} {suffix} live odds {live_odds} more "
-                f"than 10% below tipster odds {tipster_odds} -> manual (price-"
-                f"moved / wrong-selection guard)"
-            )
+        _refuse, _reason = _nfl_odds_guard_refuses(tipster, tipster_odds, live_odds)
+        if _refuse:
+            log.info(f"NFL auto-place: {player!r} {suffix} {_reason} -> manual")
             return None
 
         probe_meta = session_priority.get_session_meta(probe_sid)
@@ -17131,19 +17234,9 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
 
         live_line = sel.get("line")
         live_odds = sel.get("odds")
-        if _exceeds_odds_ceiling(tipster, tipster_odds, live_odds):
-            log.info(
-                f"NFL auto-place: {canonical_team!r} {market_type} live odds "
-                f"{live_odds} exceed the ceiling over tipster odds "
-                f"{tipster_odds} -> manual"
-            )
-            return None
-        if _below_odds_floor(tipster_odds, live_odds):
-            log.info(
-                f"NFL auto-place: {canonical_team!r} {market_type} live odds "
-                f"{live_odds} more than 10% below tipster odds {tipster_odds} "
-                f"-> manual"
-            )
+        _refuse, _reason = _nfl_odds_guard_refuses(tipster, tipster_odds, live_odds)
+        if _refuse:
+            log.info(f"NFL auto-place: {canonical_team!r} {market_type} {_reason} -> manual")
             return None
 
         probe_meta = session_priority.get_session_meta(probe_sid)
@@ -17836,12 +17929,15 @@ def _describe_a1_nfl_tip(raw: dict) -> str:
         side = raw.get("side") or "?"
         line = raw.get("line")
         units = raw.get("units")
+        fd_odds = raw.get("fd_odds")
         headline = (
             f"{player}" + (f" ({team})" if team else "")
             + f": {side} {line if line is not None else '?'} {stat}"
         )
         if units is not None:
             headline += f" ({units}u)"
+        if fd_odds is not None:
+            headline += f" [FD {fd_odds}]"
         return headline
     if mt == "h2h":
         return f"{raw.get('team') or '?'}: moneyline/H2H"
@@ -17929,6 +18025,16 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
             headline = f"(headline render failed: {e})"
 
         if (raw.get("market_type") or "").strip().lower() == "player_prop":
+            # v6.28 (Wilson: "Sportsbet copies FD prices, so we can just
+            # compare off of that"). raw.get("odds") was always None here --
+            # A1's schema never had a generic odds field, so this call was a
+            # documented no-op since the feature first shipped. TEXT_PROMPT_
+            # A1_NFL now extracts FD's American price specifically
+            # (raw["fd_odds"]); convert it to AU decimal here so
+            # _resolve_nfl_market gets a real tipster_odds to sanity-check
+            # against instead of always falling through to the no-comparison
+            # 1.6 floor (see _nfl_odds_guard_refuses).
+            _tipster_odds = _american_to_decimal_odds(raw.get("fd_odds"))
             # v6.22 code review: run off the event loop, same as the 4th&EV
             # image path -- see that call site's comment for why.
             handled = await _run_in_placement_executor(
@@ -17937,7 +18043,7 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
                 raw.get("stat"), raw.get("side"), raw.get("line"),
                 raw.get("units"), unit_size,
                 f"{headline}\n\n---- full message ----\n{text}",
-                raw.get("odds"),
+                _tipster_odds,
             )
             if handled:
                 continue
