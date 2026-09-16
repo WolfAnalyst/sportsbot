@@ -1168,9 +1168,17 @@ IMAGE_PROMPT_NFL = (
     "SPREAD/HANDICAP: a TEAM with a signed number (e.g. 'Bills -3.5', 'Jets "
     "+6.5') is market_type=\"spread\", `team`=the team, `line`=the number WITH "
     "its sign exactly as printed (negative if favourite/giving points, positive "
-    "if receiving). TOTAL (game total points, e.g. 'Over 47.5'): "
-    "market_type=\"total\", `side`=over/under, `line`=the number, `team`=null "
-    "unless the image shows one team's own team-total (then set `team`). "
+    "if receiving). TOTAL (the WHOLE GAME's combined points, e.g. 'Over 47.5', "
+    "'Total Over 47.5' with no team named): market_type=\"total\", `side`=over/"
+    "under, `line`=the number, `team`=one of the two teams playing in this game "
+    "(needed only to identify WHICH game the total is for -- the bet itself is "
+    "not about that team, it is the combined score) -- infer the team from "
+    "elsewhere on the image/card if it is not printed directly on this line. "
+    "A SEPARATE, DIFFERENT bet is a single TEAM's own point total (e.g. '49ers "
+    "Team Total Over 24.5') -- this is NOT market_type=\"total\" (that resolver "
+    "only handles the whole-game combined total); use market_type=\"other\" "
+    "with a plain-English `description` for a team's own total instead, all "
+    "other fields null. "
     "MONEYLINE / head-to-head (a SINGLE team to win outright, e.g. 'Chiefs ML', "
     "'Chiefs to win'): market_type=\"h2h\", `team`=the ONE team backed, "
     "`odds`=the price, `units`=the stake if shown, player/stat/line/side null. "
@@ -1563,6 +1571,186 @@ def parse_a1_nfl_text(
     ]
     log.info(
         f"parse_a1_nfl_text: {tipster} extracted {len(tips)} raw tip(s) "
+        f"in {elapsed:.2f}s"
+    )
+    return tips, elapsed
+
+
+# v6.26 (2026-09-16, Wilson: "i need it to parse the mass tips msg to able to
+# extract the proper tips one by one and then place them" -- built after an
+# xhigh-effort audit found 4th&EV had switched from his branded image card
+# to plain TEXT for nearly every real tip since 2026-09-11, with no
+# auto-place path at all for text on his channel). Reuses IMAGE_PROMPT_NFL's
+# EXACT JSON schema (same market_type enum, same field names) so the raw
+# tip dicts this produces are consumed identically downstream by
+# main._route_fourthandev_nfl_text -- no new dict shape, no new renderer.
+# Real message samples this was built from (main.py:19853's dispatch log,
+# 2026-09-11 through 2026-09-15): multi-leg numbered slates ('BET;'/'BET 1:'/
+# 'Bet 1:'/bare '1:' headers), price given as 'ODDS: $1.86' OR inline
+# ('Dallas Cowboys -3.0 $1.86'), 'Units:'/'UNITS:' + 'Bookie:'/'BOOK:'/
+# 'Book:' fields, an optional 'Team:' field, slates split across two
+# messages ('Part 1 below, part 2 coming in 10 mins' / 'Part 2:' continuing
+# the SAME numbering), and free-text alt-line/price-floor notes ('take up
+# to 82.5', 'Bet down to $1.78').
+TEXT_PROMPT_FOURTHANDEV_NFL = (
+    "You are an extraction tool for NFL betting-tip TEXT MESSAGES from the '4th and "
+    "+EV' tipster channel. He normally posts a branded IMAGE card for each bet, but "
+    "also frequently posts the SAME kind of bets as plain TEXT (his graphic tool is "
+    "sometimes down). Extract EVERY real bet in the message. Respond with ONLY "
+    "valid JSON, no markdown fences, in this shape: "
+    '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
+    '"side": "over"|"under"|null, "line": number|null, "odds": number|null, '
+    '"bookie": str|null, "units": number|null, '
+    '"market_type": "player_prop"|"h2h"|"spread"|"total"|"other", '
+    '"description": str|null} ]}. '
+    "REAL FORMAT: each bet is numbered/labelled -- 'BET;', 'BET 1:', 'Bet 1:', or a "
+    "bare '1:' all mark the START of a new leg. A message headed 'Part 1'/'Part 2' "
+    "is a CONTINUATION of the SAME slate (the numbering carries on, e.g. Part 1 "
+    "ends at leg 5, Part 2 starts at leg 6) -- extract every leg in it the same "
+    "way; the 'Part N' header itself is not a bet. "
+    "EACH LEG has its own price/fields nearby, in ANY of these shapes: "
+    "'ODDS: $1.86' on its own line, OR the price written inline right after the "
+    "selection ('Dallas Cowboys -3.0 $1.86', 'Denver Broncos ML $2.15') -- these "
+    "are ALREADY AU decimal, use exactly as printed for `odds`. If a price "
+    "instead looks like AMERICAN odds (a 3-digit number with an explicit + or - "
+    "sign, e.g. '-114', '+150' -- NOT a $ figure), still output the number "
+    "exactly as printed in `odds` and say so in `description` (e.g. "
+    "\"odds printed as American, not AU decimal\") -- do NOT silently convert "
+    "it yourself, and do NOT treat it as if it were already decimal. "
+    "'UNITS: <N>' / 'Units: <N>' -> `units`. 'BOOK: <name>' / 'Bookie: <name>' / "
+    "'Book: <name>' -> `bookie`, lowercased ('365' -> '365', 'SB' -> 'sportsbet'). "
+    "'Team: <name>' when present -> `team` (confirms/overrides your own inference). "
+    "PLAYER PROP, e.g. 'TERRANCE FERGURSON OVER 22.5 RECEIVING YARDS', 'Omarion "
+    "Hampton OVER 69.5 rushing yards': market_type=\"player_prop\", `player`=name "
+    "exactly as printed, `side`=over/under, `line`=the number, `stat`-> ONE "
+    "lowercase word from: receiving_yards, rushing_yards, passing_yards, "
+    "receptions, rush_attempts, pass_attempts, completions, longest_reception, "
+    "longest_rush, touchdowns, passing_touchdowns, rushing_touchdowns, "
+    "receiving_touchdowns, interceptions, sacks, tackles. ANYTIME TOUCHDOWN "
+    "('anytime TD', 'ATD', 'anytime touchdown scorer'): market_type=\"player_prop\", "
+    "stat=\"touchdowns\", side=\"over\", line=0.5. NEVER output both the OVER "
+    "and the UNDER of the same line as two separate tips -- only one side is "
+    "ever the actual bet. "
+    "SPREAD/HANDICAP, a TEAM with a signed number, e.g. 'Dallas Cowboys -3.0': "
+    "market_type=\"spread\", `team`=the team, `line`=the number WITH its sign "
+    "exactly as printed. "
+    "MONEYLINE, a team plus 'ML'/'moneyline'/'to win', e.g. 'Denver Broncos ML': "
+    "market_type=\"h2h\", `team`=the team, `line`=null. "
+    "TOTAL (the WHOLE GAME's combined points, e.g. 'Over 47.5', 'Total Over "
+    "47.5', with no team named): market_type=\"total\", `side`=over/under, "
+    "`line`=the number, `team`=one of the two teams playing in this game "
+    "(needed only to identify WHICH game the total is for -- the bet itself "
+    "is not about that team, it is the combined score) -- infer it from the "
+    "'Team:' field if present, or from another leg in the same slate/message "
+    "naming the game, if it is not stated directly on this line. "
+    "WINNING MARGIN (e.g. 'winning margin: 14+ points') and any TEAM-level "
+    "yardage/stat/points total (e.g. 'team rushing yards', 'team total yards', "
+    "'49ers team total over 24.5') do NOT fit any market_type above -- these "
+    "are NOT the same as the whole-game TOTAL above -- use market_type=\"other\" "
+    "with a plain-English `description`, all other fields null. Do not force "
+    "these into spread/total. "
+    "ALT-LINE / PRICE-FLOOR NOTES: free text like 'take up to 82.5' (he'll accept "
+    "a worse line up to that number) or 'bet down to $1.78' (he'll accept a lower "
+    "price down to that number) is real context for a human but is NOT a "
+    "separate bet and does NOT change the headline `line`/`odds` -- append it "
+    "verbatim to `description` on that SAME leg's tip object, never drop it, "
+    "never act on it yourself. "
+    "CHATTER -- return NO tip for these, never force a match: scheduling/timing "
+    "announcements ('12.45 (SA TIME)...', 'tips today will be between 12 and 1'), "
+    "results/recap commentary ('Loss on the game...', 'Diabolical start...'), "
+    "meta/admin messages ('Will have one additional tip in 20 minutes', 'having "
+    "some tech issues', 'here's the channel for SGM'), and a free-text 'Analysis' "
+    "write-up that doesn't itself contain a new numbered/labelled bet. If a "
+    "message is ONLY this kind of text, return {\"tips\": []}. "
+    "Use null for ANY field not covered above. JSON only."
+)
+
+
+def parse_fourthandev_nfl_text(
+    text: str,
+    tipster: str = "fourthandev_nfl",
+    max_retries: int = 4,
+) -> tuple[list[dict], float]:
+    """Parse a 4th and +EV NFL TEXT message into RAW tip dicts. Mirrors
+    parse_a1_nfl_text's structure/failure semantics exactly (a VALID-but-
+    empty parse returns ([], elapsed) so the caller drops it silently; a
+    HARD failure RAISES so the caller routes to MANUAL rather than
+    silently losing a real tip) but, unlike A1's one-headline-tip-only
+    parse, extracts EVERY leg in the message (TEXT_PROMPT_FOURTHANDEV_NFL's
+    schema is multi-tip, matching IMAGE_PROMPT_NFL's own shape)."""
+    start = time.time()
+    if not GROQ_API_KEY:
+        raise RuntimeError("parse_fourthandev_nfl_text: GROQ_API_KEY not set")
+    if not (text or "").strip():
+        return [], 0.0
+    body = {
+        "model": GROQ_TEXT_MODEL,
+        "temperature": 0,
+        "max_tokens": 2000,
+        "messages": [
+            {"role": "system", "content": TEXT_PROMPT_FOURTHANDEV_NFL},
+            {"role": "user", "content": text.strip()},
+        ],
+    }
+    content = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=30,
+            )
+            if resp.status_code == 429 and attempt < max_retries:
+                ra = resp.headers.get("retry-after")
+                wait = float(ra) if (ra and ra.replace(".", "", 1).isdigit()) \
+                    else 6.0 * (attempt + 1)
+                log.warning(
+                    f"parse_fourthandev_nfl_text: 429 for {tipster}, backing off "
+                    f"{wait:.0f}s (attempt {attempt + 1})"
+                )
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            break
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                time.sleep(4.0 * (attempt + 1))
+                continue
+            log.error(f"parse_fourthandev_nfl_text: Groq request failed for {tipster}: {e}")
+            raise
+        except Exception as e:
+            log.error(f"parse_fourthandev_nfl_text: unexpected error for {tipster}: {e}")
+            raise
+
+    elapsed = time.time() - start
+    if not content:
+        raise RuntimeError("parse_fourthandev_nfl_text: no content returned")
+    content = content.replace("```json", "").replace("```", "").strip()
+    parsed = _parse_json_with_repair(content)
+    if parsed is None:
+        log.error(f"parse_fourthandev_nfl_text: invalid JSON (repair failed) for {tipster}; raw: {content[:300]}")
+        raise RuntimeError("parse_fourthandev_nfl_text: invalid JSON")
+    tips = parsed.get("tips", [])
+    if not isinstance(tips, list):
+        raise RuntimeError("parse_fourthandev_nfl_text: 'tips' not a list")
+    # Same filter as parse_a1_nfl_text/IMAGE_PROMPT_NFL's consumers: a row
+    # with no player, no team, AND no description is a placeholder/chatter
+    # row that slipped past the prompt's own instruction not to emit one.
+    tips = [
+        t for t in tips
+        if isinstance(t, dict) and (
+            (t.get("player") or "").strip()
+            or (t.get("team") or "").strip()
+            or (t.get("description") or "").strip()
+        )
+    ]
+    log.info(
+        f"parse_fourthandev_nfl_text: {tipster} extracted {len(tips)} raw tip(s) "
         f"in {elapsed:.2f}s"
     )
     return tips, elapsed

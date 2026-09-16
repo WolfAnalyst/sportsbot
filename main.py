@@ -61,6 +61,7 @@ from config import (
     SELF_BET_MAX_STAKE,
     EDDIE_CAPTION_FALLBACK_ENABLED,
     EDDIE_TEXT_PLACE_ENABLED,
+    FOURTHANDEV_TEXT_PLACE_ENABLED,
     SA_THOROUGHBRED_TRACKS,
     AFL_PERIOD_MARKETS_ENABLED,
     SAIYAN_HC_SGM_ENABLED,
@@ -97,7 +98,7 @@ from config import (
     DISPOSALS_MODEL_SEQ_RESET_TOLERANCE,
     DISPOSALS_MODEL_LIVENESS_CRITICAL,
 )
-from groq_parser import parse_tip_image, parse_a1_nfl_text
+from groq_parser import parse_tip_image, parse_a1_nfl_text, parse_fourthandev_nfl_text
 from models import ParsedTip, ParsedLeg, BetResult
 from parsers.saiyan_afl import parse_saiyan_message
 try:
@@ -129,7 +130,7 @@ except ImportError:
 from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
 from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
-from nba_resolver import resolve_nba_event, resolve_mlb_event, resolve_nfl_event
+from nba_resolver import resolve_nba_event, resolve_mlb_event, resolve_nfl_event, NFL_TEAM_ALIASES
 from roster import resolve_player_name, get_player_team, afl_surname_candidates, afl_fuzzy_surname_candidates
 from roster import is_nfl_name_collision
 from roster import _GEN_SUFFIXES as _ROSTER_GEN_SUFFIXES, _fold_accents as _roster_fold_accents
@@ -16979,9 +16980,204 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
         return None
 
 
+# v6.26 (2026-09-16, Wilson: "i need it to parse the mass tips msg to able to
+# extract the proper tips one by one and then place them" -- the real 4th&EV
+# text build, following the xhigh audit that found he'd switched to text with
+# no auto-place path at all). His real slates are roughly HALF team-level
+# markets (spread/moneyline), not just player props -- "BET 1: Dallas Cowboys
+# -3.0 $1.86", "Bet 1: Denver Broncos ML $2.15". Verified LIVE (2026-09-16,
+# same real-game-probe discipline as the original player-prop build) against
+# a real game (49ers v Dolphins): Sportsbet's `head_to_head` (moneyline),
+# `line` (spread), and `total_points` (game total) markets ARE genuine
+# full-game team markets. NOT wired here: team-level YARDAGE totals (his
+# "LA Rams team over 110.5 team rushing yards" sample) -- no such market
+# exists in the live catalog at all, confirmed by listing every one of the
+# 86 keys on a real board; same "the market genuinely isn't there" situation
+# as rush_attempts for player props. Also NOT wired: winning-margin BANDS
+# (his "Denver Broncos winning margin: 14+ points" sample) -- HyperBot's
+# `margin`/`winning_margin_extended` markets are banded ranges ("1 to 6",
+# "7 to 12"...), a fundamentally different selection-matching problem than
+# a numeric line, and lower-frequency in his real history; stays manual.
+# "spread" (not "line") is the market_type name throughout this file and
+# the parse prompts -- "line" is already the generic word this codebase
+# uses everywhere for the numeric threshold value itself (tipster_line,
+# live_line, etc), so reusing it as a MARKET NAME too would read as
+# ambiguous in every log line and alert. session_priority.KNOWN_NFL_MARKETS
+# anticipated "line" as the liability-cap yaml key when it was first
+# written, so _attempt_nfl_auto_place's liability-cap lookup translates
+# "spread" -> "line" there specifically; nowhere else needs to know that.
+_NFL_TEAM_MARKET_KEY = {"h2h": "head_to_head", "spread": "line", "total": "total_points"}
+
+
+def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: str,
+                              priority_sessions: list, tipster: str = "",
+                              tipster_odds=None):
+    """Read-only: resolve one NFL TEAM-level tip (moneyline/spread/total)
+    against the LIVE Sportsbet board. Mirrors _resolve_nfl_market's shape
+    and philosophy exactly (same fail-safe-to-manual behaviour, same return
+    dict shape so _attempt_nfl_auto_place's placement loop doesn't need to
+    know which resolver produced the match) -- see that function's
+    docstring for the general design notes this one doesn't repeat.
+
+    EXACT match only, no tolerance, for all three market types (spread and
+    total were never covered by Wilson's stated '+-2 for yardage stats'
+    rule, and the live catalog carries MULTIPLE distinct lines for the
+    same team/market simultaneously -- e.g. a real probe returned BOTH a
+    -12.5 AND a -13.5 handicap for the same team, evidently two merged
+    provider feeds -- so exact match is also what correctly disambiguates
+    between them: matching on the tipster's stated number picks exactly
+    one, and refuses if that number isn't currently offered rather than
+    guessing which variant he meant)."""
+    try:
+        catalog_key = _NFL_TEAM_MARKET_KEY.get((market_type or "").strip().lower())
+        if not catalog_key:
+            return None
+
+        resolve_team = (team or "").strip()
+        if not resolve_team:
+            return None
+        canonical_team = NFL_TEAM_ALIASES.get(resolve_team.lower(), resolve_team)
+
+        market_type = market_type.strip().lower()
+        if market_type == "h2h":
+            if tipster_line is not None:
+                # h2h has no line concept; a parse that attached one is
+                # more likely wrong than a genuine zero-point spread -- refuse
+                # rather than silently ignore a field that shouldn't be there.
+                return None
+        else:
+            if tipster_line is None:
+                return None
+        if market_type == "total":
+            side = (side or "").strip().lower()
+            if side not in ("over", "under"):
+                return None
+
+        event = resolve_nfl_event(canonical_team)
+        if not event:
+            log.info(f"NFL auto-place: no event found for {canonical_team!r} -> manual")
+            return None
+
+        pc = None
+        probe_sid = None
+        for _sid in priority_sessions:
+            _pc = hb.price_check_sports(session_id=str(_sid), sport="nfl", event=event)
+            if _pc.get("success"):
+                pc, probe_sid = _pc, str(_sid)
+                break
+            log.info(
+                f"NFL auto-place: price-check failed on session {_sid} for "
+                f"{event!r} ({_pc.get('error', 'unknown')}) -- trying next session"
+            )
+        if pc is None:
+            log.info(f"NFL auto-place: price-check failed on every priority session for {event!r} -> manual")
+            return None
+
+        market = (pc.get("markets") or {}).get(catalog_key)
+        if not market:
+            log.info(f"NFL auto-place: no live {catalog_key!r} market for {event!r} -> manual")
+            return None
+
+        # v6.26 code review (xhigh adversarial pass, BLOCKER): a real live
+        # probe showed HyperBot merges a genuinely DIFFERENT market type
+        # under the SAME catalog key -- a 3-way "Handicap Betting (Inc.
+        # Tie)" market (team/team/Tie) sits alongside the normal 2-way
+        # handicap under `line`, and because Sportsbet's 2-way handicaps
+        # use HALF-point lines specifically to avoid a push, the WHOLE-
+        # number line a tipster states ("Dallas Cowboys -3.0") can ONLY
+        # ever exist on the 3-way market. Exact-line matching alone would
+        # silently place on it: a push on the tipster's actual 2-way pick
+        # becomes a real loss if the Tie outcome hits on the 3-way one.
+        # Selections sharing one `market_external_id` are one cohesive
+        # market instance; excluding any group that contains a Tie/Draw
+        # selection removes the whole 3-way market structurally, rather
+        # than guessing from the human-readable raw_market_name string.
+        _tie_group_ids = {
+            s.get("market_external_id")
+            for s in (market.get("selections", []) or [])
+            if (s.get("selection") or "").strip().lower() in ("tie", "draw")
+        }
+
+        hits = []
+        for s in market.get("selections", []) or []:
+            if s.get("market_external_id") in _tie_group_ids:
+                continue
+            sel_name = (s.get("selection") or "").strip().lower()
+            if market_type in ("h2h", "spread"):
+                if sel_name != canonical_team.strip().lower():
+                    continue
+                if market_type == "spread":
+                    if s.get("line") is None:
+                        continue
+                    if abs(float(s["line"]) - float(tipster_line)) > 1e-9:
+                        continue
+                hits.append(s)
+            elif market_type == "total":
+                if (s.get("direction") or "").strip().lower() != side:
+                    continue
+                if s.get("line") is None:
+                    continue
+                if abs(float(s["line"]) - float(tipster_line)) > 1e-9:
+                    continue
+                hits.append(s)
+
+        if len(hits) != 1:
+            log.info(
+                f"NFL auto-place: {len(hits)} matching {catalog_key!r} selections for "
+                f"{canonical_team!r} line={tipster_line} -> manual (need exactly 1)"
+            )
+            return None
+        sel = hits[0]
+
+        live_line = sel.get("line")
+        live_odds = sel.get("odds")
+        if _exceeds_odds_ceiling(tipster, tipster_odds, live_odds):
+            log.info(
+                f"NFL auto-place: {canonical_team!r} {market_type} live odds "
+                f"{live_odds} exceed the ceiling over tipster odds "
+                f"{tipster_odds} -> manual"
+            )
+            return None
+        if _below_odds_floor(tipster_odds, live_odds):
+            log.info(
+                f"NFL auto-place: {canonical_team!r} {market_type} live odds "
+                f"{live_odds} more than 10% below tipster odds {tipster_odds} "
+                f"-> manual"
+            )
+            return None
+
+        probe_meta = session_priority.get_session_meta(probe_sid)
+        probe_bookie = probe_meta.bookmaker if probe_meta else ""
+        if not probe_bookie:
+            log.warning(
+                f"NFL auto-place: no sessions.yaml metadata for probe session "
+                f"{probe_sid!r} -- cannot verify its bookie, refusing to place "
+                f"against an unverified catalog"
+            )
+            return None
+
+        # direction is a HyperBot over/under field (see place_single_sports_
+        # bet's docstring) -- only meaningful for "total"; h2h/spread select
+        # by TEAM NAME via `selection`, matching main.py's existing AFL/NBA
+        # h2h/line normalization (~line 13252-13258: "For H2H: selection
+        # must be team name").
+        return {
+            "event": event, "market": catalog_key,
+            "selection": sel.get("selection") or canonical_team,
+            "line": live_line, "odds": live_odds,
+            "proposition_id": sel.get("proposition_id"),
+            "direction": side if market_type == "total" else None,
+            "team": canonical_team, "probe_session_id": probe_sid, "bookie": probe_bookie,
+        }
+    except Exception as e:
+        log.error(f"NFL auto-place: team-market resolve crashed for {team!r} {market_type!r}: {e}")
+        return None
+
+
 def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: str,
                              stat: str, side: str, tipster_line, units, unit_size,
-                             raw_message: str, tipster_odds=None, telegram_msg_id=None) -> bool:
+                             raw_message: str, tipster_odds=None, telegram_msg_id=None,
+                             market_type: str = "player_prop") -> bool:
     """Attempt to auto-place an NFL tip against the live Sportsbet market.
     SYNCHRONOUS (plain def) by design -- the caller MUST run this via
     _run_in_placement_executor, never awaited/called bare on the event loop
@@ -17069,7 +17265,18 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
     placed anyway if a placement session ALSO had no sessions.yaml entry
     (empty == empty). _resolve_nfl_market now genuinely refuses (returns
     None) on a missing probe bookie, with the placement-loop check kept as
-    an independent second layer, not the only one."""
+    an independent second layer, not the only one.
+
+    v6.26 (Wilson: "i need it to parse the mass tips msg to able to
+    extract the proper tips one by one and then place them" -- the real
+    4th&EV text build): market_type is now a real dispatch parameter, not
+    always "player_prop". "h2h"/"spread"/"total" resolve via the new
+    _resolve_nfl_team_market (team-level moneyline/handicap/total) instead
+    of _resolve_nfl_market (player props); everything downstream of
+    resolution -- dedup, liability cap, bookie cross-check, placement,
+    ambiguous reconciliation, alerting -- is UNCHANGED and shared, so a
+    team-market bet gets every safety mechanism a player-prop bet already
+    has, not a hand-rolled parallel copy of them."""
     try:
         priority = session_priority.get_priority_for("nfl", is_sgm=False)
         if not priority:
@@ -17122,14 +17329,48 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         # both do the (redundant, harmless, read-only) price-check, then
         # serialize on this lock; the second one in finds the fp already
         # registered.
-        match = _resolve_nfl_market(player, team, stat, side, tipster_line, priority,
-                                     tipster, tipster_odds)
+        market_type_norm = (market_type or "player_prop").strip().lower()
+        if market_type_norm == "player_prop":
+            match = _resolve_nfl_market(player, team, stat, side, tipster_line, priority,
+                                         tipster, tipster_odds)
+        elif market_type_norm in _NFL_TEAM_MARKET_KEY:
+            match = _resolve_nfl_team_market(team, market_type_norm, tipster_line, side,
+                                              priority, tipster, tipster_odds)
+        else:
+            log.info(f"NFL auto-place: unrecognised market_type {market_type!r} -> manual")
+            return False
         if not match:
             return False
 
-        fp = ("NFL", tipster, (player or "").strip().lower(), (team or "").strip().lower(),
-              (stat or "").strip().lower(), (side or "").strip().lower(),
-              match["event"], _fp_line, units_f)
+        # v6.26: one readable label reused in every alert/log line below --
+        # avoids each site separately guessing which of player/team/stat is
+        # meaningful for THIS market_type (team markets leave player/stat
+        # empty; player props leave team-level fields unused).
+        if market_type_norm == "player_prop":
+            _bet_label = f"{player} {side} {tipster_line} {stat}"
+        elif market_type_norm == "h2h":
+            _bet_label = f"{match['team']} moneyline"
+        elif market_type_norm == "spread":
+            _bet_label = f"{match['team']} spread {tipster_line}"
+        else:  # total
+            _bet_label = f"{match['team']} total {side} {tipster_line}"
+
+        # v6.26 code review (xhigh adversarial pass, HIGH): use match["team"]
+        # (the CANONICAL name _resolve_nfl_market/_resolve_nfl_team_market
+        # already resolved, via NFL_TEAM_ALIASES or the roster) here, not
+        # the raw `team` parameter as parsed. "Broncos", "DEN", and "Denver
+        # Broncos" all resolve to the same event and place identically, but
+        # would have produced THREE different fingerprints -- a Telethon
+        # redelivery reparsed with a different spelling, or a Claude-vs-
+        # Groq provider fallback wording a team differently, would then
+        # double-place instead of being caught as the same bet.
+        #
+        # market_type folded into the key so a player-prop fingerprint can
+        # never collide with a team-market one even where player/stat and
+        # team/market_type happen to share empty-string fields.
+        fp = ("NFL", tipster, market_type_norm, (player or "").strip().lower(),
+              (match.get("team") or team or "").strip().lower(), (stat or "").strip().lower(),
+              (side or "").strip().lower(), match["event"], _fp_line, units_f)
 
         with _nfl_dedup_lock:
             _now = datetime.now()
@@ -17149,8 +17390,8 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
             # the same. Still returns True (fully handled -- the caller
             # must NOT also fire its own manual alert), but "handled" now
             # means "Wilson was told", not "nothing happened".
-            _dup_msg = (f"NFL DUPLICATE on {channel_name}: {player} {side} "
-                        f"{tipster_line} {stat} for {match['event']} -- already "
+            _dup_msg = (f"NFL DUPLICATE on {channel_name}: {_bet_label} "
+                        f"for {match['event']} -- already "
                         f"placed/attempted within the last "
                         f"{NFL_DEDUP_TTL_SEC // 86400} day(s). NOT re-placed. "
                         f"If this genuinely is a new/different bet, place it by "
@@ -17179,9 +17420,28 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
 
         max_odds = _bookie_max_odds(tipster, tipster_odds, target_odds=match.get("odds"))
 
+        # v6.26: team markets (h2h/spread) have no over/under direction --
+        # match["direction"] is None for those (see _resolve_nfl_team_
+        # market's docstring) -- so the ParsedLeg's selection must come
+        # from match["selection"] (the team name, or "Over"/"Under" for
+        # total) there instead of the player-prop path's match["direction"].
+        #
+        # v6.26 code review (xhigh adversarial pass): models.ParsedLeg's own
+        # docstring enumerates the codebase's canonical `market` values as
+        # "player_prop", "h2h", "total", "line" -- "spread" is not one of
+        # them, and notify_bet_failed keys on "line" specifically to decide
+        # how to render a failed-bet alert. market_type_norm stays "spread"
+        # everywhere else in this function (logs, the liability-cap
+        # translation, _bet_label) since "line" would be ambiguous there
+        # against the generic numeric-threshold meaning of that word; this
+        # is the one place it must match the shared ParsedLeg/notifier
+        # convention instead.
+        _leg_market = "line" if market_type_norm == "spread" else market_type_norm
         leg = ParsedLeg(
-            market="player_prop", player=player or "", stat=stat or "",
-            line=match["line"], selection=match["direction"],
+            market=_leg_market, player=player or "", stat=stat or "",
+            line=match["line"],
+            selection=(match["direction"] if market_type_norm == "player_prop"
+                       else match["selection"]),
             team_full=match["team"], raw_text=raw_message,
         )
         tip = ParsedTip(
@@ -17235,9 +17495,17 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
             # the retry loop -- an earlier version resolved this once against
             # priority[0] and reused it for whichever session actually
             # placed, sizing against the wrong account's cap on any fallback.
+            #
+            # v6.26: the liability-cap yaml key for a team market is
+            # market_type_norm itself ("h2h"/"total" match
+            # KNOWN_NFL_MARKETS directly; "spread" translates to "line",
+            # the one place that translation matters -- see
+            # _NFL_TEAM_MARKET_KEY's comment).
+            _cap_market = (stat or "").strip().lower() if market_type_norm == "player_prop" \
+                else ("line" if market_type_norm == "spread" else market_type_norm)
             try:
                 stake, cap_reason = session_priority.resolve_max_stake(
-                    sid, "nfl", (stat or "").strip().lower(),
+                    sid, "nfl", _cap_market,
                     match.get("odds") or 0, intended_stake,
                 )
             except Exception as e:
@@ -17343,8 +17611,8 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         try:
             if result.success:
                 log.warning(
-                    f"[{channel_name}] NFL AUTO-PLACED: {player} {match['direction']} "
-                    f"{match['line']} {stat} @ {result.odds} ${result.stake} on "
+                    f"[{channel_name}] NFL AUTO-PLACED: {_bet_label} "
+                    f"@ {result.odds} ${result.stake} on "
                     f"{result.bookie}:{result.session_id} (tipster line {tipster_line}, "
                     f"bet_id={result.bet_id})"
                 )
@@ -17360,8 +17628,7 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
                     try:
                         notifier.notify_critical(
                             f"NFL bet PLACED but the placed-alert failed on "
-                            f"{channel_name}: {player} {match['direction']} "
-                            f"{match['line']} {stat} ${result.stake} on "
+                            f"{channel_name}: {_bet_label} ${result.stake} on "
                             f"{result.bookie}:{result.session_id}, bet_id={result.bet_id} "
                             f"-- verify the ledger row exists ({e})"
                         )
@@ -17371,8 +17638,8 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
                 log.error(f"[{channel_name}] NFL auto-place AMBIGUOUS: {result.error}")
                 try:
                     notifier.notify_critical(
-                        f"NFL AUTO-PLACE AMBIGUOUS on {channel_name}: {player} "
-                        f"{match['direction']} {match['line']} {stat} ${stake} -- "
+                        f"NFL AUTO-PLACE AMBIGUOUS on {channel_name}: {_bet_label} "
+                        f"${stake} -- "
                         f"the bet MAY have landed at {result.bookie}:{result.session_id}. "
                         f"Check HyperBot pending_bets before placing this again by "
                         f"hand -- do NOT re-place blindly.\n\n{raw_message}"
@@ -17492,7 +17759,13 @@ async def _route_image_nfl_tips(raw_tips: list, tipster: str, channel_name: str,
         except Exception as e:
             desc = f"(description render failed: {e}; raw={raw!r})"
 
-        if (raw.get("market_type") or "").strip().lower() == "player_prop":
+        _mt = (raw.get("market_type") or "").strip().lower()
+        # v6.26: was player_prop-only. IMAGE_PROMPT_NFL has ALWAYS emitted
+        # h2h/spread/total (see its own market_type enum) -- this gate just
+        # never let them reach auto-place, so any team-market bet on a real
+        # 4th&EV card fell to manual even though _resolve_nfl_team_market
+        # now exists to resolve it.
+        if _mt in ("player_prop", "h2h", "spread", "total"):
             raw_text_for_alert = desc + (f"\n\n---- caption ----\n{raw_caption}" if raw_caption else "")
             # v6.22 code review: _attempt_nfl_auto_place makes genuinely
             # blocking HyperBot HTTP calls -- MUST run off the event loop,
@@ -17503,7 +17776,7 @@ async def _route_image_nfl_tips(raw_tips: list, tipster: str, channel_name: str,
                 tipster, channel_name, raw.get("player"), raw.get("team"),
                 raw.get("stat"), raw.get("side"), raw.get("line"),
                 raw.get("units"), unit_size, raw_text_for_alert,
-                raw.get("odds"),
+                raw.get("odds"), None, _mt,
             )
             if handled:
                 continue
@@ -17677,6 +17950,124 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
             )
         except Exception as e:
             log.error(f"[{channel_name}] A1 NFL tip {idx} alert failed: {e}")
+
+
+async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str,
+                                       unit_size: float = 0.0) -> None:
+    """Route a 4th and +EV NFL TEXT message (his image-card format's real-
+    world sibling): AUTO-PLACES each extracted leg that matches a live
+    Sportsbet market within tolerance, exactly like _route_image_nfl_tips
+    does for his image cards -- same _attempt_nfl_auto_place call, same
+    market_type gate (player_prop/h2h/spread/total), same fallback to a
+    MANUAL alert per non-matching leg.
+
+    v6.26 (2026-09-16, Wilson: "i need it to parse the mass tips msg to "
+    "able to extract the proper tips one by one and then place them" --
+    built after an xhigh-effort 3-agent audit of real production data
+    found 4th&EV had switched to text for nearly every real tip since
+    2026-09-11, and that text posts on his image_tips channel had NO
+    auto-place path at all, only a manual alert (which was ALSO truncating
+    his multi-leg slates to 200 chars -- fixed separately, see the
+    dispatch site that calls this).
+
+    UNLIKE A1 (one headline tip per message, deliberate): 4th&EV's real
+    slates carry MULTIPLE legs per message (numbered 'BET 1:'/'2:'/etc, or
+    split across a 'Part 1'/'Part 2' pair of separate messages continuing
+    the same numbering) -- TEXT_PROMPT_FOURTHANDEV_NFL extracts every leg,
+    mirroring IMAGE_PROMPT_NFL's own multi-tip shape exactly (same field
+    names, same market_type enum), so _describe_nfl_image_tip renders
+    these raw dicts identically to an image-parsed one -- no separate
+    renderer needed. A 'Part 2' message needs no special cross-message
+    state: it is parsed independently and each of its legs gets its own
+    dedup fingerprint, same as any other message."""
+    loop = asyncio.get_event_loop()
+    # Mirrors _route_a1_nfl_text's provider-fallback shape exactly (see
+    # that function's v6.21 code-review comment for why the naive
+    # "claude_fallback and not claude_primary" guard is wrong here).
+    _primary_claude = tip_parser._claude_primary_enabled()
+    try:
+        if _primary_claude:
+            raw_tips, elapsed = await loop.run_in_executor(
+                None, tip_parser.parse_fourthandev_nfl_text_fallback, text, tipster
+            )
+        else:
+            raw_tips, elapsed = await loop.run_in_executor(
+                None, parse_fourthandev_nfl_text, text, tipster
+            )
+    except Exception as e:
+        log.warning(f"[{channel_name}] 4th&EV NFL text parse failed ({e}); trying the other provider")
+        raw_tips = None
+        try:
+            if _primary_claude:
+                raw_tips, elapsed = await loop.run_in_executor(
+                    None, parse_fourthandev_nfl_text, text, tipster
+                )
+            elif tip_parser._claude_fallback_enabled():
+                raw_tips, elapsed = await loop.run_in_executor(
+                    None, tip_parser.parse_fourthandev_nfl_text_fallback, text, tipster
+                )
+        except Exception as e2:
+            log.error(f"[{channel_name}] 4th&EV NFL text parse failed on both providers: {e2}")
+        if raw_tips is None:
+            try:
+                notifier.notify_text_manual_alert(
+                    channel_name, text, header="4TH&EV NFL PARSE FAILED",
+                )
+            except Exception as e3:
+                log.error(f"[{channel_name}] 4th&EV NFL parse-failure alert failed: {e3}")
+            return
+
+    if not raw_tips:
+        # v6.26 code review (xhigh adversarial pass, HIGH): unlike
+        # _route_a1_nfl_text (called for EVERY message on a pure-text
+        # channel, so a 0-tip chatter result is the common case and a
+        # silent drop is correct), this router is ONLY reached after
+        # _image_text_is_actionable() has already classified the message
+        # as bet-like. A 0-tip parse here means either the LLM's broad
+        # CHATTER clause caught something it shouldn't have, or every leg
+        # got filtered out downstream -- the pre-existing behaviour for
+        # this exact dispatch branch (before this router existed) was an
+        # UNCONDITIONAL manual alert; dropping to a log-only line here
+        # would silently regress that guarantee for a message someone
+        # already decided was worth surfacing.
+        log.warning(f"[{channel_name}] 4th&EV NFL text classified actionable but parsed "
+                    f"to 0 tips -> manual (review the classification): {text[:80]}")
+        try:
+            notifier.notify_text_manual_alert(
+                channel_name, text, header="4TH&EV NFL, MANUAL (parsed to 0 tips)",
+            )
+        except Exception as e:
+            log.error(f"[{channel_name}] 4th&EV NFL zero-tip alert failed: {e}")
+        return
+
+    log.info(f"[{channel_name}] 4th&EV NFL text extracted {len(raw_tips)} tip(s) in {elapsed:.2f}s")
+    for idx, raw in enumerate(raw_tips):
+        try:
+            desc = _describe_nfl_image_tip(raw)
+        except Exception as e:
+            desc = f"(description render failed: {e}; raw={raw!r})"
+
+        _mt = (raw.get("market_type") or "").strip().lower()
+        if _mt in ("player_prop", "h2h", "spread", "total"):
+            handled = await _run_in_placement_executor(
+                _attempt_nfl_auto_place,
+                tipster, channel_name, raw.get("player"), raw.get("team"),
+                raw.get("stat"), raw.get("side"), raw.get("line"),
+                raw.get("units"), unit_size,
+                f"{desc}\n\n---- full message ----\n{text}",
+                raw.get("odds"), None, _mt,
+            )
+            if handled:
+                continue
+
+        try:
+            notifier.notify_text_manual_alert(
+                channel_name,
+                f"{desc}\n\n---- full message ----\n{text}",
+                header="4TH&EV NFL TEXT, MANUAL",
+            )
+        except Exception as e:
+            log.error(f"[{channel_name}] 4th&EV NFL text tip {idx} alert failed: {e}")
 
 
 async def _process_image_tip(image_bytes: bytes, tipster: str, sport: str,
@@ -19849,6 +20240,31 @@ async def main():
                                     img_unit_size, img_default_units, msg_time, channel_name,
                                 )
                             )
+                    elif (img_sport or "").lower() == "nfl" and FOURTHANDEV_TEXT_PLACE_ENABLED:
+                        # v6.26 (2026-09-16, Wilson: "i need it to parse the
+                        # mass tips msg to able to extract the proper tips
+                        # one by one and then place them"). 4th&EV's REAL
+                        # posting pattern (xhigh audit, first ~5 days of
+                        # production data): 2 image tips total, then TEXT
+                        # for nearly every slate since -- this branch is
+                        # what the image-only build was missing. Routes
+                        # through the SAME auto-place path as his image
+                        # cards (_attempt_nfl_auto_place via
+                        # _route_fourthandev_nfl_text), so a text slate now
+                        # gets exactly the money-safety machinery an image
+                        # slate already had, not a lesser copy. Gated by
+                        # FOURTHANDEV_TEXT_PLACE_ENABLED (defaults ON, but a
+                        # real kill switch for a brand-new real-money path's
+                        # first live use -- .env + restart, no redeploy
+                        # needed, mirroring EDDIE_TEXT_PLACE_ENABLED's own
+                        # rationale). When off, falls to the generic manual
+                        # alert branch below, same as before this shipped.
+                        log.info(f"[{channel_name}] actionable 4th&EV NFL TEXT post -> parsing for placement")
+                        asyncio.create_task(
+                            _route_fourthandev_nfl_text(
+                                text, img_tipster, channel_name, unit_size=img_unit_size,
+                            )
+                        )
                     else:
                         # v6.25 code review (xhigh audit): this was calling
                         # notify_image_alert, which truncates to 200 chars

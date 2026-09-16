@@ -298,6 +298,42 @@ def parse_a1_nfl_text_claude(text, tipster="a1_fantasy_nfl", model=None):
     return tips, elapsed
 
 
+def parse_fourthandev_nfl_text_claude(text, tipster="fourthandev_nfl", model=None):
+    """Free-TEXT 4th and +EV NFL parse via Claude -- mirrors
+    parse_a1_nfl_text_claude exactly (same fallback/raise semantics), using
+    groq_parser.TEXT_PROMPT_FOURTHANDEV_NFL. Unlike A1's one-headline-tip
+    parse, this extracts EVERY leg in a multi-bet slate."""
+    start = time.time()
+    if not ANTHROPIC_API_KEY:
+        return [], 0.0
+    if not (text or "").strip():
+        return [], 0.0
+    model = model or CLAUDE_PARSER_MODEL
+    user_content = f"Tipster: {tipster}\nMessage:\n{text}"
+    content = _complete_text(groq_parser.TEXT_PROMPT_FOURTHANDEV_NFL, user_content, model)
+    elapsed = time.time() - start
+
+    content = content.replace("```json", "").replace("```", "").strip()
+    parsed = groq_parser._parse_json_with_repair(content)
+    if parsed is None:
+        raise ValueError(f"parse_fourthandev_nfl_text_claude: invalid JSON (repair failed) for {tipster}")
+    if not isinstance(parsed, dict):
+        raise ValueError(f"parse_fourthandev_nfl_text_claude: top-level JSON not an object for {tipster}")
+    tips = parsed.get("tips", [])
+    if not isinstance(tips, list):
+        raise ValueError(f"parse_fourthandev_nfl_text_claude: 'tips' not a list for {tipster}")
+    tips = [
+        t for t in tips
+        if isinstance(t, dict) and (
+            (t.get("player") or "").strip()
+            or (t.get("team") or "").strip()
+            or (t.get("description") or "").strip()
+        )
+    ]
+    log.info(f"parse_fourthandev_nfl_text_claude ({model}): {tipster} extracted {len(tips)} raw tip(s) in {elapsed:.2f}s")
+    return tips, elapsed
+
+
 # ── Web-search RESOLVERS ─────────────────────────────────────────────
 # When the roster/HB catalog can't resolve a player or track, ask Claude to
 # look it up with the server-side web_search tool. The result is ONLY a hint —

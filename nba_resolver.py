@@ -167,18 +167,28 @@ def _fetch_schedule(sport: str, date: str) -> list[dict]:
 
     try:
         # v6.22 (2026-09-10): Akamai (ESPN's CDN) started 403-blocking the bare
-        # "tipbot/1.0" UA specifically -- verified live, back-to-back same
-        # request: "tipbot/1.0" -> 403, a browser-style UA -> 200. Zero prior
-        # occurrences in tipbot.log (this path is rarely exercised: MLB has no
-        # priority list, NBA is out of season in September), so it was dormant
-        # rather than actively broken, but it would have silently degraded
-        # MLB/NBA/NFL event resolution the next time any of them needed it.
+        # "tipbot/1.0" UA -- verified live, back-to-back same request:
+        # "tipbot/1.0" -> 403, a browser-style UA -> 200. Fixed by switching
+        # to a browser UA.
+        #
+        # v6.25 (2026-09-16): that fix had since STOPPED WORKING -- verified
+        # live again, same A/B methodology: a Chrome UA -> 403, a Safari UA
+        # -> 403, "tipbot/1.0" -> 403, but sending NO User-Agent override at
+        # all (requests' own default "python-requests/X.Y.Z" string) -> 200
+        # with real data. Akamai's bot-detection evidently now flags a
+        # request that CLAIMS to be a real browser but is missing every
+        # other header/behaviour a real browser would send (the exact
+        # signature this fix added) -- and, counter-intuitively, does NOT
+        # flag an honest "this is a script" UA. This path was NEVER
+        # successfully exercised in production before this fix (zero
+        # "Resolved NFL"/"ESPN schedule fetch failed" log lines ever, for
+        # any sport) -- the v6.22 fix looked plausible from a clean isolated
+        # test but nothing had actually placed an NFL/MLB bet yet to prove
+        # it live end-to-end. Do NOT reintroduce a UA override without a
+        # fresh live A/B test first; this has now flipped behaviour twice.
         resp = requests.get(
             url,
             params={"dates": date.replace("-", "")},
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                    "Chrome/120.0.0.0 Safari/537.36"},
             timeout=10,
         )
         resp.raise_for_status()
