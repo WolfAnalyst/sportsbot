@@ -15285,7 +15285,19 @@ def _image_text_is_actionable(text: str, sport: str = "") -> bool:
     # SKIP this for RACING — that text path PARSES+PLACES real money and already
     # has its own results guard, so a recap word in a real forward tip
     # ('R4 7 Lingani 2u for the next meet') must NOT be silently dropped here.
-    if ((sport or "").lower() != "racing"
+    #
+    # v6.29 (2026-09-19, Wilson: "how is a1 and 4th ev both still routing all
+    # to manual"): SKIP this for NFL too, same reasoning as racing. Since
+    # v6.27, 4th&EV's NFL text IS the real tip (parsed+placed, not just
+    # supplementary commentary like Eddie's AFL text) and his real slates are
+    # long analysis paragraphs that routinely use "result(s)" as an ordinary
+    # verb ("...which should result in plenty of second half carries") —
+    # _IMAGE_SUMMARY_RE's \bresults?\b silently dropped an entire real 7-leg
+    # slate (BET 1..7, real $ prices/Units/Bookie fields) as if it were a
+    # recap. A real forward tip already survives via _image_text_selection_pattern
+    # /the actionable-keyword list; this guard is skipped so a stray "result"
+    # in the analysis prose can't take it down first.
+    if ((sport or "").lower() not in ("racing", "nfl")
             and (_IMAGE_SUMMARY_RE.search(t) or _IMAGE_RECAP_RE.search(t))
             and not _IMAGE_URGENT_INSTRUCTION_RE.search(t)):
         return False
