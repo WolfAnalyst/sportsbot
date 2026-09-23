@@ -1765,6 +1765,172 @@ def parse_fourthandev_nfl_text(
     return tips, elapsed
 
 
+# v6.32 (Wilson 2026-09-23: "build nbl please ... they come in as huge chunks of
+# text with multiple tips for each game"). The Bettors Edge - NBL channel
+# (-1003319708262). Written against the channel's FULL history (80 messages,
+# 2025-12 to 2026-09, all text): one post covers 1-2 games, each under a
+# 'Team v Team' header, one bet per line as '<selection> $<odds>. [bookie.]
+# <N> units', with '- ' commentary lines between. Since 2026-09-19 his stated
+# rule is "all bets will always be on Sportsbet, unless otherwise specified
+# it'll be 365" -- so an untagged leg is Sportsbet (bookie=null here, the router
+# applies the rule). Team fields are forced to ESPN's canonical names so the
+# resolver never has to guess 'Kings'/'Hawks'/'Phoenix' (which collide with NBA).
+NBL_CANONICAL_TEAMS = (
+    "Adelaide 36ers", "Brisbane Bullets", "Cairns Taipans", "Illawarra Hawks",
+    "Melbourne United", "New Zealand Breakers", "Perth Wildcats",
+    "South East Melbourne Phoenix", "Sydney Kings", "Tasmania JackJumpers",
+)
+
+TEXT_PROMPT_BETTORSEDGE_NBL = (
+    "You are an extraction tool for NBL (Australian National Basketball League) "
+    "betting-tip TEXT MESSAGES from 'The Bettors Edge - NBL' channel. Extract EVERY "
+    "real bet in the message. Respond with ONLY valid JSON, no markdown fences, in "
+    "this shape: "
+    '{"tips": [ {"game_team_1": str|null, "game_team_2": str|null, '
+    '"market_type": "player_prop"|"h2h"|"spread"|"total"|"sgm"|"other", '
+    '"player": str|null, "team": str|null, "stat": str|null, '
+    '"side": "over"|"under"|null, "line": number|null, "threshold": integer|null, '
+    '"odds": number|null, "bookie": "sportsbet"|"bet365"|"tab"|null, '
+    '"units": number|null, "description": str|null} ]}. '
+    "TEAMS: every team field (game_team_1, game_team_2, team) MUST be one of exactly "
+    "these ten names, or null: " + ", ".join(NBL_CANONICAL_TEAMS) + ". Map his "
+    "shorthand: Adelaide/36ers -> Adelaide 36ers; Brisbane/Bullets -> Brisbane "
+    "Bullets; Cairns/Taipans (also typos like 'Carina Taipans') -> Cairns Taipans; "
+    "Illawarra/Hawks -> Illawarra Hawks; Melbourne/United (when NOT 'South East') -> "
+    "Melbourne United; NZ/New Zealand/Breakers -> New Zealand Breakers; Perth/"
+    "Wildcats/Cats -> Perth Wildcats; SEM/South East/SE Melbourne/Phoenix -> South "
+    "East Melbourne Phoenix; Sydney/Kings -> Sydney Kings; Tasmania/Tassie/Jackies/"
+    "JackJumpers -> Tasmania JackJumpers. "
+    "GAME HEADERS: a line naming two teams ('Tassie v Cairns', 'SYDNEY KINGS V NZ "
+    "BREAKERS', 'Kings V Taipans', 'Brisbane vs Perth') starts a game; every bet "
+    "after it, until the next header, belongs to that game: set game_team_1/"
+    "game_team_2 to the two teams (canonical names, in the order written). A bet "
+    "with no header above it gets game_team_1=game_team_2=null. "
+    "PLAYER PROPS (market_type=\"player_prop\", `player`=the name exactly as printed, "
+    "fix nothing): "
+    "(a) OVER/UNDER form 'David Johnson over 16.5 points $1.90', 'Nathan Sobey UNDER "
+    "23.5 POINTS': side=over/under, line=the number, threshold=null. "
+    "(b) THRESHOLD form 'Parker Jackson Cartwright 10+ assists $3.55', 'John Brown 15+ "
+    "POINTS', 'Tyler Harvey 3+ 3's made', also written 'OVER 5+ ASSISTS': "
+    "threshold=the integer N, side=\"over\", line=null. "
+    "(c) 'Charles Bediako to record a double double $6.50' / 'DOUBLE DOUBLE': "
+    "stat=\"double_double\" (\"triple_double\" for a triple double), side=\"over\", "
+    "line=null, threshold=null. "
+    "`stat` is ONE of: points, rebounds, assists, threes (made threes / 3's made / "
+    "3PM), points_rebounds_assists ('points, rebounds and assists', PRA), "
+    "points_rebounds, points_assists, rebounds_assists ('rebounds and assists'), "
+    "steals, blocks, double_double, triple_double. "
+    "A line with a decimal number but NO over/under word and no '+' (e.g. 'Mitch "
+    "Norton 3.5 assists $2') is ambiguous: side=null. "
+    "TEAM MARKETS: '<Team> WIN $2.45' -> market_type=\"h2h\", team=that team, "
+    "line=null. '<Team> +4.5 $1.86' / '<Team> -10.5' -> market_type=\"spread\", "
+    "team=that team, line=the number WITH its sign. 'Total match points over 184.5', "
+    "'OVER 186.5 total points' -> market_type=\"total\", side=over/under, line=the "
+    "number, team=null (the game headers identify the game). "
+    "ODDS: '$1.87' -> 1.87, '$12' -> 12. Always AU decimal. "
+    "UNITS: '2 units', '2.5 UNITS', '1 unit', '.25 UNITS' -> the number (0.25). His "
+    "typos still mean units when they sit in the units position (e.g. '$10. 0.5 "
+    "assists' -> units 0.5; '0.5 UNTS' -> 0.5). "
+    "BOOKIE: a tag on the bet's own line: 'SPORTSBET'/'SB' -> \"sportsbet\"; '365'/"
+    "'BET 365'/'bet365' -> \"bet365\"; 'TAB' -> \"tab\"; 'SB/365' -> \"sportsbet\". A "
+    "SCOPE line applies to every following bet that has no tag of its own, until "
+    "the next scope line or game header: 'All on 365', 'All bets on 365 unless "
+    "specified', 'Bets on Sportsbet unless specified', 'VALUE SINGLES: 365', "
+    "'Values- SB', 'VALUE ... 365'. 'All Sportsbet aside from last one' means every "
+    "bet is sportsbet except the last, which keeps its own tag. No tag and no scope "
+    "-> bookie=null. "
+    "SGM / same-game multi (a block of legs sharing ONE price and ONE units figure): "
+    "ONE tip with market_type=\"sgm\", its odds and units, the legs listed in "
+    "`description`, other fields null. Never split an SGM into single bets. "
+    "CONDITIONAL / ALTERNATIVE NOTES are NOT separate bets: 'If you can't get on with "
+    "365, take the 10+ on SB for 1.5 units and the 12+ for 1 unit', 'Can get the "
+    "McVeigh bet for 19.5 on tab. Take that if you can' -- copy the note verbatim "
+    "into `description` of the bet(s) it refers to. "
+    "IGNORE: commentary lines (usually starting with '-' or plain prose reasoning), "
+    "section labels ('NBL TIPS', 'VALUE SINGLES', 'ROUGHIES', 'LATE BET'). "
+    "CHATTER -- return {\"tips\": []}: timing announcements ('Bets in 10 min', '5pm "
+    "for tips tonight!', 'Tips in about 15 minutes'), results/celebration ('Nice "
+    "start lads!', 'Bang bang!!'), admin ('5 more spots', 'prices have been moving "
+    "fast'). NEVER output both the over and the under of one line. "
+    "Use null for ANY field not covered above. JSON only."
+)
+
+
+def _groq_text_tips(prompt: str, text: str, tipster: str, fn_name: str,
+                    max_tokens: int = 3000, max_retries: int = 4) -> tuple[list[dict], float]:
+    """Groq text parse with the same retry/raise semantics as
+    parse_fourthandev_nfl_text: a VALID-but-empty parse returns ([], elapsed); a
+    hard failure RAISES so the caller routes to manual instead of losing a tip."""
+    start = time.time()
+    if not GROQ_API_KEY:
+        raise RuntimeError(f"{fn_name}: GROQ_API_KEY not set")
+    if not (text or "").strip():
+        return [], 0.0
+    body = {
+        "model": GROQ_TEXT_MODEL,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": text.strip()},
+        ],
+    }
+    content = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=30,
+            )
+            if resp.status_code == 429 and attempt < max_retries:
+                ra = resp.headers.get("retry-after")
+                wait = float(ra) if (ra and ra.replace(".", "", 1).isdigit()) \
+                    else 6.0 * (attempt + 1)
+                log.warning(f"{fn_name}: 429 for {tipster}, backing off {wait:.0f}s "
+                            f"(attempt {attempt + 1})")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            break
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                time.sleep(4.0 * (attempt + 1))
+                continue
+            log.error(f"{fn_name}: Groq request failed for {tipster}: {e}")
+            raise
+        except Exception as e:
+            log.error(f"{fn_name}: unexpected error for {tipster}: {e}")
+            raise
+
+    elapsed = time.time() - start
+    if not content:
+        raise RuntimeError(f"{fn_name}: no content returned")
+    content = content.replace("```json", "").replace("```", "").strip()
+    parsed = _parse_json_with_repair(content)
+    if parsed is None or not isinstance(parsed, dict):
+        log.error(f"{fn_name}: invalid JSON (repair failed) for {tipster}; raw: {content[:300]}")
+        raise RuntimeError(f"{fn_name}: invalid JSON")
+    tips = parsed.get("tips", [])
+    if not isinstance(tips, list):
+        raise RuntimeError(f"{fn_name}: 'tips' not a list")
+    tips = [t for t in tips if isinstance(t, dict)]
+    log.info(f"{fn_name}: {tipster} extracted {len(tips)} raw tip(s) in {elapsed:.2f}s")
+    return tips, elapsed
+
+
+def parse_bettorsedge_nbl_text(text: str, tipster: str = "bettorsedge_nbl",
+                               max_retries: int = 4) -> tuple[list[dict], float]:
+    """Parse a Bettors Edge NBL post into RAW leg dicts (every bet in the post)."""
+    return _groq_text_tips(TEXT_PROMPT_BETTORSEDGE_NBL, text, tipster,
+                           "parse_bettorsedge_nbl_text", max_retries=max_retries)
+
+
 def parse_with_groq(
     text: str,
     tipster: str,

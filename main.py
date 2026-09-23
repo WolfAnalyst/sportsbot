@@ -62,6 +62,7 @@ from config import (
     EDDIE_CAPTION_FALLBACK_ENABLED,
     EDDIE_TEXT_PLACE_ENABLED,
     FOURTHANDEV_TEXT_PLACE_ENABLED,
+    BETTORSEDGE_NBL_PLACE_ENABLED,
     SA_THOROUGHBRED_TRACKS,
     AFL_PERIOD_MARKETS_ENABLED,
     SAIYAN_HC_SGM_ENABLED,
@@ -99,6 +100,7 @@ from config import (
     DISPOSALS_MODEL_LIVENESS_CRITICAL,
 )
 from groq_parser import parse_tip_image, parse_a1_nfl_text, parse_fourthandev_nfl_text
+from groq_parser import parse_bettorsedge_nbl_text
 from models import ParsedTip, ParsedLeg, BetResult
 from parsers.saiyan_afl import parse_saiyan_message
 try:
@@ -131,8 +133,10 @@ from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
 from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
 from nba_resolver import resolve_nba_event, resolve_mlb_event, resolve_nfl_event, NFL_TEAM_ALIASES
+from nba_resolver import resolve_nbl_event, canonical_nbl_team
 from roster import resolve_player_name, get_player_team, afl_surname_candidates, afl_fuzzy_surname_candidates
 from roster import is_nfl_name_collision
+from roster import exact_match_player
 from roster import _GEN_SUFFIXES as _ROSTER_GEN_SUFFIXES, _fold_accents as _roster_fold_accents
 from roster import _team_matches as _roster_team_matches
 import notifier
@@ -17281,7 +17285,7 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
 
 def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stake: float,
                       cap_market: str, channel_name: str, raw_message: str,
-                      bet_label: str) -> list[BetResult]:
+                      bet_label: str, sport: str = "nfl") -> list[BetResult]:
     """v6.31 NFL concurrent fan-out (Wilson 2026-09-22: "fan out to all available
     sportsbet accounts and then place and then ladder down if needed").
 
@@ -17306,13 +17310,16 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     import time as _time_mod
     import concurrent.futures
     _t_start = _time_mod.time()
+    # v6.32: shared with the Bettors Edge NBL fan-out; `sport` drives the log/alert
+    # label and the sessions.yaml cap lookup (NBL caps resolve to the nba block).
+    _S = (sport or "nfl").upper()
     priced_bookie = (match.get("bookie") or "").strip().lower()
 
     # ── Eligible sessions: priority order, active + owned, priced bookie only ──
     try:
         raw_sessions = _v4_get_active_sessions_unfiltered(tip) or []
     except Exception as e:
-        log.error(f"[{channel_name}] NFL fan-out: could not list active sessions ({e})")
+        log.error(f"[{channel_name}] {_S} fan-out: could not list active sessions ({e})")
         raw_sessions = []
     active_by_sid = {str(s.get("session_id", "")): s for s in raw_sessions}
     sessions: list[dict] = []
@@ -17320,7 +17327,7 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     for sid in priority:
         sid = str(sid)
         if sid in seen:
-            log.warning(f"NFL fan-out: duplicate session {sid} in priority, de-duped")
+            log.warning(f"{_S} fan-out: duplicate session {sid} in priority, de-duped")
             continue
         seen.add(sid)
         meta = session_priority.get_session_meta(sid)
@@ -17328,26 +17335,26 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
         if not yaml_bookie:
             # Fail closed, same rule as the old sequential loop: no sessions.yaml
             # entry means the bookie can't be verified against the priced catalog.
-            log.warning(f"[{channel_name}] NFL fan-out: no sessions.yaml metadata for "
+            log.warning(f"[{channel_name}] {_S} fan-out: no sessions.yaml metadata for "
                         f"session {sid}, skipping rather than guess its bookie")
             continue
         if not priced_bookie or yaml_bookie != priced_bookie:
-            log.info(f"[{channel_name}] NFL fan-out: skipping session {sid} ({yaml_bookie}), "
+            log.info(f"[{channel_name}] {_S} fan-out: skipping session {sid} ({yaml_bookie}), "
                      f"priced against {priced_bookie or '?'}'s catalog")
             continue
         sess = active_by_sid.get(sid)
         if sess is None:
-            log.info(f"[{channel_name}] NFL fan-out: session {sid} not active, skipping")
+            log.info(f"[{channel_name}] {_S} fan-out: session {sid} not active, skipping")
             continue
         if ((sess.get("bookie") or "").strip().lower()) != priced_bookie:
-            log.warning(f"[{channel_name}] NFL fan-out: session {sid} is live on "
+            log.warning(f"[{channel_name}] {_S} fan-out: session {sid} is live on "
                         f"{sess.get('bookie')!r} but sessions.yaml says {yaml_bookie}, skipping")
             continue
         sessions.append(sess)
 
     if not sessions:
-        log.warning(f"[{channel_name}] NFL fan-out: no active {priced_bookie or '?'} session "
-                    f"in NFL_SESSION_PRIORITY for {bet_label} -> manual")
+        log.warning(f"[{channel_name}] {_S} fan-out: no active {priced_bookie or '?'} session "
+                    f"in {_S}_SESSION_PRIORITY for {bet_label} -> manual")
         return []
 
     # _execute_bet reads target_odds (not the resolver's "odds") and the exact
@@ -17366,7 +17373,7 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     }
     n_accounts = len(sessions)
     per_account = round(intended_stake / n_accounts, 2)
-    log.info(f"[{channel_name}] NFL fan-out: {bet_label} on {match['event']}: "
+    log.info(f"[{channel_name}] {_S} fan-out: {bet_label} on {match['event']}: "
              f"{n_accounts} account(s), intended ${intended_stake:.2f} -> "
              f"${per_account:.2f}/account (even split), live odds {match.get('odds')}")
 
@@ -17381,7 +17388,7 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
         sid = str(sess.get("session_id", ""))
         remaining = round(intended_stake - allocated, 2)
         if remaining <= 0:
-            log.info(f"NFL fan-out: unit fully allocated, session {sid} not needed")
+            log.info(f"{_S} fan-out: unit fully allocated, session {sid} not needed")
             break
         share = round(min(per_account, remaining), 2)
         # A sessions.yaml NFL cap, if Wilson ever adds one, still bounds the share
@@ -17389,13 +17396,13 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
         # a capped account's shortfall goes to manual like any other.
         try:
             _capped, _cap_reason = session_priority.resolve_max_stake(
-                sid, "nfl", cap_market, match.get("odds") or 0, share)
+                sid, sport, cap_market, match.get("odds") or 0, share)
             if _capped < share:
-                log.info(f"[{channel_name}] NFL fan-out: {sid} share ${share:.2f} "
+                log.info(f"[{channel_name}] {_S} fan-out: {sid} share ${share:.2f} "
                          f"capped to ${_capped:.2f} ({_cap_reason})")
                 share = round(_capped, 2)
         except Exception as e:
-            log.error(f"[{channel_name}] NFL fan-out: resolve_max_stake crashed for "
+            log.error(f"[{channel_name}] {_S} fan-out: resolve_max_stake crashed for "
                       f"{sid} ({e}), placing the uncapped share")
         # No minimum-stake floor: raising a small share to a floor gave the first
         # account several shares' worth and starved the rest (caught in the $1 live
@@ -17403,17 +17410,17 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
         if share <= 0:
             continue
         allocated = round(allocated + share, 2)
-        log.info(f"[{channel_name}] NFL fan-out: {sess.get('bookie')}:{sid} -> ${share:.2f}")
+        log.info(f"[{channel_name}] {_S} fan-out: {sess.get('bookie')}:{sid} -> ${share:.2f}")
         jobs.append((sess, [share]))
 
     if not jobs:
-        log.warning(f"[{channel_name}] NFL fan-out: no account had a usable stake for "
+        log.warning(f"[{channel_name}] {_S} fan-out: no account had a usable stake for "
                     f"{bet_label} -> manual")
         return []
 
     # ── Fire concurrently. From here on a bet may be on the book. ─────────
     results: list[BetResult] = []
-    log.info(f"[{channel_name}] NFL fan-out: firing {len(jobs)} concurrent placement(s)")
+    log.info(f"[{channel_name}] {_S} fan-out: firing {len(jobs)} concurrent placement(s)")
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
         futures = {
             ex.submit(_fanout_place_account, tip, sess, ladder, presolved): sess
@@ -17425,22 +17432,23 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
             try:
                 results.append(fut.result())
             except Exception as e:
-                log.error(f"[{channel_name}] NFL fan-out: placement on {sid} raised: {e}")
+                log.error(f"[{channel_name}] {_S} fan-out: placement on {sid} raised: {e}")
                 results.append(BetResult(
                     success=False, tip=tip, session_id=sid,
                     bookie=sess.get("bookie", "unknown"),
-                    error=f"NFL fan-out placement exception: {e}",
+                    error=f"{_S} fan-out placement exception: {e}",
                     timestamp=datetime.now()))
 
     try:
         _nfl_fanout_rollup(tip, jobs, results, intended_stake, channel_name,
-                           raw_message, bet_label, _time_mod.time() - _t_start)
+                           raw_message, bet_label, _time_mod.time() - _t_start,
+                           sport=sport)
     except Exception as e:
-        log.error(f"[{channel_name}] NFL fan-out: rollup/alerting crashed ({e}); "
+        log.error(f"[{channel_name}] {_S} fan-out: rollup/alerting crashed ({e}); "
                   f"placements were ATTEMPTED, so not re-trying")
         try:
             notifier.notify_critical(
-                f"NFL fan-out alerting crashed on {channel_name} for {bet_label} "
+                f"{_S} fan-out alerting crashed on {channel_name} for {bet_label} "
                 f"after placements fired ({e}). Check HyperBot pending_bets and the "
                 f"ledger before placing anything by hand.\n\n{raw_message}")
         except Exception:
@@ -17450,10 +17458,11 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
 
 def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake: float,
                        channel_name: str, raw_message: str, bet_label: str,
-                       elapsed_sec: float) -> None:
+                       elapsed_sec: float, sport: str = "nfl") -> None:
     """Classify an NFL fan-out's results and send the placed / unfilled / ambiguous
     alerts plus the audit row. Mirrors _place_etr_nba_fanout's tail. Split out so
     _place_nfl_fanout can guard it with one try/except after bets have fired."""
+    _S = (sport or "nfl").upper()
     placed_results: list[BetResult] = []
     ambiguous_results: list[BetResult] = []
     failed_results: list[BetResult] = []
@@ -17506,7 +17515,7 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
         "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
         "intended_stake": display_intended, "attempted_stake": attempted_stake,
         "placed_stake": total_placed, "ambiguous_stake": ambiguous_total,
-        "unfilled_stake": unfilled, "fanout": "nfl", "accounts": len(jobs),
+        "unfilled_stake": unfilled, "fanout": sport, "accounts": len(jobs),
         "placements": [
             {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
              "fill_odds": r.odds, "bet_id": r.bet_id}
@@ -17524,9 +17533,9 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
     })
 
     for r in placed_results:
-        log.warning(f"[{channel_name}] NFL AUTO-PLACED: {bet_label} @ {r.odds} "
+        log.warning(f"[{channel_name}] {_S} AUTO-PLACED: {bet_label} @ {r.odds} "
                     f"${r.stake} on {r.bookie}:{r.session_id} (bet_id={r.bet_id})")
-    log.info(f"[{channel_name}] NFL fan-out: placed ${total_placed:.2f} of "
+    log.info(f"[{channel_name}] {_S} fan-out: placed ${total_placed:.2f} of "
              f"${display_intended:.2f} across {len(placed_results)}/{len(jobs)} "
              f"account(s) ({len(failed_results)} failed, {len(ambiguous_results)} "
              f"ambiguous, ${unfilled:.2f} unfilled)")
@@ -17541,10 +17550,10 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
             )
         except Exception as e:
             # notify_tip_placed_summary also owns the ledger rows for these bets.
-            log.error(f"[{channel_name}] NFL fan-out: placed-summary alert failed: {e}")
+            log.error(f"[{channel_name}] {_S} fan-out: placed-summary alert failed: {e}")
             try:
                 notifier.notify_critical(
-                    f"NFL bet(s) PLACED but the placed-alert failed on {channel_name}: "
+                    f"{_S} bet(s) PLACED but the placed-alert failed on {channel_name}: "
                     f"{bet_label} ${total_placed:.2f} across "
                     f"{', '.join(f'{r.bookie}:{r.session_id}' for r in placed_results)}"
                     f" -- verify the ledger rows exist ({e})")
@@ -17552,7 +17561,7 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
                 pass
 
     if unfilled > 1.0:
-        log.warning(f"[{channel_name}] NFL fan-out: ${unfilled:.2f} unfilled for "
+        log.warning(f"[{channel_name}] {_S} fan-out: ${unfilled:.2f} unfilled for "
                     f"{bet_label} ({len(failed_results)} account(s) failed)")
         try:
             notifier.notify_tip_unfilled_with_placements(
@@ -17563,31 +17572,31 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
                 concurrent_bookies=True,
             )
         except Exception as e:
-            log.error(f"[{channel_name}] NFL fan-out: unfilled alert failed: {e}")
+            log.error(f"[{channel_name}] {_S} fan-out: unfilled alert failed: {e}")
         # The unfilled alert truncates the raw text to 300 chars; this keeps the full
         # tipster message (alt lines, take-down-to prices) in front of Wilson.
         try:
             notifier.notify_text_manual_alert(
                 channel_name, raw_message,
-                header=(f"NFL PARTIAL FILL, ${unfilled:.2f} left to place by hand"
+                header=(f"{_S} PARTIAL FILL, ${unfilled:.2f} left to place by hand"
                         if total_placed > 0 or ambiguous_total > 0
-                        else "NFL AUTO-PLACE FAILED, review"),
+                        else f"{_S} AUTO-PLACE FAILED, review"),
             )
         except Exception as e:
-            log.error(f"[{channel_name}] NFL fan-out: raw-text manual alert failed: {e}")
+            log.error(f"[{channel_name}] {_S} fan-out: raw-text manual alert failed: {e}")
         _log_jsonl(ERROR_LOG, {
             "type": "tip_unfilled", "tipster": tip.tipster, "event": tip.event,
             "intended_stake": display_intended, "attempted_stake": attempted_stake,
             "placed_stake": total_placed, "unfilled_stake": unfilled,
             "last_error": failed_results[-1].error if failed_results else None,
-            "message": tip.raw_message, "fanout": "nfl",
+            "message": tip.raw_message, "fanout": sport,
         })
 
     if ambiguous_outcomes:
         try:
             _emit_sports_ambiguous_alert(tip, ambiguous_outcomes)
         except Exception as e:
-            log.error(f"[{channel_name}] NFL fan-out: ambiguous alert failed: {e}")
+            log.error(f"[{channel_name}] {_S} fan-out: ambiguous alert failed: {e}")
         # _emit_sports_ambiguous_alert names only the event and accounts. A 4th&EV
         # slate often has several legs on one game, so say WHICH bet may have landed
         # (the old sequential path did; caught in the v6.31 review).
@@ -17595,12 +17604,12 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
             _accts = ", ".join(f"{o['bookie']}:{o['session_id']} ${o['stake']:.2f}"
                                for o in ambiguous_outcomes)
             notifier.notify_critical(
-                f"NFL AUTO-PLACE AMBIGUOUS on {channel_name}: {bet_label} -- "
+                f"{_S} AUTO-PLACE AMBIGUOUS on {channel_name}: {bet_label} -- "
                 f"${ambiguous_total:.2f} MAY have landed ({_accts}). Check HyperBot "
                 f"pending_bets before placing this again by hand -- do NOT re-place "
                 f"blindly.\n\n{raw_message}")
         except Exception as e:
-            log.error(f"[{channel_name}] NFL fan-out: ambiguous critical alert failed: {e}")
+            log.error(f"[{channel_name}] {_S} fan-out: ambiguous critical alert failed: {e}")
 
 
 def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: str,
@@ -17904,6 +17913,657 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         log.error(f"[{channel_name}] NFL auto-place crashed for {player!r}: {e} "
                   f"-> falling back to manual")
         return False
+
+
+# ── The Bettors Edge - NBL (v6.32) ────────────────────────────────────
+# Wilson 2026-09-23: "build nbl please ... be able to match the tips that come in
+# to that roster, they come in as huge chunks of text with multiple tips for each
+# game" and "the NBL telegram channel will ONLY be NBL, so dedicate to only NBL
+# player matching". Pipeline: TEXT_PROMPT_BETTORSEDGE_NBL parse -> each leg
+# resolved against the LIVE Sportsbet NBL catalog of its own game (never the NBA
+# tables) -> the shared concurrent fan-out (_place_nfl_fanout, sport="nbl").
+#
+# Catalog facts this is built on (live probe of Cairns v Tasmania, 2026-09-23):
+#   * player O/U selections: raw_market_name "<Player> - Points", direction
+#     over/under, line X.5. The SAME catalog key also carries "<Player> - 1st Qtr
+#     Points" (period "1q"), so every match is restricted to full-game rows.
+#   * thresholds: "To Score 20+ Points" / "To Record 8+ Assists" / "2+ Made
+#     Threes" / "To Record 2+ Steals", selection = the bare player name, line N-0.5.
+#     "N+" and "over N-0.5" are the same bet, so either row satisfies either form.
+#   * "To Record A Double Double" / "Triple Double" under `doubles`.
+#   * team selections use Sportsbet's names ("S.E. Melbourne Phoenix"), mapped
+#     through nba_resolver.canonical_nbl_team.
+# Every mismatch (unknown stat, player not in that game, line moved, price more
+# than 10% under his, 2+ candidate rows) goes to manual. Wilson's 365 rule
+# (2026-09-23): a leg he tags 365/TAB is still placed on Sportsbet if the price
+# is within 10% of his, which is exactly _nfl_odds_guard_refuses' floor.
+_NBL_PROP_STAT_KEY = {
+    "points": "player_points",
+    "rebounds": "player_rebounds",
+    "assists": "player_assists",
+    "threes": "player_threes",
+    "points_rebounds_assists": "player_pra",
+    "points_rebounds": "player_pts_rebs",
+    "points_assists": "player_pts_asts",
+    "rebounds_assists": "player_asts_rebs",
+    "steals": "player_steals",
+    "blocks": "player_blocks",
+    "double_double": "doubles",
+    "triple_double": "doubles",
+}
+# sessions.yaml cap key per catalog key (NBL caps resolve to the nba block).
+# `doubles` has no key of its own in sessions.yaml; without this mapping a
+# double/triple double would be the one uncapped NBL market (v6.32 review M1).
+_NBL_CAP_MARKET = {"head_to_head": "h2h", "line": "line", "pick_own_line": "line",
+                   "total_points": "total_points", "alternate_total": "total_points",
+                   "doubles": "player_threshold"}
+_NBL_MAX_UNITS = 5.0  # his whole history is 0.25-5u; anything above is a misparse
+NBL_MIN_SECS_BEFORE_START = 60  # refuse a leg this close to (or after) tip-off
+# He posts ~30 min before tip-off. A board whose game is days away means Sportsbet
+# matched a later meeting of the same two teams, not tonight's (review L1).
+NBL_MAX_SECS_BEFORE_START = 36 * 3600
+NBL_SB_COMPETITION_ID = "10605"  # Sportsbet's NBL competition (live probe 2026-09-23)
+_nbl_recent_fps: dict = {}  # {(tipster, event, market, selection, line, units): ts}
+_nbl_dedup_lock = threading.Lock()
+NBL_DEDUP_TTL_SEC = 3 * 24 * 3600
+
+
+def _nbl_name_tokens(s: str) -> list:
+    """Ordered lowercase alnum tokens, accent-folded, Jr./III dropped: the list
+    form of _nfl_slug_tokens ("Jo Lual-Acuil Jr." -> ['jo', 'lual', 'acuil'])."""
+    toks = re.findall(r"[a-z0-9]+", _roster_fold_accents((s or "").lower()))
+    core = [t for t in toks if t.rstrip(".") not in _ROSTER_GEN_SUFFIXES]
+    return core or toks
+
+
+def _nbl_match_player(name: str, candidates, allow_fuzzy: bool = True) -> tuple:
+    """Pick the ONE catalog player `name` refers to, from the players Sportsbet lists
+    for this game only. Returns (catalog_name, "") or (None, reason).
+
+    Deliberately not roster.fuzzy_match_player (v6.07 shipped four wrong-player
+    bets through it). Steps, each requiring a unique answer:
+      1. same token set ("Parker Jackson Cartwright" = "Parker Jackson-Cartwright")
+      2. same surname + compatible first name (Will/William, Jayljn/Jaylin), and
+         never a guess between two same-surname players (Cairns has two Browns)
+      3. only when the game is known from his header (allow_fuzzy): whole-name
+         similarity >= 0.88 with a 0.05 margin over the runner-up, for his typos
+         (Vasilevic, Rakoecevic, Mennnenga, Acual)."""
+    from difflib import SequenceMatcher
+    q = _nbl_name_tokens(name)
+    if not q:
+        return None, "no player name"
+    cands = {c: _nbl_name_tokens(c) for c in candidates if c}
+    exact = [c for c, t in cands.items() if set(t) == set(q)]
+    if len(exact) == 1:
+        return exact[0], ""
+    if len(exact) > 1:
+        return None, f"{name!r} matches {len(exact)} Sportsbet players"
+    if len(q) >= 2:
+        same_last = [c for c, t in cands.items() if len(t) >= 2 and t[-1] == q[-1]]
+
+        def _first_ok(a: str, b: str) -> bool:
+            if a == b:
+                return True
+            if min(len(a), len(b)) >= 3 and (a.startswith(b) or b.startswith(a)):
+                return True
+            return SequenceMatcher(None, a, b).ratio() >= 0.8
+
+        compat = [c for c in same_last if _first_ok(q[0], cands[c][0])]
+        if len(compat) == 1:
+            return compat[0], ""
+        if len(compat) > 1:
+            return None, f"{name!r} could be any of {compat}"
+    if allow_fuzzy:
+        qs = " ".join(q)
+        scored = sorted(((SequenceMatcher(None, qs, " ".join(t)).ratio(), c)
+                         for c, t in cands.items()), reverse=True)
+        if scored and scored[0][0] >= 0.88 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.05):
+            return scored[0][1], ""
+    return None, f"{name!r} not found among this game's Sportsbet players"
+
+
+def _nbl_roster_team_by_tokens(name: str) -> str:
+    """The NBL roster team of the ONE full-name roster entry whose tokens equal
+    `name`'s ("Parker Jackson Cartwright" = "Parker Jackson-Cartwright"), else ""
+    (no match or 2+ teams). Exact token equality only, never fuzzy."""
+    q = set(_nbl_name_tokens(name))
+    if len(q) < 2:
+        return ""
+    try:
+        import roster as _roster_mod
+        _roster_mod._load_rosters()
+        teams = {canonical_nbl_team(v.get("team")) for v in _roster_mod._nbl_roster.values()
+                 if " " in (v.get("name") or "") and set(_nbl_name_tokens(v["name"])) == q}
+    except Exception as e:
+        log.error(f"NBL roster token scan failed for {name!r}: {e}")
+        return ""
+    teams.discard("")
+    return next(iter(teams)) if len(teams) == 1 else ""
+
+
+def _nbl_full_game(sel: dict) -> bool:
+    period = (sel.get("period") or "full_game").strip().lower()
+    raw = (sel.get("raw_market_name") or "").lower()
+    return period == "full_game" and not re.search(
+        r"\b(qtr|quarter|half|1st|2nd|3rd|4th|q[1-4]|[1-4]q|[12]h|first|second|minutes?)\b", raw)
+
+
+def _nbl_threshold_of(sel: dict):
+    """N for an 'N+' row ('To Score 20+ Points', '2+ Made Threes'), else None."""
+    m = re.search(r"(?<![\d.])(\d+)\+", sel.get("raw_market_name") or "")
+    return int(m.group(1)) if m else None
+
+
+def _nbl_same_line(a, b) -> bool:
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except (TypeError, ValueError):
+        return False
+
+
+def _nbl_pick_prop(markets: dict, raw: dict, allow_fuzzy: bool) -> tuple:
+    """(catalog_key, selection, catalog_player, "") or (None, None, None, reason)."""
+    stat = (raw.get("stat") or "").strip().lower()
+    key = _NBL_PROP_STAT_KEY.get(stat)
+    if not key:
+        return None, None, None, f"stat {stat or '?'!r} is not an auto-placeable NBL market"
+    players = {s.get("player") for k, m in markets.items()
+               if k.startswith("player_") or k == "doubles"
+               for s in (m.get("selections") or []) if s.get("player")}
+    pname, why = _nbl_match_player(raw.get("player") or "", players, allow_fuzzy=allow_fuzzy)
+    if not pname:
+        return None, None, None, why
+    rows = [s for s in ((markets.get(key) or {}).get("selections") or [])
+            if s.get("player") == pname and s.get("proposition_id") and _nbl_full_game(s)]
+    if not rows:
+        return None, None, pname, f"Sportsbet has no full-game {key} market for {pname}"
+
+    if stat in ("double_double", "triple_double"):
+        want = "double double" if stat == "double_double" else "triple double"
+        hits = [s for s in rows if want in (s.get("raw_market_name") or "").lower()]
+    else:
+        thr = raw.get("threshold")
+        side = (raw.get("side") or "").strip().lower()
+        line = raw.get("line")
+        try:
+            thr = int(thr) if thr is not None and float(thr) == int(float(thr)) else None
+        except (TypeError, ValueError):
+            thr = None
+        if thr is not None:
+            hits = [s for s in rows if _nbl_threshold_of(s) == thr]
+            if not hits:
+                hits = [s for s in rows if _nbl_threshold_of(s) is None
+                        and (s.get("direction") or "").lower() == "over"
+                        and _nbl_same_line(s.get("line"), thr - 0.5)]
+        elif side in ("over", "under") and line is not None:
+            hits = [s for s in rows if _nbl_threshold_of(s) is None
+                    and (s.get("direction") or "").lower() == side
+                    and _nbl_same_line(s.get("line"), line)]
+            try:
+                _n = float(line) + 0.5
+            except (TypeError, ValueError):
+                _n = None
+            if not hits and side == "over" and _n is not None and _n == int(_n):
+                hits = [s for s in rows if _nbl_threshold_of(s) == int(_n)]
+        else:
+            return None, None, pname, "no over/under side or N+ threshold on the leg"
+    if len(hits) != 1:
+        lines = sorted({(s.get("direction"), s.get("line")) for s in rows
+                        if _nbl_threshold_of(s) is None})
+        return None, None, pname, (f"{len(hits)} Sportsbet rows match (live O/U lines "
+                                   f"for {pname}: {lines or 'none'})")
+    return key, hits[0], pname, ""
+
+
+_NBL_SIGNED_LINE_RE = re.compile(r"^(.*\S)\s+([+-]\d+(?:\.\d+)?)$")
+
+
+def _nbl_pick_team(markets: dict, raw: dict, team: str) -> tuple:
+    """(catalog_key, selection, "") or (None, None, reason) for h2h/spread/total."""
+    mt = (raw.get("market_type") or "").strip().lower()
+    line = raw.get("line")
+    side = (raw.get("side") or "").strip().lower()
+
+    def _two_way(key):
+        allrows = (markets.get(key) or {}).get("selections") or []
+        # Tie groups from EVERY row, before any filter: a suspended Tie row with no
+        # proposition_id must still knock out its whole 3-way market (review L3).
+        tie_groups = {s.get("market_external_id") for s in allrows
+                      if (s.get("selection") or "").strip().lower() in ("tie", "draw")}
+        return [s for s in allrows
+                if s.get("proposition_id") and _nbl_full_game(s)
+                and s.get("market_external_id") not in tie_groups]
+
+    if mt == "h2h":
+        if line is not None:
+            return None, None, "a WIN bet came with a line attached"
+        hits = [s for s in _two_way("head_to_head")
+                if canonical_nbl_team(s.get("selection")) == team]
+        return (("head_to_head", hits[0], "") if len(hits) == 1
+                else (None, None, f"{len(hits)} head-to-head rows for {team}"))
+    if mt == "spread":
+        if line is None:
+            return None, None, "a line bet with no number"
+        hits = [s for s in _two_way("line")
+                if canonical_nbl_team(s.get("selection")) == team
+                and _nbl_same_line(s.get("line"), line)]
+        if len(hits) == 1:
+            return "line", hits[0], ""
+        pyol = []
+        for s in _two_way("pick_own_line"):
+            m = _NBL_SIGNED_LINE_RE.match((s.get("selection") or "").strip())
+            if m and canonical_nbl_team(m.group(1)) == team and _nbl_same_line(m.group(2), line):
+                pyol.append(s)
+        if len(pyol) == 1:
+            return "pick_own_line", pyol[0], ""
+        live = [(s.get("selection"), s.get("line")) for s in _two_way("line")]
+        return None, None, f"{team} {line:+g} not offered (live line {live or 'none'})"
+    if mt == "total":
+        if side not in ("over", "under") or line is None:
+            return None, None, "a total with no over/under side or line"
+        for key, raw_name in (("total_points", "total points"),
+                              ("alternate_total", "alternate total points")):
+            hits = [s for s in _two_way(key)
+                    if (s.get("raw_market_name") or "").strip().lower() == raw_name
+                    and (s.get("direction") or "").lower() == side
+                    and _nbl_same_line(s.get("line"), line)]
+            if len(hits) == 1:
+                return key, hits[0], ""
+        live = [s.get("line") for s in _two_way("total_points")
+                if (s.get("raw_market_name") or "").strip().lower() == "total points"]
+        return None, None, f"total {side} {line} not offered (live total {sorted(set(live)) or 'none'})"
+    return None, None, f"market type {mt!r} is not auto-placeable"
+
+
+def _resolve_nbl_leg(raw: dict, tipster: str, priority: list) -> tuple:
+    """Read-only: resolve one parsed Bettors Edge leg against its game's LIVE
+    Sportsbet NBL board. Returns (match, "") with the same shape
+    _resolve_nfl_market returns (so _place_nfl_fanout can place it), or
+    (None, reason). NEVER raises."""
+    try:
+        mt = (raw.get("market_type") or "").strip().lower()
+        g1_raw, g2_raw = raw.get("game_team_1"), raw.get("game_team_2")
+        g1, g2 = canonical_nbl_team(g1_raw), canonical_nbl_team(g2_raw)
+        if (g1_raw and not g1) or (g2_raw and not g2):
+            return None, f"game header team not recognised ({g1_raw!r} v {g2_raw!r})"
+        header = (g1, g2) if (g1 and g2 and g1 != g2) else None
+
+        team = ""
+        if mt in ("h2h", "spread"):
+            team = canonical_nbl_team(raw.get("team"))
+            if not team:
+                return None, f"team {raw.get('team')!r} not recognised as an NBL team"
+            if header and team not in header:
+                return None, f"{team} is not in the game header {header[0]} v {header[1]}"
+            event = resolve_nbl_event(team, (header[1] if team == header[0] else header[0])
+                                      if header else "")
+        elif mt == "total":
+            if not header:
+                return None, "a total with no game header to say which game"
+            event = resolve_nbl_event(*header)
+        elif mt == "player_prop":
+            if header:
+                event = resolve_nbl_event(*header)
+            else:
+                # No header ("Additional bet(s) for the second game"): the roster
+                # only picks the game; the strict in-game match below still decides.
+                _r = exact_match_player(raw.get("player") or "", "nbl") or {}
+                team = canonical_nbl_team(_r.get("team")) or _nbl_roster_team_by_tokens(
+                    raw.get("player") or "")
+                if not team:
+                    return None, "no game header and the player is not on the NBL roster"
+                event = resolve_nbl_event(team)
+        else:
+            return None, f"market type {mt or '?'!r} is not auto-placeable"
+        if not event:
+            return None, "no NBL fixture found today/tomorrow for that game"
+
+        pc, probe_sid = None, None
+        for _sid in priority:
+            _pc = hb.price_check_sports(session_id=str(_sid), sport="nbl", event=event)
+            if _pc.get("success") and _pc.get("markets"):
+                pc, probe_sid = _pc, str(_sid)
+                break
+            log.info(f"NBL auto-place: price-check failed on {_sid} for {event!r} "
+                     f"({_pc.get('error', 'no markets')}), trying the next session")
+        if pc is None:
+            return None, f"Sportsbet price-check failed on every session for {event}"
+        # Never bet in-running: a late or replayed post (restart backlog, slow parse)
+        # would otherwise resolve against the LIVE in-play board (dry run 2026-09-23:
+        # tonight's h2h still priced 20 minutes after tip-off). Fail closed on a
+        # missing start time too.
+        try:
+            _start = float(pc.get("start_time_iso"))
+        except (TypeError, ValueError):
+            return None, f"Sportsbet gave no start time for {event}, can't rule out in-play"
+        _secs_to_start = _start - time.time()
+        if _secs_to_start < NBL_MIN_SECS_BEFORE_START:
+            return None, (f"{event} has started (or starts within "
+                          f"{NBL_MIN_SECS_BEFORE_START}s), not betting in-play")
+        if _secs_to_start > NBL_MAX_SECS_BEFORE_START:
+            return None, (f"Sportsbet's {event} starts {_secs_to_start / 3600:.0f}h away, "
+                          f"not tonight's game")
+        _comp = pc.get("competition_external_id")
+        if _comp is not None and str(_comp) != NBL_SB_COMPETITION_ID:
+            return None, (f"{event} is Sportsbet competition {_comp}, not the NBL "
+                          f"({NBL_SB_COMPETITION_ID})")
+        markets = pc.get("markets") or {}
+
+        catalog_player = None
+        if mt == "player_prop":
+            key, sel, catalog_player, why = _nbl_pick_prop(markets, raw, allow_fuzzy=bool(header))
+        else:
+            key, sel, why = _nbl_pick_team(markets, raw, team)
+        if not sel:
+            return None, why
+
+        live_odds = sel.get("odds")
+        _refuse, _reason = _nfl_odds_guard_refuses(tipster, raw.get("odds"), live_odds)
+        if _refuse:
+            return None, _reason
+        probe_meta = session_priority.get_session_meta(probe_sid)
+        probe_bookie = (probe_meta.bookmaker if probe_meta else "") or ""
+        if not probe_bookie:
+            return None, f"no sessions.yaml metadata for probe session {probe_sid}"
+        direction = (sel.get("direction") or "").strip().lower() or None
+        return {
+            "event": event, "market": key, "selection": sel.get("selection") or "",
+            "line": sel.get("line"), "odds": live_odds,
+            "proposition_id": sel.get("proposition_id"), "direction": direction,
+            "team": team or (header[0] if header else ""), "player": catalog_player,
+            "probe_session_id": probe_sid, "bookie": probe_bookie,
+            "raw_market_name": sel.get("raw_market_name") or "",
+            "start_time_iso": _start,
+        }, ""
+    except Exception as e:
+        log.error(f"NBL auto-place: resolve crashed for {raw!r}: {e}")
+        return None, f"resolver error ({e})"
+
+
+def _describe_nbl_leg(raw: dict) -> str:
+    """One readable line for a parsed leg, for alerts."""
+    mt = (raw.get("market_type") or "").strip().lower()
+    bits = []
+    if mt == "player_prop":
+        thr = raw.get("threshold")
+        what = (f"{thr}+" if thr is not None
+                else f"{raw.get('side') or '?'} {raw.get('line')}")
+        bits.append(f"{raw.get('player')} {what} {(raw.get('stat') or '?').replace('_', ' ')}")
+    elif mt == "h2h":
+        bits.append(f"{raw.get('team')} WIN")
+    elif mt == "spread":
+        try:
+            bits.append(f"{raw.get('team')} {float(raw.get('line')):+g}")
+        except (TypeError, ValueError):
+            bits.append(f"{raw.get('team')} {raw.get('line')}")
+    elif mt == "total":
+        bits.append(f"total points {raw.get('side')} {raw.get('line')}")
+    else:
+        bits.append(f"[{mt or 'other'}] {raw.get('description') or raw.get('player') or ''}".strip())
+    if raw.get("odds"):
+        bits.append(f"${raw.get('odds')}")
+    if raw.get("units") is not None:
+        bits.append(f"{raw.get('units')}u")
+    if raw.get("bookie"):
+        bits.append(f"({raw.get('bookie')})")
+    g1, g2 = raw.get("game_team_1"), raw.get("game_team_2")
+    line = " ".join(str(b) for b in bits)
+    if g1 and g2:
+        line += f"  [{g1} v {g2}]"
+    if raw.get("description") and mt in ("player_prop", "h2h", "spread", "total"):
+        line += f"\n     note: {raw.get('description')}"
+    return line
+
+
+def _attempt_nbl_auto_place(tipster: str, channel_name: str, raw: dict, unit_size,
+                            raw_message: str) -> tuple:
+    """Resolve and place one Bettors Edge NBL leg. SYNCHRONOUS: run it through
+    _run_in_placement_executor (the HyperBot calls block).
+
+    Returns (handled, reason). handled=True means a placement was attempted (the
+    fan-out has already sent its placed/partial/ambiguous alerts) or a duplicate
+    was reported; the caller must not alert again. handled=False means nothing
+    was attempted and `reason` says why, for the caller's one consolidated
+    manual alert. NEVER raises."""
+    try:
+        priority = session_priority.get_priority_for("nbl", is_sgm=False)
+        if not priority:
+            return False, "NBL_SESSION_PRIORITY / NBA_SESSION_PRIORITY is empty"
+        try:
+            units_f = float(raw.get("units"))
+        except (TypeError, ValueError):
+            units_f = 0.0
+        if units_f <= 0:
+            return False, "no units on the leg"
+        if units_f > _NBL_MAX_UNITS:
+            return False, f"{units_f}u is above the {_NBL_MAX_UNITS:g}u sanity cap (misparse?)"
+        bookie_tag = (raw.get("bookie") or "").strip().lower()
+        if bookie_tag and bookie_tag != "sportsbet":
+            try:
+                _t = float(raw.get("odds") or 0)
+            except (TypeError, ValueError):
+                _t = 0.0
+            if _t <= 1.0:
+                # Wilson's 365 rule needs his price to compare against.
+                return False, f"tagged {bookie_tag} with no usable price to compare Sportsbet to"
+            if (raw.get("description") or "").strip():
+                # e.g. "If you can't get on with 365, take the 10+ on SB for 1.5 units
+                # and the 12+ for 1 unit": he said what he wants on Sportsbet, and it
+                # is not this leg's line/stake. A person reads that (review M4).
+                return False, (f"tagged {bookie_tag} with his own Sportsbet instruction: "
+                               f"{raw.get('description')}")
+
+        match, why = _resolve_nbl_leg(raw, tipster, priority)
+        if not match:
+            return False, why
+
+        mt = (raw.get("market_type") or "").strip().lower()
+        player = match.get("player") or raw.get("player") or ""
+        if mt == "player_prop":
+            _bet_label = f"{player} {match['raw_market_name'] or match['market']} {match['selection']} {match.get('line')}"
+        elif mt == "h2h":
+            _bet_label = f"{match['selection']} WIN"
+        elif mt == "spread":
+            _bet_label = f"{match['selection']} line {match.get('line')}"
+        else:
+            _bet_label = f"total points {match['selection']} {match.get('line')}"
+        if bookie_tag and bookie_tag != "sportsbet":
+            _bet_label += f" (tipped {bookie_tag} ${raw.get('odds')}, placed on Sportsbet)"
+
+        # Keyed on the BET as he stated it, built from the TIP, not the catalog row
+        # (v6.32 review M2/M3): "5+ assists" and "over 4.5 assists" are one bet; a
+        # moved main line can send a spread to pick_own_line (whose row may carry no
+        # line); a double double and a triple double are two bets; and units are
+        # left out so a re-post with a different units figure is flagged as a
+        # duplicate for Wilson to top up by hand instead of stacking a second stake.
+        stat_key = (raw.get("stat") or "").strip().lower() if mt == "player_prop" else ""
+        _thr = raw.get("threshold")
+        try:
+            _fp_line = (round(float(_thr) - 0.5, 4) if _thr is not None
+                        else round(float(raw.get("line")), 4) if raw.get("line") is not None
+                        else None)
+        except (TypeError, ValueError):
+            _fp_line = str(raw.get("line"))
+        _fp_side = ("over" if (mt == "player_prop" and (_thr is not None or stat_key in (
+                        "double_double", "triple_double")))
+                    else (raw.get("side") or "").strip().lower())
+        if mt == "player_prop":
+            _fp_who = (match.get("player") or "").lower()
+        elif mt == "total":
+            _fp_who = ""
+        else:
+            _fp_who = (match.get("team") or "").lower()
+        # The start time separates a rematch of the same two teams inside the 3-day
+        # window ("Perth v Adelaide" Thursday and again Sunday) from a re-post.
+        fp = (tipster, match["event"], match.get("start_time_iso"), mt, _fp_who,
+              stat_key, _fp_side, _fp_line)
+        intended_stake = round(units_f * float(unit_size or 0), 2)
+        if intended_stake <= 0:
+            # Checked BEFORE registering, so a misconfigured unit never leaves a
+            # "duplicate" entry for a bet that was never attempted.
+            return False, f"stake ${intended_stake} (unit_size={unit_size!r})"
+        with _nbl_dedup_lock:
+            _now = datetime.now()
+            for _k in [k for k, t in _nbl_recent_fps.items()
+                       if (_now - t).total_seconds() > NBL_DEDUP_TTL_SEC]:
+                del _nbl_recent_fps[_k]
+            is_dup = fp in _nbl_recent_fps
+            if not is_dup:
+                _nbl_recent_fps[fp] = _now
+        if is_dup:
+            _dup_msg = (f"NBL DUPLICATE on {channel_name}: {_bet_label} for {match['event']} "
+                        f"-- already placed/attempted within the last "
+                        f"{NBL_DEDUP_TTL_SEC // 86400} day(s). NOT re-placed. If this "
+                        f"genuinely is a new bet, place it by hand.\n\n{raw_message}")
+            log.warning(f"[{channel_name}] {_dup_msg}")
+            try:
+                notifier.notify_text_manual_alert(channel_name, _dup_msg,
+                                                  header="NBL DUPLICATE, not re-placed")
+            except Exception as e:
+                log.error(f"NBL auto-place: duplicate-alert failed: {e}")
+            return True, "duplicate"
+
+        _leg_market = {"h2h": "h2h", "spread": "line", "total": "total"}.get(mt, "player_prop")
+        leg = ParsedLeg(
+            market=_leg_market, player=player, stat=(raw.get("stat") or ""),
+            line=match.get("line"),
+            selection=(match["direction"] if (mt == "player_prop" and match.get("direction"))
+                       else match["selection"]),
+            team_full=match.get("team") or "", raw_text=raw_message,
+        )
+        try:
+            _tipped = float(raw.get("odds") or 0) or 0.0
+        except (TypeError, ValueError):
+            _tipped = 0.0
+        tip = ParsedTip(
+            tipster=tipster, sport="nbl", is_sgm=False, legs=[leg],
+            units=units_f, unit_size=unit_size or 0.0, raw_message=raw_message,
+            timestamp=datetime.now(), event=match["event"],
+            suggested_bookie="sportsbet", suggested_odds=_tipped or match.get("odds") or 0.0,
+        )
+        _cap_market = _NBL_CAP_MARKET.get(match["market"], match["market"])
+        results = _place_nfl_fanout(
+            tip, priority, match, intended_stake, _cap_market,
+            channel_name, raw_message, _bet_label, sport="nbl",
+        )
+        if not results:
+            # Nothing fired, so a later re-post of this bet must not be blocked as
+            # "already placed/attempted" (review L7).
+            with _nbl_dedup_lock:
+                _nbl_recent_fps.pop(fp, None)
+            return False, "no active Sportsbet account in the NBL priority list"
+        return True, "attempted"
+    except Exception as e:
+        log.error(f"[{channel_name}] NBL auto-place crashed for {raw!r}: {e}")
+        return False, f"auto-place error ({e})"
+
+
+_NBL_PRICE_RE = re.compile(r"\$\s*\d")
+
+
+async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str,
+                                      unit_size: float = 0.0) -> None:
+    """Route one Bettors Edge NBL post: parse every leg, auto-place each one that
+    matches its game's live Sportsbet market, then send ONE manual alert listing
+    every leg that didn't (with the reason) plus the full post. Placed legs get
+    the fan-out's own alerts. Legs are placed one after another: each leg's
+    accounts already fire concurrently, and two legs racing on the same account
+    is untested."""
+    if not _NBL_PRICE_RE.search(text or ""):
+        # Every real bet in the channel's history carries a $ price; timing notes,
+        # results and admin posts never do. Dropped without an LLM call or alert.
+        log.info(f"[{channel_name}] NBL: no $ price in post, chatter -> dropped: {text[:80]!r}")
+        return
+    loop = asyncio.get_event_loop()
+    _primary_claude = tip_parser._claude_primary_enabled()
+    raw_tips, elapsed = None, 0.0
+    try:
+        if _primary_claude:
+            raw_tips, elapsed = await loop.run_in_executor(
+                None, tip_parser.parse_bettorsedge_nbl_text_fallback, text, tipster)
+        else:
+            raw_tips, elapsed = await loop.run_in_executor(
+                None, parse_bettorsedge_nbl_text, text, tipster)
+    except Exception as e:
+        log.warning(f"[{channel_name}] NBL parse failed ({e}); trying the other provider")
+        raw_tips = None
+        try:
+            if _primary_claude:
+                raw_tips, elapsed = await loop.run_in_executor(
+                    None, parse_bettorsedge_nbl_text, text, tipster)
+            elif tip_parser._claude_fallback_enabled():
+                raw_tips, elapsed = await loop.run_in_executor(
+                    None, tip_parser.parse_bettorsedge_nbl_text_fallback, text, tipster)
+        except Exception as e2:
+            log.error(f"[{channel_name}] NBL parse failed on both providers: {e2}")
+    if raw_tips is None:
+        try:
+            notifier.notify_text_manual_alert(channel_name, text, header="NBL PARSE FAILED, MANUAL")
+        except Exception as e3:
+            log.error(f"[{channel_name}] NBL parse-failure alert failed: {e3}")
+        return
+    if not raw_tips:
+        # It had a $ price, so it looked like a bet; never drop that silently.
+        log.warning(f"[{channel_name}] NBL post with a price parsed to 0 legs -> manual")
+        try:
+            notifier.notify_text_manual_alert(channel_name, text,
+                                              header="NBL, MANUAL (parsed to 0 bets)")
+        except Exception as e:
+            log.error(f"[{channel_name}] NBL zero-leg alert failed: {e}")
+        return
+
+    log.info(f"[{channel_name}] NBL: {len(raw_tips)} leg(s) parsed in {elapsed:.2f}s")
+    manual: list[str] = []
+    placed_or_handled = 0
+    for raw in raw_tips:
+        if not isinstance(raw, dict):
+            manual.append(f"- (unreadable parsed leg: {raw!r})")
+            continue
+        try:
+            desc = _describe_nbl_leg(raw)
+        except Exception as e:
+            desc = f"(render failed: {e}; raw={raw!r})"
+        mt = str(raw.get("market_type") or "").strip().lower()
+        if not BETTORSEDGE_NBL_PLACE_ENABLED:
+            reason = "auto-place is switched off (BETTORSEDGE_NBL_PLACE_ENABLED)"
+        elif raw.get("alert_only"):
+            # groq_parser._flag_repair_damaged_tips: the model reply was cut off and
+            # JSON-repaired. Its field check looks for `selection`, which NBL legs
+            # don't have, so after ANY repair every NBL leg lands here: deliberate,
+            # since a repair can silently drop a leg's side/units/bookie.
+            reason = "the parse of this leg was repaired after a truncated reply, check it"
+        elif mt in ("player_prop", "h2h", "spread", "total"):
+            try:
+                handled, reason = await _run_in_placement_executor(
+                    _attempt_nbl_auto_place, tipster, channel_name, raw, unit_size,
+                    f"{desc}\n\n---- full message ----\n{text}")
+            except Exception as e:
+                # Never let one leg kill the loop and the consolidated alert.
+                log.error(f"[{channel_name}] NBL placement call raised: {e}")
+                handled, reason = False, (f"placement call raised ({e}); check HyperBot "
+                                          f"pending_bets before placing by hand")
+            if handled:
+                placed_or_handled += 1
+                continue
+        elif mt == "sgm":
+            reason = "SGM, place by hand"
+        else:
+            reason = "not an auto-placeable market"
+        log.info(f"[{channel_name}] NBL manual: {desc.splitlines()[0]} -> {reason}")
+        manual.append(f"- {desc}\n  -> {reason}")
+
+    _repaired = any(isinstance(r, dict) and r.get("alert_only") for r in raw_tips)
+    if manual or _repaired:
+        body = (f"{len(manual)} of {len(raw_tips)} bet(s) need placing by hand "
+                f"({placed_or_handled} auto-placed/attempted):\n\n" + "\n".join(manual)
+                + ("\n\nWARNING: the parse was cut off and repaired, so bets at the END of "
+                   "the post may be missing from this list. Check the full message."
+                   if _repaired else "")
+                + f"\n\n---- full message ----\n{text}")
+        try:
+            notifier.notify_text_manual_alert(channel_name, body, header="NBL, MANUAL")
+        except Exception as e:
+            log.error(f"[{channel_name}] NBL manual alert failed: {e}")
 
 
 def _describe_nfl_image_tip(raw: dict) -> str:
@@ -20537,6 +21197,28 @@ async def main():
                             log.error(f"[{channel_name}] text manual alert failed: {e}")
                 else:
                     log.info(f"[{channel_name}] text-only chatter on image channel -> dropped (not bet-like): {text[:80]}")
+            return
+
+        # The Bettors Edge - NBL (v6.32): NBL-only text posts -> its own router
+        # (parse every leg, place each on Sportsbet, one manual alert for the rest).
+        # Before the generic media/_process_tip paths below, like A1.
+        if channel_cfg.get("parser") == "bettorsedge_nbl":
+            if text:
+                asyncio.create_task(
+                    _route_bettorsedge_nbl_text(
+                        text, "bettorsedge_nbl", channel_name,
+                        unit_size=channel_cfg.get("unit_size", 0.0),
+                    )
+                )
+            elif event.media:
+                log.info(f"[{channel_name}] NBL image/media with no caption -> manual alert")
+                try:
+                    notifier.notify_text_manual_alert(
+                        channel_name, "(image/media, no caption)",
+                        header="NBL, MANUAL",
+                    )
+                except Exception as e:
+                    log.error(f"[{channel_name}] NBL no-caption media alert failed: {e}")
             return
 
         # A1 Fantasy Sports NFL (v6.21, 2026-09-10): a plain TEXT channel, but

@@ -298,6 +298,32 @@ def parse_a1_nfl_text_claude(text, tipster="a1_fantasy_nfl", model=None):
     return tips, elapsed
 
 
+def parse_bettorsedge_nbl_text_claude(text, tipster="bettorsedge_nbl", model=None):
+    """v6.32: The Bettors Edge NBL post via Claude, using
+    groq_parser.TEXT_PROMPT_BETTORSEDGE_NBL. Same raise-on-bad-JSON semantics as
+    parse_fourthandev_nfl_text_claude; extracts every bet in the post."""
+    start = time.time()
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("parse_bettorsedge_nbl_text_claude: ANTHROPIC_API_KEY not set")
+    if not (text or "").strip():
+        return [], 0.0
+    model = model or CLAUDE_PARSER_MODEL
+    user_content = f"Tipster: {tipster}\nMessage:\n{text}"
+    content = _complete_text(groq_parser.TEXT_PROMPT_BETTORSEDGE_NBL, user_content, model)
+    elapsed = time.time() - start
+    content = content.replace("```json", "").replace("```", "").strip()
+    parsed = groq_parser._parse_json_with_repair(content)
+    if parsed is None or not isinstance(parsed, dict):
+        raise ValueError(f"parse_bettorsedge_nbl_text_claude: invalid JSON for {tipster}")
+    tips = parsed.get("tips", [])
+    if not isinstance(tips, list):
+        raise ValueError(f"parse_bettorsedge_nbl_text_claude: 'tips' not a list for {tipster}")
+    tips = [t for t in tips if isinstance(t, dict)]
+    log.info(f"parse_bettorsedge_nbl_text_claude ({model}): {tipster} extracted "
+             f"{len(tips)} raw tip(s) in {elapsed:.2f}s")
+    return tips, elapsed
+
+
 def parse_fourthandev_nfl_text_claude(text, tipster="fourthandev_nfl", model=None):
     """Free-TEXT 4th and +EV NFL parse via Claude -- mirrors
     parse_a1_nfl_text_claude exactly (same fallback/raise semantics), using

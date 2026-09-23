@@ -1744,6 +1744,160 @@ def update_nfl_roster_from_api():
     return roster
 
 
+# NBL (v6.32). Team names are canonicalised to ESPN's displayName, because
+# nba_resolver.resolve_nba_event matches a roster team against ESPN's NBL
+# scoreboard event names ("Tasmania JackJumpers at Cairns Taipans"). The
+# official NBL API says "NZ Breakers"; ESPN and Sportsbet say "New Zealand
+# Breakers". Keys are lowercased source names.
+NBL_TEAM_CANONICAL = {
+    "adelaide 36ers": "Adelaide 36ers",
+    "brisbane bullets": "Brisbane Bullets",
+    "cairns taipans": "Cairns Taipans",
+    "illawarra hawks": "Illawarra Hawks",
+    "melbourne united": "Melbourne United",
+    "nz breakers": "New Zealand Breakers",
+    "new zealand breakers": "New Zealand Breakers",
+    "perth wildcats": "Perth Wildcats",
+    "south east melbourne phoenix": "South East Melbourne Phoenix",
+    "se melbourne phoenix": "South East Melbourne Phoenix",
+    "sydney kings": "Sydney Kings",
+    "tasmania jackjumpers": "Tasmania JackJumpers",
+}
+
+# The official feed only answers requests carrying the nbl.com.au origin (the
+# same headers its own website sends); without them it returns MISSING_API_KEY.
+_NBL_SITE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (tipbot roster refresh)",
+    "Origin": "https://www.nbl.com.au",
+    "Referer": "https://www.nbl.com.au/",
+}
+NBL_ROSETTA_BASE = "https://prod.rosetta.nbl.com.au/get"
+ESPN_NBL_TEAMS_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nbl/teams"
+
+
+def _nbl_get_json(url: str, headers: dict | None = None):
+    import urllib.request
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "tipbot/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def _nbl_players_official() -> list:
+    """[(full_name, canonical_team)] from the official NBL API (the feed behind
+    nbl.com.au's team roster pages). Raises on any failure so the caller can
+    fall back to ESPN."""
+    season = (_nbl_get_json(f"{NBL_ROSETTA_BASE}/nbl/seasons/current",
+                            _NBL_SITE_HEADERS).get("data") or [None])[0]
+    if not season:
+        raise RuntimeError("no current NBL season")
+    year = season.get("year")
+    teams = {}
+    for m in season.get("matches") or []:
+        if not isinstance(m, dict):
+            continue
+        for side in ("home_team", "away_team"):
+            t = m.get(side) or {}
+            if t.get("id") and t.get("name"):
+                teams[t["id"]] = t["name"]
+    if len(teams) < 8:
+        raise RuntimeError(f"only {len(teams)} NBL teams in the current season fixture")
+    out = []
+    for tid, tname in teams.items():
+        canon = NBL_TEAM_CANONICAL.get(tname.strip().lower())
+        if not canon:
+            raise RuntimeError(f"unrecognised NBL team {tname!r} -- add to NBL_TEAM_CANONICAL")
+        rows = _nbl_get_json(f"{NBL_ROSETTA_BASE}/nbl/players/for/team/{tid}/in/season/{year}",
+                             _NBL_SITE_HEADERS).get("data") or []
+        if not rows:
+            raise RuntimeError(f"official NBL roster for {tname} is empty")
+        for r in rows:
+            p = r.get("player") or {}
+            name = (p.get("full_name")
+                    or f"{p.get('first_name') or ''} {p.get('last_name') or ''}").strip()
+            if name:
+                out.append((" ".join(name.split()), canon))
+    return out
+
+
+def _nbl_players_espn() -> list:
+    """[(full_name, canonical_team)] from ESPN's NBL roster API (fallback)."""
+    d = _nbl_get_json(ESPN_NBL_TEAMS_URL)
+    teams = d["sports"][0]["leagues"][0]["teams"]
+    out = []
+    for t in teams:
+        tm = t.get("team") or {}
+        canon = NBL_TEAM_CANONICAL.get((tm.get("displayName") or "").strip().lower())
+        if not canon:
+            raise RuntimeError(f"unrecognised ESPN NBL team {tm.get('displayName')!r}")
+        r = _nbl_get_json(f"{ESPN_NBL_TEAMS_URL}/{tm.get('id')}/roster")
+        for a in r.get("athletes") or []:
+            name = (a.get("fullName") or "").strip()
+            if name:
+                out.append((" ".join(name.split()), canon))
+    return out
+
+
+def update_nbl_roster_from_api():
+    """Refresh roster_nbl.json. Run locally: python roster.py --update-nbl
+
+    Source: the official NBL API behind nbl.com.au's roster pages (Wilson asked
+    for a credible source like the NBL website), falling back to ESPN's NBL
+    roster API if that fails. Same collision rules as NFL/MLB: a full name on
+    more than one team gets NO mapping, and a surname-only alias is written only
+    when exactly one player in the league has that surname (Cairns alone has
+    Jaylon + Walter Brown and Jack + Lloyd McVeigh, so 'Brown' and 'McVeigh'
+    must never resolve on their own)."""
+    source = "nbl.com.au"
+    try:
+        players = _nbl_players_official()
+    except Exception as e:
+        log.warning(f"NBL roster: official NBL API failed ({e}); falling back to ESPN")
+        source = "espn"
+        try:
+            players = _nbl_players_espn()
+        except Exception as e2:
+            log.error(f"NBL roster update failed on both sources: {e2}")
+            return {}
+    if len(players) < 80:
+        # A full league is ~10 teams x 14-19 players. Far fewer means a partial
+        # pull; keep the old file rather than overwrite it with a torso.
+        log.error(f"NBL roster update: only {len(players)} players from {source}; "
+                  f"keeping the existing {NBL_ROSTER_FILE.name}")
+        return {}
+
+    def _norm(s: str) -> str:
+        s = unicodedata.normalize("NFD", s or "")
+        return "".join(c for c in s if not unicodedata.combining(c)).lower()
+
+    fullname_teams: dict = {}
+    for name, team in players:
+        fullname_teams.setdefault(name, set()).add(team)
+    collisions = {n: sorted(ts) for n, ts in fullname_teams.items() if len(ts) > 1}
+    roster: dict = {n: next(iter(ts)) for n, ts in fullname_teams.items() if len(ts) == 1}
+    surname_count: dict = {}
+    for name in fullname_teams:
+        parts = name.split()
+        if len(parts) >= 2:
+            surname_count[_norm(parts[-1])] = surname_count.get(_norm(parts[-1]), 0) + 1
+    for name, teams in fullname_teams.items():
+        parts = name.split()
+        if (len(parts) >= 2 and len(teams) == 1 and surname_count.get(_norm(parts[-1])) == 1
+                and parts[-1] not in roster):
+            roster[parts[-1]] = next(iter(teams))
+    if collisions:
+        roster["__collisions__"] = collisions
+        log.warning(f"NBL same-name collisions dropped from name->team: {collisions}")
+
+    _tmp = NBL_ROSTER_FILE.with_suffix(".json.tmp")
+    with open(_tmp, "w", encoding="utf-8") as f:
+        json.dump(roster, f, indent=2, ensure_ascii=False, sort_keys=True)
+    os.replace(_tmp, NBL_ROSTER_FILE)
+    log.info(f"Saved {len(roster)} NBL entries ({len(fullname_teams)} players, "
+             f"{len({t for ts in fullname_teams.values() for t in ts})} teams) from {source} "
+             f"to {NBL_ROSTER_FILE}")
+    return roster
+
+
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO)
@@ -1754,6 +1908,8 @@ if __name__ == "__main__":
         update_mlb_roster_from_api()
     elif "--update-nfl" in sys.argv:
         update_nfl_roster_from_api()
+    elif "--update-nbl" in sys.argv:
+        update_nbl_roster_from_api()
     else:
         # Quick test
         _load_rosters()

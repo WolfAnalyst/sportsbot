@@ -149,6 +149,47 @@ def _build_nfl_team_aliases() -> dict:
 NFL_TEAM_ALIASES = _build_nfl_team_aliases()
 
 
+# NBL (v6.32, The Bettors Edge). Values are ESPN's NBL displayName (what
+# _fetch_schedule returns and what the event string is built from). NBL MUST
+# NOT go through NBA_TEAM_ALIASES: there "kings" -> Sacramento Kings, "hawks" ->
+# Atlanta Hawks and "phoenix" -> Phoenix Suns, and the H43 rule in _match_team
+# then refuses to substring-match, so Sydney Kings / Illawarra Hawks / SE
+# Melbourne Phoenix could never resolve. Bare "melbourne" is Melbourne United
+# (the Phoenix are always "South East"/"SEM" in his posts); because it is an
+# alias, it can only match exactly and never substring-matches the Phoenix.
+NBL_TEAM_ALIASES = {
+    **{k: "Adelaide 36ers" for k in (
+        "adelaide 36ers", "adelaide", "36ers", "sixers", "adl")},
+    **{k: "Brisbane Bullets" for k in (
+        "brisbane bullets", "brisbane", "bullets", "bne", "bri")},
+    **{k: "Cairns Taipans" for k in (
+        "cairns taipans", "cairns", "taipans", "cns")},
+    **{k: "Illawarra Hawks" for k in (
+        "illawarra hawks", "illawarra", "hawks", "ill", "hwk")},
+    **{k: "Melbourne United" for k in (
+        "melbourne united", "melbourne", "united", "melb united", "melbourne utd", "mel")},
+    **{k: "New Zealand Breakers" for k in (
+        "new zealand breakers", "nz breakers", "new zealand", "nz", "breakers", "nzl", "nzb")},
+    **{k: "Perth Wildcats" for k in (
+        "perth wildcats", "perth", "wildcats", "per")},
+    **{k: "South East Melbourne Phoenix" for k in (
+        "south east melbourne phoenix", "se melbourne phoenix", "south east melbourne",
+        # Sportsbet's own selection spelling (live catalog, 2026-09-23)
+        "s.e. melbourne phoenix", "s.e. melbourne", "se melb phoenix",
+        "se melbourne", "south east", "sem", "phoenix", "pnx")},
+    **{k: "Sydney Kings" for k in (
+        "sydney kings", "sydney", "kings", "syd")},
+    **{k: "Tasmania JackJumpers" for k in (
+        "tasmania jackjumpers", "tasmania jack jumpers", "tasmania", "tassie",
+        "jackjumpers", "jack jumpers", "jackies", "jacks", "tas")},
+}
+
+
+def canonical_nbl_team(name: str) -> str:
+    """ESPN's name for an NBL team, or "" if `name` isn't a known NBL team."""
+    return NBL_TEAM_ALIASES.get(" ".join((name or "").strip().lower().split()), "")
+
+
 def _fetch_schedule(sport: str, date: str) -> list[dict]:
     """Fetch games for a date. Returns list of {"home": name, "away": name}."""
     cache_key = f"{sport}_{date}"
@@ -307,7 +348,9 @@ def resolve_nba_event(
     for check_date in check_order:
         games = _fetch_schedule(sport, check_date)
         for try_team in teams_to_try:
-            game = _match_team(try_team, games)
+            # v6.32: NBL must never use the NBA alias table (Kings/Hawks/Phoenix).
+            game = _match_team(try_team, games,
+                               NBL_TEAM_ALIASES if sport == "nbl" else NBA_TEAM_ALIASES)
             if game:
                 event = f"{game['home']} v {game['away']}"
                 log.info(f"Resolved '{search_team}' -> '{event}' on {check_date}")
@@ -378,4 +421,39 @@ def resolve_nfl_event(team: str = "") -> Optional[str]:
                 log.info(f"Resolved NFL '{team}' -> '{event}' on {check_date}")
                 return event
     log.warning(f"No NFL game found for '{team}' within the next 7 days or yesterday")
+    return None
+
+
+def resolve_nbl_event(team: str, opponent: str = "") -> Optional[str]:
+    """Resolve an NBL team (and optionally its opponent) to ESPN's 'Home v Away'.
+
+    v6.32. Uses NBL_TEAM_ALIASES only (never the NBA table), and only exact
+    canonical-name matches: an unknown team name returns None rather than
+    substring-guessing. With `opponent` (the post's game header), BOTH teams
+    must be in the same fixture, so a header typo or a stale roster team can
+    never bind a bet to a different game. NBL tips are posted the same day, so
+    today and tomorrow are checked first, then yesterday (ESPN's date bucket
+    for an evening AEST game can fall either side)."""
+    home_team = canonical_nbl_team(team)
+    if not home_team:
+        log.warning(f"Cannot resolve NBL event: {team!r} is not a known NBL team")
+        return None
+    other = ""
+    if (opponent or "").strip():
+        other = canonical_nbl_team(opponent)
+        if not other or other == home_team:
+            log.warning(f"Cannot resolve NBL event: bad opponent {opponent!r} for {home_team}")
+            return None
+    now = datetime.now()
+    check_order = [(now + timedelta(days=d)).strftime("%Y-%m-%d") for d in (0, 1, -1)]
+    for check_date in check_order:
+        for game in _fetch_schedule("nbl", check_date):
+            names = {game["home"].strip().lower(), game["away"].strip().lower()}
+            if home_team.lower() in names and (not other or other.lower() in names):
+                event = f"{game['home']} v {game['away']}"
+                log.info(f"Resolved NBL '{team}'{f' v {opponent!r}' if other else ''} "
+                         f"-> '{event}' on {check_date}")
+                return event
+    log.warning(f"No NBL game found for {home_team}"
+                f"{f' v {other}' if other else ''} today, tomorrow or yesterday")
     return None

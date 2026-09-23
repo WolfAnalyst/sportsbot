@@ -134,14 +134,18 @@ class PriorityConfig:
     mlb_sgm: list[str] = field(default_factory=list)
     racing: list[str] = field(default_factory=list)
     nfl_singles: list[str] = field(default_factory=list)
+    # v6.32: The Bettors Edge NBL fan-out. Empty -> NBL singles use the NBA list
+    # (the pre-v6.32 behaviour), so an unset env var changes nothing.
+    nbl_singles: list[str] = field(default_factory=list)
 
     def for_sport(self, sport: str, is_sgm: bool = False) -> list[str]:
         """
         Return priority list for a (sport, is_sgm) combo.
 
-        Sport keys: 'nba', 'nbl', 'afl', 'mlb', 'racing', 'nfl'. NBL falls
-        back to NBA priority (no separate list: same bookmakers, same
-        accounts). Anything else returns [] (no auto-placement).
+        Sport keys: 'nba', 'nbl', 'afl', 'mlb', 'racing', 'nfl'. NBL singles
+        use NBL_SESSION_PRIORITY when set (v6.32, the Bettors Edge fan-out),
+        else fall back to NBA priority; NBL SGMs always use the NBA SGM list.
+        Anything else returns [] (no auto-placement).
 
         MLB (2026-06-01): mlb_singles is intentionally left EMPTY in .env so
         MLB singles return [] -> manual. Only mlb_sgm is populated, so the
@@ -153,6 +157,8 @@ class PriorityConfig:
         way) -- matches racing's shape, not nba/afl/mlb's separate sgm list.
         """
         s = (sport or "").lower()
+        if s == "nbl" and not is_sgm and self.nbl_singles:
+            return self.nbl_singles
         if s in ("nba", "nbl"):
             return self.nba_sgm if is_sgm else self.nba_singles
         if s == "afl":
@@ -403,6 +409,8 @@ def load_priority_from_env() -> PriorityConfig:
       RACING_SESSION_PRIORITY
       NFL_SESSION_PRIORITY        (v6.22 -- 4th&EV image + A1 text auto-place,
                                     line-within-2 match only)
+      NBL_SESSION_PRIORITY        (v6.32 -- Bettors Edge NBL singles fan-out;
+                                    empty -> falls back to NBA_SESSION_PRIORITY)
 
     Sessions not in the relevant list are excluded from auto-placement
     for that (sport, kind) — manual alert only.
@@ -417,6 +425,7 @@ def load_priority_from_env() -> PriorityConfig:
         mlb_sgm=_parse_priority_env("MLB_SGM_SESSION_PRIORITY"),
         racing=_parse_priority_env("RACING_SESSION_PRIORITY"),
         nfl_singles=_parse_priority_env("NFL_SESSION_PRIORITY"),
+        nbl_singles=_parse_priority_env("NBL_SESSION_PRIORITY"),
     )
     _priority_config = cfg
     return cfg
@@ -489,7 +498,7 @@ def all_priority_session_ids() -> set[str]:
     return set(
         cfg.nba_singles + cfg.nba_sgm + cfg.afl_singles
         + cfg.afl_sgm + cfg.mlb_singles + cfg.mlb_sgm + cfg.racing
-        + cfg.nfl_singles
+        + cfg.nfl_singles + cfg.nbl_singles
     )
 
 
@@ -1112,6 +1121,7 @@ def log_startup_summary() -> None:
     log.info(f"  MLB SGM     : {cfg.mlb_sgm or '(empty)'}")
     log.info(f"  Racing      : {cfg.racing or '(empty)'}")
     log.info(f"  NFL singles : {cfg.nfl_singles or '(empty)'}")
+    log.info(f"  NBL singles : {cfg.nbl_singles or '(empty -> NBA singles list)'}")
 
     # MLB design (2026-06-01): only the HRRBI 2-leg SGM auto-places; MLB
     # singles route to manual. MLB_SESSION_PRIORITY is meant to stay EMPTY.
