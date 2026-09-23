@@ -17279,6 +17279,330 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
         return None
 
 
+def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stake: float,
+                      cap_market: str, channel_name: str, raw_message: str,
+                      bet_label: str) -> list[BetResult]:
+    """v6.31 NFL concurrent fan-out (Wilson 2026-09-22: "fan out to all available
+    sportsbet accounts and then place and then ladder down if needed").
+
+    Sibling of _place_etr_nba_fanout / _place_afl_fanout. The leg is already fully
+    resolved (one bookie, one proposition_id) by _resolve_nfl_market /
+    _resolve_nfl_team_market, which also ran the odds guard, so there is no
+    per-bookie resolve here.
+
+    Stake rule (Wilson 2026-09-22): intended / N active Sportsbet sessions in
+    NFL_SESSION_PRIORITY, one concurrent attempt per account at that share. On a
+    538 Sportsbet reports its max stake and _execute_bet rebets ONCE at exactly
+    that max; anything still unplaced goes to manual. No sessions.yaml NFL caps
+    (Wilson doesn't know Sportsbet's NFL prop limits yet) and no blind ladder.
+    The old sequential loop called hb.place_single_sports_bet directly, so it
+    never got that max-stake rebet at all.
+
+    Returns [] when no account was eligible (nothing attempted, caller alerts
+    manual). Otherwise returns every BetResult, and this function has already sent
+    the placed / unfilled / ambiguous alerts and written the audit row. After the
+    first placement fires it never raises, so a crash in alerting can't make the
+    caller treat an attempted bet as untouched."""
+    import time as _time_mod
+    import concurrent.futures
+    _t_start = _time_mod.time()
+    priced_bookie = (match.get("bookie") or "").strip().lower()
+
+    # ── Eligible sessions: priority order, active + owned, priced bookie only ──
+    try:
+        raw_sessions = _v4_get_active_sessions_unfiltered(tip) or []
+    except Exception as e:
+        log.error(f"[{channel_name}] NFL fan-out: could not list active sessions ({e})")
+        raw_sessions = []
+    active_by_sid = {str(s.get("session_id", "")): s for s in raw_sessions}
+    sessions: list[dict] = []
+    seen: set[str] = set()
+    for sid in priority:
+        sid = str(sid)
+        if sid in seen:
+            log.warning(f"NFL fan-out: duplicate session {sid} in priority, de-duped")
+            continue
+        seen.add(sid)
+        meta = session_priority.get_session_meta(sid)
+        yaml_bookie = ((meta.bookmaker if meta else "") or "").strip().lower()
+        if not yaml_bookie:
+            # Fail closed, same rule as the old sequential loop: no sessions.yaml
+            # entry means the bookie can't be verified against the priced catalog.
+            log.warning(f"[{channel_name}] NFL fan-out: no sessions.yaml metadata for "
+                        f"session {sid}, skipping rather than guess its bookie")
+            continue
+        if not priced_bookie or yaml_bookie != priced_bookie:
+            log.info(f"[{channel_name}] NFL fan-out: skipping session {sid} ({yaml_bookie}), "
+                     f"priced against {priced_bookie or '?'}'s catalog")
+            continue
+        sess = active_by_sid.get(sid)
+        if sess is None:
+            log.info(f"[{channel_name}] NFL fan-out: session {sid} not active, skipping")
+            continue
+        if ((sess.get("bookie") or "").strip().lower()) != priced_bookie:
+            log.warning(f"[{channel_name}] NFL fan-out: session {sid} is live on "
+                        f"{sess.get('bookie')!r} but sessions.yaml says {yaml_bookie}, skipping")
+            continue
+        sessions.append(sess)
+
+    if not sessions:
+        log.warning(f"[{channel_name}] NFL fan-out: no active {priced_bookie or '?'} session "
+                    f"in NFL_SESSION_PRIORITY for {bet_label} -> manual")
+        return []
+
+    # _execute_bet reads target_odds (not the resolver's "odds") and the exact
+    # selection string the catalog priced (e.g. "Jadarian Price Over"), which for a
+    # player prop is NOT the leg's bare "over"/"under".
+    leg = tip.legs[0]
+    presolved = {
+        "market": match["market"],
+        "selection": match["selection"],
+        "player": leg.player,
+        "stat": leg.stat,
+        "line": match["line"],
+        "target_odds": match.get("odds"),
+        "proposition_id": match.get("proposition_id"),
+        "live_odds": match.get("odds"),
+    }
+    n_accounts = len(sessions)
+    per_account = round(intended_stake / n_accounts, 2)
+    log.info(f"[{channel_name}] NFL fan-out: {bet_label} on {match['event']}: "
+             f"{n_accounts} account(s), intended ${intended_stake:.2f} -> "
+             f"${per_account:.2f}/account (even split), live odds {match.get('odds')}")
+
+    # ── One rung per account: its even share of the unit ──────────────────
+    # Wilson 2026-09-22: each account places total/N once; on a 538 Sportsbet
+    # reports its max stake and _execute_bet rebets ONCE at exactly that max
+    # (_sb_max_stake_target). Whatever still didn't land goes to manual. No blind
+    # percentage ladder: the bookie's own max is the ladder.
+    jobs: list[tuple[dict, list]] = []
+    allocated = 0.0
+    for sess in sessions:
+        sid = str(sess.get("session_id", ""))
+        remaining = round(intended_stake - allocated, 2)
+        if remaining <= 0:
+            log.info(f"NFL fan-out: unit fully allocated, session {sid} not needed")
+            break
+        share = round(min(per_account, remaining), 2)
+        # A sessions.yaml NFL cap, if Wilson ever adds one, still bounds the share
+        # (v6.22 safety). None configured today, so this returns the share as-is;
+        # a capped account's shortfall goes to manual like any other.
+        try:
+            _capped, _cap_reason = session_priority.resolve_max_stake(
+                sid, "nfl", cap_market, match.get("odds") or 0, share)
+            if _capped < share:
+                log.info(f"[{channel_name}] NFL fan-out: {sid} share ${share:.2f} "
+                         f"capped to ${_capped:.2f} ({_cap_reason})")
+                share = round(_capped, 2)
+        except Exception as e:
+            log.error(f"[{channel_name}] NFL fan-out: resolve_max_stake crashed for "
+                      f"{sid} ({e}), placing the uncapped share")
+        # No minimum-stake floor: raising a small share to a floor gave the first
+        # account several shares' worth and starved the rest (caught in the $1 live
+        # test, 2026-09-23). Sportsbet's own minimum is $0.01.
+        if share <= 0:
+            continue
+        allocated = round(allocated + share, 2)
+        log.info(f"[{channel_name}] NFL fan-out: {sess.get('bookie')}:{sid} -> ${share:.2f}")
+        jobs.append((sess, [share]))
+
+    if not jobs:
+        log.warning(f"[{channel_name}] NFL fan-out: no account had a usable stake for "
+                    f"{bet_label} -> manual")
+        return []
+
+    # ── Fire concurrently. From here on a bet may be on the book. ─────────
+    results: list[BetResult] = []
+    log.info(f"[{channel_name}] NFL fan-out: firing {len(jobs)} concurrent placement(s)")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        futures = {
+            ex.submit(_fanout_place_account, tip, sess, ladder, presolved): sess
+            for (sess, ladder) in jobs
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            sess = futures[fut]
+            sid = str(sess.get("session_id", ""))
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                log.error(f"[{channel_name}] NFL fan-out: placement on {sid} raised: {e}")
+                results.append(BetResult(
+                    success=False, tip=tip, session_id=sid,
+                    bookie=sess.get("bookie", "unknown"),
+                    error=f"NFL fan-out placement exception: {e}",
+                    timestamp=datetime.now()))
+
+    try:
+        _nfl_fanout_rollup(tip, jobs, results, intended_stake, channel_name,
+                           raw_message, bet_label, _time_mod.time() - _t_start)
+    except Exception as e:
+        log.error(f"[{channel_name}] NFL fan-out: rollup/alerting crashed ({e}); "
+                  f"placements were ATTEMPTED, so not re-trying")
+        try:
+            notifier.notify_critical(
+                f"NFL fan-out alerting crashed on {channel_name} for {bet_label} "
+                f"after placements fired ({e}). Check HyperBot pending_bets and the "
+                f"ledger before placing anything by hand.\n\n{raw_message}")
+        except Exception:
+            pass
+    return results
+
+
+def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake: float,
+                       channel_name: str, raw_message: str, bet_label: str,
+                       elapsed_sec: float) -> None:
+    """Classify an NFL fan-out's results and send the placed / unfilled / ambiguous
+    alerts plus the audit row. Mirrors _place_etr_nba_fanout's tail. Split out so
+    _place_nfl_fanout can guard it with one try/except after bets have fired."""
+    placed_results: list[BetResult] = []
+    ambiguous_results: list[BetResult] = []
+    failed_results: list[BetResult] = []
+    for r in results:
+        if r.success:
+            placed_results.append(r)
+        elif _is_ambiguous_result(r):
+            ambiguous_results.append(r)
+        else:
+            failed_results.append(r)
+
+    top_by_sid = {str(s.get("session_id", "")): ladder[0] for (s, ladder) in jobs}
+
+    def _at_risk_stake(r: BetResult) -> float:
+        # Same rule as the AFL/ETR fan-outs: the stake actually fired (smaller after
+        # a Sportsbet max-stake rebet) beats the pre-rebet rung, so maybe-landed
+        # exposure is never over-counted.
+        return round(
+            (r.stake or getattr(r, "_requested_stake", None)
+             or top_by_sid.get(str(r.session_id), 0.0) or 0.0), 2)
+
+    attempted_stake = round(sum(top_by_sid.values()), 2)
+    total_placed = round(sum(r.stake or 0 for r in placed_results), 2)
+    ambiguous_total = round(sum(_at_risk_stake(r) for r in ambiguous_results), 2)
+    unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
+    display_intended = round(intended_stake, 2)
+
+    ambiguous_outcomes = [
+        {
+            "bookie": r.bookie, "session_id": r.session_id,
+            "stake": _at_risk_stake(r), "odds": (r.odds or 0),
+            "elapsed_sec": round(getattr(r, "elapsed_sec", None) or 0.0, 2),
+            "error": (r.error or "")[:200],
+            "reason": ("fast_ambiguous" if getattr(r, "is_ambiguous", False)
+                       else "slow_rejection"),
+            "correlation_id": getattr(r, "correlation_id", None),
+        }
+        for r in ambiguous_results
+    ]
+    session_timing = [
+        {
+            "session_id": r.session_id, "bookie": r.bookie,
+            "elapsed_sec": getattr(r, "elapsed_sec", None) or 0.0,
+            "attempts": 1, "fails": 0 if r.success else 1, "succeeded": r.success,
+        }
+        for r in results
+    ]
+
+    _log_jsonl(_audit_log_path(), {
+        "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
+        "intended_stake": display_intended, "attempted_stake": attempted_stake,
+        "placed_stake": total_placed, "ambiguous_stake": ambiguous_total,
+        "unfilled_stake": unfilled, "fanout": "nfl", "accounts": len(jobs),
+        "placements": [
+            {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
+             "fill_odds": r.odds, "bet_id": r.bet_id}
+            for r in placed_results
+        ],
+        "ambiguous": [
+            {"session_id": r.session_id, "bookie": r.bookie, "stake": _at_risk_stake(r),
+             "error": r.error, "correlation_id": getattr(r, "correlation_id", None)}
+            for r in ambiguous_results
+        ],
+        "failures": [
+            {"session_id": r.session_id, "bookie": r.bookie, "error": r.error}
+            for r in failed_results
+        ],
+    })
+
+    for r in placed_results:
+        log.warning(f"[{channel_name}] NFL AUTO-PLACED: {bet_label} @ {r.odds} "
+                    f"${r.stake} on {r.bookie}:{r.session_id} (bet_id={r.bet_id})")
+    log.info(f"[{channel_name}] NFL fan-out: placed ${total_placed:.2f} of "
+             f"${display_intended:.2f} across {len(placed_results)}/{len(jobs)} "
+             f"account(s) ({len(failed_results)} failed, {len(ambiguous_results)} "
+             f"ambiguous, ${unfilled:.2f} unfilled)")
+
+    if placed_results:
+        try:
+            notifier.notify_tip_placed_summary(
+                tip, placed_results, display_intended, unfilled,
+                total_elapsed_sec=round(elapsed_sec, 2),
+                session_timing=session_timing,
+                concurrent_bookies=True,
+            )
+        except Exception as e:
+            # notify_tip_placed_summary also owns the ledger rows for these bets.
+            log.error(f"[{channel_name}] NFL fan-out: placed-summary alert failed: {e}")
+            try:
+                notifier.notify_critical(
+                    f"NFL bet(s) PLACED but the placed-alert failed on {channel_name}: "
+                    f"{bet_label} ${total_placed:.2f} across "
+                    f"{', '.join(f'{r.bookie}:{r.session_id}' for r in placed_results)}"
+                    f" -- verify the ledger rows exist ({e})")
+            except Exception:
+                pass
+
+    if unfilled > 1.0:
+        log.warning(f"[{channel_name}] NFL fan-out: ${unfilled:.2f} unfilled for "
+                    f"{bet_label} ({len(failed_results)} account(s) failed)")
+        try:
+            notifier.notify_tip_unfilled_with_placements(
+                tip, display_intended, total_placed, unfilled,
+                placed_results, failed_results,
+                session_timing=session_timing,
+                total_elapsed_sec=round(elapsed_sec, 2),
+                concurrent_bookies=True,
+            )
+        except Exception as e:
+            log.error(f"[{channel_name}] NFL fan-out: unfilled alert failed: {e}")
+        # The unfilled alert truncates the raw text to 300 chars; this keeps the full
+        # tipster message (alt lines, take-down-to prices) in front of Wilson.
+        try:
+            notifier.notify_text_manual_alert(
+                channel_name, raw_message,
+                header=(f"NFL PARTIAL FILL, ${unfilled:.2f} left to place by hand"
+                        if total_placed > 0 or ambiguous_total > 0
+                        else "NFL AUTO-PLACE FAILED, review"),
+            )
+        except Exception as e:
+            log.error(f"[{channel_name}] NFL fan-out: raw-text manual alert failed: {e}")
+        _log_jsonl(ERROR_LOG, {
+            "type": "tip_unfilled", "tipster": tip.tipster, "event": tip.event,
+            "intended_stake": display_intended, "attempted_stake": attempted_stake,
+            "placed_stake": total_placed, "unfilled_stake": unfilled,
+            "last_error": failed_results[-1].error if failed_results else None,
+            "message": tip.raw_message, "fanout": "nfl",
+        })
+
+    if ambiguous_outcomes:
+        try:
+            _emit_sports_ambiguous_alert(tip, ambiguous_outcomes)
+        except Exception as e:
+            log.error(f"[{channel_name}] NFL fan-out: ambiguous alert failed: {e}")
+        # _emit_sports_ambiguous_alert names only the event and accounts. A 4th&EV
+        # slate often has several legs on one game, so say WHICH bet may have landed
+        # (the old sequential path did; caught in the v6.31 review).
+        try:
+            _accts = ", ".join(f"{o['bookie']}:{o['session_id']} ${o['stake']:.2f}"
+                               for o in ambiguous_outcomes)
+            notifier.notify_critical(
+                f"NFL AUTO-PLACE AMBIGUOUS on {channel_name}: {bet_label} -- "
+                f"${ambiguous_total:.2f} MAY have landed ({_accts}). Check HyperBot "
+                f"pending_bets before placing this again by hand -- do NOT re-place "
+                f"blindly.\n\n{raw_message}")
+        except Exception as e:
+            log.error(f"[{channel_name}] NFL fan-out: ambiguous critical alert failed: {e}")
+
+
 def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: str,
                              stat: str, side: str, tipster_line, units, unit_size,
                              raw_message: str, tipster_odds=None, telegram_msg_id=None,
@@ -17523,8 +17847,6 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
                       f"(unit_size={unit_size!r}) -> manual")
             return False
 
-        max_odds = _bookie_max_odds(tipster, tipster_odds, target_odds=match.get("odds"))
-
         # v6.26: team markets (h2h/spread) have no over/under direction --
         # match["direction"] is None for those (see _resolve_nfl_team_
         # market's docstring) -- so the ParsedLeg's selection must come
@@ -17557,220 +17879,27 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
             suggested_bookie="sportsbet", suggested_odds=tipster_odds or match.get("odds") or 0.0,
         )
 
-        # v6.22 code review: proposition_id/market/line/odds were resolved
-        # against ONE session's (match["bookie"]) catalog -- HyperBot's
-        # catalog is bookie-scoped, not universal, so sending that SAME
-        # payload to a session on a DIFFERENT bookie would be wrong (a
-        # mismatched proposition_id). NFL_SESSION_PRIORITY is documented as
-        # an all-Sportsbet list today, so this is latent, not live -- but
-        # nothing enforced it, so enforce it here: skip any priority session
-        # whose sessions.yaml bookie doesn't match the one actually priced.
-        result = None
-        for sid in priority:
-            sid = str(sid)
-            meta = session_priority.get_session_meta(sid)
-            # v6.23 (third review): no "or sportsbet" fallback here either --
-            # see the matching fix on probe_bookie in _resolve_nfl_market.
-            # An empty string can never equal a real bookie name, so a
-            # session with missing/typo'd sessions.yaml metadata now fails
-            # CLOSED (skipped below) instead of silently assuming Sportsbet
-            # and potentially matching a proposition_id priced for a
-            # different bookie entirely.
-            sess_bookie = meta.bookmaker if meta else ""
-            if not sess_bookie:
-                # v6.25 code review (xhigh audit): the warning below used to
-                # claim "skipping" with no `continue` actually enforcing it
-                # -- if match["bookie"] were EVER also "" (now impossible,
-                # _resolve_nfl_market refuses that case at the source, but
-                # this is the second, independent layer, not a single point
-                # of failure), "" == "" would have silently passed the
-                # mismatch check two lines down and placed against an
-                # unverified bookie. Explicit continue here regardless.
-                log.warning(f"[{channel_name}] NFL auto-place: no sessions.yaml "
-                            f"metadata for session {sid!r} -- cannot verify its "
-                            f"bookie, skipping rather than guess")
-                continue
-            if sess_bookie != match["bookie"]:
-                log.info(f"[{channel_name}] NFL auto-place: skipping session {sid} "
-                          f"({sess_bookie}) -- priced against {match['bookie']}'s "
-                          f"catalog, proposition_id would not apply")
-                continue
-
-            # v6.22 code review: liability cap resolved PER SESSION, inside
-            # the retry loop -- an earlier version resolved this once against
-            # priority[0] and reused it for whichever session actually
-            # placed, sizing against the wrong account's cap on any fallback.
-            #
-            # v6.26: the liability-cap yaml key for a team market is
-            # market_type_norm itself ("h2h"/"total" match
-            # KNOWN_NFL_MARKETS directly; "spread" translates to "line",
-            # the one place that translation matters -- see
-            # _NFL_TEAM_MARKET_KEY's comment).
-            _cap_market = (stat or "").strip().lower() if market_type_norm == "player_prop" \
-                else ("line" if market_type_norm == "spread" else market_type_norm)
-            try:
-                stake, cap_reason = session_priority.resolve_max_stake(
-                    sid, "nfl", _cap_market,
-                    match.get("odds") or 0, intended_stake,
-                )
-            except Exception as e:
-                # v6.23 (third review): this fallback (full intended_stake,
-                # "no-cap") is the SAME one every other sport's equivalent
-                # try/except uses on a missing yaml entry -- kept identical
-                # on purpose, not weakened further. What was missing was
-                # visibility: an actual CRASH here (a malformed yaml entry, a
-                # bug in the brand-new NFL liability-cap path) was
-                # indistinguishable in the logs from the legitimate
-                # "no cap configured" case. Now logged so a real bug doesn't
-                # look like routine, intended behaviour.
-                log.error(f"[{channel_name}] NFL auto-place: resolve_max_stake "
-                          f"crashed for session {sid} ({e}) -- falling back to "
-                          f"the full intended stake, uncapped")
-                stake = intended_stake
-                cap_reason = "no-cap"
-            if stake <= 0:
-                log.info(f"[{channel_name}] NFL auto-place: skipping session {sid} "
-                          f"-- liability cap resolved to $0 ({cap_reason})")
-                continue
-            log.info(f"[{channel_name}] NFL auto-place: {sid} stake=${stake:.2f} "
-                      f"(intended=${intended_stake:.2f}, {cap_reason})")
-
-            _t0 = time.time()
-            resp = hb.place_single_sports_bet(
-                session_id=sid, sport="nfl", event=match["event"],
-                market=match["market"], selection=match["selection"], stake=stake,
-                player=player, stat=stat, line=match["line"],
-                target_odds=match.get("odds"), proposition_id=match.get("proposition_id"),
-                direction=match["direction"], max_odds=max_odds,
-            )
-            _elapsed = time.time() - _t0
-            cid_unresolved = bool(resp.get("cid_unresolved", False))
-            err_str = resp.get("error") or ""
-            # v6.22 code review: mirrors _execute_bet's Erasmus-safety rule
-            # (main.py ~1349-1360) -- a SLOW rejection may have actually
-            # landed at the bookie despite the "failure" response (the bookie
-            # can take 10+s and still have placed it), so it must be treated
-            # as ambiguous too, not just an explicit ambiguous/cid_unresolved
-            # flag. Only a definitely-pre-placement error (never reached the
-            # bookie) is exempt. This is the exact gap that cost $525 on a
-            # $400 tip (Erasmus 2026-05-03) and again on AFL (Dawson,
-            # 2026-05-21) for other sports before this rule existed.
-            _slow = _elapsed >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
-            is_ambiguous = (
-                bool(resp.get("ambiguous", False)) or cid_unresolved
-                or (_slow and not _is_definitely_pre_placement(err_str))
-            )
-
-            result = BetResult(
-                success=bool(resp.get("success")), tip=tip,
-                session_id=sid, bookie=sess_bookie,
-                bet_id=resp.get("bet_id"),
-                odds=resp.get("odds") if "odds" in resp else match.get("odds"),
-                stake=resp.get("stake") if "stake" in resp else stake,
-                error=resp.get("error"), timestamp=datetime.now(),
-                is_ambiguous=is_ambiguous, cid_unresolved=cid_unresolved,
-                elapsed_sec=_elapsed,
-                placed_market=match["market"], placed_player=player, placed_stat=stat,
-                placed_line=match["line"], placed_selection=match["selection"],
-            )
-
-            if result.success:
-                break
-            if is_ambiguous:
-                # NEVER try another session after an ambiguous outcome -- the
-                # bet may already be on the books; placing again elsewhere
-                # would be a real double-stake. Reconcile via the SAME
-                # battle-tested /api/pending_bets check every other
-                # real-money sports path relies on. get_sessions() (needed
-                # for account_id) is fetched here, lazily, ONLY on this rare
-                # path -- not on every call (v6.22 code review: two
-                # independent findings caught the earlier unconditional
-                # fetch wasting a full HyperBot round-trip on every clean
-                # success/reject for data only this branch ever uses).
-                all_sessions = hb.get_sessions() or []
-                by_sid = {str(s.get("session_id", "")): s for s in all_sessions}
-                sess = by_sid.get(sid) or {"session_id": sid, "bookie": sess_bookie}
-                try:
-                    result = _reconcile_fanout_ambiguous(
-                        tip, sess, result, stake, f"NFL auto-place {sid}")
-                except Exception as e:
-                    log.error(f"NFL auto-place: reconcile crashed ({e}) -- staying "
-                              f"conservative (debit-as-placed)")
-                break
-            log.info(f"[{channel_name}] NFL auto-place: {sid} rejected "
-                      f"({result.error}) -- trying next priority session")
-
-        if result is None:
-            return False
-
-        # v6.22 code review (Angle D): from THIS point on, a real placement
-        # has been ATTEMPTED (result is a real BetResult, possibly success,
-        # possibly a clean/ambiguous failure) -- the function MUST return
-        # True no matter what happens in the logging/alerting below. The
-        # earlier version let this whole block share the outer try/except,
-        # so a crash in an f-string or a raised notify_* call would flip an
-        # ALREADY-PLACED bet to handled=False, and the caller would then
-        # fire its OWN "not matched" manual alert on top of a bet that had
-        # already landed -- the same double-stake risk class the ambiguous
-        # handling above exists to prevent, just via a different path.
-        try:
-            if result.success:
-                log.warning(
-                    f"[{channel_name}] NFL AUTO-PLACED: {_bet_label} "
-                    f"@ {result.odds} ${result.stake} on "
-                    f"{result.bookie}:{result.session_id} (tipster line {tipster_line}, "
-                    f"bet_id={result.bet_id})"
-                )
-                try:
-                    notifier.notify_bet_placed(result)
-                except Exception as e:
-                    log.error(f"NFL auto-place: placed-alert failed: {e}")
-                    # notify_bet_placed also owns the ONE ledger write for
-                    # this path (see the docstring); if it raised, both the
-                    # alert AND the ledger row may be missing. A real bet
-                    # landed with only a log line otherwise -- one more
-                    # attempt at SOME user-facing signal.
-                    try:
-                        notifier.notify_critical(
-                            f"NFL bet PLACED but the placed-alert failed on "
-                            f"{channel_name}: {_bet_label} ${result.stake} on "
-                            f"{result.bookie}:{result.session_id}, bet_id={result.bet_id} "
-                            f"-- verify the ledger row exists ({e})"
-                        )
-                    except Exception:
-                        pass
-            elif result.is_ambiguous:
-                log.error(f"[{channel_name}] NFL auto-place AMBIGUOUS: {result.error}")
-                try:
-                    notifier.notify_critical(
-                        f"NFL AUTO-PLACE AMBIGUOUS on {channel_name}: {_bet_label} "
-                        f"${stake} -- "
-                        f"the bet MAY have landed at {result.bookie}:{result.session_id}. "
-                        f"Check HyperBot pending_bets before placing this again by "
-                        f"hand -- do NOT re-place blindly.\n\n{raw_message}"
-                    )
-                except Exception as e:
-                    log.error(f"NFL auto-place: ambiguous-alert failed: {e}")
-            else:
-                log.error(f"[{channel_name}] NFL auto-place FAILED: {result.error}")
-                try:
-                    notifier.notify_bet_failed(result)
-                except Exception as e:
-                    log.error(f"NFL auto-place: failed-alert failed: {e}")
-                # notify_bet_failed's alert is structured (legs only) -- also
-                # send the full raw text so nothing about the original A1/
-                # 4th&EV message is lost, same reasoning as the manual path.
-                try:
-                    notifier.notify_text_manual_alert(
-                        channel_name, raw_message, header="NFL AUTO-PLACE FAILED, review",
-                    )
-                except Exception:
-                    pass
-        except Exception as e:
-            log.error(f"[{channel_name}] NFL auto-place: post-placement alerting "
-                      f"crashed ({e}) -- a placement was still ATTEMPTED, so "
-                      f"returning handled=True regardless (never re-attempt)")
-        return True
+        # v6.31 (Wilson: "fan out to all available sportsbet accounts and then place
+        # and then ladder down if needed"): was a SEQUENTIAL loop -- the full stake
+        # on one session, then the full stake again on the next -- with no NFL
+        # liability caps, so every real 4th&EV leg on 2026-09-20 hit HTTP 538 on all
+        # five accounts and nothing placed. _place_nfl_fanout splits the stake across
+        # every active Sportsbet account concurrently, each laddering down on its own
+        # 538, and owns every alert/ledger/audit write from here on.
+        if market_type_norm == "player_prop":
+            _cap_market = (stat or "").strip().lower()
+        elif market_type_norm == "spread":
+            _cap_market = "line"
+        else:
+            _cap_market = market_type_norm
+        # [] means no account was eligible, so nothing was attempted and the caller
+        # sends its manual alert. Anything else means a placement was attempted and
+        # _place_nfl_fanout has already alerted.
+        results = _place_nfl_fanout(
+            tip, priority, match, intended_stake, _cap_market,
+            channel_name, raw_message, _bet_label,
+        )
+        return bool(results)
     except Exception as e:
         log.error(f"[{channel_name}] NFL auto-place crashed for {player!r}: {e} "
                   f"-> falling back to manual")
