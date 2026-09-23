@@ -491,6 +491,10 @@ def _norm_runner(selection: str, runner_match: str = "") -> str:
     or nothing older than 2026-08-11 ever matches."""
     s = str(runner_match or selection or "")
     s = re.sub(r"^\s*\d+\s*[.\-]\s*", "", s)          # "7. Alchemistic" -> "Alchemistic"
+    # v6.33: fold accents too, so "Je Suis Beyoncé" (tipped) and "Je Suis Beyonce"
+    # (the bookie's runner_match) are the same runner for the duplicate guard.
+    import unicodedata
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
