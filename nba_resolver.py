@@ -147,6 +147,42 @@ def _build_nfl_team_aliases() -> dict:
 
 
 NFL_TEAM_ALIASES = _build_nfl_team_aliases()
+_NFL_FULL_NAMES = {v.lower(): v for v in NFL_TEAM_ALIASES.values()}
+_NFL_MASCOTS = {full.rsplit(" ", 1)[-1].lower(): full for full in NFL_TEAM_ALIASES.values()}
+_NFL_CITY_WORDS: dict = {}
+for _full in set(NFL_TEAM_ALIASES.values()):
+    for _w in _full.lower().split()[:-1]:
+        _NFL_CITY_WORDS.setdefault(_w, set()).add(_full)
+
+
+def canonical_nfl_team(name: str) -> str:
+    """Map a tipster's NFL team text to ESPN's full name, or return it unchanged.
+
+    v6.35 (4th&EV 2026-09-24 'GB Packers -4.5' went manual): an abbreviation +
+    mascot ('GB Packers', 'KC Chiefs', 'LA Rams', 'NY Jets') matched neither the
+    alias table nor a substring of 'Green Bay Packers'. The last word must be a
+    team's mascot, and no earlier word may name a DIFFERENT team ('NY Giants' ok,
+    'KC Packers' is left unresolved)."""
+    raw = (name or "").strip()
+    low = " ".join(raw.lower().split())
+    if not low:
+        return raw
+    if low in NFL_TEAM_ALIASES:
+        return NFL_TEAM_ALIASES[low]
+    if low in _NFL_FULL_NAMES:
+        return _NFL_FULL_NAMES[low]
+    words = low.replace(".", "").split()
+    full = _NFL_MASCOTS.get(words[-1]) if len(words) > 1 else None
+    if not full:
+        return raw
+    for w in words[:-1]:
+        other = NFL_TEAM_ALIASES.get(w)
+        if other and other != full:
+            return raw
+        cities = _NFL_CITY_WORDS.get(w)
+        if cities and full not in cities:
+            return raw
+    return full
 
 
 # NBL (v6.32, The Bettors Edge). Values are ESPN's NBL displayName (what
@@ -412,6 +448,7 @@ def resolve_nfl_event(team: str = "") -> Optional[str]:
         (now + timedelta(days=d)).strftime("%Y-%m-%d") for d in range(0, 7)
     ] + [(now - timedelta(days=1)).strftime("%Y-%m-%d")]
     teams_to_try = [team] if "/" not in team else [t.strip() for t in team.split("/")]
+    teams_to_try = [canonical_nfl_team(t) for t in teams_to_try]
     for check_date in check_order:
         games = _fetch_schedule("nfl", check_date)
         for try_team in teams_to_try:

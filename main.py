@@ -132,7 +132,7 @@ except ImportError:
 from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
 from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
-from nba_resolver import resolve_nba_event, resolve_mlb_event, resolve_nfl_event, NFL_TEAM_ALIASES
+from nba_resolver import resolve_nba_event, resolve_mlb_event, resolve_nfl_event, NFL_TEAM_ALIASES, canonical_nfl_team
 from nba_resolver import resolve_nbl_event, canonical_nbl_team
 from roster import resolve_player_name, get_player_team, afl_surname_candidates, afl_fuzzy_surname_candidates
 from roster import is_nfl_name_collision
@@ -16733,6 +16733,25 @@ _NFL_AUTOPLACE_STAT_SUFFIX = {
     "rushing_yards": "rushing_yds",
     "passing_yards": "passing_yds",
     "receptions": "total_receptions",
+    # v6.35 (live board 2026-09-24, Packers v Falcons): Sportsbet now carries
+    # full-game O/U lines for these too; the 2026-09-10 probe above predates them.
+    # 4th&EV's 'Jordan Love 3+/4+ passing touchdowns' went manual for lack of this.
+    "passing_touchdowns": "passing_tds",
+    "pass_attempts": "pass_attempts",
+    "passing_attempts": "pass_attempts",
+    "completions": "pass_completions",
+    "rush_attempts": "rush_attempts",
+}
+# v6.35: Sportsbet's 'N+' ladders ('Jordan Love 3+ Passing Touchdowns', line 2.5,
+# direction over). Used only for an OVER whose exact line the main O/U market
+# doesn't offer, and only on an EXACT line match (no tolerance), so it never
+# changes which bet is placed, only where an exact one can be found.
+_NFL_AUTOPLACE_ALT_SUFFIX = {
+    "receiving_yards": "alt_receiving_yds",
+    "rushing_yards": "alt_rushing_yds",
+    "passing_yards": "alt_passing_yds",
+    "receptions": "alt_receptions",
+    "passing_touchdowns": "alt_passing_tds",
 }
 # v6.25 code review (xhigh audit, Wilson's explicit correction): "within 2"
 # only ever made sense for YARDAGE -- 2 receiving/rushing/passing yards is
@@ -17029,33 +17048,62 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             log.info(f"NFL auto-place: price-check failed on every priority session for {event!r} -> manual")
             return None
 
-        key, market = _find_nfl_market(pc.get("markets") or {}, player, suffix)
-        if not market:
-            log.info(
-                f"NFL auto-place: no unambiguous live '{suffix}' market for "
-                f"{player!r} on {event!r} -> manual"
-            )
+        # v6.35: 'N+' written as a whole number ('3+ passing touchdowns' -> 3) is
+        # over N-0.5. NFL O/U lines are always half-points, so a whole-number
+        # OVER can only mean N+.
+        try:
+            _tl = float(tipster_line)
+        except (TypeError, ValueError):
             return None
+        if side == "over" and _tl == int(_tl):
+            log.info(f"NFL auto-place: {player!r} whole-number over {tipster_line} "
+                     f"read as {int(_tl)}+ (over {_tl - 0.5})")
+            tipster_line = _tl - 0.5
+        else:
+            tipster_line = _tl
 
+        markets_all = pc.get("markets") or {}
+        key, market = _find_nfl_market(markets_all, player, suffix)
         sel = None
-        for s in market.get("selections", []) or []:
-            if (s.get("direction") or "").strip().lower() == side:
-                sel = s
-                break
-        if not sel or sel.get("line") is None:
-            log.info(
-                f"NFL auto-place: no {side!r} selection with a line for "
-                f"{player!r} {suffix} -> manual"
-            )
-            return None
+        live_line = None
+        _why = f"no unambiguous live '{suffix}' market for {player!r} on {event!r}"
+        if market:
+            for s in market.get("selections", []) or []:
+                if (s.get("direction") or "").strip().lower() == side:
+                    sel = s
+                    break
+            if not sel or sel.get("line") is None:
+                _why = f"no {side!r} selection with a line for {player!r} {suffix}"
+                sel = None
+            else:
+                live_line = float(sel["line"])
+                _tol = _nfl_line_tolerance(stat)
+                if abs(float(tipster_line) - live_line) > _tol + 1e-9:
+                    _why = (f"{player!r} {suffix} tipster line {tipster_line} vs "
+                            f"live {live_line} -- outside {_tol} tolerance for {stat!r}")
+                    sel = None
 
-        live_line = float(sel["line"])
-        _tol = _nfl_line_tolerance(stat)
-        if abs(float(tipster_line) - live_line) > _tol + 1e-9:
-            log.info(
-                f"NFL auto-place: {player!r} {suffix} tipster line {tipster_line} vs "
-                f"live {live_line} -- outside {_tol} tolerance for {stat!r} -> manual"
-            )
+        # v6.35: the main line missed -> an OVER may still exist at EXACTLY the
+        # tipped line on the 'N+' ladder.
+        alt_suffix = _NFL_AUTOPLACE_ALT_SUFFIX.get((stat or "").strip().lower())
+        if sel is None and side == "over" and alt_suffix:
+            akey, amarket = _find_nfl_market(markets_all, player, alt_suffix)
+            if amarket:
+                ahits = [s for s in (amarket.get("selections", []) or [])
+                         if (s.get("direction") or "").strip().lower() == "over"
+                         and s.get("line") is not None
+                         and abs(float(s["line"]) - float(tipster_line)) < 1e-9]
+                if len(ahits) == 1:
+                    key, sel = akey, ahits[0]
+                    live_line = float(sel["line"])
+                    log.info(f"NFL auto-place: {player!r} over {tipster_line} found on "
+                             f"'{alt_suffix}' ({sel.get('selection')!r}) after: {_why}")
+                elif len(ahits) > 1:
+                    _why += f"; {len(ahits)} '{alt_suffix}' rows at {tipster_line} (ambiguous)"
+                else:
+                    _why += f"; no '{alt_suffix}' row at exactly {tipster_line}"
+        if sel is None:
+            log.info(f"NFL auto-place: {_why} -> manual")
             return None
 
         live_odds = sel.get("odds")
@@ -17155,7 +17203,7 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
         resolve_team = (team or "").strip()
         if not resolve_team:
             return None
-        canonical_team = NFL_TEAM_ALIASES.get(resolve_team.lower(), resolve_team)
+        canonical_team = canonical_nfl_team(resolve_team)
 
         market_type = market_type.strip().lower()
         if market_type == "h2h":
@@ -17746,6 +17794,10 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         # identical tip compare unequal and miss the duplicate entirely.
         try:
             _fp_line = round(float(tipster_line), 4)
+            # v6.35: '3+' parsed as 3 or as 2.5 is the same bet (see _resolve_nfl_market).
+            if ((market_type or "player_prop").strip().lower() == "player_prop"
+                    and (side or "").strip().lower() == "over" and _fp_line == int(_fp_line)):
+                _fp_line = _fp_line - 0.5
         except (TypeError, ValueError):
             _fp_line = str(tipster_line)
 
