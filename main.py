@@ -18797,23 +18797,30 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
         log.info(f"[{channel_name}] NBL manual: {desc.splitlines()[0]} -> {reason}")
         manual.append(f"- {desc}\n  -> {reason}")
 
-    _repaired = any(isinstance(r, dict) and r.get("alert_only") for r in raw_tips)
-    if manual or short or _repaired:
-        n_hand = len(manual) + len(short)
-        body = (f"{n_hand} of {len(raw_tips)} bet(s) need placing by hand "
-                f"({placed_or_handled} fully placed):\n\n"
-                + "\n".join(manual)
-                + (("\n\n" if manual else "") + "Tried on Sportsbet but NOT fully placed:\n"
-                   + "\n".join(short) if short else "")
-                + ("\n\nWARNING: the parse was cut off and repaired, so bets at the END of "
-                   "the post may be missing from this list. Check the full message."
-                   if _repaired else "")
-                + (f"\n\n---- full message ----\n{text}" if _repaired
-                   else f"\n\n{_post_context(text)}"))
+    # v6.39 (Wilson: "there wasnt a dedicated manual bet msg for hickey o26.5 pra"): ONE
+    # alert PER unplaced bet, like NFL, instead of one combined list per post. Legs that
+    # were tried on Sportsbet but not fully placed (`short`) already got their own
+    # fan-out alert (BET FAILED / PARTIAL FILL), so they are not repeated here.
+    _ctx = _post_context(text)
+    for entry in manual:
+        body = entry[2:] if entry.startswith("- ") else entry
         try:
-            notifier.notify_text_manual_alert(channel_name, body, header="NBL, MANUAL")
+            notifier.notify_text_manual_alert(channel_name, f"{body}\n{_ctx}", header="NBL, MANUAL")
         except Exception as e:
             log.error(f"[{channel_name}] NBL manual alert failed: {e}")
+    log.info(f"[{channel_name}] NBL post done: {placed_or_handled} fully placed, "
+             f"{len(short)} tried but not fully placed, {len(manual)} manual, of {len(raw_tips)}")
+
+    _repaired = any(isinstance(r, dict) and r.get("alert_only") for r in raw_tips)
+    if _repaired:
+        try:
+            notifier.notify_text_manual_alert(
+                channel_name,
+                "The parse of this post was cut off and repaired, so bets at the END of the "
+                "post may not have been read at all. Check the full post:\n\n" + text,
+                header="NBL, CHECK THE FULL POST")
+        except Exception as e:
+            log.error(f"[{channel_name}] NBL repaired-parse alert failed: {e}")
 
 
 def _describe_nfl_image_tip(raw: dict) -> str:
