@@ -58,6 +58,7 @@ from config import (
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
     SPORTSBET_MAX_STAKE_REBET,
     HB_SEND_MAX_ODDS, HB_SEND_DIRECTION, HB_RETRY_WITHOUT_PLAYER, NFL_WORSE_LINE_STAKE_MULT,
+    HB_RETRY_WITHOUT_STAT,
     SELF_BET_MAX_STAKE,
     EDDIE_CAPTION_FALLBACK_ENABLED,
     EDDIE_TEXT_PLACE_ENABLED,
@@ -14321,6 +14322,44 @@ def _execute_bet(
         )
         _elapsed = round(_time_mod.time() - _t_place_start, 2)
 
+    # v6.38 STAT-LESS RETRY: HyperBot filters candidates by our `stat` and Sportsbet's
+    # rows carry none, so e.g. NBL 'doubles' (a double-double AND a triple-double row,
+    # both named 'William Hickey', line 0.5) answered "Selection 'William Hickey' not
+    # found. Available selections in 'doubles': [... 'William Hickey']". Without `stat`
+    # HB binds the proposition_id we priced (LIVE 2026-09-25: $1 placed at 23.0, the
+    # triple-double row). Retry ONCE without `stat` only when HB says our exact
+    # selection is "not found" yet lists it, the reject was fast, and a prop id pins it.
+    _hb_stat = stat
+    _err1 = str(resp.get("error") or "") if not resp.get("success") else ""
+    _avail = _err1.split("Available selections", 1)[1] if "Available selections" in _err1 else ""
+    if (HB_RETRY_WITHOUT_STAT and stat and selection and _resolved_prop_id
+            and "[selection_not_carried]" in _err1
+            and f"Selection '{selection}' not found" in _err1
+            and f"'{selection}'" in _avail
+            and not resp.get("ambiguous")
+            and _elapsed < STAKE_REJECT_LATENCY_THRESHOLD_SEC):
+        log.info(f"STAT-LESS RETRY: {bookie}:{sid} {selection!r} prop={_resolved_prop_id}: "
+                 f"HB listed the selection but filtered it out on stat={stat!r}, retrying once without stat")
+        _afl_log_event(tip, f"STATLESS-RETRY bookie={bookie} sid={sid} sel={selection!r}")
+        _hb_stat = None
+        _t_place_start = _time_mod.time()
+        resp = hb.place_single_sports_bet(
+            session_id=sid,
+            sport=tip.sport,
+            event=event_for_hb,
+            market=market,
+            selection=selection,
+            stake=stake,
+            player=_hb_player,
+            stat=None,
+            line=line,
+            target_odds=target_odds,
+            proposition_id=_resolved_prop_id,
+            direction=_direction,
+            max_odds=_max_odds,
+        )
+        _elapsed = round(_time_mod.time() - _t_place_start, 2)
+
     # v5.9x MAX-STAKE REBET (shared chokepoint for every sports-singles caller:
     # AFL fan-out, singles_v4, spillover, name-variants). On a Sportsbet
     # stake-too-high (538) reject the bookie now tells us the allowable max
@@ -14365,7 +14404,7 @@ def _execute_bet(
             selection=selection,
             stake=_mx_target,
             player=_hb_player,
-            stat=stat,
+            stat=_hb_stat,
             line=line,
             target_odds=target_odds,
             proposition_id=_resolved_prop_id,
@@ -18241,6 +18280,25 @@ def _nbl_pick_prop(markets: dict, raw: dict, allow_fuzzy: bool) -> tuple:
                 _n = None
             if not hits and side == "over" and _n is not None and _n == int(_n):
                 hits = [s for s in rows if _nbl_threshold_of(s) == int(_n)]
+            if not hits and _n is not None:
+                # v6.38 (Wilson 2026-09-25, Hickey o26.5 PRA vs Sportsbet 27.5: "better
+                # lines only"): an O/U line up to _NBL_BETTER_LINE_MAX EASIER than tipped
+                # (over: lower, under: higher) places at full stake; a worse line never
+                # does. Exactly one such row, or manual.
+                _tl = float(line)
+                better = []
+                for s in rows:
+                    if _nbl_threshold_of(s) is not None or s.get("line") is None:
+                        continue
+                    if (s.get("direction") or "").lower() != side:
+                        continue
+                    _gain = (_tl - float(s["line"])) if side == "over" else (float(s["line"]) - _tl)
+                    if 1e-9 < _gain <= _NBL_BETTER_LINE_MAX + 1e-9:
+                        better.append(s)
+                if len(better) == 1:
+                    log.info(f"NBL: {pname} {side} {line} {key}: Sportsbet line "
+                             f"{better[0].get('line')} is better -> full stake")
+                    hits = better
         else:
             return None, None, pname, "no over/under side or N+ threshold on the leg"
     if len(hits) != 1:
@@ -18251,6 +18309,7 @@ def _nbl_pick_prop(markets: dict, raw: dict, allow_fuzzy: bool) -> tuple:
     return key, hits[0], pname, ""
 
 
+_NBL_BETTER_LINE_MAX = 2.0  # v6.38: same cap as NFL count stats
 _NBL_SIGNED_LINE_RE = re.compile(r"^(.*\S)\s+([+-]\d+(?:\.\d+)?)$")
 
 
@@ -18462,6 +18521,37 @@ def _describe_nbl_leg(raw: dict) -> str:
     return line
 
 
+def _nbl_fanout_outcome(results: list, intended_stake: float) -> str:
+    """v6.38: one line on what a fan-out actually did, for the NBL summary alert.
+    'placed' when (nearly) all of it landed; otherwise starts with 'FAILED' or 'PARTIAL'
+    so the router lists the leg (Wilson 2026-09-25: the summary said 1 of 7 needed
+    placing by hand while a failed triple double sat among the 6 'auto-placed/attempted')."""
+    placed = 0.0
+    at_risk = 0.0
+    errs = []
+    for r in results or []:
+        try:
+            if getattr(r, "success", False):
+                placed += float(getattr(r, "stake", 0) or 0)
+            elif _is_ambiguous_result(r):
+                at_risk += float(getattr(r, "stake", 0) or 0)
+            else:
+                e = (getattr(r, "error", "") or "").strip()
+                if e:
+                    errs.append(e[:90])
+        except Exception:
+            continue
+    left = round(float(intended_stake or 0) - placed - at_risk, 2)
+    if left <= 1.0:
+        return "placed"
+    why = errs[0] if errs else "no reason given"
+    if placed <= 0 and at_risk <= 0:
+        return f"FAILED: nothing placed of ${intended_stake:.2f} ({why})"
+    return (f"PARTIAL: ${placed:.2f} placed of ${intended_stake:.2f}, ${left:.2f} left to place"
+            + (f", ${at_risk:.2f} unconfirmed (check pending bets)" if at_risk > 0 else "")
+            + f" ({why})")
+
+
 def _attempt_nbl_auto_place(tipster: str, channel_name: str, raw: dict, unit_size,
                             raw_message: str) -> tuple:
     """Resolve and place one Bettors Edge NBL leg. SYNCHRONOUS: run it through
@@ -18599,7 +18689,7 @@ def _attempt_nbl_auto_place(tipster: str, channel_name: str, raw: dict, unit_siz
             with _nbl_dedup_lock:
                 _nbl_recent_fps.pop(fp, None)
             return False, "no active Sportsbet account in the NBL priority list"
-        return True, "attempted"
+        return True, _nbl_fanout_outcome(results, intended_stake)
     except Exception as e:
         log.error(f"[{channel_name}] NBL auto-place crashed for {raw!r}: {e}")
         return False, f"auto-place error ({e})"
@@ -18662,6 +18752,7 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
 
     log.info(f"[{channel_name}] NBL: {len(raw_tips)} leg(s) parsed in {elapsed:.2f}s")
     manual: list[str] = []
+    short: list[str] = []
     placed_or_handled = 0
     for raw in raw_tips:
         if not isinstance(raw, dict):
@@ -18690,8 +18781,14 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
                 log.error(f"[{channel_name}] NBL placement call raised: {e}")
                 handled, reason = False, (f"placement call raised ({e}); check HyperBot "
                                           f"pending_bets before placing by hand")
-            if handled:
+            if handled and not str(reason).startswith(("FAILED", "PARTIAL")):
                 placed_or_handled += 1
+                continue
+            if handled:
+                # Tried on Sportsbet but not fully placed: the fan-out already sent its
+                # own alert, and the summary must say so too (v6.38).
+                log.info(f"[{channel_name}] NBL not fully placed: {desc.splitlines()[0]} -> {reason}")
+                short.append(f"- {desc}\n  -> {reason}")
                 continue
         elif mt == "sgm":
             reason = "SGM, place by hand"
@@ -18701,9 +18798,13 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
         manual.append(f"- {desc}\n  -> {reason}")
 
     _repaired = any(isinstance(r, dict) and r.get("alert_only") for r in raw_tips)
-    if manual or _repaired:
-        body = (f"{len(manual)} of {len(raw_tips)} bet(s) need placing by hand "
-                f"({placed_or_handled} auto-placed/attempted):\n\n" + "\n".join(manual)
+    if manual or short or _repaired:
+        n_hand = len(manual) + len(short)
+        body = (f"{n_hand} of {len(raw_tips)} bet(s) need placing by hand "
+                f"({placed_or_handled} fully placed):\n\n"
+                + "\n".join(manual)
+                + (("\n\n" if manual else "") + "Tried on Sportsbet but NOT fully placed:\n"
+                   + "\n".join(short) if short else "")
                 + ("\n\nWARNING: the parse was cut off and repaired, so bets at the END of "
                    "the post may be missing from this list. Check the full message."
                    if _repaired else "")
