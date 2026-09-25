@@ -57,7 +57,7 @@ from config import (
     STARTUP_DEAD_SESSION_ALERT, STARTUP_DEAD_SESSION_GRACE_SEC, STARTUP_DEAD_SESSION_MAX,
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
     SPORTSBET_MAX_STAKE_REBET,
-    HB_SEND_MAX_ODDS, HB_SEND_DIRECTION,
+    HB_SEND_MAX_ODDS, HB_SEND_DIRECTION, HB_RETRY_WITHOUT_PLAYER,
     SELF_BET_MAX_STAKE,
     EDDIE_CAPTION_FALLBACK_ENABLED,
     EDDIE_TEXT_PLACE_ENABLED,
@@ -14287,6 +14287,40 @@ def _execute_bet(
     )
     _elapsed = round(_time_mod.time() - _t_place_start, 2)
 
+    # v6.36 PLAYER-LESS RETRY: HyperBot matched our `player` against a catalog row whose
+    # player field is None and refused ([selection_not_carried]), despite the exact
+    # proposition_id we priced. Retry ONCE without `player` only when HB's own
+    # candidate list shows OUR exact selection string with player=None, the reject
+    # was fast (never submitted), and a proposition_id pins the row.
+    _hb_player = player
+    _err0 = str(resp.get("error") or "") if not resp.get("success") else ""
+    if (HB_RETRY_WITHOUT_PLAYER and player and selection and _resolved_prop_id
+            and "[selection_not_carried]" in _err0 and "player=None" in _err0
+            and f"sel='{selection}'" in _err0
+            and not resp.get("ambiguous")
+            and _elapsed < STAKE_REJECT_LATENCY_THRESHOLD_SEC):
+        log.info(f"PLAYER-LESS RETRY: {bookie}:{sid} {selection!r} "
+                 f"prop={_resolved_prop_id}: HB catalog row has player=None, retrying once without player")
+        _afl_log_event(tip, f"PLAYERLESS-RETRY bookie={bookie} sid={sid} sel={selection!r}")
+        _hb_player = None
+        _t_place_start = _time_mod.time()
+        resp = hb.place_single_sports_bet(
+            session_id=sid,
+            sport=tip.sport,
+            event=event_for_hb,
+            market=market,
+            selection=selection,
+            stake=stake,
+            player=None,
+            stat=stat,
+            line=line,
+            target_odds=target_odds,
+            proposition_id=_resolved_prop_id,
+            direction=_direction,
+            max_odds=_max_odds,
+        )
+        _elapsed = round(_time_mod.time() - _t_place_start, 2)
+
     # v5.9x MAX-STAKE REBET (shared chokepoint for every sports-singles caller:
     # AFL fan-out, singles_v4, spillover, name-variants). On a Sportsbet
     # stake-too-high (538) reject the bookie now tells us the allowable max
@@ -14330,7 +14364,7 @@ def _execute_bet(
             market=market,
             selection=selection,
             stake=_mx_target,
-            player=player,
+            player=_hb_player,
             stat=stat,
             line=line,
             target_odds=target_odds,
