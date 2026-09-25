@@ -57,7 +57,7 @@ from config import (
     STARTUP_DEAD_SESSION_ALERT, STARTUP_DEAD_SESSION_GRACE_SEC, STARTUP_DEAD_SESSION_MAX,
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
     SPORTSBET_MAX_STAKE_REBET,
-    HB_SEND_MAX_ODDS, HB_SEND_DIRECTION, HB_RETRY_WITHOUT_PLAYER,
+    HB_SEND_MAX_ODDS, HB_SEND_DIRECTION, HB_RETRY_WITHOUT_PLAYER, NFL_WORSE_LINE_STAKE_MULT,
     SELF_BET_MAX_STAKE,
     EDDIE_CAPTION_FALLBACK_ENABLED,
     EDDIE_TEXT_PLACE_ENABLED,
@@ -16826,6 +16826,32 @@ def _nfl_line_tolerance(stat: str) -> float:
     return _NFL_LINE_TOLERANCE_BY_STAT.get((stat or "").strip().lower(), _NFL_LINE_TOLERANCE_DEFAULT)
 
 
+# v6.37 (Wilson 2026-09-25, after A1's Judkins o14.5 -> SB 15.5 and Goff u34.5 -> SB 33.5
+# rush/pass attempts both went manual): for these count stats a line BETTER than tipped
+# places at full stake (over: lower line, under: higher line) and a line exactly 1 WORSE
+# places at NFL_WORSE_LINE_STAKE_MULT (75%). Anything else stays exact. Passing TDs and
+# yardage are deliberately NOT in this set.
+_NFL_COUNT_LINE_RULE_STATS = {"rush_attempts", "receptions", "pass_attempts",
+                              "passing_attempts", "completions"}
+_NFL_BETTER_LINE_MAX = 2.0
+
+
+def _nfl_count_line_shift(stat: str, side: str, tipped: float, live: float):
+    """'better', 'worse1' or None for a count-stat line that isn't the tipped one."""
+    if (stat or "").strip().lower() not in _NFL_COUNT_LINE_RULE_STATS:
+        return None
+    if side not in ("over", "under"):
+        return None
+    gain = (tipped - live) if side == "over" else (live - tipped)
+    # v6.37 review: 'better' is capped at 2 lines. A board wildly easier than the tip
+    # (stale or glitched line) goes manual rather than full stake on the odds floor alone.
+    if 1e-9 < gain <= _NFL_BETTER_LINE_MAX + 1e-9:
+        return "better"
+    if abs(gain + 1.0) < 1e-9:
+        return "worse1"
+    return None
+
+
 # v6.28 (Wilson, 2026-09-16: "Sportsbet copies FD prices, so we can just
 # compare off of that, if there is not odds comparison available just place
 # it as long as odds above 1.6"). Closes the A1 gap the earlier review
@@ -17100,6 +17126,8 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
         key, market = _find_nfl_market(markets_all, player, suffix)
         sel = None
         live_line = None
+        stake_mult = 1.0
+        _worse_by_one = None  # (key, sel) held back until the exact alt rung is tried
         _why = f"no unambiguous live '{suffix}' market for {player!r} on {event!r}"
         if market:
             for s in market.get("selections", []) or []:
@@ -17113,9 +17141,19 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
                 live_line = float(sel["line"])
                 _tol = _nfl_line_tolerance(stat)
                 if abs(float(tipster_line) - live_line) > _tol + 1e-9:
-                    _why = (f"{player!r} {suffix} tipster line {tipster_line} vs "
+                    _why = (f"{player!r} {side} {suffix} tipster line {tipster_line} vs "
                             f"live {live_line} -- outside {_tol} tolerance for {stat!r}")
-                    sel = None
+                    # v6.37 (Wilson 2026-09-25): count stats in _NFL_COUNT_LINE_RULE_STATS
+                    # take a BETTER line at full stake and a line exactly 1 worse at 75%.
+                    _shift = _nfl_count_line_shift(stat, side, float(tipster_line), live_line)
+                    if _shift == "better":
+                        log.info(f"NFL auto-place: {player!r} {side} {suffix} live {live_line} is "
+                                 f"BETTER than tipped {tipster_line} -> full stake")
+                    elif _shift == "worse1":
+                        _worse_by_one = (key, sel)
+                        sel = None
+                    else:
+                        sel = None
 
         # v6.35: the main line missed -> an OVER may still exist at EXACTLY the
         # tipped line on the 'N+' ladder.
@@ -17136,6 +17174,12 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
                     _why += f"; {len(ahits)} '{alt_suffix}' rows at {tipster_line} (ambiguous)"
                 else:
                     _why += f"; no '{alt_suffix}' row at exactly {tipster_line}"
+        if sel is None and _worse_by_one is not None and 0 < NFL_WORSE_LINE_STAKE_MULT <= 1:
+            key, sel = _worse_by_one
+            live_line = float(sel["line"])
+            stake_mult = NFL_WORSE_LINE_STAKE_MULT
+            log.info(f"NFL auto-place: {player!r} {side} {suffix} live {live_line} is 1 WORSE "
+                     f"than tipped {tipster_line} -> placing at {stake_mult:.0%} of the stake")
         if sel is None:
             log.info(f"NFL auto-place: {_why} -> manual")
             return None
@@ -17175,6 +17219,7 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             "line": live_line, "odds": sel.get("odds"),
             "proposition_id": sel.get("proposition_id"), "direction": side,
             "team": resolve_team, "probe_session_id": probe_sid, "bookie": probe_bookie,
+            "stake_mult": stake_mult,
         }
     except Exception as e:
         log.error(f"NFL auto-place: resolve crashed for {player!r} {stat!r}: {e}")
@@ -17930,6 +17975,11 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
             return True
 
         intended_stake = round(units_f * float(unit_size or 0), 2)
+        # v6.37: a count-stat line 1 worse than tipped places at 75% of the stake.
+        _mult = float(match.get("stake_mult", 1.0))
+        if _mult < 1.0:
+            intended_stake = round(intended_stake * _mult, 2)
+            _bet_label += f" (SB line {match['line']}, {_mult:.0%} stake)"
         if intended_stake <= 0:
             # v6.25 code review (xhigh audit): was silent. units_f is
             # already confirmed > 0 above, so this only fires on a
@@ -18366,6 +18416,17 @@ def _resolve_nbl_leg(raw: dict, tipster: str, priority: list) -> tuple:
         return None, f"resolver error ({e})"
 
 
+def _post_context(text: str) -> str:
+    """v6.37 (Wilson: 'the raw msg shouldnt be sent, it should just be one by one parsing of
+    the bets ... i dont want spam of hella long msgs'). One short line naming the post a bet
+    came from (its first non-empty line, usually the game), instead of the whole post."""
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if ln:
+            return f"From post: {ln[:80]}{'...' if len(ln) > 80 else ''}"
+    return ""
+
+
 def _describe_nbl_leg(raw: dict) -> str:
     """One readable line for a parsed leg, for alerts."""
     mt = (raw.get("market_type") or "").strip().lower()
@@ -18551,7 +18612,8 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
                                       unit_size: float = 0.0) -> None:
     """Route one Bettors Edge NBL post: parse every leg, auto-place each one that
     matches its game's live Sportsbet market, then send ONE manual alert listing
-    every leg that didn't (with the reason) plus the full post. Placed legs get
+    every leg that didn't (with the reason) plus the post's first line (the full
+    post only when the parse was repaired, v6.37). Placed legs get
     the fan-out's own alerts. Legs are placed one after another: each leg's
     accounts already fire concurrently, and two legs racing on the same account
     is untested."""
@@ -18622,7 +18684,7 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
             try:
                 handled, reason = await _run_in_placement_executor(
                     _attempt_nbl_auto_place, tipster, channel_name, raw, unit_size,
-                    f"{desc}\n\n---- full message ----\n{text}")
+                    f"{desc}\n{_post_context(text)}")
             except Exception as e:
                 # Never let one leg kill the loop and the consolidated alert.
                 log.error(f"[{channel_name}] NBL placement call raised: {e}")
@@ -18645,7 +18707,8 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
                 + ("\n\nWARNING: the parse was cut off and repaired, so bets at the END of "
                    "the post may be missing from this list. Check the full message."
                    if _repaired else "")
-                + f"\n\n---- full message ----\n{text}")
+                + (f"\n\n---- full message ----\n{text}" if _repaired
+                   else f"\n\n{_post_context(text)}"))
         try:
             notifier.notify_text_manual_alert(channel_name, body, header="NBL, MANUAL")
         except Exception as e:
@@ -18684,7 +18747,7 @@ def _describe_nfl_image_tip(raw: dict) -> str:
             f"{_or_q(raw.get('line'))}"
         )
     else:
-        lines.append(raw.get("description") or "(unschematic bet, see raw below)")
+        lines.append(raw.get("description") or "(unreadable bet, check the channel)")
     odds = raw.get("odds")
     units = raw.get("units")
     bookie = raw.get("bookie")
@@ -18697,6 +18760,10 @@ def _describe_nfl_image_tip(raw: dict) -> str:
         tail.append(str(bookie))
     if tail:
         lines.append("  " + " / ".join(tail))
+    # v6.37: the full post is no longer attached, so keep this bet's own note
+    # ('take up to 74.5', 'bet down to $1.80') with it.
+    if mt in ("player_prop", "h2h", "spread", "total") and raw.get("description"):
+        lines.append(f"  Note: {raw.get('description')}")
     return "\n".join(lines)
 
 
@@ -18825,10 +18892,12 @@ def _describe_a1_nfl_tip(raw: dict) -> str:
             headline += f" ({units}u)"
         if fd_odds is not None:
             headline += f" [FD {fd_odds}]"
+        if raw.get("description"):
+            headline += f"\n  Note: {raw.get('description')}"
         return headline
     if mt == "h2h":
         return f"{raw.get('team') or '?'}: moneyline/H2H"
-    return raw.get("description") or "(see raw message below)"
+    return raw.get("description") or "(unreadable bet, check the channel)"
 
 
 async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
@@ -18929,7 +18998,7 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
                 tipster, channel_name, raw.get("player"), raw.get("team"),
                 raw.get("stat"), raw.get("side"), raw.get("line"),
                 raw.get("units"), unit_size,
-                f"{headline}\n\n---- full message ----\n{text}",
+                f"{headline}\n{_post_context(text)}",
                 _tipster_odds,
             )
             if handled:
@@ -18938,7 +19007,7 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
         try:
             notifier.notify_text_manual_alert(
                 channel_name,
-                f"{headline}\n\n---- full message ----\n{text}",
+                f"{headline}\n{_post_context(text)}",
                 header="A1 NFL, MANUAL",
             )
         except Exception as e:
@@ -19047,7 +19116,7 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
                 tipster, channel_name, raw.get("player"), raw.get("team"),
                 raw.get("stat"), raw.get("side"), raw.get("line"),
                 raw.get("units"), unit_size,
-                f"{desc}\n\n---- full message ----\n{text}",
+                f"{desc}\n{_post_context(text)}",
                 raw.get("odds"), None, _mt,
             )
             if handled:
@@ -19056,7 +19125,7 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
         try:
             notifier.notify_text_manual_alert(
                 channel_name,
-                f"{desc}\n\n---- full message ----\n{text}",
+                f"{desc}\n{_post_context(text)}",
                 header="4TH&EV NFL TEXT, MANUAL",
             )
         except Exception as e:
@@ -21318,8 +21387,9 @@ async def main():
         # legs-only alert would still lose the prose nuance (alt-book line
         # variants, price flexibility, conditional fallback markets) A1's
         # real messages carry, so this bespoke router was kept even after
-        # v6.22 turned NFL_SESSION_PRIORITY on: it preserves the full raw
-        # text on every manual fallback AND does its own live-market
+        # v6.22 turned NFL_SESSION_PRIORITY on: it keeps each bet's own note
+        # on every manual fallback (v6.37: one bet per alert, never the whole
+        # post, except a parse failure) AND does its own live-market
         # resolution before ever calling place_single_sports_bet directly
         # (see _attempt_nfl_auto_place) -- it does not route through
         # _process_tip/place_tip at all.
