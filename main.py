@@ -58,7 +58,7 @@ from config import (
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
     SPORTSBET_MAX_STAKE_REBET,
     HB_SEND_MAX_ODDS, HB_SEND_DIRECTION, HB_RETRY_WITHOUT_PLAYER, NFL_WORSE_LINE_STAKE_MULT,
-    HB_RETRY_WITHOUT_STAT,
+    HB_RETRY_WITHOUT_STAT, SB_SLOW_538_REBET_MAX_SEC,
     SELF_BET_MAX_STAKE,
     EDDIE_CAPTION_FALLBACK_ENABLED,
     EDDIE_TEXT_PLACE_ENABLED,
@@ -14378,10 +14378,13 @@ def _execute_bet(
     # original. So on a slow reject we SKIP the rebet and let the original slow
     # failure flow to the maybe-landed handling. Symmetric with the racing gate.
     _mx_target = _sb_max_stake_target(resp, bookie, stake)
-    if _mx_target is not None and _elapsed >= STAKE_REJECT_LATENCY_THRESHOLD_SEC:
+    # v6.40 (Wilson): a 538 that states a max is rebet even when slow, up to
+    # SB_SLOW_538_REBET_MAX_SEC; only slower than that is it treated as maybe-landed.
+    _rebet_window = max(STAKE_REJECT_LATENCY_THRESHOLD_SEC, float(SB_SLOW_538_REBET_MAX_SEC or 0))
+    if _mx_target is not None and _elapsed >= _rebet_window:
         log.warning(
             f"MAX-STAKE REBET SKIPPED: {bookie}:{sid} stake-too-high on ${stake:.2f} "
-            f"came back SLOW ({_elapsed:.1f}s >= {STAKE_REJECT_LATENCY_THRESHOLD_SEC}s) "
+            f"came back SLOW ({_elapsed:.1f}s >= {_rebet_window}s) "
             f"— treating as maybe-landed (Erasmus guard), NOT rebetting"
         )
         _mx_target = None
