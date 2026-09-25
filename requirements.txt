@@ -2,3 +2,6 @@ telethon
 requests
 PyYAML
 python-dotenv
+# Only needed if you turn on Claude tip parsing (see section 3b of .env.example).
+anthropic>=0.111,<1
+tzdata
