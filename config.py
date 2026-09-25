@@ -104,17 +104,16 @@ CLAUDE_PARSER_MODEL = os.getenv("CLAUDE_PARSER_MODEL", "claude-sonnet-4-6")
 # re-open the AusBets "$400 on a no-bet message" hole). Every Claude-recovered
 # tip re-enters the IDENTICAL placement/roster/floor/dedup gates. OFF by default.
 CLAUDE_FALLBACK_ENABLED = os.getenv("CLAUDE_FALLBACK_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
-# Opus 4.8 — fires only after Groq already failed (a few/day), so accuracy over
-# cost. Exact ID, no date suffix. Parse is prompt-guided + JSON-repair (schema
-# NOT enforced — a nested raw_legs/alt_line json_schema would risk a 400); a
-# repair failure returns the empty sentinel -> manual. Opus reliably emits JSON,
-# so the 06-20 Groq-gibberish failure mode does not recur on the Claude tier.
-CLAUDE_FALLBACK_MODEL = os.getenv("CLAUDE_FALLBACK_MODEL", "claude-opus-4-8")
+# The model EVERY tip is parsed with when CLAUDE_PRIMARY=true (the name dates from
+# v5.80, when Claude only ran after a Groq failure and Opus 4.8 was chosen for that
+# rare path). v6.41 (Wilson 2026-09-25: "use sonnet 5.0 instead, doubt opus is
+# needed"): Sonnet 5. Exact ID, no date suffix. Parse is prompt-guided + JSON-repair
+# (schema NOT enforced); a repair failure returns the empty sentinel -> manual.
+CLAUDE_FALLBACK_MODEL = os.getenv("CLAUDE_FALLBACK_MODEL", "claude-sonnet-5")
 # v5.81: web-search resolvers (player/track) use SONNET — ~3x cheaper than Opus
 # and ample for "current club / today's SA track" lookups. The web_search path is
 # the costly one (search fees + large result contexts), so the cheaper model +
-# the search/loop caps below keep each resolve well under a dollar. Parse fallback
-# stays on Opus (CLAUDE_FALLBACK_MODEL) for extraction accuracy.
+# the search/loop caps below keep each resolve well under a dollar.
 CLAUDE_WEBSEARCH_MODEL = os.getenv("CLAUDE_WEBSEARCH_MODEL", "claude-sonnet-4-6")
 # v5.83: CLAUDE PRIMARY — when true, the parser SKIPS Groq entirely and parses
 # every tip (text / vision / racing-text) with Claude up front. Rationale: the
