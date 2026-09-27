@@ -1115,9 +1115,11 @@ IMAGE_PROMPT_AFL = (
 # win little win ... team totals too"): shared by the NFL image, 4th&EV text and A1 prompts.
 NEW_STATS_IMG = (
     'rushing_receiving_yards (rushing + receiving yards), passing_rushing_yards, and for a '
-    "FIRST-QUARTER player stat ('1st quarter receiving yards', '1Q rec yds', 'Q1'): "
-    '1st_quarter_receiving_yards, 1st_quarter_rushing_yards, 1st_quarter_passing_yards '
-    '(never map a quarter stat to the full-game one or the reverse). '
+    "FIRST-QUARTER player stat ('1st quarter receiving yards', 'first Q receiving', "
+    "'first quarter receiving', '1Q rec yds', 'Q1'): 1st_quarter_receiving_yards, "
+    '1st_quarter_rushing_yards, 1st_quarter_passing_yards, 1st_quarter_rushing_receiving_yards '
+    "(never map a quarter stat to the full-game one or the reverse; '1+ first Q receiving' "
+    'is 1st_quarter_receiving_yards over 0.5). '
 )
 TEAM_MARKETS_PROMPT = (
     "TEAM TOTAL, a single team's OWN full-game points total ('49ers Team Total Over "

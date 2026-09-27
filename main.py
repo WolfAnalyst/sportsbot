@@ -2449,9 +2449,8 @@ def _register_tip_fingerprint(tip: ParsedTip, fp: str = None) -> None:
 
 
 def _persist_placed_fingerprint(fp: str) -> None:
-    """v6.44: persist a LANDED (or ambiguous) generic bet so a same-day re-send hours
-    later, or after a restart, is ignored. Not called on a clean failure (review v6.44:
-    the in-memory claim is released then, so a failed bet can still be re-posted)."""
+    """v6.44: persist a generic bet so a same-day re-send hours later, or after a
+    restart, is ignored. v6.46: called at the placement claim for every real bet."""
     seen_bets.mark(_generic_seen_key(fp), fp)
 
 
@@ -15036,8 +15035,9 @@ async def _process_tip(text: str, tipster: str, sport: str,
             continue
         # v6.44: the 10-min in-memory window above misses a re-send hours later or
         # after a restart. Same tipster + same bet on the same calendar day = ignored.
-        # Checked here, REGISTERED only once placed (_persist_placed_fingerprint), so a
-        # tip that fails a gate (no units) can still be re-posted properly.
+        # Checked here, REGISTERED at the placement claim for every real bet
+        # (_persist_placed_fingerprint), so a tip gated as not-a-bet (no units) can
+        # still be re-posted properly.
         if not skip_dedup:
             _gprev = seen_bets.check(_generic_seen_key(_dupe_fp), GENERIC_SEEN_TTL_SEC)
             if _gprev:
@@ -15109,6 +15109,12 @@ async def _process_tip(text: str, tipster: str, sport: str,
             if not skip_dedup:
                 _register_tip_fingerprint(tip, fp=_dupe_fp)
                 _inflight_fps.add(_dupe_fp)  # v6.03: block re-send for the WHOLE flight
+                # v6.46 (Wilson: "the resend guard needs to be activated for all future
+                # bets from any tipsters"): a real bet is registered here whatever its
+                # outcome (a failed one goes to manual and he places it by hand). A tip
+                # gated to manual as NOT a bet (no units, "no bets today") is not.
+                if not getattr(tip, "alert_only", False):
+                    _persist_placed_fingerprint(_dupe_fp)
             # v6.07 (sweep #15): from here on a crash may follow a LANDED bet, so the
             # except below must NOT release the re-send claim. See it for the detail.
             _place_attempted = True
@@ -15132,7 +15138,6 @@ async def _process_tip(text: str, tipster: str, sport: str,
                     # in neither _inflight_fps (discarded above) nor _recent_tips (purged)
                     # -> double fan-out onto accounts where attempt #1 may have landed.
                     _register_tip_fingerprint(tip, fp=_dupe_fp)
-                    _persist_placed_fingerprint(_dupe_fp)
                 else:
                     # clean total failure: RELEASE the claim (re-sendable), preserves the
                     # v5.13 "re-send after a clean fail" semantics.
@@ -15842,12 +15847,13 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
                 continue
             _racing_recent_fps[_rfp] = _rnow
             # v6.44: persistent re-send guard (Zak re-posts whole cards days later).
-            # Same tipster + track + horse + market + UNITS within 7 days is the same
-            # bet; different units stays a re-add and goes on to the dup-runner guard,
+            # Same tipster + track + horse + market + UNITS (+ the parsed race date, v6.46
+            # review: a horse racing again at the track within 7 days is a new bet) is the
+            # same bet; different units stays a re-add and goes on to the dup-runner guard,
             # which still decides it (Wilson's racing rule).
             _rkey = (f"RACE|{tipster}|{_seen_text(parsed.get('track'))}|"
                      f"{_seen_text(parsed.get('runner'))}|{parsed.get('market')}|"
-                     f"{_seen_num(parsed.get('units'))}")
+                     f"{_seen_num(parsed.get('units'))}|{parsed.get('date') or ''}")
             _rlabel = (f"{parsed.get('runner')} {parsed.get('track') or '?'} "
                        f"R{parsed.get('race_num')} {parsed.get('market')} {parsed.get('units')}u")
             _rprev = seen_bets.check_and_mark(_rkey, RACING_SEEN_TTL_SEC, _rlabel)
@@ -16766,6 +16772,7 @@ async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
     # _recent_tips, so the dedup map is only read/written from this main thread).
     jobs = []          # [(idx, tip, dupe_fp)]
     _batch_fps = set()
+    _resent_img: list = []  # v6.46: bets already sent earlier, ignored
     for idx, raw in enumerate(raw_tips):
         try:
             # E (2026-06-28): an unschematic / moneyline / multi-parlay selection the
@@ -16886,6 +16893,15 @@ async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
             if _is_duplicate(tip) or _dupe_fp in _batch_fps:
                 log.info(f"[{channel_name}] DUPE image tip skipped: {_tip_fingerprint(tip)}")
                 continue
+            # v6.46: persistent re-send guard (same tipster + same bet, same day)
+            _gprev = seen_bets.check_and_mark(_generic_seen_key(_dupe_fp),
+                                              GENERIC_SEEN_TTL_SEC, _dupe_fp)
+            if _gprev:
+                log.warning(f"[{channel_name}] RESENT image tip, ignored (first seen "
+                            f"{seen_bets.age_text(_gprev)} ago): {_dupe_fp}")
+                _resent_img.append(f"- {_tip_fingerprint(tip)} (first sent "
+                                   f"{seen_bets.age_text(_gprev)} ago)")
+                continue
             _batch_fps.add(_dupe_fp)
 
             # v5.37: stamp arrival t0 + vision parse so the summary reconciles a
@@ -16912,6 +16928,16 @@ async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                 )
             except Exception:
                 pass
+
+    if _resent_img:
+        try:
+            notifier.notify_text_manual_alert(
+                channel_name,
+                f"{len(_resent_img)} bet(s) in this image were already sent earlier and were "
+                f"NOT placed again:\n" + "\n".join(_resent_img),
+                header="RESENT BETS, ignored")
+        except Exception as e:
+            log.error(f"[{channel_name}] resent-bets note failed: {e}")
 
     if not jobs:
         return
@@ -17043,6 +17069,7 @@ _NFL_AUTOPLACE_STAT_SUFFIX = {
     "1st_quarter_receiving_yards": "1st_qtr_receiving_yds",
     "1st_quarter_rushing_yards": "1st_qtr_rushing_yds",
     "1st_quarter_passing_yards": "1st_qtr_passing_yds",
+    "1st_quarter_rushing_receiving_yards": "1st_qtr_rushing_+_receiving_yds",
     "rushing_receiving_yards": "rushing_+_receiving_yds",
     "passing_rushing_yards": "passing_+_rushing_yds",
 }
@@ -17061,6 +17088,7 @@ _NFL_AUTOPLACE_ALT_SUFFIX = {
     "1st_quarter_receiving_yards": "1st_qtr_alt_receiving_yds",
     "1st_quarter_rushing_yards": "1st_qtr_alt_rushing_yds",
     "1st_quarter_passing_yards": "1st_qtr_alt_passing_yds",
+    "1st_quarter_rushing_receiving_yards": "1st_qtr_alt_rushing_+_receiving_yds",
 }
 # v6.25 code review (xhigh audit, Wilson's explicit correction): "within 2"
 # only ever made sense for YARDAGE -- 2 receiving/rushing/passing yards is
@@ -17090,6 +17118,7 @@ _NFL_LINE_TOLERANCE_BY_STAT = {
     "1st_quarter_receiving_yards": 0.0,
     "1st_quarter_rushing_yards": 0.0,
     "1st_quarter_passing_yards": 0.0,
+    "1st_quarter_rushing_receiving_yards": 0.0,
     "receptions": 0.0,
     "rush_attempts": 0.0,
     "pass_attempts": 0.0,
@@ -17171,7 +17200,7 @@ _NFL_ALT_NEAR_RUNG_STATS = {"receiving_yards", "rushing_yards", "passing_yards"}
 # v6.44: 1st quarter yardage takes a BETTER line (up to _NFL_BETTER_LINE_MAX) at full
 # stake, never a worse one (Wilson's NBL choice, "better lines only").
 _NFL_BETTER_ONLY_LINE_STATS = {"1st_quarter_receiving_yards", "1st_quarter_rushing_yards",
-                               "1st_quarter_passing_yards"}
+                               "1st_quarter_passing_yards", "1st_quarter_rushing_receiving_yards"}
 
 
 def _nfl_count_line_shift(stat: str, side: str, tipped: float, live: float):
@@ -20681,6 +20710,13 @@ async def _leroy_place_race(parsed_race, date_str, channel_name):
             if fp in _leroy_recent_fps:
                 log.info(f"[{channel_name}] Leroy DUPLICATE {track} R{race_num} #{saddle} "
                          f"{market} (already placed/attempted) -> skipped (no double-bet)")
+                continue
+            # v6.46: the same, persisted (a restart used to empty it)
+            _lprev = seen_bets.check_and_mark("|".join(str(x) for x in fp),
+                                              LEROY_DEDUP_TTL_SEC, f"{track} R{race_num} #{saddle} {market}")
+            if _lprev:
+                log.warning(f"[{channel_name}] Leroy RESENT {track} R{race_num} #{saddle} {market} "
+                            f"(first seen {seen_bets.age_text(_lprev)} ago) -> ignored")
                 continue
             _leroy_recent_fps[fp] = _now
 
