@@ -1111,13 +1111,35 @@ IMAGE_PROMPT_AFL = (
 )
 
 
+# v6.44 (Wilson 2026-09-27: "hook up nfl 1st quarter receiving yards ... win by 14+, big
+# win little win ... team totals too"): shared by the NFL image, 4th&EV text and A1 prompts.
+NEW_STATS_IMG = (
+    'rushing_receiving_yards (rushing + receiving yards), passing_rushing_yards, and for a '
+    "FIRST-QUARTER player stat ('1st quarter receiving yards', '1Q rec yds', 'Q1'): "
+    '1st_quarter_receiving_yards, 1st_quarter_rushing_yards, 1st_quarter_passing_yards '
+    '(never map a quarter stat to the full-game one or the reverse). '
+)
+TEAM_MARKETS_PROMPT = (
+    "TEAM TOTAL, a single team's OWN full-game points total ('49ers Team Total Over "
+    "24.5', 'Jets team total under 20.5', 'Lions over 27.5 team points'): "
+    'market_type="team_total", `team`=that team, `side`=over/under, `line`=the '
+    'number. A half/quarter team total is market_type="other". '
+    "WINNING MARGIN / BIG WIN LITTLE WIN: '<team> 14+', '<team> to win by 14+', "
+    '\'winning margin 14+ points\', \'big win\': market_type="margin", `team`=the team, '
+    '`side`="over", `line`=14. \'<team> to win by 1-13\', \'little win\', \'win by 13 or '
+    'less\': market_type="margin", `team`, `side`="under", `line`=13. Any other '
+    'margin (a band such as 1-6 or 7-12): market_type="margin" with a '
+    '`description` of the band. '
+)
+
+
 IMAGE_PROMPT_NFL = (
     "You are an OCR + extraction tool for NFL betting-tip images. Respond with "
     "ONLY valid JSON, no markdown fences, in this shape: "
     '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
     '"side": "over"|"under"|null, "line": number|null, "odds": number|null, '
     '"bookie": str|null, "units": number|null, '
-    '"market_type": "player_prop"|"h2h"|"spread"|"total"|"other", '
+    '"market_type": "player_prop"|"h2h"|"spread"|"total"|"team_total"|"margin"|"other", '
     '"description": str|null} ]}. '
     "4th AND +EV BRANDED CARD FORMAT: this tipster posts a black-and-gold "
     "graphic card headed '4TH AND +EV BETTING PICKS' with EXPLICIT labelled "
@@ -1156,7 +1178,7 @@ IMAGE_PROMPT_NFL = (
     "rush_attempts, pass_attempts, touchdowns, passing_touchdowns, "
     "rushing_touchdowns, receiving_touchdowns, "
     "interceptions, completions, passing_attempts, sacks, tackles, "
-    "longest_reception, longest_rush. `side` is \"over\" for 'over'/'more'/'o' "
+    "longest_reception, longest_rush, " + NEW_STATS_IMG + "`side` is \"over\" for 'over'/'more'/'o' "
     "lines and \"under\" for 'under'/'less'/'u'. `line` is the number (74.5). "
     "ANYTIME TOUCHDOWN: 'anytime TD' / 'ATD' / 'anytime touchdown scorer' means "
     "market_type=\"player_prop\", stat=\"touchdowns\", side=\"over\", line=0.5. "
@@ -1174,11 +1196,9 @@ IMAGE_PROMPT_NFL = (
     "(needed only to identify WHICH game the total is for -- the bet itself is "
     "not about that team, it is the combined score) -- infer the team from "
     "elsewhere on the image/card if it is not printed directly on this line. "
-    "A SEPARATE, DIFFERENT bet is a single TEAM's own point total (e.g. '49ers "
-    "Team Total Over 24.5') -- this is NOT market_type=\"total\" (that resolver "
-    "only handles the whole-game combined total); use market_type=\"other\" "
-    "with a plain-English `description` for a team's own total instead, all "
-    "other fields null. "
+    "A SEPARATE, DIFFERENT bet is a single TEAM's own point total -- NOT "
+    "market_type=\"total\" (that is only the whole-game combined total). "
+    + TEAM_MARKETS_PROMPT +
     "MONEYLINE / head-to-head (a SINGLE team to win outright, e.g. 'Chiefs ML', "
     "'Chiefs to win'): market_type=\"h2h\", `team`=the ONE team backed, "
     "`odds`=the price, `units`=the stake if shown, player/stat/line/side null. "
@@ -1454,7 +1474,7 @@ TEXT_PROMPT_A1_NFL = (
     "`stat` -> ONE lowercase word from: receiving_yards, rushing_yards, "
     "passing_yards, receptions, rush_attempts, pass_attempts, completions, "
     "longest_reception, longest_rush, touchdowns, passing_touchdowns, "
-    "rushing_touchdowns, receiving_touchdowns, interceptions, sacks. Map printed "
+    "rushing_touchdowns, receiving_touchdowns, interceptions, sacks, " + NEW_STATS_IMG + "Map printed "
     "phrases directly: 'receiving' -> receiving_yards, 'rush attempts' -> "
     "rush_attempts, 'longest reception' -> longest_reception. "
     "`team` = a team name ONLY if EXPLICITLY stated as its own short "
@@ -1610,7 +1630,7 @@ TEXT_PROMPT_FOURTHANDEV_NFL = (
     '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
     '"side": "over"|"under"|null, "line": number|null, "odds": number|null, '
     '"bookie": str|null, "units": number|null, '
-    '"market_type": "player_prop"|"h2h"|"spread"|"total"|"other", '
+    '"market_type": "player_prop"|"h2h"|"spread"|"total"|"team_total"|"margin"|"other", '
     '"description": str|null} ]}. '
     "REAL FORMAT: each bet is numbered/labelled -- 'BET;', 'BET 1:', 'Bet 1:', or a "
     "bare '1:' all mark the START of a new leg. A message headed 'Part 1'/'Part 2' "
@@ -1635,7 +1655,7 @@ TEXT_PROMPT_FOURTHANDEV_NFL = (
     "lowercase word from: receiving_yards, rushing_yards, passing_yards, "
     "receptions, rush_attempts, pass_attempts, completions, longest_reception, "
     "longest_rush, touchdowns, passing_touchdowns, rushing_touchdowns, "
-    "receiving_touchdowns, interceptions, sacks, tackles. 'N+' ('Jordan Love 3+ "
+    "receiving_touchdowns, interceptions, sacks, tackles, " + NEW_STATS_IMG + "'N+' ('Jordan Love 3+ "
     "passing touchdowns', '6+ receptions', '70+ receiving yards'): side=\"over\", "
     "line=N minus 0.5 (3+ -> 2.5). ANYTIME TOUCHDOWN "
     "('anytime TD', 'ATD', 'anytime touchdown scorer'): market_type=\"player_prop\", "
@@ -1654,12 +1674,10 @@ TEXT_PROMPT_FOURTHANDEV_NFL = (
     "is not about that team, it is the combined score) -- infer it from the "
     "'Team:' field if present, or from another leg in the same slate/message "
     "naming the game, if it is not stated directly on this line. "
-    "WINNING MARGIN (e.g. 'winning margin: 14+ points') and any TEAM-level "
-    "yardage/stat/points total (e.g. 'team rushing yards', 'team total yards', "
-    "'49ers team total over 24.5') do NOT fit any market_type above -- these "
-    "are NOT the same as the whole-game TOTAL above -- use market_type=\"other\" "
-    "with a plain-English `description`, all other fields null. Do not force "
-    "these into spread/total. "
+    + TEAM_MARKETS_PROMPT +
+    "A TEAM-level yardage/stat total (e.g. 'team rushing yards', 'team total "
+    "yards') fits no market_type above: market_type=\"other\" with a plain-English "
+    "`description`, all other fields null. Do not force these into spread/total. "
     "ALT-LINE / PRICE-FLOOR NOTES: free text like 'take up to 82.5' (he'll accept "
     "a worse line up to that number) or 'bet down to $1.78' (he'll accept a lower "
     "price down to that number) is real context for a human but is NOT a "

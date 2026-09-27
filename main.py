@@ -138,6 +138,7 @@ from nba_resolver import resolve_nbl_event, canonical_nbl_team
 from roster import resolve_player_name, get_player_team, afl_surname_candidates, afl_fuzzy_surname_candidates
 from roster import is_nfl_name_collision
 from roster import exact_match_player
+import seen_bets
 from roster import _GEN_SUFFIXES as _ROSTER_GEN_SUFFIXES, _fold_accents as _roster_fold_accents
 from roster import _team_matches as _roster_team_matches
 import notifier
@@ -307,6 +308,17 @@ def _audit_log_path():
         import tempfile
         return os.path.join(tempfile.gettempdir(), "tipbot_test_audit.jsonl")
     return AUDIT_LOG
+
+
+def _archive_tip_post(channel_name: str, text: str) -> None:
+    """v6.44: keep the FULL text of every NFL/NBL tip post (logs/tip_posts.jsonl). The
+    2026-09-27 audit could not rebuild 4th&EV's manual bets: tipbot.log keeps only the
+    first line of a post. NEVER raises; nothing is written under the test suite."""
+    if os.getenv("TIPBOT_TESTING"):
+        return
+    _log_jsonl(Path(AUDIT_LOG).with_name("tip_posts.jsonl"),
+               {"ts": datetime.now().isoformat(timespec="seconds"), "channel": channel_name,
+                "text": text})
 
 
 # ── Stake Search Ladder ─────────────────────────────────────────────
@@ -2247,6 +2259,123 @@ _nfl_recent_fps: dict = {}  # {nfl fingerprint tuple (event-scoped): timestamp}
 _nfl_dedup_lock = threading.Lock()
 NFL_DEDUP_TTL_SEC = 3 * 24 * 3600
 
+# ── v6.44: persistent "already sent" guard (seen_bets.py) ─────────────────────
+# Wilson 2026-09-27 after 4th&EV's 16:38 summary re-sent the day's 21 bets and six were
+# re-placed ($2,610): "we now need a guard that checks to see if the bet for ANY BET from
+# any tipster was already sent and if it was, to ignore it". Keys come from the tipster's
+# own PARSED fields (before any market resolution), so a leg that went to manual the
+# first time (and Wilson placed by hand) is caught too, and the store is a file, so a
+# restart can't wipe it (the 16:13 deploy wiped the in-memory NFL guard above).
+# Player names key on first initial + surname so 'Garret'/'Garrett Wilson' match.
+RACING_SEEN_TTL_SEC = 7 * 24 * 3600   # same window as the dup-runner guard
+GENERIC_SEEN_TTL_SEC = 24 * 3600      # plus the calendar day in the key
+
+
+def _seen_name(name) -> str:
+    t = _nbl_name_tokens(name or "")
+    if not t:
+        return ""
+    return t[0] if len(t) == 1 else f"{t[0][0]}.{t[-1]}"
+
+
+def _seen_num(v, whole_over_half: bool = False) -> str:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if whole_over_half and f == int(f):
+        f -= 0.5
+    return f"{f:g}"
+
+
+def _seen_text(v) -> str:
+    return " ".join(re.findall(r"[a-z0-9+.]+", str(v or "").lower()))[:80]
+
+
+def _nfl_seen_key(tipster: str, raw: dict) -> str:
+    """Key for one parsed NFL tip (4th&EV text/image, A1). Units are left out: a
+    re-sent bet is the same bet whatever unit line he re-types."""
+    try:
+        mt = (raw.get("market_type") or "other").strip().lower()
+        side = (raw.get("side") or "").strip().lower()
+        if mt == "player_prop":
+            who = _seen_name(raw.get("player"))
+            if not who:
+                return ""
+            return (f"NFL|{tipster}|pp|{who}|{(raw.get('stat') or '').strip().lower()}|{side}|"
+                    f"{_seen_num(raw.get('line'), whole_over_half=(side == 'over'))}")
+        if mt in ("h2h", "spread", "team_total", "margin"):
+            team = canonical_nfl_team(raw.get("team") or "").lower()
+            if not team:
+                return ""
+            line = raw.get("line")
+            if mt == "margin":
+                line = _nfl_margin_band(side, line) or _seen_num(line)
+            return f"NFL|{tipster}|{mt}|{team}|{side}|{_seen_num(line) if mt != 'margin' else line}"
+        if mt == "total":
+            # the team only names the game, and he may name the other side next time
+            team = canonical_nfl_team(raw.get("team") or "")
+            game = resolve_nfl_event(team) if team else None
+            if not game:
+                return ""
+            return f"NFL|{tipster}|total|{game.lower()}|{side}|{_seen_num(raw.get('line'))}"
+        desc = _seen_text(raw.get("description"))
+        return f"NFL|{tipster}|other|{desc}" if desc else ""
+    except Exception as e:
+        log.warning(f"seen key failed for NFL tip {raw!r}: {e}")
+        return ""
+
+
+def _nbl_seen_key(tipster: str, raw: dict) -> str:
+    """NBL legs: players can meet the same line in two games 2 days apart, so the key
+    carries the calendar day (a same-day re-send is what this guard is for)."""
+    try:
+        mt = (raw.get("market_type") or "").strip().lower()
+        who = _seen_name(raw.get("player")) or _seen_text(raw.get("team"))
+        if not who:
+            return ""
+        return (f"NBL|{tipster}|{_date.today().isoformat()}|{mt}|{who}|"
+                f"{(raw.get('stat') or '').strip().lower()}|{(raw.get('side') or '').strip().lower()}|"
+                f"{_seen_num(raw.get('line'))}")
+    except Exception as e:
+        log.warning(f"seen key failed for NBL leg {raw!r}: {e}")
+        return ""
+
+
+def _generic_seen_key(fp: str) -> str:
+    return f"GEN|{fp}|{_date.today().isoformat()}"
+
+
+def _drop_resent(tipster: str, channel_name: str, items: list, key_fn, label_fn,
+                 ttl_sec: float) -> list:
+    """Filter a post's parsed tips: any tip already seen within `ttl_sec` is dropped
+    (logged, and listed in ONE short note for the whole post); every new one is
+    registered now, whatever its outcome turns out to be."""
+    keep, dropped = [], []
+    for it in items or []:
+        try:
+            key = key_fn(tipster, it) if isinstance(it, dict) else ""
+            label = label_fn(it).splitlines()[0] if isinstance(it, dict) else str(it)
+        except Exception:
+            key, label = "", str(it)[:120]
+        prev = seen_bets.check_and_mark(key, ttl_sec, label) if key else None
+        if prev:
+            log.warning(f"[{channel_name}] RESENT, ignored (first seen {seen_bets.age_text(prev)} "
+                        f"ago): {label}")
+            dropped.append(f"- {label} (first sent {seen_bets.age_text(prev)} ago)")
+        else:
+            keep.append(it)
+    if dropped:
+        try:
+            notifier.notify_text_manual_alert(
+                channel_name,
+                f"{len(dropped)} bet(s) in this post were already sent earlier and were "
+                f"NOT placed again:\n" + "\n".join(dropped),
+                header="RESENT BETS, ignored")
+        except Exception as e:
+            log.error(f"[{channel_name}] resent-bets note failed: {e}")
+    return keep
+
 
 def _tip_fingerprint(tip: ParsedTip) -> str:
     """Build a fingerprint for dupe detection (player+stat+line+selection+sport)."""
@@ -2310,6 +2439,13 @@ def _register_tip_fingerprint(tip: ParsedTip, fp: str = None) -> None:
     if fp is None:
         fp = f"{tip.tipster}::{_tip_fingerprint(tip)}"
     _recent_tips[fp] = datetime.now()
+
+
+def _persist_placed_fingerprint(fp: str) -> None:
+    """v6.44: persist a LANDED (or ambiguous) generic bet so a same-day re-send hours
+    later, or after a restart, is ignored. Not called on a clean failure (review v6.44:
+    the in-memory claim is released then, so a failed bet can still be re-posted)."""
+    seen_bets.mark(_generic_seen_key(fp), fp)
 
 
 # ── Multi-prop alt merger ───────────────────────────────────────────
@@ -14262,6 +14398,10 @@ def _execute_bet(
         payload["target_odds"] = target_odds
     if _resolved_prop_id:
         payload["proposition_id"] = _resolved_prop_id
+    # v6.44: quarter markets need their period (see place_single_sports_bet)
+    _period = resolved.get("period") if isinstance(resolved, dict) else None
+    if _period and _period != "full_game":
+        payload["period"] = _period
     log.info(f"HyperBot payload: {json.dumps(payload)}")
     _afl_log_event(
         tip,
@@ -14297,6 +14437,7 @@ def _execute_bet(
         proposition_id=_resolved_prop_id,
         direction=_direction,
         max_odds=_max_odds,
+        period=_period,
     )
     _elapsed = round(_time_mod.time() - _t_place_start, 2)
 
@@ -14331,6 +14472,7 @@ def _execute_bet(
             proposition_id=_resolved_prop_id,
             direction=_direction,
             max_odds=_max_odds,
+            period=_period,
         )
         _elapsed = round(_time_mod.time() - _t_place_start, 2)
 
@@ -14369,6 +14511,7 @@ def _execute_bet(
             proposition_id=_resolved_prop_id,
             direction=_direction,
             max_odds=_max_odds,
+            period=_period,
         )
         _elapsed = round(_time_mod.time() - _t_place_start, 2)
 
@@ -14423,6 +14566,7 @@ def _execute_bet(
             line=line,
             target_odds=target_odds,
             proposition_id=_resolved_prop_id,
+            period=_period,
         )
         _elapsed = round(_time_mod.time() - _t_place_start, 2)
         # Reassign `stake` so the auto-cap check + BetResult reflect the true
@@ -14883,6 +15027,16 @@ async def _process_tip(text: str, tipster: str, sport: str,
         if not skip_dedup and _is_duplicate(tip):
             log.info(f"DUPE detected, skipping: {tip.tipster} {_tip_fingerprint(tip)}")
             continue
+        # v6.44: the 10-min in-memory window above misses a re-send hours later or
+        # after a restart. Same tipster + same bet on the same calendar day = ignored.
+        # Checked here, REGISTERED only once placed (_persist_placed_fingerprint), so a
+        # tip that fails a gate (no units) can still be re-posted properly.
+        if not skip_dedup:
+            _gprev = seen_bets.check(_generic_seen_key(_dupe_fp), GENERIC_SEEN_TTL_SEC)
+            if _gprev:
+                log.warning(f"RESENT, ignored (first seen {seen_bets.age_text(_gprev)} ago): "
+                            f"{_dupe_fp}")
+                continue
         if skip_dedup:
             log.info(f"[{tip.tipster}] self-bet: dedup bypassed (intentional re-bet allowed)")
 
@@ -14971,6 +15125,7 @@ async def _process_tip(text: str, tipster: str, sport: str,
                     # in neither _inflight_fps (discarded above) nor _recent_tips (purged)
                     # -> double fan-out onto accounts where attempt #1 may have landed.
                     _register_tip_fingerprint(tip, fp=_dupe_fp)
+                    _persist_placed_fingerprint(_dupe_fp)
                 else:
                     # clean total failure: RELEASE the claim (re-sendable), preserves the
                     # v5.13 "re-send after a clean fail" semantics.
@@ -15578,6 +15733,7 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
     # (PASS 2) is parallelised. Mirrors _route_image_afl_tips (v5.91).
     jobs = []  # [(idx, parsed, intended_stake)]
     last_race_num = None  # forward-fill across selections grouped under a race
+    _racing_resent: list = []  # v6.44: tips already sent earlier, ignored
     for idx, raw in enumerate(raw_tips):
         try:
             saddle = _img_coerce_int(raw.get("saddle"))
@@ -15659,6 +15815,21 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
                          f"{parsed.get('track')} R{parsed.get('race_num')}")
                 continue
             _racing_recent_fps[_rfp] = _rnow
+            # v6.44: persistent re-send guard (Zak re-posts whole cards days later).
+            # Same tipster + track + horse + market + UNITS within 7 days is the same
+            # bet; different units stays a re-add and goes on to the dup-runner guard,
+            # which still decides it (Wilson's racing rule).
+            _rkey = (f"RACE|{tipster}|{_seen_text(parsed.get('track'))}|"
+                     f"{_seen_text(parsed.get('runner'))}|{parsed.get('market')}|"
+                     f"{_seen_num(parsed.get('units'))}")
+            _rlabel = (f"{parsed.get('runner')} {parsed.get('track') or '?'} "
+                       f"R{parsed.get('race_num')} {parsed.get('market')} {parsed.get('units')}u")
+            _rprev = seen_bets.check_and_mark(_rkey, RACING_SEEN_TTL_SEC, _rlabel)
+            if _rprev:
+                log.warning(f"[{channel_name}] RESENT racing tip, ignored (first seen "
+                            f"{seen_bets.age_text(_rprev)} ago): {_rlabel}")
+                _racing_resent.append(f"- {_rlabel} (first sent {seen_bets.age_text(_rprev)} ago)")
+                continue
 
             # Stake = units × unit_size, capped at the DEDICATED racing-image
             # cap (Zak/Trial max 3u — survives a global MAX_UNITS bump) AND the
@@ -15682,6 +15853,16 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
                 )
             except Exception:
                 pass
+
+    if _racing_resent:
+        try:
+            notifier.notify_text_manual_alert(
+                channel_name,
+                f"{len(_racing_resent)} tip(s) in this post were already sent earlier and "
+                f"were NOT placed again:\n" + "\n".join(_racing_resent),
+                header="RESENT TIPS, ignored")
+        except Exception as e:
+            log.error(f"[{channel_name}] resent-tips note failed: {e}")
 
     if not jobs:
         log.info(f"[{channel_name}] no placeable racing tips after guards")
@@ -16829,6 +17010,15 @@ _NFL_AUTOPLACE_STAT_SUFFIX = {
     "passing_attempts": "pass_attempts",
     "completions": "pass_completions",
     "rush_attempts": "rush_attempts",
+    # v6.44 (Wilson 2026-09-27: "hook up nfl 1st quarter receiving yards (under 1st
+    # quarter player prop section)"; live board Lions v Jets): Sportsbet carries a 1st
+    # quarter O/U line per player ('<player>_-_1st_qtr_receiving_yds', 10.5 for Garrett
+    # Wilson) and the combined-yardage lines ('rushing_+_receiving_yds').
+    "1st_quarter_receiving_yards": "1st_qtr_receiving_yds",
+    "1st_quarter_rushing_yards": "1st_qtr_rushing_yds",
+    "1st_quarter_passing_yards": "1st_qtr_passing_yds",
+    "rushing_receiving_yards": "rushing_+_receiving_yds",
+    "passing_rushing_yards": "passing_+_rushing_yds",
 }
 # v6.35: Sportsbet's 'N+' ladders ('Jordan Love 3+ Passing Touchdowns', line 2.5,
 # direction over). Used only for an OVER whose exact line the main O/U market
@@ -16840,6 +17030,11 @@ _NFL_AUTOPLACE_ALT_SUFFIX = {
     "passing_yards": "alt_passing_yds",
     "receptions": "alt_receptions",
     "passing_touchdowns": "alt_passing_tds",
+    # v6.44: the 1st quarter ladders ('Garrett Wilson 10+ Yards', 5-yard steps). Their
+    # rows carry NO line/direction, so _nfl_alt_rows reads N from the 'N+' text.
+    "1st_quarter_receiving_yards": "1st_qtr_alt_receiving_yds",
+    "1st_quarter_rushing_yards": "1st_qtr_alt_rushing_yds",
+    "1st_quarter_passing_yards": "1st_qtr_alt_passing_yds",
 }
 # v6.25 code review (xhigh audit, Wilson's explicit correction): "within 2"
 # only ever made sense for YARDAGE -- 2 receiving/rushing/passing yards is
@@ -16861,6 +17056,14 @@ _NFL_LINE_TOLERANCE_BY_STAT = {
     "receiving_yards": 2.0,
     "rushing_yards": 2.0,
     "passing_yards": 2.0,
+    # v6.44: full-game combined yardage is yardage (+-2). 1st quarter lines are ~10
+    # yards, so 2 worse is a real difference there: exact, or better (see
+    # _NFL_BETTER_ONLY_LINE_STATS).
+    "rushing_receiving_yards": 2.0,
+    "passing_rushing_yards": 2.0,
+    "1st_quarter_receiving_yards": 0.0,
+    "1st_quarter_rushing_yards": 0.0,
+    "1st_quarter_passing_yards": 0.0,
     "receptions": 0.0,
     "rush_attempts": 0.0,
     "pass_attempts": 0.0,
@@ -16890,6 +17093,27 @@ _NFL_COUNT_LINE_RULE_STATS = {"rush_attempts", "receptions", "pass_attempts",
 _NFL_BETTER_LINE_MAX = 2.0
 
 
+_NFL_N_PLUS_RE = re.compile(r"(?<![\d.])(\d+)\+")
+
+
+def _nfl_alt_rows(amarket) -> list:
+    """v6.44: an 'N+' ladder's rows as OVER rows with a line. The full-game ladders
+    carry line/direction; the 1st quarter ones ('Garrett Wilson 10+ Yards') carry
+    neither, so line = N - 0.5 is read from the text (exactly one 'N+' in it) and the
+    row is flagged `_line_from_text` so the bet is sent without a line (HyperBot
+    matches the row by proposition_id + selection)."""
+    out = []
+    for s in (amarket or {}).get("selections", []) or []:
+        if s.get("line") is not None and (s.get("direction") or "").strip():
+            out.append(s)
+            continue
+        ns = _NFL_N_PLUS_RE.findall(s.get("selection") or "")
+        if len(ns) != 1:
+            continue
+        out.append(dict(s, line=float(ns[0]) - 0.5, direction="over", _line_from_text=True))
+    return out
+
+
 def _nfl_alt_near_rung(stat: str, tipped: float, amarket):
     """v6.43 (Wilson 2026-09-27: "if 120 receiving is tipped, place at 125 receiving yards
     on sportsbet as they only offer that market and it's basically the same"): Sportsbet's
@@ -16902,7 +17126,7 @@ def _nfl_alt_near_rung(stat: str, tipped: float, amarket):
     if (stat or "").strip().lower() not in _NFL_ALT_NEAR_RUNG_STATS or NFL_ALT_RUNG_MAX_YDS <= 0:
         return None
     tol = NFL_ALT_RUNG_MAX_YDS if tipped >= 99.5 else min(NFL_ALT_RUNG_MAX_YDS, _nfl_line_tolerance(stat))
-    rows = [s for s in (amarket.get("selections", []) or [])
+    rows = [s for s in _nfl_alt_rows(amarket)
             if (s.get("direction") or "").strip().lower() == "over" and s.get("line") is not None
             and abs(float(s["line"]) - tipped) <= tol + 1e-9]
     if not rows:
@@ -16918,13 +17142,22 @@ def _nfl_alt_near_rung(stat: str, tipped: float, amarket):
 _NFL_ALT_NEAR_RUNG_STATS = {"receiving_yards", "rushing_yards", "passing_yards"}
 
 
+# v6.44: 1st quarter yardage takes a BETTER line (up to _NFL_BETTER_LINE_MAX) at full
+# stake, never a worse one (Wilson's NBL choice, "better lines only").
+_NFL_BETTER_ONLY_LINE_STATS = {"1st_quarter_receiving_yards", "1st_quarter_rushing_yards",
+                               "1st_quarter_passing_yards"}
+
+
 def _nfl_count_line_shift(stat: str, side: str, tipped: float, live: float):
     """'better', 'worse1' or None for a count-stat line that isn't the tipped one."""
-    if (stat or "").strip().lower() not in _NFL_COUNT_LINE_RULE_STATS:
+    _st = (stat or "").strip().lower()
+    if _st not in _NFL_COUNT_LINE_RULE_STATS and _st not in _NFL_BETTER_ONLY_LINE_STATS:
         return None
     if side not in ("over", "under"):
         return None
     gain = (tipped - live) if side == "over" else (live - tipped)
+    if _st in _NFL_BETTER_ONLY_LINE_STATS:
+        return "better" if 1e-9 < gain <= _NFL_BETTER_LINE_MAX + 1e-9 else None
     # v6.37 review: 'better' is capped at 2 lines. A board wildly easier than the tip
     # (stale or glitched line) goes manual rather than full stake on the odds floor alone.
     if 1e-9 < gain <= _NFL_BETTER_LINE_MAX + 1e-9:
@@ -17303,7 +17536,7 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
         if sel is None and side == "over" and alt_suffix:
             akey, amarket = _find_nfl_market(markets_all, player, alt_suffix)
             if amarket:
-                ahits = [s for s in (amarket.get("selections", []) or [])
+                ahits = [s for s in _nfl_alt_rows(amarket)
                          if (s.get("direction") or "").strip().lower() == "over"
                          and s.get("line") is not None
                          and abs(float(s["line"]) - float(tipster_line)) < 1e-9]
@@ -17386,6 +17619,9 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             "proposition_id": sel.get("proposition_id"), "direction": side,
             "team": resolve_team, "probe_session_id": probe_sid, "bookie": probe_bookie,
             "stake_mult": stake_mult, "player": player,
+            # v6.44: a 1st quarter ladder row has no line of its own; don't send one.
+            "hb_omit_line": bool(sel.get("_line_from_text")),
+            "period": sel.get("period") or "full_game",
         }
     except Exception as e:
         log.error(f"NFL auto-place: resolve crashed for {player!r} {stat!r}: {e}")
@@ -17418,7 +17654,45 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
 # anticipated "line" as the liability-cap yaml key when it was first
 # written, so _attempt_nfl_auto_place's liability-cap lookup translates
 # "spread" -> "line" there specifically; nowhere else needs to know that.
-_NFL_TEAM_MARKET_KEY = {"h2h": "head_to_head", "spread": "line", "total": "total_points"}
+_NFL_TEAM_MARKET_KEY = {"h2h": "head_to_head", "spread": "line", "total": "total_points",
+                        # v6.44 (Wilson 2026-09-27: "win by 14+, big win little win market
+                        # for nfl ... team totals too under points market").
+                        "team_total": "team_total", "margin": "big_win_little_win"}
+# v6.44: a spread/total whose exact line is not on the main market may be on Sportsbet's
+# alternate ladder ('New York Jets (+23.5)', 'Over (33.5)'), same outcome, exact line only.
+_NFL_TEAM_ALT_MARKET_KEY = {"spread": "alternate_handicap", "total": "alternate_total"}
+_NFL_TEAM_TOTAL_SUFFIX = " total points"
+
+
+def _nfl_team_total_team(sel) -> str:
+    """The canonical team of a `team_total` row, from its raw_market_name ('NY Jets
+    Total Points', 'DET Lions Total Points'), or '' for anything else (the 1st/2nd half
+    team totals and the Yes/No rows share the key)."""
+    if (sel.get("period") or "full_game") != "full_game":
+        return ""
+    rm = (sel.get("raw_market_name") or "").strip()
+    if not rm.lower().endswith(_NFL_TEAM_TOTAL_SUFFIX):
+        return ""
+    head = rm[: -len(_NFL_TEAM_TOTAL_SUFFIX)].strip()
+    if not head or head.lower().startswith(("1st", "2nd", "first", "second")):
+        return ""
+    return canonical_nfl_team(head)
+
+
+def _nfl_margin_band(side: str, line):
+    """v6.44: which big_win_little_win row a margin tip is: '14+' (side over, line 14 or
+    13.5) or '1-13' (side under, line 13 or 13.5). None for any other margin, which
+    Sportsbet only offers as banded markets (stays manual)."""
+    try:
+        ln = float(line)
+    except (TypeError, ValueError):
+        return None
+    side = (side or "").strip().lower()
+    if side == "over" and ln in (13.5, 14.0):
+        return "14+"
+    if side == "under" and ln in (13.0, 13.5):
+        return "1-13"
+    return None
 
 
 def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: str,
@@ -17451,7 +17725,14 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
         canonical_team = canonical_nfl_team(resolve_team)
 
         market_type = market_type.strip().lower()
-        if market_type == "h2h":
+        _band = None
+        if market_type == "margin":
+            _band = _nfl_margin_band(side, tipster_line)
+            if not _band:
+                log.info(f"NFL auto-place: {canonical_team!r} margin {side} {tipster_line} is "
+                         f"not big win (14+) / little win (1-13) -> manual")
+                return None
+        elif market_type == "h2h":
             if tipster_line is not None:
                 # h2h has no line concept; a parse that attached one is
                 # more likely wrong than a genuine zero-point spread -- refuse
@@ -17460,7 +17741,7 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
         else:
             if tipster_line is None:
                 return None
-        if market_type == "total":
+        if market_type in ("total", "team_total"):
             side = (side or "").strip().lower()
             if side not in ("over", "under"):
                 return None
@@ -17485,7 +17766,8 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
             log.info(f"NFL auto-place: price-check failed on every priority session for {event!r} -> manual")
             return None
 
-        market = (pc.get("markets") or {}).get(catalog_key)
+        markets_all = pc.get("markets") or {}
+        market = markets_all.get(catalog_key)
         if not market:
             log.info(f"NFL auto-place: no live {catalog_key!r} market for {event!r} -> manual")
             return None
@@ -17510,28 +17792,69 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
             if (s.get("selection") or "").strip().lower() in ("tie", "draw")
         }
 
-        hits = []
-        for s in market.get("selections", []) or []:
-            if s.get("market_external_id") in _tie_group_ids:
-                continue
-            sel_name = (s.get("selection") or "").strip().lower()
-            if market_type in ("h2h", "spread"):
-                if sel_name != canonical_team.strip().lower():
+        _team_lc = canonical_team.strip().lower()
+
+        def _hits_in(mkt, alt=False):
+            out = []
+            for s in mkt.get("selections", []) or []:
+                if s.get("market_external_id") in _tie_group_ids:
                     continue
-                if market_type == "spread":
+                sel_name = (s.get("selection") or "").strip().lower()
+                if market_type in ("h2h", "spread"):
+                    # alternate_handicap rows read 'New York Jets (+6.5)'
+                    if alt:
+                        if not sel_name.startswith(_team_lc + " ("):
+                            continue
+                    elif sel_name != _team_lc:
+                        continue
+                    if market_type == "spread":
+                        if s.get("line") is None:
+                            continue
+                        if abs(float(s["line"]) - float(tipster_line)) > 1e-9:
+                            continue
+                    out.append(s)
+                elif market_type in ("total", "team_total"):
+                    if (s.get("direction") or "").strip().lower() != side:
+                        continue
                     if s.get("line") is None:
                         continue
                     if abs(float(s["line"]) - float(tipster_line)) > 1e-9:
                         continue
-                hits.append(s)
-            elif market_type == "total":
-                if (s.get("direction") or "").strip().lower() != side:
-                    continue
-                if s.get("line") is None:
-                    continue
-                if abs(float(s["line"]) - float(tipster_line)) > 1e-9:
-                    continue
-                hits.append(s)
+                    if market_type == "team_total" and _nfl_team_total_team(s) != canonical_team:
+                        continue
+                    out.append(s)
+                elif market_type == "margin":
+                    if not sel_name.startswith(_team_lc + " "):
+                        continue
+                    _rest = sel_name[len(_team_lc):]
+                    if _band == "14+" and "14+" not in _rest:
+                        continue
+                    if _band == "1-13" and "1-13" not in _rest:
+                        continue
+                    out.append(s)
+            return out
+
+        hits = _hits_in(market)
+        # v6.44: 'Handicap' + 'Handicap Betting' and 'Total Points' + 'Total Match
+        # Points' are two full-game 2-way markets under one key, so the same line shows
+        # twice (2026-09-16 Seahawks -4.5 and Colts total 46.5 went manual "need exactly
+        # 1"). Same selection at the same line is the same bet: take the better price.
+        if len(hits) > 1 and len({((h.get("selection") or "").strip().lower(),
+                                   h.get("line")) for h in hits}) == 1:
+            hits = [max(hits, key=lambda h: float(h.get("odds") or 0))]
+            log.info(f"NFL auto-place: {canonical_team!r} {market_type} {tipster_line}: "
+                     f"same line on {len({h.get('market_external_id') for h in _hits_in(market)})} "
+                     f"Sportsbet markets -> best price {hits[0].get('odds')}")
+        if not hits and market_type in _NFL_TEAM_ALT_MARKET_KEY:
+            _akey = _NFL_TEAM_ALT_MARKET_KEY[market_type]
+            _amkt = markets_all.get(_akey)
+            if _amkt:
+                _ahits = _hits_in(_amkt, alt=True)
+                if len(_ahits) == 1:
+                    hits, catalog_key = _ahits, _akey
+                    log.info(f"NFL auto-place: {canonical_team!r} {market_type} {tipster_line} "
+                             f"not on the main market -> {_akey} "
+                             f"({_ahits[0].get('selection')!r})")
 
         if len(hits) != 1:
             log.info(
@@ -17568,7 +17891,7 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
             "selection": sel.get("selection") or canonical_team,
             "line": live_line, "odds": live_odds,
             "proposition_id": sel.get("proposition_id"),
-            "direction": side if market_type == "total" else None,
+            "direction": side if market_type in ("total", "team_total") else None,
             "team": canonical_team, "probe_session_id": probe_sid, "bookie": probe_bookie,
         }
     except Exception as e:
@@ -17659,14 +17982,21 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     # stat-less retry cost a round trip (Bediako DD 8.0 -> 7.0 inside it). The
     # proposition_id pins the row, so send no stat from the start.
     _stat = leg.stat
+    _player = leg.player
     if (_stat or "").strip().lower() in ("double_double", "triple_double") and match.get("proposition_id"):
         _stat = None
+    # v6.44: a quarter row has player=None and no stat, so HyperBot's player/stat filters
+    # could only fail first (selection_not_carried) and cost the v6.36/v6.38 retries.
+    _period = match.get("period") or "full_game"
+    if _period != "full_game" and match.get("proposition_id"):
+        _stat, _player = None, None
     presolved = {
         "market": match["market"],
         "selection": match["selection"],
-        "player": leg.player,
+        "player": _player,
         "stat": _stat,
-        "line": match["line"],
+        "period": _period,
+        "line": None if match.get("hb_omit_line") else match["line"],
         "target_odds": match.get("odds"),
         "proposition_id": match.get("proposition_id"),
         "live_odds": match.get("odds"),
@@ -18098,6 +18428,10 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
             _bet_label = f"{match['team']} moneyline"
         elif market_type_norm == "spread":
             _bet_label = f"{match['team']} spread {tipster_line}"
+        elif market_type_norm == "team_total":
+            _bet_label = f"{match['team']} team total {side} {tipster_line}"
+        elif market_type_norm == "margin":
+            _bet_label = f"{match['selection']}"
         else:  # total
             _bet_label = f"{match['team']} total {side} {tipster_line}"
 
@@ -18186,11 +18520,17 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         # is the one place it must match the shared ParsedLeg/notifier
         # convention instead.
         _leg_market = "line" if market_type_norm == "spread" else market_type_norm
+        if market_type_norm == "player_prop":
+            _leg_sel = match["direction"]
+        elif market_type_norm == "team_total":
+            # v6.44: the row itself only says 'Over'/'Under'
+            _leg_sel = f"{match['team']} {match['selection']}"
+        else:
+            _leg_sel = match["selection"]
         leg = ParsedLeg(
             market=_leg_market, player=player or "", stat=stat or "",
             line=match["line"],
-            selection=(match["direction"] if market_type_norm == "player_prop"
-                       else match["selection"]),
+            selection=_leg_sel,
             team_full=match["team"], raw_text=raw_message,
         )
         tip = ParsedTip(
@@ -18847,6 +19187,7 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
     the fan-out's own alerts. Legs are placed one after another: each leg's
     accounts already fire concurrently, and two legs racing on the same account
     is untested."""
+    _archive_tip_post(channel_name, text)
     if not _NBL_PRICE_RE.search(text or ""):
         # Every real bet in the channel's history carries a $ price; timing notes,
         # results and admin posts never do. Dropped without an LLM call or alert.
@@ -18891,6 +19232,8 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
         return
 
     log.info(f"[{channel_name}] NBL: {len(raw_tips)} leg(s) parsed in {elapsed:.2f}s")
+    raw_tips = _drop_resent(tipster, channel_name, raw_tips, _nbl_seen_key,
+                            _describe_nbl_leg, 24 * 3600)
     manual: list[str] = []
     short: list[str] = []
     placed_or_handled = 0
@@ -18994,6 +19337,14 @@ def _describe_nfl_image_tip(raw: dict) -> str:
             f"Total{f' ({team})' if team else ''}: {raw.get('side') or '?'} "
             f"{_or_q(raw.get('line'))}"
         )
+    elif mt == "team_total":
+        lines.append(f"{raw.get('team') or '?'} team total: {raw.get('side') or '?'} "
+                     f"{_or_q(raw.get('line'))}")
+    elif mt == "margin":
+        _b = _nfl_margin_band(raw.get("side"), raw.get("line"))
+        lines.append(f"{raw.get('team') or '?'} winning margin: "
+                     + ({"14+": "14+ (big win)", "1-13": "1-13 (little win)"}.get(_b)
+                        or raw.get("description") or f"{raw.get('side')} {raw.get('line')}"))
     else:
         lines.append(raw.get("description") or "(unreadable bet, check the channel)")
     odds = raw.get("odds")
@@ -19048,6 +19399,8 @@ async def _route_image_nfl_tips(raw_tips: list, tipster: str, channel_name: str,
     (not notify_image_alert -- that truncates to 200 chars, too short to
     carry the caption) so a multi-leg image never collapses into a single
     message that's easy to half-read."""
+    raw_tips = _drop_resent(tipster, channel_name, raw_tips, _nfl_seen_key,
+                            _describe_nfl_image_tip, NFL_DEDUP_TTL_SEC)
     for idx, raw in enumerate(raw_tips):
         try:
             desc = _describe_nfl_image_tip(raw)
@@ -19060,7 +19413,7 @@ async def _route_image_nfl_tips(raw_tips: list, tipster: str, channel_name: str,
         # never let them reach auto-place, so any team-market bet on a real
         # 4th&EV card fell to manual even though _resolve_nfl_team_market
         # now exists to resolve it.
-        if _mt in ("player_prop", "h2h", "spread", "total"):
+        if _mt in ("player_prop", "h2h", "spread", "total", "team_total", "margin"):
             raw_text_for_alert = desc + (f"\n\n---- caption ----\n{raw_caption}" if raw_caption else "")
             # v6.22 code review: _attempt_nfl_auto_place makes genuinely
             # blocking HyperBot HTTP calls -- MUST run off the event loop,
@@ -19165,6 +19518,7 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
     (announcement messages, and anything else the parser reads as carrying
     no real selection) is dropped silently, matching the rest of this
     codebase's convention for non-bet-like text on a monitored channel."""
+    _archive_tip_post(channel_name, text)
     if _A1_ANNOUNCEMENT_RE.fullmatch((text or "").strip()):
         log.info(f"[{channel_name}] A1 announcement (no selection) -> dropped: {text[:80]}")
         return
@@ -19222,6 +19576,8 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
         return
 
     log.info(f"[{channel_name}] A1 NFL text extracted {len(raw_tips)} tip(s) in {elapsed:.2f}s")
+    raw_tips = _drop_resent(tipster, channel_name, raw_tips, _nfl_seen_key,
+                            _describe_a1_nfl_tip, NFL_DEDUP_TTL_SEC)
     for idx, raw in enumerate(raw_tips):
         try:
             headline = _describe_a1_nfl_tip(raw)
@@ -19290,6 +19646,7 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
     renderer needed. A 'Part 2' message needs no special cross-message
     state: it is parsed independently and each of its legs gets its own
     dedup fingerprint, same as any other message."""
+    _archive_tip_post(channel_name, text)
     loop = asyncio.get_event_loop()
     # Mirrors _route_a1_nfl_text's provider-fallback shape exactly (see
     # that function's v6.21 code-review comment for why the naive
@@ -19351,6 +19708,8 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
         return
 
     log.info(f"[{channel_name}] 4th&EV NFL text extracted {len(raw_tips)} tip(s) in {elapsed:.2f}s")
+    raw_tips = _drop_resent(tipster, channel_name, raw_tips, _nfl_seen_key,
+                            _describe_nfl_image_tip, NFL_DEDUP_TTL_SEC)
     for idx, raw in enumerate(raw_tips):
         try:
             desc = _describe_nfl_image_tip(raw)
@@ -19358,7 +19717,7 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
             desc = f"(description render failed: {e}; raw={raw!r})"
 
         _mt = (raw.get("market_type") or "").strip().lower()
-        if _mt in ("player_prop", "h2h", "spread", "total"):
+        if _mt in ("player_prop", "h2h", "spread", "total", "team_total", "margin"):
             handled = await _run_in_placement_executor(
                 _attempt_nfl_auto_place,
                 tipster, channel_name, raw.get("player"), raw.get("team"),

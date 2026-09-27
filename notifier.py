@@ -983,9 +983,9 @@ def notify_bet_placed(result) -> bool:
 
     if not used_placed_snapshot:
         for leg in tip.legs:
-            if leg.market in ("h2h", "head_to_head"):
+            if leg.market in ("h2h", "head_to_head", "margin"):
                 legs_lines.append(f"  {leg.selection} Win")
-            elif leg.market in ("total", "total_points", "line"):
+            elif leg.market in ("total", "total_points", "line", "team_total"):
                 legs_lines.append(f"  {leg.selection} {leg.line}")
             else:
                 legs_lines.append(
@@ -1082,7 +1082,7 @@ def notify_bet_failed(result) -> bool:
         return True
     legs_lines = []
     for leg in tip.legs:
-        if leg.market in ("h2h", "head_to_head"):
+        if leg.market in ("h2h", "head_to_head", "margin"):
             legs_lines.append(f"  {leg.selection} Win")
         elif leg.market in ("line", "first_half_line"):
             sign = "+" if (leg.line or 0) >= 0 else ""
@@ -1136,9 +1136,9 @@ def notify_manual_alert(tip) -> bool:
         return True
     legs_lines = []
     for leg in tip.legs:
-        if leg.market in ("h2h", "head_to_head"):
+        if leg.market in ("h2h", "head_to_head", "margin"):
             legs_lines.append(f"  {leg.selection} Win")
-        elif leg.market in ("total", "total_points", "line"):
+        elif leg.market in ("total", "total_points", "line", "team_total"):
             legs_lines.append(f"  {leg.selection} {leg.line}")
         elif leg.market == "player_prop":
             legs_lines.append(
@@ -1354,9 +1354,9 @@ def notify_tip_placed_summary(
     """
     legs_lines = []
     for leg in tip.legs:
-        if leg.market in ("h2h", "head_to_head"):
+        if leg.market in ("h2h", "head_to_head", "margin"):
             legs_lines.append(f"  {leg.selection} Win")
-        elif leg.market in ("total", "total_points", "line"):
+        elif leg.market in ("total", "total_points", "line", "team_total"):
             legs_lines.append(f"  {leg.selection} {leg.line}")
         else:
             legs_lines.append(
@@ -1534,9 +1534,9 @@ def notify_tip_unfilled(tip, intended_stake, placed_stake, unfilled, failed_resu
     """Alert when a tip couldn't be fully filled - manual placement needed for remainder."""
     legs_lines = []
     for leg in tip.legs:
-        if leg.market in ("h2h", "head_to_head"):
+        if leg.market in ("h2h", "head_to_head", "margin"):
             legs_lines.append(f"  {leg.selection} Win")
-        elif leg.market in ("total", "total_points", "line"):
+        elif leg.market in ("total", "total_points", "line", "team_total"):
             legs_lines.append(f"  {leg.selection} {leg.line}")
         else:
             legs_lines.append(

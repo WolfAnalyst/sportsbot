@@ -972,6 +972,7 @@ class HyperBotClient:
         line: float = None, target_odds: float = None,
         proposition_id: str = None,
         direction: str = None, max_odds: float = None,
+        period: str = None,
     ) -> dict:
         """Place a single sports bet (NBA, AFL, etc).
 
@@ -1033,6 +1034,11 @@ class HyperBotClient:
         # bet, never place a bigger/extra one. Must be >= target_odds (caller enforces).
         if max_odds:
             payload["max_odds"] = max_odds
+        # v6.44 (live $1 test 2026-09-27): a quarter market is rejected unless its period
+        # is sent: "[market_not_carried] No selections for period=full_game (default for
+        # 'garrett_wilson_-_1st_qtr_alt_receiving_yds' is 'full_game') ... Available: ['1q']".
+        if period and period != "full_game":
+            payload["period"] = period
         poll_result = self._post_v3_async("/v3/place_bet", payload)
         if poll_result.get("success") is False and "statuses" not in poll_result:
             return poll_result
