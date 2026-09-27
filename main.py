@@ -58,7 +58,7 @@ from config import (
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
     SPORTSBET_MAX_STAKE_REBET,
     HB_SEND_MAX_ODDS, HB_SEND_DIRECTION, HB_RETRY_WITHOUT_PLAYER, NFL_WORSE_LINE_STAKE_MULT,
-    HB_RETRY_WITHOUT_STAT, SB_SLOW_538_REBET_MAX_SEC,
+    HB_RETRY_WITHOUT_STAT, SB_SLOW_538_REBET_MAX_SEC, NFL_ALT_RUNG_MAX_YDS, NFL_ALT_MAX_ODDS_MULT,
     SELF_BET_MAX_STAKE,
     EDDIE_CAPTION_FALLBACK_ENABLED,
     EDDIE_TEXT_PLACE_ENABLED,
@@ -6405,6 +6405,18 @@ def _schedule_deferred_sports_cid_verify(*, session_id, bookie, tip, stake, odds
                        if sel_id else "")
                     + f"\n\nIf the game has not started: verify the account, then place "
                       f"MANUALLY. The bot will NOT place it.")
+                # v6.43 (NBL audit: Mennenga DD $42.86 on 65463, 2026-09-26): the critical
+                # above goes to the ops chat only; Wilson places from the manual chat, so a
+                # stake that now needs placing by hand gets its own manual message there too.
+                try:
+                    notifier.notify_text_manual_alert(
+                        getattr(tip, "tipster", "?") or "?",
+                        f"{selection_text}\n{_event}\n${stake:.2f} @ {odds} on "
+                        f"{session_priority.session_label(session_id, bookie)} did NOT land "
+                        f"(deferred {waited}s re-check). Verify the account, then place by hand.",
+                        header=f"{(_sport or 'SPORTS').upper()}, MANUAL: ${stake:.2f} did not land")
+                except Exception as _e:
+                    log.warning(f"[deferred-verify] {_label}: manual alert failed: {_e}")
             except Exception as e:
                 log.warning(f"[deferred-verify] {_label}: failed: {e}")
 
@@ -16878,6 +16890,34 @@ _NFL_COUNT_LINE_RULE_STATS = {"rush_attempts", "receptions", "pass_attempts",
 _NFL_BETTER_LINE_MAX = 2.0
 
 
+def _nfl_alt_near_rung(stat: str, tipped: float, amarket):
+    """v6.43 (Wilson 2026-09-27: "if 120 receiving is tipped, place at 125 receiving yards
+    on sportsbet as they only offer that market and it's basically the same"): Sportsbet's
+    yardage 'N+' ladders step 10 then 25 (109.5, 124.5, 149.5), so a 120+ tip has no exact
+    rung. For a YARDAGE over only, the rung nearest the tipped line places at full stake
+    (a tie takes the lower, easier rung), within NFL_ALT_RUNG_MAX_YDS (5) from 100 yards
+    up, where the ladder has 25-yard gaps, and within the normal yardage tolerance (2)
+    below that, where 5 yards is a real difference (dry run: a 60.5 tip would otherwise
+    have taken any rung from 55.5 to 65.5). Count stats and TDs never use this."""
+    if (stat or "").strip().lower() not in _NFL_ALT_NEAR_RUNG_STATS or NFL_ALT_RUNG_MAX_YDS <= 0:
+        return None
+    tol = NFL_ALT_RUNG_MAX_YDS if tipped >= 99.5 else min(NFL_ALT_RUNG_MAX_YDS, _nfl_line_tolerance(stat))
+    rows = [s for s in (amarket.get("selections", []) or [])
+            if (s.get("direction") or "").strip().lower() == "over" and s.get("line") is not None
+            and abs(float(s["line"]) - tipped) <= tol + 1e-9]
+    if not rows:
+        return None
+    rows.sort(key=lambda s: (abs(float(s["line"]) - tipped), float(s["line"])))
+    best = rows[0]
+    # Two rows at the SAME line would be an ambiguous catalog: refuse.
+    if sum(1 for s in rows if abs(float(s["line"]) - float(best["line"])) < 1e-9) > 1:
+        return None
+    return best
+
+
+_NFL_ALT_NEAR_RUNG_STATS = {"receiving_yards", "rushing_yards", "passing_yards"}
+
+
 def _nfl_count_line_shift(stat: str, side: str, tipped: float, live: float):
     """'better', 'worse1' or None for a count-stat line that isn't the tipped one."""
     if (stat or "").strip().lower() not in _NFL_COUNT_LINE_RULE_STATS:
@@ -17059,6 +17099,48 @@ def _find_nfl_market(markets: dict, player: str, suffix: str):
     return hits[0]
 
 
+def _nfl_fix_player_name(player: str, markets: dict, event: str):
+    """v6.43 (2026-09-27: 4th&EV wrote 'Garret Wilson', 'Devante Adams', 'Tetiora
+    McMillan'; all three went manual on an exact-name miss). Returns the roster name of
+    the ONE player in THIS game's Sportsbet catalog the misspelling refers to, or None.
+
+    Guards, all required:
+      - the tipped spelling is not itself a real NFL roster player (a real player with
+        no market here must never be mapped onto someone else);
+      - _nbl_match_player's unique pick over this game's players only (same surname +
+        compatible first name, or whole-name similarity >= 0.88 with a clear margin);
+      - that pick is exactly one roster player, on one of the two teams in `event`,
+        and not a same-name collision."""
+    try:
+        if exact_match_player(player, "nfl"):
+            return None
+        cands = sorted({k.split("_-_", 1)[0].replace("_", " ") for k in (markets or {})
+                        if "_-_" in k})
+        hit, why = _nbl_match_player(player, cands, allow_fuzzy=True)
+        if not hit:
+            return None
+        want = set(_nbl_name_tokens(hit))
+        import roster as _roster_mod
+        _roster_mod._load_rosters()
+        rows = [v for v in _roster_mod._nfl_roster.values()
+                if set(_nbl_name_tokens(v.get("name") or "")) == want]
+        if len({(r.get("name"), r.get("team")) for r in rows}) != 1:
+            log.info(f"NFL auto-place: {player!r} ~ {hit!r} but the roster has "
+                     f"{len(rows)} match(es) -> no name correction")
+            return None
+        name, rteam = rows[0].get("name") or "", rows[0].get("team") or ""
+        if not rteam or rteam not in (event or "") or is_nfl_name_collision(name):
+            log.info(f"NFL auto-place: {player!r} ~ {name!r} ({rteam}) is not a player "
+                     f"in {event!r} -> no name correction")
+            return None
+        log.info(f"NFL auto-place: tipped name {player!r} corrected to {name!r} "
+                 f"({rteam}, Sportsbet catalog for {event!r})")
+        return name
+    except Exception as e:
+        log.warning(f"NFL auto-place: name correction for {player!r} failed ({e})")
+        return None
+
+
 def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
                          tipster_line, priority_sessions: list, tipster: str = "",
                          tipster_odds=None):
@@ -17114,14 +17196,26 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
         if not priority_sessions:
             return None
 
+        _collision_event = None
         if player:
             collision_teams = is_nfl_name_collision(player)
             if collision_teams:
-                log.warning(
-                    f"NFL auto-place: {player!r} is a roster-known same-name "
-                    f"collision {collision_teams} -> manual (never guess)"
-                )
-                return None
+                # v6.43 (2026-09-27, 4th&EV Justin Jefferson with Egbuka's Bucs v Vikings
+                # game): a collision is settled by the tip's own team when that team is
+                # one of the colliding ones and none of the others plays in its game.
+                _ct = canonical_nfl_team(team) if team else ""
+                _ev = resolve_nfl_event(_ct) if _ct in collision_teams else None
+                _others = [t for t in collision_teams if t != _ct]
+                if _ev and not any(o and o in _ev for o in _others):
+                    log.info(f"NFL auto-place: {player!r} same-name collision {collision_teams} "
+                             f"settled by the tip's team {_ct!r} ({_ev!r})")
+                    team, _collision_event = _ct, _ev
+                else:
+                    log.warning(
+                        f"NFL auto-place: {player!r} is a roster-known same-name "
+                        f"collision {collision_teams} -> manual (never guess)"
+                    )
+                    return None
 
         resolve_team = (team or "").strip()
         if not resolve_team and player:
@@ -17130,7 +17224,7 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             log.info(f"NFL auto-place: no team resolved for {player!r} -> manual")
             return None
 
-        event = resolve_nfl_event(resolve_team)
+        event = _collision_event or resolve_nfl_event(resolve_team)
         if not event:
             log.info(f"NFL auto-place: no event found for {resolve_team!r} -> manual")
             return None
@@ -17166,9 +17260,15 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
 
         markets_all = pc.get("markets") or {}
         key, market = _find_nfl_market(markets_all, player, suffix)
+        if market is None and player:
+            _fixed = _nfl_fix_player_name(player, markets_all, event)
+            if _fixed:
+                player = _fixed
+                key, market = _find_nfl_market(markets_all, player, suffix)
         sel = None
         live_line = None
         stake_mult = 1.0
+        _alt_bound = False  # sel came from an 'N+' ladder rung (v6.43 alt ceiling)
         _worse_by_one = None  # (key, sel) held back until the exact alt rung is tried
         _why = f"no unambiguous live '{suffix}' market for {player!r} on {event!r}"
         if market:
@@ -17210,12 +17310,21 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
                 if len(ahits) == 1:
                     key, sel = akey, ahits[0]
                     live_line = float(sel["line"])
+                    _alt_bound = True
                     log.info(f"NFL auto-place: {player!r} over {tipster_line} found on "
                              f"'{alt_suffix}' ({sel.get('selection')!r}) after: {_why}")
                 elif len(ahits) > 1:
                     _why += f"; {len(ahits)} '{alt_suffix}' rows at {tipster_line} (ambiguous)"
                 else:
                     _why += f"; no '{alt_suffix}' row at exactly {tipster_line}"
+                    _near = _nfl_alt_near_rung(stat, float(tipster_line), amarket)
+                    if _near is not None:
+                        key, sel = akey, _near
+                        live_line = float(sel["line"])
+                        _alt_bound = True
+                        log.info(f"NFL auto-place: {player!r} over {tipster_line} not on the "
+                                 f"'{alt_suffix}' ladder -> nearest rung {live_line} "
+                                 f"({sel.get('selection')!r}) at full stake")
         if sel is None and _worse_by_one is not None and 0 < NFL_WORSE_LINE_STAKE_MULT <= 1:
             key, sel = _worse_by_one
             live_line = float(sel["line"])
@@ -17228,6 +17337,21 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
 
         live_odds = sel.get("odds")
         _refuse, _reason = _nfl_odds_guard_refuses(tipster, tipster_odds, live_odds)
+        if _refuse and _alt_bound and "exceed the ceiling" in _reason:
+            # v6.43 (Wilson 2026-09-27: all of 4th&EV's legs were on Sportsbet): an 'N+'
+            # rung is pinned by the player's own market and the exact (or nearest, see
+            # _nfl_alt_near_rung) line, so a price above the tipster's is value, not a
+            # wrong row. Garrett Wilson 150+ at $9 was refused at SB $12 (> 1.25x), and a
+            # 125+ rung for a 120+ tip is dearer by construction. Alt rungs get a wider
+            # ceiling instead of none; the floor and 1.6 floor are unchanged.
+            try:
+                _alt_ok = float(live_odds) <= float(tipster_odds) * NFL_ALT_MAX_ODDS_MULT + 1e-9
+            except (TypeError, ValueError):
+                _alt_ok = False
+            if _alt_ok:
+                log.info(f"NFL auto-place: {player!r} {suffix} alt rung {live_line}: within "
+                         f"{NFL_ALT_MAX_ODDS_MULT}x alt ceiling ({_reason})")
+                _refuse = False
         if _refuse:
             log.info(f"NFL auto-place: {player!r} {suffix} {_reason} -> manual")
             return None
@@ -17261,7 +17385,7 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             "line": live_line, "odds": sel.get("odds"),
             "proposition_id": sel.get("proposition_id"), "direction": side,
             "team": resolve_team, "probe_session_id": probe_sid, "bookie": probe_bookie,
-            "stake_mult": stake_mult,
+            "stake_mult": stake_mult, "player": player,
         }
     except Exception as e:
         log.error(f"NFL auto-place: resolve crashed for {player!r} {stat!r}: {e}")
@@ -17530,11 +17654,18 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     # selection string the catalog priced (e.g. "Jadarian Price Over"), which for a
     # player prop is NOT the leg's bare "over"/"under".
     leg = tip.legs[0]
+    # v6.43 (NBL audit 2026-09-27): Sportsbet's 'doubles' rows carry no stat, so HyperBot's
+    # stat filter always failed the first try with selection_not_carried and the v6.38
+    # stat-less retry cost a round trip (Bediako DD 8.0 -> 7.0 inside it). The
+    # proposition_id pins the row, so send no stat from the start.
+    _stat = leg.stat
+    if (_stat or "").strip().lower() in ("double_double", "triple_double") and match.get("proposition_id"):
+        _stat = None
     presolved = {
         "market": match["market"],
         "selection": match["selection"],
         "player": leg.player,
-        "stat": leg.stat,
+        "stat": _stat,
         "line": match["line"],
         "target_odds": match.get("odds"),
         "proposition_id": match.get("proposition_id"),
@@ -17952,6 +18083,10 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
             return False
         if not match:
             return False
+        # v6.43: the resolver may have corrected a misspelt name ('Garret Wilson' ->
+        # 'Garrett Wilson'); bet, label and dedup key all use the corrected one.
+        if market_type_norm == "player_prop" and match.get("player"):
+            player = match["player"]
 
         # v6.26: one readable label reused in every alert/log line below --
         # avoids each site separately guessing which of player/team/stat is
@@ -18547,7 +18682,9 @@ def _nbl_fanout_outcome(results: list, intended_stake: float) -> str:
     left = round(float(intended_stake or 0) - placed - at_risk, 2)
     if left <= 1.0:
         return "placed"
-    why = errs[0] if errs else "no reason given"
+    # v6.43: max-stake rebets count as successes, so a max-stake partial has no error.
+    why = errs[0] if errs else ("Sportsbet max stake reached on every account" if placed > 0
+                                else "no reason given")
     if placed <= 0 and at_risk <= 0:
         return f"FAILED: nothing placed of ${intended_stake:.2f} ({why})"
     return (f"PARTIAL: ${placed:.2f} placed of ${intended_stake:.2f}, ${left:.2f} left to place"
@@ -19232,6 +19369,10 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
             )
             if handled:
                 continue
+        else:
+            # v6.43: this branch was silent (2026-09-27 15:43, 2nd leg of the Texans post).
+            log.info(f"[{channel_name}] 4th&EV NFL tip {idx}: market_type {_mt!r} is not "
+                     f"auto-placed -> manual: {desc[:160]!r}")
 
         try:
             notifier.notify_text_manual_alert(
