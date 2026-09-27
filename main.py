@@ -1347,6 +1347,13 @@ PRE_PLACEMENT_REJECT_PATTERNS = [
     "unauthorized",
     "400 client error",
     "bad request",
+    # v6.43 (2026-09-27): insufficient funds and bet365's missing-'cp' confirmbet are
+    # final refusals before submission; a slow one spills at once instead of waiting
+    # out the reconcile. Keep in sync w/ racing_placer.py.
+    "insufficient funds",
+    "insufficient_funds",
+    "no 'cp' placeability",
+    "cp=false",
 ]
 
 # Slow-rejection latency threshold (seconds). Mirrors racing_placer.py's
@@ -15652,8 +15659,27 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
                 # v6.06: shared SA candidate list (config) so the upstream resolver and
                 # the racing_placer live-catalog probe (STAGE 1B) stay in sync.
                 _sa_tracks = SA_THOROUGHBRED_TRACKS
-                _resolved = claude_parser.resolve_sa_track_today(
-                    race_num, runner, _date_str, candidate_tracks=_sa_tracks)
+                # v6.43 (2026-09-26: 3 web-search timeouts ~40s each, then a Gawler
+                # guess): narrow the list to the SA meetings the Racing Australia
+                # calendar has on the tip's date. One meeting -> that track, no Claude
+                # call (NAME match still forced downstream). None -> unchanged.
+                try:
+                    import racing_placer as _rp
+                    _sched = _rp.sa_schedule_candidates(
+                        _img_parse_racing_date(raw.get("date"), msg_time) or _date_str,
+                        SA_THOROUGHBRED_TRACKS)
+                except Exception as _se:
+                    log.warning(f"[{tipster}] SA schedule filter failed ({_se}); full list")
+                    _sched = None
+                if _sched and len(_sched) == 1:
+                    _resolved = _sched[0]
+                    log.warning(f"[{tipster}] track=None -> '{_resolved}' is the only SA "
+                                f"meeting in the racing schedule for that day; no web search")
+                elif _sched:
+                    _sa_tracks = _sched
+                if not _resolved:
+                    _resolved = claude_parser.resolve_sa_track_today(
+                        race_num, runner, _date_str, candidate_tracks=_sa_tracks)
                 if not _resolved:
                     _resolved = claude_parser.resolve_sa_track_today(
                         race_num, runner, _date_str, candidate_tracks=_sa_tracks)
