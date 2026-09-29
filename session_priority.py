@@ -324,8 +324,13 @@ def _validate_racing_block(sid: str, racing_body: dict) -> None:
             f"<track> -> caps"
         )
     else:
-        legacy = {k: v for k, v in racing_body.items() if k != "thoroughbreds"}
+        legacy = {k: v for k, v in racing_body.items() if k not in ("thoroughbreds", "max_stake")}
         _validate_track_caps(sid, "racing", legacy)
+
+    ms = racing_body.get("max_stake")
+    if ms is not None and not (isinstance(ms, (int, float)) and ms > 0):
+        log.warning(f"sessions.yaml: session {sid} racing.max_stake = {ms!r} should be a "
+                    f"positive number (per-bet STAKE cap)")
 
 
 def _validate_track_caps(sid: str, prefix: str, tracks_body: dict) -> None:
@@ -750,6 +755,24 @@ def lookup_thoroughbreds_liability(
     if cap is None:
         return None
     return _normalise_cap(cap)
+
+
+def lookup_racing_max_stake(session_id: str) -> Optional[float]:
+    """v6.49: optional per-bet STAKE cap for racing on this account (`racing.max_stake`),
+    applied on top of the liability caps. Wilson 2026-09-29: TAB sends bets above about
+    this size to trader review (24-35s, often cut down or timed out). None = no cap."""
+    meta = _session_meta.get(str(session_id))
+    if not meta:
+        return None
+    racing_block = meta.liability.get("racing")
+    if not isinstance(racing_block, dict):
+        return None
+    v = racing_block.get("max_stake")
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
 
 
 def _resolve_day_name(date: Optional[str]) -> Optional[str]:
