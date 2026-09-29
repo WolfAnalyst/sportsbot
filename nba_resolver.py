@@ -8,7 +8,7 @@ for player -> team mapping.
 
 import requests
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from roster import resolve_player_name, get_player_team
@@ -286,7 +286,9 @@ def _fetch_schedule(sport: str, date: str) -> list[dict]:
                 if "/" in home or "/" in away:
                     log.info(f"  Skipping TBD game: {home} v {away}")
                     continue
-                games.append({"home": home, "away": away})
+                # v6.47: kickoff (ISO UTC, ESPN event["date"]) so NFL can pick the NEXT
+                # game rather than the first date that has one (see resolve_nfl_event).
+                games.append({"home": home, "away": away, "start": event.get("date") or ""})
 
         # Only cache non-empty results
         if games:
@@ -295,6 +297,7 @@ def _fetch_schedule(sport: str, date: str) -> list[dict]:
                 "fetched_at": datetime.now(),
             }
 
+        _schedule_fetch_failed.pop(cache_key, None)
         # Log actual game names for debugging
         log.info(f"Fetched {len(games)} {sport.upper()} games for {date}")
         for g in games:
@@ -304,7 +307,14 @@ def _fetch_schedule(sport: str, date: str) -> list[dict]:
 
     except Exception as e:
         log.warning(f"ESPN schedule fetch failed for {sport} {date}: {e}")
+        # v6.47 (Opus review): remembered so resolve_nfl_event can tell "no games that
+        # day" from "the page failed" (a failed MNF page would otherwise let the resolver
+        # skip a live game and pick next week's).
+        _schedule_fetch_failed[cache_key] = datetime.now()
         return []
+
+
+_schedule_fetch_failed: dict = {}  # {"nfl_2026-09-28": when the last fetch failed}
 
 
 def _match_team(query: str, games: list[dict], aliases: dict = NBA_TEAM_ALIASES) -> Optional[dict]:
@@ -444,21 +454,72 @@ def resolve_nfl_event(team: str = "") -> Optional[str]:
         log.warning("Cannot resolve NFL event: no team given")
         return None
     now = datetime.now()
-    check_order = [
-        (now + timedelta(days=d)).strftime("%Y-%m-%d") for d in range(0, 7)
-    ] + [(now - timedelta(days=1)).strftime("%Y-%m-%d")]
+    # v6.47 (2026-09-29, A1 'Colston Loveland 30+' for Tuesday-morning Eagles v Bears went
+    # manual): ESPN files a game under its US date, so Monday Night Football (Tuesday
+    # morning here) sits on YESTERDAY's page. The old order checked today..+6 first and
+    # yesterday last, so it resolved 'Chicago Bears' to NEXT week's Bears v Jets. Now every
+    # date from yesterday to +6 is read and the team's game with the soonest kickoff that
+    # has NOT started wins. If its game is already under way (kicked off < 5h ago) it
+    # refuses (manual) rather than jump to next week. Games with no kickoff time keep the
+    # old date order.
+    check_order = [(now + timedelta(days=d)).strftime("%Y-%m-%d") for d in range(-1, 7)]
     teams_to_try = [team] if "/" not in team else [t.strip() for t in team.split("/")]
     teams_to_try = [canonical_nfl_team(t) for t in teams_to_try]
-    for check_date in check_order:
+    now_utc = datetime.now(timezone.utc)
+    t_start = datetime.now()
+    found = []  # (kickoff or None, order, event, check_date)
+    for order, check_date in enumerate(check_order):
         games = _fetch_schedule("nfl", check_date)
         for try_team in teams_to_try:
             game = _match_team(try_team, games, NFL_TEAM_ALIASES)
             if game:
-                event = f"{game['home']} v {game['away']}"
-                log.info(f"Resolved NFL '{team}' -> '{event}' on {check_date}")
-                return event
-    log.warning(f"No NFL game found for '{team}' within the next 7 days or yesterday")
-    return None
+                ko = _parse_kickoff(game.get("start"))
+                found.append((ko, order, f"{game['home']} v {game['away']}", check_date))
+                break
+    if not found:
+        log.warning(f"No NFL game found for '{team}' from yesterday to 6 days ahead")
+        return None
+    timed = [f for f in found if f[0] is not None]
+    if timed:
+        live = [f for f in timed if timedelta(0) <= now_utc - f[0] < timedelta(hours=5)]
+        if live:
+            log.warning(f"NFL '{team}': its game {live[0][2]!r} kicked off "
+                        f"{(now_utc - live[0][0]).total_seconds() / 60:.0f} min ago -> not "
+                        f"resolving to a later game")
+            return None
+        upcoming = sorted((f for f in timed if f[0] > now_utc), key=lambda f: f[0])
+        if upcoming:
+            ko, _, event, check_date = upcoming[0]
+            # v6.47 (Opus review): a page that FAILED on or before the chosen game's date
+            # could hide an earlier (or live) game for this team: refuse rather than
+            # risk next week's game.
+            _failed = [d for d in check_order if d <= check_date
+                       and _schedule_fetch_failed.get(f"nfl_{d}", datetime.min) >= t_start]
+            if _failed:
+                log.warning(f"NFL '{team}': ESPN page(s) {_failed} failed, cannot rule out an "
+                            f"earlier game than {event!r} -> not resolving")
+                return None
+            log.info(f"Resolved NFL '{team}' -> '{event}' (kickoff {ko.isoformat()}, "
+                     f"ESPN date {check_date})")
+            return event
+        log.warning(f"No upcoming NFL game for '{team}' (all found games have started)")
+        return None
+    # No kickoff times at all: the old behaviour (today..+6 first, yesterday last).
+    found.sort(key=lambda f: (f[1] == 0, f[1]))
+    event, check_date = found[0][2], found[0][3]
+    log.info(f"Resolved NFL '{team}' -> '{event}' on {check_date} (no kickoff time)")
+    return event
+
+
+def _parse_kickoff(v):
+    """ESPN event date ('2026-09-29T00:15Z') -> aware UTC datetime, or None."""
+    if not v:
+        return None
+    try:
+        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 def resolve_nbl_event(team: str, opponent: str = "") -> Optional[str]:

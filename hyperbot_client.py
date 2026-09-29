@@ -160,6 +160,25 @@ _V3_POLL_FALLBACK_BUDGET_SEC = 60.0
 _V3_POLL_HARD_CEILING_SEC = V3_POLL_HARD_CEILING_SEC
 
 
+
+def _is_definite_4xx(err_lower: str, status=None) -> bool:
+    """v6.47: HyperBot answered the placement POST with a 4xx and no correlation id: it
+    refused the request before any bookie slip, so nothing can land. 2026-09-28: 28
+    placements got "422 Client Error: Unprocessable Entity" in 0.2s, were treated as
+    maybe-landed, and sent 36 criticals + 28 manual messages for $0 placed. 408 (request
+    timeout) stays maybe-landed."""
+    if status is not None:
+        try:
+            s = int(status)
+            return 400 <= s < 500 and s != 408
+        except (TypeError, ValueError):
+            pass
+    import re as _re
+    # Opus review: anchored to the requests prefix ("NNN Client Error: ..."), never a
+    # match somewhere inside a body.
+    m = _re.match(r"(4\d\d) client error", (err_lower or "").strip())
+    return bool(m) and m.group(1) != "408"
+
 class HyperBotClient:
     def __init__(self, api_key: str = HYPERBOT_API_KEY, base_url: str = HYPERBOT_BASE_URL):
         self.api_key = api_key
@@ -176,6 +195,7 @@ class HyperBotClient:
             return {"success": False, "error": "[test guard] blocked under pytest"}
         url = f"{self.base_url}{path}"
         last_err = None
+        last_status = None  # v6.47: HTTP status of a failed response, if there was one
         # Caller can override _RETRY_ATTEMPTS for time-sensitive endpoints
         # (price_check_racing uses max_attempts=1 to bound dead-session waits
         # to the per-request timeout instead of timeout x retries + backoffs).
@@ -235,10 +255,26 @@ class HyperBotClient:
             except requests.exceptions.RequestException as e:
                 # Non-retriable HTTP error (4xx or unhandled) — fail immediately
                 last_err = str(e)
-                log.error(f"Request error on {path}: {e}")
+                # v6.47 (2026-09-28: 28 x "422 Client Error: Unprocessable Entity" on the
+                # 4th&EV Eagles v Bears legs; HyperBot's reason was never logged): keep the
+                # status, and the response body of a 4xx (it says WHY). NOT the body of a
+                # 5xx (Opus review): a 5xx may have landed, and its body text could match a
+                # "definitely not placed" pattern downstream and turn it into a clean reject.
+                try:
+                    _r = getattr(e, "response", None)
+                    last_status = int(_r.status_code) if _r is not None else None
+                    # not 408: a request timeout may still have landed (Opus review)
+                    if last_status is not None and 400 <= last_status < 500 and last_status != 408:
+                        _body = (_r.text or "").strip()
+                        if _body:
+                            last_err = f"{last_err} | {_body[:400]}"
+                except Exception:
+                    pass
+                log.error(f"Request error on {path}: {last_err}")
                 break
 
-        return {"success": False, "error": last_err or "Request failed"}
+        return {"success": False, "error": last_err or "Request failed",
+                "http_status": last_status}
 
     # ── v3 Async Helper ─────────────────────────────────────────────
 
@@ -302,7 +338,7 @@ class HyperBotClient:
                         "401 client error", "unauthorized",
                         "400 client error", "bad request",
                     )
-                )
+                ) or _is_definite_4xx(_err_l, initial.get("http_status"))
                 if not _definitive_reject:
                     # v6.07 (Batch A audit): this is the FOURTH maybe-landed
                     # placement envelope and the MOST unresolved of all — the POST

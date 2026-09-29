@@ -287,6 +287,11 @@ def _log_jsonl(path: Path, entry: dict):
     on. All 15 call sites are fire-and-forget; none depends on this raising."""
     try:
         entry["timestamp"] = datetime.now().isoformat()
+        # v6.47 (28 Sep audit: fake 4th&EV `event="e"` rows in errors.jsonl from the
+        # pre-commit test gate): under the test suite no record reaches logs/.
+        if os.getenv("TIPBOT_TESTING") and Path(path).resolve().parent == LOG_DIR.resolve():
+            import tempfile as _tf
+            path = Path(_tf.gettempdir()) / f"tipbot_test_{Path(path).name}"
         with _AUDIT_LOCK:
             with open(path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
@@ -1343,6 +1348,7 @@ PRE_PLACEMENT_REJECT_PATTERNS = [
     # HTTP-error strings only — NOT a bare "client error" (a 5xx may have landed).
     "403 client error",
     "forbidden",
+    "422 client error", "unprocessable entity",  # v6.47
     "401 client error",
     "unauthorized",
     "400 client error",
@@ -6458,6 +6464,51 @@ def _disposals_release_ambiguous(sel_id: str, amount: float, why: str) -> float:
         return _give
 
 
+_deferred_absent: dict = {}
+_deferred_absent_lock = threading.Lock()
+DEFERRED_ABSENT_GROUP_SEC = 30.0  # the accounts of one bet re-check within seconds of each other
+
+
+def _deferred_absent_add(key: tuple, item: dict) -> None:
+    """v6.47: collect the accounts of ONE bet whose deferred re-check found nothing, and
+    send one manual message for all of them DEFERRED_ABSENT_GROUP_SEC after the first."""
+    try:
+        with _deferred_absent_lock:
+            first = key not in _deferred_absent
+            _deferred_absent.setdefault(key, []).append(item)
+        if first:
+            t = threading.Timer(DEFERRED_ABSENT_GROUP_SEC, _deferred_absent_flush, args=(key,))
+            t.daemon = True
+            t.start()
+    except Exception as e:
+        log.warning(f"[deferred-verify] could not group {key!r}: {e}")
+
+
+def _deferred_absent_flush(key: tuple) -> None:
+    try:
+        with _deferred_absent_lock:
+            items = _deferred_absent.pop(key, [])
+        if not items:
+            return
+        tipster, event, selection = key
+        total = round(sum(float(i["stake"]) for i in items), 2)
+        waited = max(int(i.get("waited") or 0) for i in items)
+        sport = (items[0].get("sport") or "SPORTS").upper()
+        lines = "\n".join(f"- ${float(i['stake']):.2f} @ {i['odds']} on {i['acct']}" for i in items)
+        dm = any(i.get("sel_id") for i in items)
+        notifier.notify_text_manual_alert(
+            tipster,
+            f"{selection}\n{event}\n{len(items)} account(s), ${total:.2f} did NOT land "
+            f"(deferred {waited}s re-check):\n{lines}\n\nThey were held as maybe-placed, so "
+            f"nothing was re-tried. If the game has not started: verify the accounts, then "
+            f"place by hand."
+            + ("\n\nStill booked as maybe-placed in the DisposalsModel ledger (not "
+               "auto-released: a late land would double-stake)." if dm else ""),
+            header=f"{sport}, MANUAL: ${total:.2f} did not land")
+    except Exception as e:
+        log.warning(f"[deferred-verify] grouped alert failed for {key!r}: {e}")
+
+
 def _schedule_deferred_sports_cid_verify(*, session_id, bookie, tip, stake, odds,
                                          selection_text, sel_id=None):
     """Fire-and-forget: re-query the book later for a sports bet whose cid never resolved.
@@ -6530,35 +6581,15 @@ def _schedule_deferred_sports_cid_verify(*, session_id, bookie, tip, stake, odds
                     f"[deferred-verify] {_label}: STILL ABSENT after {waited}s — "
                     f"${stake:.2f} @ {odds} on {bookie}:{session_id} almost certainly did "
                     f"NOT land")
-                notifier.notify_critical(
-                    f"⚠️ UNRESOLVED BET now looks NOT PLACED (deferred {waited}s re-check)"
-                    f"\n{_label} — {_event}"
-                    # v6.12: name the ACCOUNT. This message tells Wilson to go and check
-                    # a bookie account by hand, so a session id is the wrong thing to show.
-                    f"\n<b>${stake:.2f}</b> @ {odds} on "
-                    f"{session_priority.session_label(session_id, bookie)}"
-                    f"\n\nIt was counted as maybe-placed at the time (correctly — a "
-                    f"re-place could have double-staked), so NOTHING was re-shopped and "
-                    f"this stake is UNFILLED."
-                    + (f"\n\n<b>${stake:.2f} is still booked as maybe-placed</b> in the "
-                       f"DisposalsModel ledger, so that selection reads fuller than it is "
-                       f"and will not be re-offered. Deliberately NOT auto-released: a "
-                       f"late land would then double-stake."
-                       if sel_id else "")
-                    + f"\n\nIf the game has not started: verify the account, then place "
-                      f"MANUALLY. The bot will NOT place it.")
-                # v6.43 (NBL audit: Mennenga DD $42.86 on 65463, 2026-09-26): the critical
-                # above goes to the ops chat only; Wilson places from the manual chat, so a
-                # stake that now needs placing by hand gets its own manual message there too.
-                try:
-                    notifier.notify_text_manual_alert(
-                        getattr(tip, "tipster", "?") or "?",
-                        f"{selection_text}\n{_event}\n${stake:.2f} @ {odds} on "
-                        f"{session_priority.session_label(session_id, bookie)} did NOT land "
-                        f"(deferred {waited}s re-check). Verify the account, then place by hand.",
-                        header=f"{(_sport or 'SPORTS').upper()}, MANUAL: ${stake:.2f} did not land")
-                except Exception as _e:
-                    log.warning(f"[deferred-verify] {_label}: manual alert failed: {_e}")
+                # v6.47 (Wilson: "fully spammed my manual bets and critical bets channels"):
+                # the 28 Sep Eagles v Bears legs sent a critical AND a manual message per
+                # ACCOUNT (28 + 28). Now every account of one bet is gathered and ONE manual
+                # message goes out per bet; the ambiguous critical at placement time already
+                # flagged it on the ops chat.
+                _deferred_absent_add(
+                    (getattr(tip, "tipster", "?") or "?", _event, selection_text),
+                    {"stake": stake, "odds": odds, "acct": session_priority.session_label(session_id, bookie),
+                     "waited": waited, "sel_id": sel_id, "sport": _sport, "label": _label})
             except Exception as e:
                 log.warning(f"[deferred-verify] {_label}: failed: {e}")
 
@@ -6933,7 +6964,10 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
             # dropping to Manual. `_is_definitely_pre_placement` is the narrow
             # provably-not-placed gate. (Stake-rejects ladder DOWN below;
             # AMBIGUOUS/maybe-landed already stopped above and is NEVER retried.)
-            if AFL_FANOUT_PREPLACEMENT_RETRY and _is_definitely_pre_placement(r.error or ""):
+            # v6.47: a 422 is HyperBot refusing the request itself (validation), not a
+            # transient: retrying it is one more wasted call per account.
+            if (AFL_FANOUT_PREPLACEMENT_RETRY and _is_definitely_pre_placement(r.error or "")
+                    and "422 client error" not in (r.error or "").lower()):
                 _orig_err = r.error or ""
                 _el = _orig_err.lower()
                 # v5.92 (Wilson): short problem label for the bet-log / manual note.
@@ -18248,24 +18282,27 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
     if unfilled > 1.0:
         log.warning(f"[{channel_name}] {_S} fan-out: ${unfilled:.2f} unfilled for "
                     f"{bet_label} ({len(failed_results)} account(s) failed)")
-        try:
-            notifier.notify_tip_unfilled_with_placements(
-                tip, display_intended, total_placed, unfilled,
-                placed_results, failed_results,
-                session_timing=session_timing,
-                total_elapsed_sec=round(elapsed_sec, 2),
-                concurrent_bookies=True,
-            )
-        except Exception as e:
-            log.error(f"[{channel_name}] {_S} fan-out: unfilled alert failed: {e}")
-        # The unfilled alert truncates the raw text to 300 chars; this keeps the full
-        # tipster message (alt lines, take-down-to prices) in front of Wilson.
+        # v6.47 (Wilson 2026-09-29, the Eagles v Bears spam): ONE manual message per
+        # unfilled leg. It used to be a BET UNFILLED alert plus this one. It now carries
+        # what landed where and HyperBot's reason for the rest.
+        def _short_err(e):
+            # drop requests' " for url: https://..." so HyperBot's own reason survives the cut
+            return re.sub(r"\s*for url: \S+", "", (e or "?").strip())[:200]
+
+        _why = ""
+        if failed_results:
+            _why = "\nNot placed:\n" + "\n".join(
+                f"- {session_priority.session_label(r.session_id, r.bookie)}: {_short_err(r.error)}"
+                for r in failed_results)
+        _landed = ("\nPlaced:\n" + "\n".join(
+            f"- {session_priority.session_label(r.session_id, r.bookie)} ${r.stake:.2f} @ {r.odds}"
+            for r in placed_results)) if placed_results else ""
         try:
             notifier.notify_text_manual_alert(
-                channel_name, raw_message,
+                channel_name, f"{raw_message}{_landed}{_why}",
                 header=(f"{_S} PARTIAL FILL, ${unfilled:.2f} left to place by hand"
                         if total_placed > 0 or ambiguous_total > 0
-                        else f"{_S} AUTO-PLACE FAILED, review"),
+                        else f"{_S} AUTO-PLACE FAILED, ${unfilled:.2f} to place by hand"),
             )
         except Exception as e:
             log.error(f"[{channel_name}] {_S} fan-out: raw-text manual alert failed: {e}")
@@ -18278,16 +18315,13 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
         })
 
     if ambiguous_outcomes:
+        # v6.47: ONE critical per leg. _emit_sports_ambiguous_alert sent a second one for
+        # the same leg (event + accounts only); this one names the bet too.
         try:
-            _emit_sports_ambiguous_alert(tip, ambiguous_outcomes)
-        except Exception as e:
-            log.error(f"[{channel_name}] {_S} fan-out: ambiguous alert failed: {e}")
-        # _emit_sports_ambiguous_alert names only the event and accounts. A 4th&EV
-        # slate often has several legs on one game, so say WHICH bet may have landed
-        # (the old sequential path did; caught in the v6.31 review).
-        try:
-            _accts = ", ".join(f"{o['bookie']}:{o['session_id']} ${o['stake']:.2f}"
-                               for o in ambiguous_outcomes)
+            _accts = ", ".join(
+                f"{session_priority.session_label(o['session_id'], o['bookie'])} ${o['stake']:.2f}"
+                + (f" (cid {o.get('correlation_id')})" if o.get("correlation_id") else "")
+                for o in ambiguous_outcomes)
             notifier.notify_critical(
                 f"{_S} AUTO-PLACE AMBIGUOUS on {channel_name}: {bet_label} -- "
                 f"${ambiguous_total:.2f} MAY have landed ({_accts}). Check HyperBot "
