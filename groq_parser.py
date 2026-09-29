@@ -1120,6 +1120,13 @@ NEW_STATS_IMG = (
     '1st_quarter_rushing_yards, 1st_quarter_passing_yards, 1st_quarter_rushing_receiving_yards '
     "(never map a quarter stat to the full-game one or the reverse; '1+ first Q receiving' "
     'is 1st_quarter_receiving_yards over 0.5). '
+    # v6.48 (Opus review: 'first TD scorer', 'last TD scorer' and '1st half anytime TD'
+    # all parsed identically to a full-game anytime TD).
+    "ANYTIME TOUCHDOWN ('anytime TD', 'ATD', 'to score a TD', 'anytime touchdown scorer') "
+    "is stat='touchdowns', side='over', line=0.5, market_type='player_prop'. FIRST TD "
+    "scorer, LAST TD scorer, first-TEAM TD scorer and any HALF or QUARTER TD scorer are NOT "
+    "anytime TDs: market_type='other' with a `description`. '2+ TDs' is touchdowns over 1.5. "
+    "A quarterback's 'over 0.5 TDs' / '1+ TD' with no other word is passing_touchdowns. "
 )
 TEAM_MARKETS_PROMPT = (
     "TEAM TOTAL, a single team's OWN full-game points total ('49ers Team Total Over "

@@ -2315,7 +2315,10 @@ def _nfl_seen_key(tipster: str, raw: dict) -> str:
             who = _seen_name(raw.get("player"))
             if not who:
                 return ""
-            return (f"NFL|{tipster}|pp|{who}|{(raw.get('stat') or '').strip().lower()}|{side}|"
+            _st = (raw.get('stat') or '').strip().lower()
+            if _st in _NFL_ATD_STATS:
+                _st = "touchdowns"
+            return (f"NFL|{tipster}|pp|{who}|{_st}|{side}|"
                     f"{_seen_num(raw.get('line'), whole_over_half=(side == 'over'))}")
         if mt in ("h2h", "spread", "team_total", "margin"):
             team = canonical_nfl_team(raw.get("team") or "").lower()
@@ -17421,6 +17424,38 @@ def _find_nfl_market(markets: dict, player: str, suffix: str):
     return hits[0]
 
 
+_NFL_ATD_STATS = {"touchdowns", "anytime_touchdown", "anytime_td", "anytime_touchdowns"}
+
+
+def _nfl_atd_row(player: str, markets: dict, event: str):
+    """v6.48: (player name, row) for `player` in this game's 'touchdown_scorer' market,
+    or (name, None). Exact token match first; otherwise the same guarded typo correction
+    as the other props (_nfl_fix_player_name: game-scoped, roster team check, never
+    renames a real roster player). Team 'Defense' rows never match a player."""
+    rows = [s for s in ((markets or {}).get("touchdown_scorer") or {}).get("selections", []) or []
+            if (s.get("direction") or "over").strip().lower() == "over"
+            and "defense" not in (s.get("selection") or "").lower()]
+    if not rows:
+        return player, None
+
+    def _pick(name):
+        want = _nfl_slug_tokens(name)
+        hits = [s for s in rows if _nfl_slug_tokens(s.get("selection") or "") == want]
+        return hits[0] if len(hits) == 1 else None
+
+    row = _pick(player)
+    if row is not None:
+        return row.get("selection") or player, row
+    # typo: reuse the prop-market correction on '<name>_-_atd' pseudo keys of this game
+    pseudo = {f"{(s.get('selection') or '').lower().replace(' ', '_')}_-_atd": {} for s in rows}
+    fixed = _nfl_fix_player_name(player, pseudo, event)
+    if fixed:
+        row = _pick(fixed)
+        if row is not None:
+            return row.get("selection") or fixed, row
+    return player, None
+
+
 def _nfl_fix_player_name(player: str, markets: dict, event: str):
     """v6.43 (2026-09-27: 4th&EV wrote 'Garret Wilson', 'Devante Adams', 'Tetiora
     McMillan'; all three went manual on an exact-name miss). Returns the roster name of
@@ -17507,6 +17542,13 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
     nothing to compare against."""
     try:
         suffix = _NFL_AUTOPLACE_STAT_SUFFIX.get((stat or "").strip().lower())
+        # v6.48 (Wilson 2026-09-29: "map anytime TD please"; 28 Sep 'Darius Cooper anytime
+        # TD $10' went manual "no live-market mapping"): Sportsbet's anytime TD is ONE
+        # game-level market, 'touchdown_scorer', with a row per player (line 0.5, over),
+        # not a '<player>_-_<stat>' key like the other props.
+        _is_atd = (stat or "").strip().lower() in _NFL_ATD_STATS
+        if _is_atd:
+            suffix = "touchdown_scorer"
         if not suffix:
             log.info(f"NFL auto-place: stat {stat!r} has no live-market mapping -> manual")
             return None
@@ -17581,13 +17623,38 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             tipster_line = _tl
 
         markets_all = pc.get("markets") or {}
-        key, market = _find_nfl_market(markets_all, player, suffix)
-        if market is None and player:
+        if _is_atd:
+            # v6.48 Opus review: an anytime TD auto-places only WITH the tipster's price, so
+            # the 10% floor and the ceiling always run (a first/last/1st-half TD scorer tip
+            # mis-parsed as 'touchdowns' is then refused on price, never on the 1.6 floor alone).
+            try:
+                _atd_odds_ok = float(tipster_odds) > 1.0
+            except (TypeError, ValueError):
+                _atd_odds_ok = False
+            if not _atd_odds_ok:
+                log.info(f"NFL auto-place: {player!r} anytime TD has no usable tipster price "
+                         f"({tipster_odds!r}) -> manual")
+                return None
+            # anytime TD = the 0.5 'over' only; 2+ / 3+ TDs are separate markets
+            if side != "over" or abs(float(tipster_line) - 0.5) > 1e-9:
+                log.info(f"NFL auto-place: {player!r} touchdowns {side} {tipster_line} is not "
+                         f"an anytime TD (over 0.5) -> manual")
+                return None
+            _atd_name, _atd_row = _nfl_atd_row(player, markets_all, event)
+            if _atd_row is None:
+                log.info(f"NFL auto-place: no unambiguous anytime TD row for {player!r} on "
+                         f"{event!r} -> manual")
+                return None
+            player = _atd_name
+        key, market = (None, None) if _is_atd else _find_nfl_market(markets_all, player, suffix)
+        if market is None and player and not _is_atd:
             _fixed = _nfl_fix_player_name(player, markets_all, event)
             if _fixed:
                 player = _fixed
                 key, market = _find_nfl_market(markets_all, player, suffix)
         sel = None
+        if _is_atd:
+            key, sel = "touchdown_scorer", _atd_row
         live_line = None
         stake_mult = 1.0
         _alt_bound = False  # sel came from an 'N+' ladder rung (v6.43 alt ceiling)
@@ -17657,6 +17724,8 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             log.info(f"NFL auto-place: {_why} -> manual")
             return None
 
+        if _is_atd:
+            live_line = float(sel.get("line") if sel.get("line") is not None else 0.5)
         live_odds = sel.get("odds")
         _refuse, _reason = _nfl_odds_guard_refuses(tipster, tipster_odds, live_odds)
         if _refuse and _alt_bound and "exceed the ceiling" in _reason:
@@ -17711,6 +17780,8 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             # v6.44: a 1st quarter ladder row has no line of its own; don't send one.
             "hb_omit_line": bool(sel.get("_line_from_text")),
             "period": sel.get("period") or "full_game",
+            # v6.48: the anytime TD row carries no stat; the prop id pins it
+            "hb_no_stat": _is_atd,
         }
     except Exception as e:
         log.error(f"NFL auto-place: resolve crashed for {player!r} {stat!r}: {e}")
@@ -18073,6 +18144,8 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     _stat = leg.stat
     _player = leg.player
     if (_stat or "").strip().lower() in ("double_double", "triple_double") and match.get("proposition_id"):
+        _stat = None
+    if match.get("hb_no_stat") and match.get("proposition_id"):
         _stat = None
     # v6.44: a quarter row has player=None and no stat, so HyperBot's player/stat filters
     # could only fail first (selection_not_carried) and cost the v6.36/v6.38 retries.
