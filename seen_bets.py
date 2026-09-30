@@ -124,6 +124,23 @@ def mark(key: str, label: str = "", path: Path | None = None) -> None:
         log.error(f"seen_bets: mark failed for {key!r} ({e})")
 
 
+def scan(prefix: str, ttl_sec: float, path: Path | None = None) -> list:
+    """[(key, entry)] for every key starting with `prefix` seen within `ttl_sec`."""
+    if not prefix or not _active():
+        return []
+    try:
+        with _lock:
+            data = _load(path or SEEN_PATH)
+            if data is None:
+                return []
+            now = time.time()
+            return [(k, dict(v)) for k, v in data.items()
+                    if k.startswith(prefix) and now - float(v.get("ts", 0)) <= ttl_sec]
+    except Exception as e:
+        log.error(f"seen_bets: scan failed for {prefix!r} ({e})")
+        return []
+
+
 def age_text(entry) -> str:
     try:
         mins = (time.time() - float(entry.get("ts", 0))) / 60

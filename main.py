@@ -2350,12 +2350,47 @@ def _nbl_seen_key(tipster: str, raw: dict) -> str:
         who = _seen_name(raw.get("player")) or _seen_text(raw.get("team"))
         if not who:
             return ""
+        # v6.51 (Wilson: "there was a bet for 3+ Threes and 4+ Threes"): an 'N+' leg keeps N
+        # in `threshold` with no line, so 3+ and 4+ threes shared one key and the 4+ was
+        # dropped as a resend of the 3+. N+ is keyed as over N-0.5.
+        side = (raw.get('side') or '').strip().lower()
+        line = _seen_num(raw.get('line'))
+        if raw.get("threshold") is not None:
+            try:
+                side, line = "over", _seen_num(float(raw.get("threshold")) - 0.5)
+            except (TypeError, ValueError):
+                line = f"t{raw.get('threshold')}"
         return (f"NBL|{tipster}|{_date.today().isoformat()}|{mt}|{who}|"
-                f"{(raw.get('stat') or '').strip().lower()}|{(raw.get('side') or '').strip().lower()}|"
-                f"{_seen_num(raw.get('line'))}")
+                f"{(raw.get('stat') or '').strip().lower()}|{side}|{line}")
     except Exception as e:
         log.warning(f"seen key failed for NBL leg {raw!r}: {e}")
         return ""
+
+
+def _racing_resend_prev(base: str, units, date):
+    """v6.51: the earlier sighting that makes this racing tip a resend, or None. Same
+    tipster/track/horse/market (`base`); dates must agree unless either copy is undated;
+    and the earlier stake must be at least as big (a bigger re-post is a re-add)."""
+    try:
+        want_u = float(units) if units is not None else None
+    except (TypeError, ValueError):
+        want_u = None
+    for k, e in seen_bets.scan(base + "|", RACING_SEEN_TTL_SEC):
+        parts = k[len(base) + 1:].split("|")
+        try:
+            ku = float(parts[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        kd = parts[1] if len(parts) > 1 else ""
+        if date and kd and kd != str(date):
+            continue
+        # Opus review: an undated copy only matches a recent sighting (48h, Wilson's
+        # dup-runner rule that race dates 2+ days apart are different races).
+        if (not date or not kd) and time.time() - float(e.get("ts", 0)) > 48 * 3600:
+            continue
+        if want_u is None or ku + 1e-4 >= want_u:
+            return e
+    return None
 
 
 def _generic_seen_key(fp: str) -> str:
@@ -2368,6 +2403,7 @@ def _drop_resent(tipster: str, channel_name: str, items: list, key_fn, label_fn,
     (logged, and listed in ONE short note for the whole post); every new one is
     registered now, whatever its outcome turns out to be."""
     keep, dropped = [], []
+    _this_post: set = set()  # v6.51: keys registered by THIS post
     for it in items or []:
         try:
             key = key_fn(tipster, it) if isinstance(it, dict) else ""
@@ -2375,6 +2411,15 @@ def _drop_resent(tipster: str, channel_name: str, items: list, key_fn, label_fn,
         except Exception:
             key, label = "", str(it)[:120]
         prev = seen_bets.check_and_mark(key, ttl_sec, label) if key else None
+        if prev and key in _this_post:
+            # two legs of ONE post can't be a resend of each other: a key collision (the
+            # 3+/4+ threes case) must never cost a bet. Logged so the key can be fixed.
+            log.warning(f"[{channel_name}] two legs of one post share resend key {key!r} -> "
+                        f"both kept: {label}")
+            keep.append(it)
+            continue
+        if key and not prev:
+            _this_post.add(key)   # Opus review: only what THIS post registered
         if prev:
             log.warning(f"[{channel_name}] RESENT, ignored (first seen {seen_bets.age_text(prev)} "
                         f"ago): {label}")
@@ -15888,12 +15933,21 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
             # review: a horse racing again at the track within 7 days is a new bet) is the
             # same bet; different units stays a re-add and goes on to the dup-runner guard,
             # which still decides it (Wilson's racing rule).
-            _rkey = (f"RACE|{tipster}|{_seen_text(parsed.get('track'))}|"
-                     f"{_seen_text(parsed.get('runner'))}|{parsed.get('market')}|"
-                     f"{_seen_num(parsed.get('units'))}|{parsed.get('date') or ''}")
+            # v6.51 (Wilson 2026-09-30: "these two trial tips were resent from before right?
+            # same with the zak tips at 12:38pm, please fix these"): the key needed the SAME
+            # units and the SAME parsed date, so Zak's Willebob (yesterday undated, today
+            # dated) and Trial's Aroused/Cavill (10:00 dated 1.4u/0.7u, 12:39 undated 1u,
+            # "we'll just take a smaller position") got through. Now an undated copy matches
+            # a dated one, and a re-post at the SAME or LOWER units is a resend; only MORE
+            # units stays a re-add (his racing rule) and two different dates stay two races.
+            _rbase = (f"RACE|{tipster}|{_seen_text(parsed.get('track'))}|"
+                      f"{_seen_text(parsed.get('runner'))}|{parsed.get('market')}")
+            _rkey = f"{_rbase}|{_seen_num(parsed.get('units'))}|{parsed.get('date') or ''}"
             _rlabel = (f"{parsed.get('runner')} {parsed.get('track') or '?'} "
                        f"R{parsed.get('race_num')} {parsed.get('market')} {parsed.get('units')}u")
-            _rprev = seen_bets.check_and_mark(_rkey, RACING_SEEN_TTL_SEC, _rlabel)
+            _rprev = _racing_resend_prev(_rbase, parsed.get("units"), parsed.get("date"))
+            if not _rprev:
+                seen_bets.mark(_rkey, _rlabel)
             if _rprev:
                 log.warning(f"[{channel_name}] RESENT racing tip, ignored (first seen "
                             f"{seen_bets.age_text(_rprev)} ago): {_rlabel}")
