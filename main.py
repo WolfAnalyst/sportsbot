@@ -2224,6 +2224,7 @@ _inflight_fps: set = set()
 # racing tip double-placed real money. Fingerprint racing selections here and skip
 # a repeat within DUPE_WINDOW_SECS. Keyed in _route_image_racing_tips.
 _racing_recent_fps: dict = {}  # {racing fingerprint tuple: timestamp}
+_racing_recent_meta: dict = {}  # v6.52: {fingerprint: [(posted_at, units, units_explicit), ...]}
 # v5.93: the Leroy Betfair-BSP path is a NEW real-money placement path — a telethon
 # reconnect catch-up re-delivery / a tipster re-post would double-back on Betfair.
 # Keyed per (LEROY, track, race, date, saddle, market), registered BEFORE the place.
@@ -2367,10 +2368,14 @@ def _nbl_seen_key(tipster: str, raw: dict) -> str:
         return ""
 
 
-def _racing_resend_prev(base: str, units, date):
+def _racing_resend_prev(base: str, units, date, units_explicit: bool = True):
     """v6.51: the earlier sighting that makes this racing tip a resend, or None. Same
-    tipster/track/horse/market (`base`); dates must agree unless either copy is undated;
-    and the earlier stake must be at least as big (a bigger re-post is a re-add)."""
+    tipster/track/horse/market (`base`); dates must agree unless either copy is undated.
+    v6.52 (Wilson 2026-09-30: "it should be add on if smaller units, but today's two
+    'resends' from trial didnt even have units, it was just a statement of which horse was
+    tipped"): a repost with its OWN units is a resend only at the SAME units; fewer units
+    is an add-on and more a re-add (both placed). A repost with NO units of its own (the
+    default was filled in) is always a resend of an earlier sighting."""
     try:
         want_u = float(units) if units is not None else None
     except (TypeError, ValueError):
@@ -2388,7 +2393,7 @@ def _racing_resend_prev(base: str, units, date):
         # dup-runner rule that race dates 2+ days apart are different races).
         if (not date or not kd) and time.time() - float(e.get("ts", 0)) > 48 * 3600:
             continue
-        if want_u is None or ku + 1e-4 >= want_u:
+        if not units_explicit or want_u is None or abs(ku - want_u) < 1e-4:
             return e
     return None
 
@@ -15688,6 +15693,8 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
     runner = (raw.get("runner") or "").strip()
     odds = _img_coerce_float(raw.get("odds")) or 0.0
     units = _img_coerce_float(raw.get("units"))
+    # v6.52: remembered for the resend guard (a units-less repost is not a new bet)
+    units_explicit = units is not None and units > 0
     if units is None or units <= 0:
         units = float(default_units)
     market = (raw.get("market") or "win").strip().lower()
@@ -15803,6 +15810,9 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
         "saddle": saddle,
         "market": market,
         "units": units,
+        "units_explicit": units_explicit,
+        # v6.52: the Telegram post time; a re-delivery carries the same one
+        "posted_at": str(msg_time) if msg_time is not None else None,
         "tipster_odds": odds,
         # Carry the meeting date from the image (ante-post tips are for a future
         # day; null defaults to today downstream). 2026-06-03.
@@ -15922,12 +15932,19 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
             for _rk in [k for k, t in _racing_recent_fps.items()
                         if (_rnow - t).total_seconds() > DUPE_WINDOW_SECS]:
                 del _racing_recent_fps[_rk]
-            if _rfp in _racing_recent_fps:
+                _racing_recent_meta.pop(_rk, None)
+            # v6.52 (Opus review): units-agnostic key; a hit passes ONLY as a genuine
+            # add-on/re-add (a different message, both with explicit, different units), so
+            # a re-delivered message re-parsed with other units stays a duplicate.
+            import tiptitans_processor as _ttp_meta
+            if _rfp in _racing_recent_fps and not _ttp_meta._is_add_on(
+                    _racing_recent_meta.get(_rfp), _ttp_meta._bet_meta(parsed)):
                 log.info(f"[{channel_name}] DUPLICATE racing tip (seen <{DUPE_WINDOW_SECS}s "
                          f"ago) -> skipped (no double-bet): {parsed.get('runner')} "
                          f"{parsed.get('track')} R{parsed.get('race_num')}")
                 continue
             _racing_recent_fps[_rfp] = _rnow
+            _racing_recent_meta.setdefault(_rfp, []).append(_ttp_meta._bet_meta(parsed))
             # v6.44: persistent re-send guard (Zak re-posts whole cards days later).
             # Same tipster + track + horse + market + UNITS (+ the parsed race date, v6.46
             # review: a horse racing again at the track within 7 days is a new bet) is the
@@ -15938,14 +15955,16 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
             # units and the SAME parsed date, so Zak's Willebob (yesterday undated, today
             # dated) and Trial's Aroused/Cavill (10:00 dated 1.4u/0.7u, 12:39 undated 1u,
             # "we'll just take a smaller position") got through. Now an undated copy matches
-            # a dated one, and a re-post at the SAME or LOWER units is a resend; only MORE
-            # units stays a re-add (his racing rule) and two different dates stay two races.
+            # a dated one; v6.52: a re-post at the SAME units or with NO units is a resend,
+            # FEWER units is an add-on and MORE a re-add (both placed); different dates
+            # stay two races.
             _rbase = (f"RACE|{tipster}|{_seen_text(parsed.get('track'))}|"
                       f"{_seen_text(parsed.get('runner'))}|{parsed.get('market')}")
             _rkey = f"{_rbase}|{_seen_num(parsed.get('units'))}|{parsed.get('date') or ''}"
             _rlabel = (f"{parsed.get('runner')} {parsed.get('track') or '?'} "
                        f"R{parsed.get('race_num')} {parsed.get('market')} {parsed.get('units')}u")
-            _rprev = _racing_resend_prev(_rbase, parsed.get("units"), parsed.get("date"))
+            _rprev = _racing_resend_prev(_rbase, parsed.get("units"), parsed.get("date"),
+                                         parsed.get("units_explicit", True))
             if not _rprev:
                 seen_bets.mark(_rkey, _rlabel)
             if _rprev:
