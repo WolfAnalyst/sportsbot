@@ -17500,7 +17500,7 @@ def _nfl_fix_player_name(player: str, markets: dict, event: str):
 
 def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
                          tipster_line, priority_sessions: list, tipster: str = "",
-                         tipster_odds=None):
+                         tipster_odds=None, exact_line_only: bool = False):
     """Read-only: resolve one NFL tip against the LIVE Sportsbet board and
     check the line-within-tolerance match (see _nfl_line_tolerance --
     yardage stats get +-2, everything else is exact). Returns a dict ready
@@ -17659,6 +17659,7 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
         stake_mult = 1.0
         _alt_bound = False  # sel came from an 'N+' ladder rung (v6.43 alt ceiling)
         _worse_by_one = None  # (key, sel) held back until the exact alt rung is tried
+        _better_hold = None   # v6.50: same for a BETTER main line
         _why = f"no unambiguous live '{suffix}' market for {player!r} on {event!r}"
         if market:
             for s in market.get("selections", []) or []:
@@ -17670,7 +17671,10 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
                 sel = None
             else:
                 live_line = float(sel["line"])
-                _tol = _nfl_line_tolerance(stat)
+                # v6.50 Opus review: an A1 LADDER leg ('0.15u 5+ receptions') takes its exact
+                # line or its 'N+' rung only, never a tolerance/better/worse main line (that
+                # would stack it onto the headline's own selection).
+                _tol = 0.0 if exact_line_only else _nfl_line_tolerance(stat)
                 if abs(float(tipster_line) - live_line) > _tol + 1e-9:
                     _why = (f"{player!r} {side} {suffix} tipster line {tipster_line} vs "
                             f"live {live_line} -- outside {_tol} tolerance for {stat!r}")
@@ -17678,8 +17682,11 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
                     # take a BETTER line at full stake and a line exactly 1 worse at 75%.
                     _shift = _nfl_count_line_shift(stat, side, float(tipster_line), live_line)
                     if _shift == "better":
-                        log.info(f"NFL auto-place: {player!r} {side} {suffix} live {live_line} is "
-                                 f"BETTER than tipped {tipster_line} -> full stake")
+                        # v6.50: held until the EXACT 'N+' rung has been tried. A1's '0.15u 5+
+                        # receptions' (+175) would otherwise bind the o3.5 main line (1.81), a
+                        # different, much shorter-priced bet.
+                        _better_hold = (key, sel)
+                        sel = None
                     elif _shift == "worse1":
                         _worse_by_one = (key, sel)
                         sel = None
@@ -17714,7 +17721,14 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
                         log.info(f"NFL auto-place: {player!r} over {tipster_line} not on the "
                                  f"'{alt_suffix}' ladder -> nearest rung {live_line} "
                                  f"({sel.get('selection')!r}) at full stake")
-        if sel is None and _worse_by_one is not None and 0 < NFL_WORSE_LINE_STAKE_MULT <= 1:
+        if sel is None and _better_hold is not None and not exact_line_only:
+            key, sel = _better_hold
+            live_line = float(sel["line"])
+            _alt_bound = False
+            log.info(f"NFL auto-place: {player!r} {side} {suffix} live {live_line} is BETTER than "
+                     f"tipped {tipster_line} (no exact rung) -> full stake")
+        if (sel is None and _worse_by_one is not None and not exact_line_only
+                and 0 < NFL_WORSE_LINE_STAKE_MULT <= 1):
             key, sel = _worse_by_one
             live_line = float(sel["line"])
             stake_mult = NFL_WORSE_LINE_STAKE_MULT
@@ -18407,7 +18421,8 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
 def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: str,
                              stat: str, side: str, tipster_line, units, unit_size,
                              raw_message: str, tipster_odds=None, telegram_msg_id=None,
-                             market_type: str = "player_prop") -> bool:
+                             market_type: str = "player_prop",
+                             exact_line_only: bool = False) -> bool:
     """Attempt to auto-place an NFL tip against the live Sportsbet market.
     SYNCHRONOUS (plain def) by design -- the caller MUST run this via
     _run_in_placement_executor, never awaited/called bare on the event loop
@@ -18566,7 +18581,7 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         market_type_norm = (market_type or "player_prop").strip().lower()
         if market_type_norm == "player_prop":
             match = _resolve_nfl_market(player, team, stat, side, tipster_line, priority,
-                                         tipster, tipster_odds)
+                                         tipster, tipster_odds, exact_line_only=exact_line_only)
         elif market_type_norm in _NFL_TEAM_MARKET_KEY:
             match = _resolve_nfl_team_market(team, market_type_norm, tipster_line, side,
                                               priority, tipster, tipster_odds)
@@ -19118,12 +19133,29 @@ def _resolve_nbl_leg(raw: dict, tipster: str, priority: list) -> tuple:
 def _post_context(text: str) -> str:
     """v6.37 (Wilson: 'the raw msg shouldnt be sent, it should just be one by one parsing of
     the bets ... i dont want spam of hella long msgs'). One short line naming the post a bet
-    came from (its first non-empty line, usually the game), instead of the whole post."""
+    came from (its first non-empty line, usually the game), instead of the whole post.
+    v6.50: channel headers ('A1 NFL:') and @-mention lines are skipped (every A1 alert read
+    just 'From post: A1 NFL:')."""
     for ln in (text or "").splitlines():
         ln = ln.strip()
-        if ln:
-            return f"From post: {ln[:80]}{'...' if len(ln) > 80 else ''}"
+        if not ln or ln.startswith("@") or (ln.endswith(":") and len(ln) <= 30):
+            continue
+        return f"From post: {ln[:80]}{'...' if len(ln) > 80 else ''}"
     return ""
+
+
+_A1_STAKE_LINE_RE = re.compile(r"^\s*\d*\.?\d+\s*u\b", re.IGNORECASE)
+
+
+def _a1_post_context(text: str) -> str:
+    """v6.50 (Opus review): A1's manual alerts carry every staked line of the post ('0.85u
+    ...', '0.15u 5+ receptions ...'), so a line the parser leaves out (another book's line,
+    an 'if' fallback, a dropped ladder leg) is still in front of Wilson. Short: stake lines
+    only, at most 6, each cut to 140 chars."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if _A1_STAKE_LINE_RE.match(ln or "")]
+    if not lines:
+        return _post_context(text)
+    return "Post bets:\n" + "\n".join(f"- {ln[:140]}" for ln in lines[:6])
 
 
 def _describe_nbl_leg(raw: dict) -> str:
@@ -19738,8 +19770,14 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
         return
 
     log.info(f"[{channel_name}] A1 NFL text extracted {len(raw_tips)} tip(s) in {elapsed:.2f}s")
+    # v6.50: A1's headline play comes first; every later tip is a LADDER leg ('0.15u 5+
+    # receptions'), placed on its exact line/rung only. Tagged before the resend filter.
+    for _i, _r in enumerate(raw_tips):
+        if isinstance(_r, dict):
+            _r["_ladder"] = _i > 0
     raw_tips = _drop_resent(tipster, channel_name, raw_tips, _nfl_seen_key,
                             _describe_a1_nfl_tip, NFL_DEDUP_TTL_SEC)
+    _ctx = _a1_post_context(text)
     for idx, raw in enumerate(raw_tips):
         try:
             headline = _describe_a1_nfl_tip(raw)
@@ -19764,8 +19802,8 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
                 tipster, channel_name, raw.get("player"), raw.get("team"),
                 raw.get("stat"), raw.get("side"), raw.get("line"),
                 raw.get("units"), unit_size,
-                f"{headline}\n{_post_context(text)}",
-                _tipster_odds,
+                f"{headline}\n{_ctx}",
+                _tipster_odds, None, "player_prop", bool(raw.get("_ladder")),
             )
             if handled:
                 continue
@@ -19773,7 +19811,7 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
         try:
             notifier.notify_text_manual_alert(
                 channel_name,
-                f"{headline}\n{_post_context(text)}",
+                f"{headline}\n{_ctx}",
                 header="A1 NFL, MANUAL",
             )
         except Exception as e:
@@ -19798,7 +19836,7 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
     his multi-leg slates to 200 chars -- fixed separately, see the
     dispatch site that calls this).
 
-    UNLIKE A1 (one headline tip per message, deliberate): 4th&EV's real
+    Like A1 since v6.50 (headline plus ladder legs): 4th&EV's real
     slates carry MULTIPLE legs per message (numbered 'BET 1:'/'2:'/etc, or
     split across a 'Part 1'/'Part 2' pair of separate messages continuing
     the same numbering) -- TEXT_PROMPT_FOURTHANDEV_NFL extracts every leg,

@@ -1458,8 +1458,9 @@ def parse_racing_text(
 
 TEXT_PROMPT_A1_NFL = (
     "You are an extraction tool for NFL betting-tip TEXT MESSAGES from the A1 Fantasy "
-    "Sports tipster channel. Read the message and extract the ONE headline bet A1 is "
-    "BACKING. Respond with ONLY valid JSON, no markdown fences, in this shape: "
+    "Sports tipster channel. Read the message and extract the headline bet A1 is "
+    "BACKING, plus every EXTRA LADDER LEG he stakes separately (see LADDER LEGS below). "
+    "Respond with ONLY valid JSON, no markdown fences, in this shape: "
     '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
     '"side": "over"|"under"|null, "line": number|null, "units": number|null, '
     '"fd_odds": number|null, '
@@ -1507,10 +1508,23 @@ TEXT_PROMPT_A1_NFL = (
     "at reduced stake for the SAME pick (e.g. '0.85u 13.5 on HR, etc.') and a "
     "conditional fallback market (e.g. 'u30.5 yards 0.5u if no longest for you') "
     "are real nuance meant for a HUMAN to read in the full raw message -- do NOT "
-    "try to model these as separate tips or fold them into your one tip's numbers. "
-    "Extract ONLY the single PRIMARY/headline play (the first player+market+line+"
-    "units combination in the message) as your one tip object; the caller keeps "
-    "the full raw text alongside your summary so nothing is lost. "
+    "try to model these as separate tips or fold them into any tip's numbers. "
+    "Extract the PRIMARY/headline play (the first player+market+line+units "
+    "combination in the message) as the first tip object; the caller keeps the full "
+    "raw text alongside your summary so nothing is lost. "
+    # v6.50 (2026-09-29 23:53, KC Concepcion: '0.85u ... o3.5 receptions' then '0.15u 5+
+    # receptions (+175 FD ...)' and '0.1u 6+ receptions (+320 FD)'; only the o3.5 was
+    # parsed and the two ladder legs were never placed nor alerted).
+    "LADDER LEGS: a LATER line that starts with its OWN '<N>u ' stake and gives a "
+    "DIFFERENT threshold of the same market written as 'N+' (e.g. '0.15u 5+ receptions "
+    "(+185 TS/+175 FD)', '0.1u 6+ receptions (+320 FD)'), is a SEPARATE, ADDITIONAL bet: "
+    "output it as its OWN tip object, in the order listed. It often omits the player and "
+    "sometimes the stat: take them from the headline play. 'N+' means side=\"over\", "
+    "line=N minus 0.5 (5+ -> 4.5). Its `units` and `fd_odds` come from ITS OWN line only. "
+    "NOT a ladder leg (keep it out of the tips; it stays in the raw text for a human): the "
+    "same pick at another book's line ('0.85u 13.5 on HR'), a conditional fallback "
+    "('u30.5 yards 0.5u if no longest for you'), or anything phrased with 'if', 'or', "
+    "'instead', 'on <book>'. "
     "SGP / same-game-parlay posts (e.g. '0.1u SGP ...') are not a standard single "
     "bet: market_type=\"other\", player/team/stat/line/units null, "
     "`description`=\"SGP, see raw text\". "
@@ -1530,7 +1544,8 @@ def parse_a1_nfl_text(
     retries, bad JSON) RAISES so the caller routes to MANUAL rather than
     silently losing a real tip. Uses GROQ_TEXT_MODEL, one text call.
 
-    v6.21 (2026-09-10): only ever produces ONE raw tip dict (the headline
+    v6.50: produces the headline tip plus any 'N+' LADDER legs (was v6.21: only ever ONE
+    raw tip dict (the headline
     play) even when the source message carries alt-book/fallback nuance --
     see TEXT_PROMPT_A1_NFL. The caller (main._route_a1_nfl_text) attaches
     the full raw message text to the manual alert so that nuance is never
