@@ -1818,7 +1818,8 @@ def notify_tiptitans_placed(
         f"<b>{_srcfield}:</b> {_escape_html(parsed['titan'])}\n"
         f"<b>Track:</b> {_escape_html(parsed['track'])} R{parsed['race_num']} "
         f"{parsed['race_type']}\n"
-        f"<b>Runner:</b> {saddle_str}{_escape_html(parsed['runner'])}\n"
+        f"<b>Runner:</b> {saddle_str}{_escape_html(parsed['runner'])}"
+        f"{racing_race_moved_note(parsed)}\n"
         f"<b>Market:</b> {parsed['market'].capitalize()} "
         f"@ tipster odds {parsed['tipster_odds']}\n"
         f"<b>Total:</b> ${total_placed:.2f} of ${intended_stake:.2f} "
@@ -1866,7 +1867,7 @@ def notify_tiptitans_ladder_maintenance(tip_id, parsed, attempts) -> bool:
     saddle_str = f"{parsed.get('saddle')}. " if parsed.get("saddle") else ""
     text = (
         f"<b>📉 LADDER ACTIVITY</b>\n"
-        f"<b>Tip ID:</b> {tip_id}\n"
+        f"<b>Tip ID:</b> {tip_id}{racing_race_moved_note(parsed)}\n"
         f"<b>Track:</b> {_escape_html(parsed['track'])} R{parsed['race_num']} "
         f"{parsed['race_type']}\n"
         f"<b>Runner:</b> {saddle_str}{_escape_html(parsed['runner'])}\n"
@@ -2016,7 +2017,7 @@ def notify_tiptitans_unfilled(
     _src, _srcfield = _racing_source(parsed.get("titan"))
     text = (
         f"<b>🏇 {_src} {title}</b>\n"
-        f"<b>Tip ID:</b> {tip_id}\n"
+        f"<b>Tip ID:</b> {tip_id}{racing_race_moved_note(parsed)}\n"
         f"<b>{_srcfield}:</b> {_escape_html(parsed['titan'])}\n"
         f"<b>Track:</b> {_escape_html(parsed['track'])} R{parsed['race_num']}\n"
         f"<b>Runner:</b> {saddle_str}{_escape_html(parsed['runner'])}\n"
@@ -2059,6 +2060,20 @@ def notify_tiptitans_manual_alert(
         f"{quotes_block}"
     )
     return _send_manual(text)
+
+
+def racing_race_moved_note(parsed) -> str:
+    """v6.55: one line when racing_placer moved the tip to another race (the tipped race
+    did not have the horse; the same name AND saddle number were in exactly one other)."""
+    try:
+        frm = (parsed or {}).get("race_moved_from")
+        if frm in (None, ""):
+            return ""
+        return (f"\n<b>⚠️ Race moved:</b> tip said R{frm}; "
+                f"#{parsed.get('saddle')} {_escape_html(parsed.get('runner') or '?')} is in "
+                f"R{parsed.get('race_num')}, bet there")
+    except Exception:
+        return ""
 
 
 def _format_bookie_quotes(quotes, tipster_odds=None) -> str:
