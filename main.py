@@ -58,6 +58,7 @@ from config import (
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
     SPORTSBET_MAX_STAKE_REBET,
     HB_SEND_MAX_ODDS, HB_SEND_DIRECTION, HB_RETRY_WITHOUT_PLAYER, NFL_WORSE_LINE_STAKE_MULT,
+    NFL_RUSH_ATT_FALLBACK_STAKE_MULT,
     HB_RETRY_WITHOUT_STAT, SB_SLOW_538_REBET_MAX_SEC, NFL_ALT_RUNG_MAX_YDS, NFL_ALT_MAX_ODDS_MULT,
     SELF_BET_MAX_STAKE,
     EDDIE_CAPTION_FALLBACK_ENABLED,
@@ -17712,9 +17713,19 @@ def _find_nfl_market(markets: dict, player: str, suffix: str):
     this is ever reached. Returns (None, None) if nothing matches, or if
     MORE than one market key matches exactly (an unresolved ambiguity --
     refuse rather than pick one)."""
+    hits = _nfl_market_hits(markets, player, suffix)
+    if len(hits) != 1:
+        return None, None
+    return hits[0]
+
+
+def _nfl_market_hits(markets: dict, player: str, suffix: str) -> list:
+    """Every (key, market) whose key is exactly '<player>_-_{suffix}' (token-set equal).
+    v6.54: split out so the rush attempts fallback can tell 'not offered' (0) from
+    'ambiguous' (2+), which _find_nfl_market reports the same way."""
     want = _nfl_slug_tokens(player)
     if not want:
-        return None, None
+        return []
     target_end = f"_-_{suffix}"
     hits = []
     for key, m in (markets or {}).items():
@@ -17723,9 +17734,7 @@ def _find_nfl_market(markets: dict, player: str, suffix: str):
         name_part = key[: -len(target_end)].replace("_", " ")
         if _nfl_slug_tokens(name_part) == want:
             hits.append((key, m))
-    if len(hits) != 1:
-        return None, None
-    return hits[0]
+    return hits
 
 
 _NFL_ATD_STATS = {"touchdowns", "anytime_touchdown", "anytime_td", "anytime_touchdowns"}
@@ -17958,6 +17967,37 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             if _fixed:
                 player = _fixed
                 key, market = _find_nfl_market(markets_all, player, suffix)
+        # v6.54 (Wilson): Sportsbet offers NO rush attempts market for this player at all ->
+        # his main rushing yards line, same side, at NFL_RUSH_ATT_FALLBACK_STAKE_MULT of the
+        # stake. A rush attempts market at a different line is NOT a fallback (manual as before).
+        # The tipster's price was for attempts, so it is not compared: the no-comparison 1.6
+        # floor applies (_nfl_odds_guard_refuses).
+        _att_fallback = False
+        _rsel = None
+        # Opus review: never for an A1 ladder leg (exact_line_only: '0.3u 11+' and '0.15u
+        # 12+' would all bind the one yards line), and only when NO rush attempts market
+        # names him (two that match ambiguously means it IS offered -> manual).
+        if (market is None and not _is_atd and player and not exact_line_only
+                and (stat or "").strip().lower() == "rush_attempts"
+                and not _nfl_market_hits(markets_all, player, suffix)
+                and 0 < NFL_RUSH_ATT_FALLBACK_STAKE_MULT <= 1):
+            _ry_suffix = _NFL_AUTOPLACE_STAT_SUFFIX.get("rushing_yards")
+            _rk, _rm = _find_nfl_market(markets_all, player, _ry_suffix)
+            _rsel = next((s for s in ((_rm or {}).get("selections") or [])
+                          if (s.get("direction") or "").strip().lower() == side
+                          and s.get("line") is not None), None)
+            if _rsel is not None:
+                log.info(f"NFL auto-place: no rush attempts market for {player!r} on {event!r} "
+                         f"-> rushing yards {side} {_rsel.get('line')} at "
+                         f"{NFL_RUSH_ATT_FALLBACK_STAKE_MULT:.0%} of the stake (Wilson's rule)")
+                key, market, suffix, stat = _rk, _rm, _ry_suffix, "rushing_yards"
+                tipster_line = float(_rsel["line"])
+                tipster_odds = None
+                exact_line_only = True
+                _att_fallback = True
+            else:
+                log.info(f"NFL auto-place: no rush attempts or rushing yards {side} market for "
+                         f"{player!r} on {event!r} -> manual")
         sel = None
         if _is_atd:
             key, sel = "touchdown_scorer", _atd_row
@@ -17967,7 +18007,11 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
         _worse_by_one = None  # (key, sel) held back until the exact alt rung is tried
         _better_hold = None   # v6.50: same for a BETTER main line
         _why = f"no unambiguous live '{suffix}' market for {player!r} on {event!r}"
-        if market:
+        if _att_fallback:
+            # Opus review: exactly the row the fallback checked; never an alt rung.
+            sel = _rsel
+            live_line = float(_rsel["line"])
+        elif market:
             for s in market.get("selections", []) or []:
                 if (s.get("direction") or "").strip().lower() == side:
                     sel = s
@@ -18043,6 +18087,8 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
         if sel is None:
             log.info(f"NFL auto-place: {_why} -> manual")
             return None
+        if _att_fallback:
+            stake_mult = NFL_RUSH_ATT_FALLBACK_STAKE_MULT
 
         if _is_atd:
             live_line = float(sel.get("line") if sel.get("line") is not None else 0.5)
@@ -18102,6 +18148,8 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             "period": sel.get("period") or "full_game",
             # v6.48: the anytime TD row carries no stat; the prop id pins it
             "hb_no_stat": _is_atd,
+            # v6.54: placed on rushing yards in place of a rush attempts tip
+            "stat_override": "rushing_yards" if _att_fallback else None,
         }
     except Exception as e:
         log.error(f"NFL auto-place: resolve crashed for {player!r} {stat!r}: {e}")
@@ -18812,9 +18860,14 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
         _landed = ("\nPlaced:\n" + "\n".join(
             f"- {session_priority.session_label(r.session_id, r.bookie)} ${r.stake:.2f} @ {r.odds}"
             for r in placed_results)) if placed_results else ""
+        # v6.54 (Opus review): when the bet placed differs from the tip (rush attempts ->
+        # rushing yards, a worse line at 75%), say so, or the top-up goes on the wrong market.
+        _placed_as = (f"\nBot placed it as: {bet_label}"
+                      if (" -> placed as " in (bet_label or "") or "% stake)" in (bet_label or ""))
+                      else "")
         try:
             notifier.notify_text_manual_alert(
-                channel_name, f"{raw_message}{_landed}{_why}",
+                channel_name, f"{raw_message}{_placed_as}{_landed}{_why}",
                 header=(f"{_S} PARTIAL FILL, ${unfilled:.2f} left to place by hand"
                         if total_placed > 0 or ambiguous_total > 0
                         else f"{_S} AUTO-PLACE FAILED, ${unfilled:.2f} to place by hand"),
@@ -19092,7 +19145,11 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
 
         intended_stake = round(units_f * float(unit_size or 0), 2)
         # v6.37: a count-stat line 1 worse than tipped places at 75% of the stake.
+        # v6.54: a rush attempts tip placed on rushing yards places at 80%.
+        _place_stat = match.get("stat_override") or stat
         _mult = float(match.get("stake_mult", 1.0))
+        if match.get("stat_override"):
+            _bet_label += f" -> placed as {_place_stat} {side} {match['line']}"
         if _mult < 1.0:
             intended_stake = round(intended_stake * _mult, 2)
             _bet_label += f" (SB line {match['line']}, {_mult:.0%} stake)"
@@ -19133,7 +19190,7 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         else:
             _leg_sel = match["selection"]
         leg = ParsedLeg(
-            market=_leg_market, player=player or "", stat=stat or "",
+            market=_leg_market, player=player or "", stat=_place_stat or "",
             line=match["line"],
             selection=_leg_sel,
             team_full=match["team"], raw_text=raw_message,
@@ -19143,7 +19200,10 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
             units=units_f, unit_size=unit_size or 0.0, raw_message=raw_message,
             timestamp=datetime.now(), event=match["event"],
             telegram_msg_id=telegram_msg_id,
-            suggested_bookie="sportsbet", suggested_odds=tipster_odds or match.get("odds") or 0.0,
+            suggested_bookie="sportsbet",
+            # v6.54: the tipster's price was for a different market on a stat fallback
+            suggested_odds=((match.get("odds") if match.get("stat_override") else tipster_odds)
+                            or match.get("odds") or 0.0),
         )
 
         # v6.31 (Wilson: "fan out to all available sportsbet accounts and then place
@@ -19154,7 +19214,7 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         # every active Sportsbet account concurrently, each laddering down on its own
         # 538, and owns every alert/ledger/audit write from here on.
         if market_type_norm == "player_prop":
-            _cap_market = (stat or "").strip().lower()
+            _cap_market = (_place_stat or "").strip().lower()
         elif market_type_norm == "spread":
             _cap_market = "line"
         else:
