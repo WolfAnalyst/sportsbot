@@ -740,7 +740,9 @@ class HyperBotClient:
 
         result = status.get("result") or {}
         if not result.get("success"):
-            return result
+            # v6.53: the cid COMPLETED, so the session itself answered (event not found,
+            # no markets...). main._probe_answered keys a stuck-session recovery on this.
+            return {**result, "session_answered": True}
 
         # Re-wrap markets to match v2 contract
         v3_markets = result.get("markets") or {}

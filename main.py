@@ -134,7 +134,7 @@ from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
 from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
 from nba_resolver import resolve_nba_event, resolve_mlb_event, resolve_nfl_event, NFL_TEAM_ALIASES, canonical_nfl_team
-from nba_resolver import resolve_nbl_event, canonical_nbl_team
+from nba_resolver import resolve_nbl_event, canonical_nbl_team, nbl_only_game_today
 from roster import resolve_player_name, get_player_team, afl_surname_candidates, afl_fuzzy_surname_candidates
 from roster import is_nfl_name_collision
 from roster import exact_match_player
@@ -6241,6 +6241,14 @@ def _v4_get_active_sessions_unfiltered(tip: ParsedTip) -> list[dict]:
     # downstream price-check or placement. Owned-session whitelist matches
     # the watchdog filter.
     sessions = [s for s in sessions if _is_owned_session(s.get("session_id", ""))]
+    # v6.53: a session HyperBot isn't answering for gets no new sports bets.
+    _stuck = _stalled_session_ids()
+    if _stuck:
+        _skip = [str(s.get("session_id", "")) for s in sessions
+                 if str(s.get("session_id", "")) in _stuck]
+        if _skip:
+            log.info(f"skipping stuck session(s) {_skip} (not answering in HyperBot)")
+            sessions = [s for s in sessions if str(s.get("session_id", "")) not in _stuck]
 
     bookie = tip.suggested_bookie
     if bookie and tip.tipster not in TIPSTERS_IGNORE_SUGGESTED_BOOKIE:
@@ -6369,10 +6377,13 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
         # read as not-found -> converted to a clean failure -> manual re-bet
         # (double bet by hand) + lost ledger row.
         _recon_event = _bookie_event(tip.event, sess.get("bookie", ""), tip.sport)
+        # v6.53 (Opus re-check): the time the bet was SENT, taken before the ~30s reconcile
+        # below, so the deferred re-check compares stalls against the real send time.
+        _sent_ts = _t.time() - _el
         decision = _recon.decide_ambiguous(
             hb, sess.get("account_id"), event=_recon_event, stake=_eff_step,
             sport=(tip.sport or "afl"), selection=sel,
-            submit_ts=_t.time() - _el,
+            submit_ts=_sent_ts,
             reconcile_enabled=RECONCILE_AMBIGUOUS, spill_enabled=False,
         )
     except Exception as e:
@@ -6422,6 +6433,13 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
             log.warning(f"{label}: reconcile says not-placed BUT this was a HARD poll "
                         f"deadline (cid never resolved) — staying CONSERVATIVE "
                         f"(debit-as-placed), NOT converting to unfilled (Guard B)")
+            # v6.53: HyperBot accepted the request (it has a cid) and the session never
+            # answered it: the session's queue is stuck. Later bets skip it. A POST that
+            # failed outright has no cid and is not the session's fault, so not marked.
+            if getattr(r, "correlation_id", None):
+                _mark_session_stalled(
+                    sess.get("session_id"), sess.get("bookie", ""), tip.sport or "",
+                    _recon_event, f"a ${_eff_step:.2f} bet sent {_el:.0f}s earlier got no answer")
             # v6.08o: Guard B is right to hold here, but until now nothing ever came
             # BACK to it. $515.70 across 6 events in three days was debited-as-placed and
             # never revisited. Racing has had a deferred re-check since 07-06; sports had
@@ -6442,7 +6460,7 @@ def _reconcile_fanout_ambiguous(tip, sess: dict, r, step: float, label: str):
                     tip=tip, stake=float(_eff_step or 0), odds=r.odds,
                     selection_text=(getattr(r, "placed_selection", "")
                                     or getattr(tip, "raw_message", "") or "")[:90],
-                    sel_id=_sel_id)
+                    sel_id=_sel_id, sent_ts=_sent_ts)
             except Exception as _e:
                 log.warning(f"{label}: could not schedule the deferred verify: {_e}")
             return r
@@ -6473,6 +6491,141 @@ SPORTS_DEFERRED_CID_VERIFY_DELAY_SEC = int(
     os.getenv("SPORTS_DEFERRED_CID_VERIFY_DELAY_SEC", "420"))
 SPORTS_DEFERRED_CID_VERIFY_WINDOW_SEC = float(
     os.getenv("SPORTS_DEFERRED_CID_VERIFY_WINDOW_SEC", "45"))
+
+
+# ── v6.53: stuck HyperBot sessions ────────────────────────────────────────────────────
+# 2026-10-01 17:27-17:56: HyperBot's connection for Wilson Sportsbet (53522) hung on a
+# balance check and its one-at-a-time command queue stopped. Every bet sent to it waited
+# the full 5-minute poll, every Bettors Edge NBL leg waited on it (~5.5 min per leg), and
+# at 17:56 HyperBot ran all six queued bets at once (refused only because the prices had
+# moved). Wilson: "even if 1 bookie isnt working ... just restake that stake across the
+# other sb's that work, and it shouldnt affect the placement of other independent bets".
+# A session that doesn't answer is now marked stuck: sports placement and price checks
+# skip it (its share goes to the accounts that work) until it answers a price check. Its
+# queue runs in order, so that answer also means the stuck bet has run, which is when
+# the deferred re-check can say whether it landed.
+FANOUT_STRAGGLER_GRACE_SEC = float(os.getenv("FANOUT_STRAGGLER_GRACE_SEC", "20"))
+STALL_PROBE_INTERVAL_SEC = float(os.getenv("STALL_PROBE_INTERVAL_SEC", "120"))
+STALL_MAX_SEC = float(os.getenv("STALL_MAX_SEC", "3600"))
+STALL_WAIT_POLL_SEC = 30.0  # how often a deferred re-check looks again at a stuck session
+_stalled_sessions: dict = {}  # sid -> {"since", "bookie", "sport", "event", "why"}
+_stalled_lock = threading.Lock()
+_session_last_answer: dict = {}  # sid -> time it last answered after being stuck
+_session_marked_at: dict = {}  # sid -> time it was last marked stuck (kept after it clears)
+
+
+def _session_stalled(sid) -> bool:
+    with _stalled_lock:
+        return str(sid) in _stalled_sessions
+
+
+def _stalled_session_ids() -> set:
+    with _stalled_lock:
+        return set(_stalled_sessions)
+
+
+def _mark_session_stalled(sid, bookie: str, sport: str, event: str, why: str) -> None:
+    """Mark `sid` stuck (no-op if it already is): one critical alert, then a background
+    probe that clears it when the session answers a price check. NEVER raises."""
+    try:
+        import time as _t
+        sid = str(sid)
+        with _stalled_lock:
+            if sid in _stalled_sessions:
+                return
+            _stalled_sessions[sid] = {"since": _t.time(), "bookie": bookie or "",
+                                      "sport": sport or "", "event": event or "", "why": why}
+            _session_marked_at[sid] = _stalled_sessions[sid]["since"]
+        _lbl = session_priority.session_label(sid, bookie or "")
+        log.error(f"[stuck-session] {_lbl} marked STUCK ({why}); sports bets skip it until "
+                  f"it answers a price check")
+        try:
+            notifier.notify_critical(
+                f"{_lbl} is not answering in HyperBot ({why}). Sports bets now skip it and "
+                f"the other accounts take its share, until it answers again (checked every "
+                f"{STALL_PROBE_INTERVAL_SEC / 60:.0f} min). Restarting that session in "
+                f"HyperBot should clear it. A bet already queued on it may still run late.")
+        except Exception as e:
+            log.warning(f"[stuck-session] alert failed for {sid}: {e}")
+        threading.Thread(target=_stall_probe_worker, args=(sid,),
+                         name=f"stall-probe-{sid[:8]}", daemon=True).start()
+    except Exception as e:
+        log.warning(f"[stuck-session] could not mark {sid}: {e}")
+
+
+def _clear_session_stall(sid, why: str, notify: bool = True) -> None:
+    try:
+        sid = str(sid)
+        with _stalled_lock:
+            info = _stalled_sessions.pop(sid, None)
+        if not info:
+            return
+        import time as _t
+        mins = (_t.time() - float(info.get("since") or _t.time())) / 60
+        _lbl = session_priority.session_label(sid, info.get("bookie") or "")
+        log.warning(f"[stuck-session] {_lbl} back in use after {mins:.0f} min ({why})")
+        if notify:
+            try:
+                notifier.notify_critical(f"{_lbl} is back in use after {mins:.0f} min ({why}).")
+            except Exception as e:
+                log.warning(f"[stuck-session] recovery alert failed for {sid}: {e}")
+    except Exception as e:
+        log.warning(f"[stuck-session] could not clear {sid}: {e}")
+
+
+def _probe_answered(pc: dict) -> bool:
+    """A price check the SESSION answered: a success, or a failure whose cid COMPLETED
+    (event not found, no markets; tagged session_answered by hyperbot_client). Anything
+    else (a poll that never resolved, a timeout, an HTTP 403/429 from the API, a crash) is
+    no answer. Allow-list, not deny-list (Opus review)."""
+    return bool(pc.get("success") or pc.get("session_answered"))
+
+
+def _stall_probe_worker(sid: str) -> None:
+    """Every STALL_PROBE_INTERVAL_SEC, price-check the stuck session's own event. An
+    answer clears the stall, but only a stall that began BEFORE that probe was sent (a probe
+    from an earlier stall must not clear a newer one; Opus review). After STALL_MAX_SEC it
+    stays skipped (Opus review: putting a still-stuck account back queues the next real bet
+    into the dead queue): one alert, and the probing goes on."""
+    import time as _t
+    _warned = False
+    while True:
+        _t.sleep(max(1.0, STALL_PROBE_INTERVAL_SEC))
+        with _stalled_lock:
+            info = dict(_stalled_sessions.get(sid) or {})
+        if not info:
+            return
+        if not _warned and _t.time() - float(info.get("since") or 0) > STALL_MAX_SEC:
+            _warned = True
+            _lbl = session_priority.session_label(sid, info.get("bookie") or "")
+            log.error(f"[stuck-session] {_lbl} still not answering after "
+                      f"{STALL_MAX_SEC / 60:.0f} min")
+            try:
+                notifier.notify_critical(
+                    f"{_lbl} has still not answered in HyperBot after {STALL_MAX_SEC / 60:.0f} "
+                    f"min. It stays skipped for sports bets until it answers: restart that "
+                    f"session in HyperBot (restarting TipBot also puts it back).")
+            except Exception as e:
+                log.warning(f"[stuck-session] still-stuck alert failed for {sid}: {e}")
+        probe_start = _t.time()
+        try:
+            pc = hb.price_check_sports(session_id=sid, sport=info.get("sport") or "",
+                                       event=info.get("event") or "")
+        except Exception as e:
+            pc = {"success": False, "error": str(e)}
+        if _probe_answered(pc):
+            with _stalled_lock:
+                cur = _stalled_sessions.get(sid)
+                newer = bool(cur and float(cur.get("since") or 0) > probe_start)
+            if newer:
+                log.info(f"[stuck-session] {sid} answered a probe sent before its current "
+                         f"stall began; still stuck (that stall's own probe takes over)")
+                return
+            # Stamped with the SEND time: only what was queued before it is proven run.
+            _session_last_answer[sid] = probe_start
+            _clear_session_stall(sid, "it answered a price check")
+            return
+        log.info(f"[stuck-session] {sid} still not answering ({str(pc.get('error'))[:80]})")
 
 
 def _disposals_release_ambiguous(sel_id: str, amount: float, why: str) -> float:
@@ -6543,10 +6696,23 @@ def _deferred_absent_flush(key: tuple) -> None:
             items = _deferred_absent.pop(key, [])
         if not items:
             return
-        tipster, event, selection = key
+        tipster, event, selection = key[:3]
         total = round(sum(float(i["stake"]) for i in items), 2)
         waited = max(int(i.get("waited") or 0) for i in items)
         sport = (items[0].get("sport") or "SPORTS").upper()
+        if len(key) > 3 and key[3] == "held":
+            # v6.53: after a stuck HyperBot session, absent is NOT proof (the queue order
+            # is unconfirmed): one message per bet saying so (Opus re-check).
+            _lines = "\n".join(f"- ${float(i['stake']):.2f} @ {i['odds']} on {i['acct']} "
+                                f"({i.get('why')})" for i in items)
+            notifier.notify_text_manual_alert(
+                tipster,
+                f"{selection}\n{event}\n{len(items)} account(s), ${total:.2f} NOT CONFIRMED "
+                f"after a stuck HyperBot session:\n{_lines}\n\nHyperBot may still be holding "
+                f"them. Check the accounts, or restart the session in HyperBot, BEFORE placing "
+                f"by hand.",
+                header=f"{sport}: ${total:.2f} not confirmed, check before placing")
+            return
         lines = "\n".join(f"- ${float(i['stake']):.2f} @ {i['odds']} on {i['acct']}" for i in items)
         dm = any(i.get("sel_id") for i in items)
         notifier.notify_text_manual_alert(
@@ -6563,7 +6729,7 @@ def _deferred_absent_flush(key: tuple) -> None:
 
 
 def _schedule_deferred_sports_cid_verify(*, session_id, bookie, tip, stake, odds,
-                                         selection_text, sel_id=None):
+                                         selection_text, sel_id=None, sent_ts=None):
     """Fire-and-forget: re-query the book later for a sports bet whose cid never resolved.
 
     v6.08o. Ported from racing (`racing_placer._schedule_deferred_cid_verify`, live since
@@ -6592,6 +6758,32 @@ def _schedule_deferred_sports_cid_verify(*, session_id, bookie, tip, stake, odds
                 import time as _t
                 import reconcile
                 _t.sleep(max(0, SPORTS_DEFERRED_CID_VERIFY_DELAY_SEC))
+                # v6.53 (1 Oct, Wilson SB 53522): at 17:43 this said "$85.71 did not land"
+                # while the bet was still QUEUED in HyperBot; it ran at 17:56 and only the
+                # moved price stopped it landing after Wilson had been told to place it by
+                # hand. While the session is stuck nothing can be concluded: wait for it to
+                # answer (its queue runs in order, so the bet has run by then).
+                _waited_stuck = False
+                while (_session_stalled(session_id)
+                       and _t.time() - submit_ts < STALL_MAX_SEC + 600):
+                    _waited_stuck = True
+                    _t.sleep(STALL_WAIT_POLL_SEC)
+                # v6.53 (Opus re-check): a stall that began after this bet was SENT and has
+                # already cleared still counts; a short stall must not fall back to "did not
+                # land" on the unconfirmed queue-order assumption.
+                if _session_marked_at.get(str(session_id), 0) >= (sent_ts or submit_ts):
+                    _waited_stuck = True
+                if _waited_stuck and (_session_last_answer.get(str(session_id), 0)
+                                      < (sent_ts or submit_ts)):
+                    _acct = session_priority.session_label(session_id, bookie)
+                    log.error(f"[deferred-verify] {_label}: {_acct} never answered, "
+                              f"${stake:.2f} may STILL run -> not concluding")
+                    _deferred_absent_add(
+                        (getattr(tip, "tipster", "?") or "?", _event, selection_text, "held"),
+                        {"stake": stake, "odds": odds, "acct": _acct, "sport": _sport,
+                         "waited": int(_t.time() - submit_ts), "label": _label,
+                         "why": "HyperBot never answered it"})
+                    return
                 _sess = {}
                 for s in (hb.get_sessions_or_none() or []):
                     if str(s.get("session_id")) == str(session_id):
@@ -6619,6 +6811,45 @@ def _schedule_deferred_sports_cid_verify(*, session_id, bookie, tip, stake, odds
                     log.info(
                         f"[deferred-verify] {_label}: LANDED after all — ${stake:.2f} @ "
                         f"{odds} on {bookie}:{session_id} is at the bookie. No action.")
+                    if _waited_stuck:
+                        # v6.53: it ran late, after a stuck queue cleared; say so plainly, and
+                        # write its ledger row (Opus review: the late-result handler only sees
+                        # the 5-min cid timeout, so this is the one place that learns it landed).
+                        _m = res.get("match") or {}
+                        try:
+                            _lr = BetResult(
+                                success=True, tip=tip, session_id=str(session_id),
+                                bookie=bookie, stake=float(_m.get("stake") or stake),
+                                odds=_m.get("odds") or odds,
+                                bet_id=str(_m.get("bookie_bet_id") or _m.get("id") or ""),
+                                timestamp=datetime.now())
+                            if _lr.bet_id:
+                                notifier.notify_tip_placed_summary(
+                                    tip, [_lr], round(float(_lr.stake or stake), 2), 0.0,
+                                    concurrent_bookies=True)
+                        except Exception as _le:
+                            log.error(f"[deferred-verify] {_label}: late ledger row failed: {_le}")
+                        notifier.notify_critical(
+                            f"{_label}\n{_event}\nLANDED LATE on "
+                            f"{session_priority.session_label(session_id, bookie)}: "
+                            f"${float(_m.get('stake') or stake):.2f} @ {_m.get('odds') or odds} "
+                            f"(bet id {_m.get('bookie_bet_id') or _m.get('id') or '?'}), after "
+                            f"HyperBot's stuck queue cleared. It is on the account: do NOT "
+                            f"place it by hand.")
+                    return
+                if _waited_stuck:
+                    # v6.53 (Opus review): that HyperBot runs a session's price checks and bets
+                    # in one queue, in order, is what the 1 Oct log suggests but is NOT
+                    # confirmed, so after a stall a missing bet may still be held. Never "did
+                    # not land" here.
+                    _acct = session_priority.session_label(session_id, bookie)
+                    log.error(f"[deferred-verify] {_label}: not on {_acct} after its stall "
+                              f"cleared; may still be held -> not concluding")
+                    _deferred_absent_add(
+                        (getattr(tip, "tipster", "?") or "?", _event, selection_text, "held"),
+                        {"stake": stake, "odds": odds, "acct": _acct, "sport": _sport,
+                         "waited": int(_t.time() - submit_ts), "label": _label,
+                         "why": "not on the account after HyperBot recovered"})
                     return
                 # DELIBERATELY DOES NOT RELEASE THE LEDGER. Raised in review and then
                 # verified against the source: verify_bet_landed returns landed=False for
@@ -17669,6 +17900,8 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
         pc = None
         probe_sid = None
         for _sid in priority_sessions:
+            if _session_stalled(_sid):
+                continue
             _pc = hb.price_check_sports(session_id=str(_sid), sport="nfl", event=event)
             if _pc.get("success"):
                 pc, probe_sid = _pc, str(_sid)
@@ -18001,6 +18234,8 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
         pc = None
         probe_sid = None
         for _sid in priority_sessions:
+            if _session_stalled(_sid):
+                continue
             _pc = hb.price_check_sports(session_id=str(_sid), sport="nfl", event=event)
             if _pc.get("success"):
                 pc, probe_sid = _pc, str(_sid)
@@ -18300,23 +18535,81 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     # ── Fire concurrently. From here on a bet may be on the book. ─────────
     results: list[BetResult] = []
     log.info(f"[{channel_name}] {_S} fan-out: firing {len(jobs)} concurrent placement(s)")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
-        futures = {
-            ex.submit(_fanout_place_account, tip, sess, ladder, presolved): sess
-            for (sess, ladder) in jobs
-        }
-        for fut in concurrent.futures.as_completed(futures):
-            sess = futures[fut]
-            sid = str(sess.get("session_id", ""))
-            try:
-                results.append(fut.result())
-            except Exception as e:
-                log.error(f"[{channel_name}] {_S} fan-out: placement on {sid} raised: {e}")
-                results.append(BetResult(
-                    success=False, tip=tip, session_id=sid,
-                    bookie=sess.get("bookie", "unknown"),
-                    error=f"{_S} fan-out placement exception: {e}",
-                    timestamp=datetime.now()))
+    # v6.53 (Wilson 1 Oct: one stuck account held every NBL leg ~5.5 min): wait for the
+    # accounts, but once the others have answered, give a straggler only
+    # FANOUT_STRAGGLER_GRACE_SEC more. It then finishes in the background (its outcome is
+    # reported on its own, see _fanout_late_result), its share counts as maybe-placed
+    # here (never re-staked: HyperBot can still run it late), and the session is marked
+    # stuck so later bets skip it.
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs))
+    futures = {
+        ex.submit(_fanout_place_account, tip, sess, ladder, presolved): (sess, ladder)
+        for (sess, ladder) in jobs
+    }
+    pending = set(futures)
+    last_done = None
+    try:
+        while pending:
+            timeout = (None if (last_done is None or len(futures) < 2)
+                       else max(0.0, FANOUT_STRAGGLER_GRACE_SEC - (_time_mod.time() - last_done)))
+            done, pending = concurrent.futures.wait(
+                pending, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED)
+            if not done:
+                break
+            for fut in done:
+                sess = futures[fut][0]
+                sid = str(sess.get("session_id", ""))
+                try:
+                    results.append(fut.result())
+                except Exception as e:
+                    log.error(f"[{channel_name}] {_S} fan-out: placement on {sid} raised: {e}")
+                    results.append(BetResult(
+                        success=False, tip=tip, session_id=sid,
+                        bookie=sess.get("bookie", "unknown"),
+                        error=f"{_S} fan-out placement exception: {e}",
+                        timestamp=datetime.now()))
+            last_done = _time_mod.time()
+    finally:
+        ex.shutdown(wait=False)
+    for fut in [f for f in pending if f.done()]:
+        # Finished between the last wait() and now (Opus review): a normal result.
+        pending.discard(fut)
+        sess = futures[fut][0]
+        try:
+            results.append(fut.result())
+        except Exception as e:
+            results.append(BetResult(
+                success=False, tip=tip, session_id=str(sess.get("session_id", "")),
+                bookie=sess.get("bookie", "unknown"),
+                error=f"{_S} fan-out placement exception: {e}", timestamp=datetime.now()))
+    for fut in pending:
+        sess, ladder = futures[fut]
+        sid = str(sess.get("session_id", ""))
+        bk = sess.get("bookie", "unknown")
+        share = float(ladder[0]) if ladder else 0.0
+        log.warning(f"[{channel_name}] {_S} fan-out: {bk}:{sid} no answer "
+                    f"{FANOUT_STRAGGLER_GRACE_SEC:.0f}s after the other accounts; moving on, "
+                    f"its ${share:.2f} stays maybe-placed and finishes in the background")
+        _ph = BetResult(
+            success=False, tip=tip, session_id=sid, bookie=bk, stake=share,
+            error=(f"no answer from HyperBot {FANOUT_STRAGGLER_GRACE_SEC:.0f}s after the other "
+                   f"accounts; still waiting in the background, it may yet land"),
+            timestamp=datetime.now())
+        _ph.is_ambiguous = True
+        _ph.cid_unresolved = True
+        try:
+            _ph._requested_stake = share
+            _ph._detached = True
+        except Exception:
+            pass
+        results.append(_ph)
+        _mark_session_stalled(sid, bk, tip.sport or sport,
+                              _bookie_event(tip.event, bk, tip.sport),
+                              f"no answer to a ${share:.2f} {_S} bet while the other "
+                              f"accounts answered")
+        fut.add_done_callback(
+            lambda f, _s=sess, _sh=share, _t0=_t_start: _fanout_late_result(
+                f, tip, _s, _sh, channel_name, raw_message, bet_label, _S, _t0))
 
     try:
         _nfl_fanout_rollup(tip, jobs, results, intended_stake, channel_name,
@@ -18333,6 +18626,68 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
         except Exception:
             pass
     return results
+
+
+def _fanout_late_result(fut, tip, sess: dict, share: float, channel_name: str,
+                        raw_message: str, bet_label: str, S: str, t_start: float) -> None:
+    """v6.53: the outcome of a fan-out account the leg stopped waiting for. Runs on the
+    worker thread when it finishes. Its share was reported as maybe-placed, so this
+    says what actually happened. NEVER raises, never re-places."""
+    import time as _t
+    sid = str(sess.get("session_id", ""))
+    bk = sess.get("bookie", "unknown")
+    _acct = session_priority.session_label(sid, bk)
+    try:
+        r = fut.result()
+    except Exception as e:
+        log.error(f"[{channel_name}] {S} late result on {bk}:{sid} raised: {e}")
+        try:
+            notifier.notify_critical(
+                f"{S} {bet_label}: the late placement on {_acct} crashed ({e}). ${share:.2f} "
+                f"may or may not have landed: check the account before placing by hand.")
+        except Exception:
+            pass
+        return
+    try:
+        _el = _t.time() - t_start
+        if r.success:
+            _session_last_answer[sid] = _t.time()
+            _clear_session_stall(sid, "it answered a bet")
+            log.warning(f"[{channel_name}] {S} LATE PLACED: {bet_label} @ {r.odds} ${r.stake} "
+                        f"on {bk}:{sid} (bet_id={r.bet_id}) after {_el:.0f}s")
+            try:
+                # Owns the ledger row for this bet, like the rollup's placed summary.
+                notifier.notify_tip_placed_summary(
+                    tip, [r], round(float(r.stake or share), 2), 0.0,
+                    total_elapsed_sec=round(_el, 2), concurrent_bookies=True)
+            except Exception as e:
+                log.error(f"[{channel_name}] {S} late placed-summary failed: {e}")
+            notifier.notify_critical(
+                f"{S} {bet_label}: LANDED LATE on {_acct}, ${float(r.stake or 0):.2f} @ "
+                f"{r.odds} after {_el:.0f}s (bet id {r.bet_id}). It is on the account: do "
+                f"NOT place it by hand.")
+            return
+        if _is_ambiguous_result(r):
+            # _fanout_place_account already reconciled it; an unresolved cid kept it
+            # maybe-placed and scheduled the deferred re-check, which reports the end.
+            log.warning(f"[{channel_name}] {S} late result on {bk}:{sid} still ambiguous "
+                        f"after {_el:.0f}s: {(r.error or '')[:120]}")
+            if not (getattr(r, "cid_unresolved", False) and getattr(r, "correlation_id", None)):
+                # HyperBot DID answer (e.g. placement_uncertain, a slow reject): the account
+                # was slow, not stuck (Opus review, 26 Sep 65463 at 33s).
+                _clear_session_stall(sid, "it answered (slow, not stuck)")
+            return
+        _session_last_answer[sid] = _t.time()
+        _clear_session_stall(sid, "it answered a bet")
+        _err = re.sub(r"\s*for url: \S+", "", (r.error or "?").strip())[:200]
+        log.warning(f"[{channel_name}] {S} late result on {bk}:{sid}: NOT placed after "
+                    f"{_el:.0f}s ({_err})")
+        notifier.notify_text_manual_alert(
+            channel_name,
+            f"{raw_message}\nNot placed on {_acct} (HyperBot answered after {_el:.0f}s): {_err}",
+            header=f"{S}: ${share:.2f} did not place on {_acct}, place by hand")
+    except Exception as e:
+        log.error(f"[{channel_name}] {S} late-result handling failed for {bk}:{sid}: {e}")
 
 
 def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake: float,
@@ -19041,8 +19396,10 @@ _NBL_BETTER_LINE_MAX = 2.0  # v6.38: same cap as NFL count stats
 _NBL_SIGNED_LINE_RE = re.compile(r"^(.*\S)\s+([+-]\d+(?:\.\d+)?)$")
 
 
-def _nbl_pick_team(markets: dict, raw: dict, team: str) -> tuple:
-    """(catalog_key, selection, "") or (None, None, reason) for h2h/spread/total."""
+def _nbl_pick_team(markets: dict, raw: dict, team: str, main_total_only: bool = False) -> tuple:
+    """(catalog_key, selection, "") or (None, None, reason) for h2h/spread/total.
+    main_total_only (v6.53, an inferred game): the main total only, never an alternate
+    line that another game's number could happen to match."""
     mt = (raw.get("market_type") or "").strip().lower()
     line = raw.get("line")
     side = (raw.get("side") or "").strip().lower()
@@ -19084,8 +19441,9 @@ def _nbl_pick_team(markets: dict, raw: dict, team: str) -> tuple:
     if mt == "total":
         if side not in ("over", "under") or line is None:
             return None, None, "a total with no over/under side or line"
-        for key, raw_name in (("total_points", "total points"),
-                              ("alternate_total", "alternate total points")):
+        for key, raw_name in ((("total_points", "total points"),) if main_total_only else
+                              (("total_points", "total points"),
+                               ("alternate_total", "alternate total points"))):
             hits = [s for s in _two_way(key)
                     if (s.get("raw_market_name") or "").strip().lower() == raw_name
                     and (s.get("direction") or "").lower() == side
@@ -19110,8 +19468,24 @@ def _resolve_nbl_leg(raw: dict, tipster: str, priority: list) -> tuple:
         if (g1_raw and not g1) or (g2_raw and not g2):
             return None, f"game header team not recognised ({g1_raw!r} v {g2_raw!r})"
         header = (g1, g2) if (g1 and g2 and g1 != g2) else None
+        # v6.53 (Wilson 1 Oct: "can infer as there is no other game today"): with no header,
+        # tonight's ONLY NBL game stands in for one, for a total and for a player the roster
+        # can't place (the header then also allows the in-game typo match). Never for
+        # h2h/spread (the team names the game).
+
+        def _infer_only_game():
+            if raw.get("_post_has_header"):
+                # Opus review: a post that names a game elsewhere may be covering two games
+                # ("Additional bet(s) for the second game"); never guess for its blank legs.
+                return None
+            g = nbl_only_game_today()
+            if not g:
+                return None
+            c1, c2 = canonical_nbl_team(g[0]), canonical_nbl_team(g[1])
+            return (c1, c2) if (c1 and c2 and c1 != c2) else None
 
         team = ""
+        _main_total_only = False
         if mt in ("h2h", "spread"):
             team = canonical_nbl_team(raw.get("team"))
             if not team:
@@ -19121,8 +19495,14 @@ def _resolve_nbl_leg(raw: dict, tipster: str, priority: list) -> tuple:
             event = resolve_nbl_event(team, (header[1] if team == header[0] else header[0])
                                       if header else "")
         elif mt == "total":
+            _main_total_only = not header
             if not header:
-                return None, "a total with no game header to say which game"
+                header = _infer_only_game()
+                if not header:
+                    return None, ("a total with no game header, and it is not the only NBL "
+                                  "game today")
+                log.info(f"NBL auto-place: total with no header -> today's only game "
+                         f"{header[0]} v {header[1]}")
             event = resolve_nbl_event(*header)
         elif mt == "player_prop":
             if header:
@@ -19133,9 +19513,16 @@ def _resolve_nbl_leg(raw: dict, tipster: str, priority: list) -> tuple:
                 _r = exact_match_player(raw.get("player") or "", "nbl") or {}
                 team = canonical_nbl_team(_r.get("team")) or _nbl_roster_team_by_tokens(
                     raw.get("player") or "")
-                if not team:
-                    return None, "no game header and the player is not on the NBL roster"
-                event = resolve_nbl_event(team)
+                if team:
+                    event = resolve_nbl_event(team)
+                else:
+                    header = _infer_only_game()
+                    if not header:
+                        return None, ("no game header, the player is not on the NBL roster, "
+                                      "and it is not the only NBL game today")
+                    log.info(f"NBL auto-place: {raw.get('player')!r} not on the roster, no "
+                             f"header -> today's only game {header[0]} v {header[1]}")
+                    event = resolve_nbl_event(*header)
         else:
             return None, f"market type {mt or '?'!r} is not auto-placeable"
         if not event:
@@ -19143,6 +19530,8 @@ def _resolve_nbl_leg(raw: dict, tipster: str, priority: list) -> tuple:
 
         pc, probe_sid = None, None
         for _sid in priority:
+            if _session_stalled(_sid):
+                continue
             _pc = hb.price_check_sports(session_id=str(_sid), sport="nbl", event=event)
             if _pc.get("success") and _pc.get("markets"):
                 pc, probe_sid = _pc, str(_sid)
@@ -19176,7 +19565,9 @@ def _resolve_nbl_leg(raw: dict, tipster: str, priority: list) -> tuple:
         if mt == "player_prop":
             key, sel, catalog_player, why = _nbl_pick_prop(markets, raw, allow_fuzzy=bool(header))
         else:
-            key, sel, why = _nbl_pick_team(markets, raw, team)
+            key, sel, why = _nbl_pick_team(
+                markets, raw, team,
+                main_total_only=_main_total_only)
         if not sel:
             return None, why
 
@@ -19499,6 +19890,13 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
         return
 
     log.info(f"[{channel_name}] NBL: {len(raw_tips)} leg(s) parsed in {elapsed:.2f}s")
+    # v6.53: a post where any leg names its game is never game-inferred for its blank legs.
+    # Decided on the WHOLE parsed post, before resent legs are dropped (Opus re-check).
+    _hdr = any(isinstance(r, dict) and r.get("game_team_1") and r.get("game_team_2")
+               for r in raw_tips)
+    for r in raw_tips:
+        if isinstance(r, dict):
+            r["_post_has_header"] = _hdr
     raw_tips = _drop_resent(tipster, channel_name, raw_tips, _nbl_seen_key,
                             _describe_nbl_leg, 24 * 3600)
     manual: list[str] = []

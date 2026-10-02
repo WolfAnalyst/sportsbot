@@ -555,3 +555,39 @@ def resolve_nbl_event(team: str, opponent: str = "") -> Optional[str]:
     log.warning(f"No NBL game found for {home_team}"
                 f"{f' v {other}' if other else ''} today, tomorrow or yesterday")
     return None
+
+
+def nbl_only_game_today() -> Optional[tuple]:
+    """v6.53 (Wilson, 1 Oct: the Bettors Edge 'Total match points over 178.5' had no game
+    header and went manual, "next time can infer as there is no other game today"). The
+    (home, away) ESPN names of the ONE NBL game that tips off later today (local date),
+    else None: none, two or more, a game with no start time, or a page that failed to
+    load (it could hide a second game). ESPN can file an evening AEST game under either
+    neighbouring date, so yesterday, today and tomorrow are all read and de-duplicated."""
+    now_local = datetime.now().astimezone()
+    today = now_local.date()
+    t_start = datetime.now()
+    seen = {}
+    for d in (-1, 0, 1):
+        check_date = (now_local + timedelta(days=d)).strftime("%Y-%m-%d")
+        games = _fetch_schedule("nbl", check_date)
+        if _schedule_fetch_failed.get(f"nbl_{check_date}", datetime.min) >= t_start:
+            log.warning(f"NBL only-game check: ESPN page {check_date} failed -> not inferring")
+            return None
+        for g in games:
+            ko = _parse_kickoff(g.get("start"))
+            if ko is None:
+                log.warning(f"NBL only-game check: {g['home']} v {g['away']} has no start "
+                            f"time -> not inferring")
+                return None
+            if ko.astimezone().date() == today:
+                seen[(g["home"], g["away"], ko)] = True
+    todays = list(seen)
+    if len(todays) != 1:
+        log.info(f"NBL only-game check: {len(todays)} NBL game(s) today -> not inferring")
+        return None
+    home, away, ko = todays[0]
+    if ko <= datetime.now(timezone.utc):
+        log.info(f"NBL only-game check: today's game {home} v {away} has started")
+        return None
+    return home, away
