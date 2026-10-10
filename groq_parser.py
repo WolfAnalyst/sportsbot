@@ -2162,6 +2162,89 @@ TEXT_PROMPT_BETTORSEDGE_NBL = (
     "Use null for ANY field not covered above. JSON only."
 )
 
+# 2026-10-10 (Wilson): since 10 Oct 'The Bettors Edge - NBL' posts SPORTSBET BETSLIP
+# SCREENSHOTS (no caption), then a units text. Same raw-dict schema as
+# TEXT_PROMPT_BETTORSEDGE_NBL (main._resolve_nbl_leg reads it) plus `slip_stake`, the
+# dollar stake typed in the slip: Wilson's rule is "$1.50 = 1.5 units", so it is the
+# primary source of units. No `units` / `bookie` here: the slip is Sportsbet's and the
+# units come from slip_stake (or the follow-up message), never from the model.
+IMAGE_PROMPT_NBL_BETSLIP = (
+    "You are an extraction tool for a SCREENSHOT of a Sportsbet (Australian bookmaker "
+    "app) NBL (Australian National Basketball League) bet slip, or of a Sportsbet NBL "
+    "market page with a selection highlighted. Read ONLY what is visible in the image; "
+    "never infer, complete or correct anything. Respond with ONLY valid JSON, no "
+    "markdown fences, in this shape: "
+    '{"tips": [ {"game_team_1": str|null, "game_team_2": str|null, '
+    '"market_type": "player_prop"|"h2h"|"spread"|"total"|"sgm"|"other", '
+    '"player": str|null, "team": str|null, "stat": str|null, '
+    '"side": "over"|"under"|null, "line": number|null, "threshold": integer|null, '
+    '"odds": number|null, "slip_stake": number|null, "slip_to_win": number|null, '
+    '"slip_return": number|null, "description": str|null} ]}. '
+    "ONE screenshot often holds SEVERAL single-bet CARDS stacked vertically, each with its "
+    "own player, market, odds, stake box and returns: output ONE tip per card, in order "
+    "from top to bottom. A card that is only partly visible (cut off at the top or bottom "
+    "so that its player, market or odds is missing) must still be output, with the fields "
+    "you cannot see as null: never guess or complete it. "
+    "ONE tip per separate single bet on the slip. If the slip holds several selections "
+    "combined into ONE bet (a multi, same game multi or SGM: a combined price, one stake, "
+    "several legs listed together), output ONE tip with market_type=\"sgm\", the "
+    "combined odds, the slip_stake, the legs listed in `description`, and every other "
+    "field null. Never split a multi/SGM into singles. If the image shows no bet at all "
+    "(a results page, a promo, a team news graphic), return {\"tips\": []}. "
+    "TEAMS: every team field (game_team_1, game_team_2, team) MUST be one of exactly "
+    "these ten names, or null: " + ", ".join(NBL_CANONICAL_TEAMS) + ". Map Sportsbet's "
+    "names: 'S.E. Melbourne Phoenix'/'SE Melbourne'/'SEM' -> South East Melbourne "
+    "Phoenix; 'Tasmania JackJumpers'/'Tassie' -> Tasmania JackJumpers; 'NZ Breakers' -> "
+    "New Zealand Breakers; 'Sydney Kings' -> Sydney Kings; 'Illawarra Hawks' -> Illawarra "
+    "Hawks; 'Cairns Taipans' -> Cairns Taipans; 'Perth Wildcats'; 'Adelaide 36ers'; "
+    "'Brisbane Bullets'; 'Melbourne United'. The game header of a card ('Sydney Kings v "
+    "Illawarra Hawks', '<team> @ <team>', 'New Zealand Breakers At Perth Wildcats': the "
+    "away team comes first with 'At') gives game_team_1/game_team_2 (canonical names, in "
+    "the order shown). A card scrolled so that its game header is cut off or not visible "
+    "gets game_team_1=game_team_2=null (never copy a header from another card). "
+    "PLAYER PROPS (market_type=\"player_prop\", `player`=the name EXACTLY as printed, "
+    "fix nothing, never expand an initial or guess a first name): "
+    "(a) OVER/UNDER selection ('Luke Travers - Points  Over 14.5', 'Over 14.5 Points', "
+    "and Sportsbet's card style 'Sam Waardenburg Over (+9.5)' with the subtitle 'Sam "
+    "Waardenburg - Points', 'Mojave King Under (+15.5)'): side=over/under, line=the number "
+    "in the brackets WITHOUT any sign (9.5, 15.5), threshold=null. In 'Over (+9.5)' / "
+    "'Under (+15.5)' the '+' is only how Sportsbet prints the line, it is NOT a handicap "
+    "and the side is the word Over/Under. The word after the player's name in the subtitle "
+    "('- Points', '- Rebounds', '- Assists') gives the stat. "
+    "(b) THRESHOLD selection ('To Score 20+ Points', 'To Record 8+ Assists', '2+ Made "
+    "Threes', 'To Record 2+ Steals'): threshold=the integer N, side=\"over\", line=null. "
+    "(c) 'To Record A Double Double' / 'Triple Double': stat=\"double_double\" / "
+    "\"triple_double\", side=\"over\", line=null, threshold=null. "
+    "`stat` is ONE of: points, rebounds, assists, threes, points_rebounds_assists, "
+    "points_rebounds, points_assists, rebounds_assists, steals, blocks, double_double, "
+    "triple_double. A quarter/half market (1st Qtr, 1st Half, 2nd Half) is NOT a "
+    "full-game bet: set market_type=\"other\" and put the whole selection text in "
+    "`description`. "
+    "TEAM MARKETS: 'Match Betting' / 'Head to Head' / 'Win' on a team -> "
+    "market_type=\"h2h\", team=that team, line=null. 'Handicap Betting' / 'Pick Your Own "
+    "Line' / 'Line' -> market_type=\"spread\", team=that team, line=the number WITH its "
+    "sign exactly as shown (-5.5, +3.5). 'Total Points' / 'Alternate Total Points' "
+    "Over/Under -> market_type=\"total\", side=over/under, line=the number, team=null. "
+    "ODDS: the decimal price shown on the selection ('1.85', '$3.40') -> number. If the "
+    "price is not visible, null. Never convert or compute odds. "
+    "THE THREE NUMBERS OF A CARD. The right-hand column of each card shows THREE different "
+    "numbers, and the bet's LINE is a fourth number inside the card's title; never mix "
+    "them up: (1) the TOP number, the large one at the top right of the card, is the "
+    "ODDS (decimal, e.g. 4.75, 11.50, 1.89) -> `odds`; (2) the MIDDLE number, a dollar "
+    "amount inside the input box, is the STAKE ('$1.50' -> 1.5, '$0.50' -> 0.5, '$2.50' "
+    "-> 2.5) -> `slip_stake`; (3) the BOTTOM number labelled 'Potential Returns' / "
+    "'Returns' (stake times odds, a dollar amount) -> `slip_return`; (4) the line, e.g. "
+    "'(+9.5)' or '4+' in the title -> `line` / `threshold`. The stake is the money the "
+    "bettor puts ON the bet: NOT the returns, NOT the odds, NOT the line, NOT a bet id. If "
+    "the stake box is empty, not visible, or the image is a market page or a receipt with "
+    "no stake -> slip_stake null. If the Potential Returns line is cut off or not visible "
+    "-> slip_return null (never compute it). slip_to_win: only if the slip shows a 'To "
+    "Win' / 'Winnings' / 'Profit' figure (return minus stake), else null; Sportsbet's "
+    "cards normally show Potential Returns and no To Win, so it is normally null. "
+    "slip_return and slip_to_win are only used to double-check slip_stake. "
+    "Use null for ANY field not covered above. JSON only."
+)
+
 
 def _groq_text_tips(prompt: str, text: str, tipster: str, fn_name: str,
                     max_tokens: int = 3000, max_retries: int = 4) -> tuple[list[dict], float]:

@@ -95,8 +95,12 @@ def _complete_text(system_prompt: str, user_content: str, model: str) -> str:
     return _text_from(resp)
 
 
-def _complete_vision(prompt: str, image_bytes: bytes, model: str) -> str:
-    """One Messages API call for an image tip (base64 image + prompt)."""
+def _complete_vision(prompt: str, image_bytes: bytes, model: str,
+                     fail_on_truncation: bool = False) -> str:
+    """One Messages API call for an image tip (base64 image + prompt). With
+    fail_on_truncation a reply cut off at the token limit RAISES (the Bettors Edge
+    betslip parse: a truncated card list must send the whole image to manual); the other
+    image parses keep their repair-what-we-got behaviour."""
     b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
     mime = groq_parser._image_mime(image_bytes)
     resp = _client().messages.create(
@@ -111,6 +115,8 @@ def _complete_vision(prompt: str, image_bytes: bytes, model: str) -> str:
             ],
         }],
     )
+    if fail_on_truncation and getattr(resp, "stop_reason", None) == "max_tokens":
+        raise ValueError("vision reply cut off at the token limit (stop_reason max_tokens)")
     return _text_from(resp)
 
 
@@ -320,6 +326,50 @@ def parse_bettorsedge_nbl_text_claude(text, tipster="bettorsedge_nbl", model=Non
         raise ValueError(f"parse_bettorsedge_nbl_text_claude: 'tips' not a list for {tipster}")
     tips = [t for t in tips if isinstance(t, dict)]
     log.info(f"parse_bettorsedge_nbl_text_claude ({model}): {tipster} extracted "
+             f"{len(tips)} raw tip(s) in {elapsed:.2f}s")
+    return tips, elapsed
+
+
+def parse_bettorsedge_nbl_image_claude(image_bytes, tipster="bettorsedge_nbl", model=None):
+    """2026-10-10: a Bettors Edge NBL Sportsbet betslip SCREENSHOT via Claude, using
+    groq_parser.IMAGE_PROMPT_NBL_BETSLIP. Same call pattern and raise-on-hard-failure
+    semantics as parse_tip_image_claude (a hard failure must reach the caller so the
+    bet goes to a manual alert, never silently drops). Returns RAW leg dicts (the text
+    parser's schema plus `slip_stake`) and elapsed."""
+    start = time.time()
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("parse_bettorsedge_nbl_image_claude: ANTHROPIC_API_KEY not set")
+    if not image_bytes:
+        return [], 0.0
+    model = model or CLAUDE_PARSER_MODEL
+    content = _complete_vision(groq_parser.IMAGE_PROMPT_NBL_BETSLIP, image_bytes, model,
+                               fail_on_truncation=True)
+    elapsed = time.time() - start
+    if not content:
+        raise ValueError(f"parse_bettorsedge_nbl_image_claude: no content returned for {tipster}")
+    content = content.replace("```json", "").replace("```", "").strip()
+    # STRICT: the repair path completes a cut-off reply by dropping its last card, silently.
+    # A reply that is not valid JSON as sent sends the whole image to manual.
+    try:
+        parsed = json.loads(content)
+    except ValueError:
+        log.error(f"Raw response (not strict JSON): {content[:500]}")
+        raise ValueError(f"parse_bettorsedge_nbl_image_claude: reply is not valid JSON for "
+                         f"{tipster} (no repair for betslips)")
+    if not isinstance(parsed, dict):
+        raise ValueError(f"parse_bettorsedge_nbl_image_claude: invalid JSON for {tipster}")
+    tips = parsed.get("tips", [])
+    if not isinstance(tips, list):
+        raise ValueError(f"parse_bettorsedge_nbl_image_claude: 'tips' not a list for {tipster}")
+    bad = [t for t in tips if not isinstance(t, dict)]
+    if bad:
+        # an entry that is not a card could be a card the model garbled: never drop it
+        # silently, the whole image goes to manual
+        log.error(f"parse_bettorsedge_nbl_image_claude: {len(bad)} of {len(tips)} 'tips' "
+                  f"entries are not objects for {tipster}: {bad[:3]!r}")
+        raise ValueError(f"parse_bettorsedge_nbl_image_claude: {len(bad)} non-object tips "
+                         f"entr{'y' if len(bad) == 1 else 'ies'} for {tipster}")
+    log.info(f"parse_bettorsedge_nbl_image_claude ({model}): {tipster} extracted "
              f"{len(tips)} raw tip(s) in {elapsed:.2f}s")
     return tips, elapsed
 

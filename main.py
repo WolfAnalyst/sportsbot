@@ -65,6 +65,8 @@ from config import (
     EDDIE_TEXT_PLACE_ENABLED,
     FOURTHANDEV_TEXT_PLACE_ENABLED,
     BETTORSEDGE_NBL_PLACE_ENABLED,
+    BETTORSEDGE_IMAGES_ENABLED, BETTORSEDGE_IMAGE_MAX_UNITS, BETTORSEDGE_IMAGE_MAX_PROFIT,
+    BETTORSEDGE_IMAGE_UNITS_WAIT_SEC,
     SA_THOROUGHBRED_TRACKS,
     AFL_PERIOD_MARKETS_ENABLED,
     SAIYAN_HC_SGM_ENABLED,
@@ -2472,6 +2474,11 @@ def _nbl_seen_key(tipster: str, raw: dict) -> str:
     try:
         mt = (raw.get("market_type") or "").strip().lower()
         who = _seen_name(raw.get("player")) or _seen_text(raw.get("team"))
+        if mt == "total":
+            # a total has no player or team: it is keyed on the game (both header teams,
+            # order-free). No known game -> "" (it cannot be placed without one anyway).
+            t1, t2 = canonical_nbl_team(raw.get("game_team_1")), canonical_nbl_team(raw.get("game_team_2"))
+            who = "/".join(sorted((t1, t2))) if (t1 and t2 and t1 != t2) else ""
         if not who:
             return ""
         # v6.51 (Wilson: "there was a bet for 3+ Threes and 4+ Threes"): an 'N+' leg keeps N
@@ -19640,6 +19647,24 @@ def _nbl_match_player(name: str, candidates, allow_fuzzy: bool = True) -> tuple:
     return None, f"{name!r} not found among this game's Sportsbet players"
 
 
+def _nbl_team_game_count(team: str) -> int:
+    """How many distinct NBL games `team` has in resolve_nbl_event's search window (today,
+    tomorrow, yesterday). Games are de-duplicated on (home, away, start); when the start time
+    is not known an entry is told apart by its date bucket, so the count can only err high."""
+    import nba_resolver as _nbr
+    want = canonical_nbl_team(team).lower()
+    now = datetime.now()
+    games = set()
+    for d in (0, 1, -1):
+        day = (now + _timedelta(days=d)).strftime("%Y-%m-%d")
+        for g in _nbr._fetch_schedule("nbl", day):
+            if want in {g["home"].strip().lower(), g["away"].strip().lower()}:
+                # with no start time the same pair on two date buckets could be a rematch:
+                # never merged (the card goes to manual, the safe side)
+                games.add((g["home"], g["away"], g.get("start") or day))
+    return len(games)
+
+
 def _nbl_roster_team_by_tokens(name: str) -> str:
     """The NBL roster team of the ONE full-name roster entry whose tokens equal
     `name`'s ("Parker Jackson Cartwright" = "Parker Jackson-Cartwright"), else ""
@@ -19885,6 +19910,10 @@ def _resolve_nbl_leg(raw: dict, tipster: str, priority: list) -> tuple:
                 team = canonical_nbl_team(_r.get("team")) or _nbl_roster_team_by_tokens(
                     raw.get("player") or "")
                 if team:
+                    if raw.get("_img_card") and _nbl_team_game_count(team) > 1:
+                        # resolve_nbl_event takes the FIRST game of today/tomorrow/yesterday:
+                        # for a card scrolled off the top that could be the wrong one
+                        return None, "game header cut off, team has more than one game"
                     event = resolve_nbl_event(team)
                 else:
                     header = _infer_only_game()
@@ -20061,6 +20090,31 @@ def _nbl_fanout_outcome(results: list, intended_stake: float) -> str:
             + f" ({why})")
 
 
+def _nbl_cap_stake_for_profit(stake: float, tipped_odds, live_odds, max_profit) -> tuple:
+    """(stake, note): `stake` cut down so stake x (odds - 1) <= max_profit, odds = the
+    HIGHER of the tipped and live odds that are known (Wilson 2026-10-10: "3u at $200/u
+    odds 5.0 -> 500"). Rounded DOWN to the cent. note is "" when nothing was cut. With no
+    usable odds or cap the stake is returned unchanged."""
+    import math
+    odds = 0.0
+    for o in (tipped_odds, live_odds):
+        try:
+            odds = max(odds, float(o or 0))
+        except (TypeError, ValueError):
+            continue
+    try:
+        cap_profit = float(max_profit)
+    except (TypeError, ValueError):
+        return stake, ""
+    if cap_profit <= 0 or odds <= 1.0:
+        return stake, ""
+    cap_stake = math.floor(cap_profit / (odds - 1.0) * 100 + 1e-6) / 100
+    if stake <= cap_stake:
+        return stake, ""
+    return cap_stake, (f"stake cut ${stake:.2f} -> ${cap_stake:.2f} by the ${cap_profit:g} "
+                       f"profit cap at odds {odds:g}")
+
+
 def _attempt_nbl_auto_place(tipster: str, channel_name: str, raw: dict, unit_size,
                             raw_message: str) -> tuple:
     """Resolve and place one Bettors Edge NBL leg. SYNCHRONOUS: run it through
@@ -20148,6 +20202,32 @@ def _attempt_nbl_auto_place(tipster: str, channel_name: str, raw: dict, unit_siz
             # Checked BEFORE registering, so a misconfigured unit never leaves a
             # "duplicate" entry for a bet that was never attempted.
             return False, f"stake ${intended_stake} (unit_size={unit_size!r})"
+        # Image bets (Wilson 2026-10-10): the whole stake is cut so stake x (odds - 1)
+        # never exceeds the profit cap, using the higher of the tipped and live odds.
+        # Only legs from the betslip-image route carry `_max_profit`; a text leg is
+        # untouched.
+        if "_max_profit" in raw:
+            # Fails CLOSED: no positive cap, or no usable price to apply it to -> manual.
+            try:
+                _mp_ok = float(raw.get("_max_profit")) > 0
+            except (TypeError, ValueError):
+                _mp_ok = False
+            _prices = []
+            for _o in (raw.get("odds"), match.get("odds")):
+                try:
+                    _prices.append(float(_o or 0))
+                except (TypeError, ValueError):
+                    pass
+            if not _mp_ok or max(_prices or [0.0]) <= 1.0:
+                return False, ("the profit cap cannot be applied (no usable odds or no "
+                               "positive cap), place by hand")
+            intended_stake, _cap_note = _nbl_cap_stake_for_profit(
+                intended_stake, raw.get("odds"), match.get("odds"), raw.get("_max_profit"))
+            if _cap_note:
+                log.info(f"[{channel_name}] NBL image bet {_bet_label}: {_cap_note}")
+                _bet_label += f" ({_cap_note})"
+            if intended_stake <= 0:
+                return False, f"stake ${intended_stake} after the profit cap"
         with _nbl_dedup_lock:
             _now = datetime.now()
             for _k in [k for k, t in _nbl_recent_fps.items()
@@ -20260,6 +20340,16 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
             log.error(f"[{channel_name}] NBL zero-leg alert failed: {e}")
         return
 
+    await _route_bettorsedge_nbl_legs(raw_tips, tipster, channel_name, unit_size, text, elapsed)
+
+
+async def _route_bettorsedge_nbl_legs(raw_tips: list, tipster: str, channel_name: str,
+                                      unit_size: float, text: str, elapsed: float = 0.0) -> None:
+    """Everything the NBL text route does AFTER the parse: resend guard, one
+    _attempt_nbl_auto_place per leg, one manual alert per leg that didn't place. Split
+    out (2026-10-10) so a betslip IMAGE places through exactly the same code, resend
+    keys and alerts as a text post. `text` only feeds the one-line "From post" context
+    and the repaired-parse alert (an image passes a one-line description of itself)."""
     log.info(f"[{channel_name}] NBL: {len(raw_tips)} leg(s) parsed in {elapsed:.2f}s")
     # v6.53: a post where any leg names its game is never game-inferred for its blank legs.
     # Decided on the WHOLE parsed post, before resent legs are dropped (Opus re-check).
@@ -20267,15 +20357,23 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
                for r in raw_tips)
     for r in raw_tips:
         if isinstance(r, dict):
-            r["_post_has_header"] = _hdr
+            # a betslip image sets this per leg itself (never game-inferred): keep a True
+            r["_post_has_header"] = _hdr or bool(r.get("_post_has_header"))
+    _all_legs = list(raw_tips)
     raw_tips = _drop_resent(tipster, channel_name, raw_tips, _nbl_seen_key,
                             _describe_nbl_leg, 24 * 3600)
+    _kept = {id(r) for r in raw_tips}
+    for r in _all_legs:
+        if isinstance(r, dict) and id(r) not in _kept:
+            r["_handled"] = True      # resent: _drop_resent already told Wilson
     manual: list[str] = []
+    manual_raws: list = []
     short: list[str] = []
     placed_or_handled = 0
     for raw in raw_tips:
         if not isinstance(raw, dict):
             manual.append(f"- (unreadable parsed leg: {raw!r})")
+            manual_raws.append(None)
             continue
         try:
             desc = _describe_nbl_leg(raw)
@@ -20302,12 +20400,14 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
                                           f"pending_bets before placing by hand")
             if handled and not str(reason).startswith(("FAILED", "PARTIAL")):
                 placed_or_handled += 1
+                raw["_handled"] = True
                 continue
             if handled:
                 # Tried on Sportsbet but not fully placed: the fan-out already sent its
                 # own alert, and the summary must say so too (v6.38).
                 log.info(f"[{channel_name}] NBL not fully placed: {desc.splitlines()[0]} -> {reason}")
                 short.append(f"- {desc}\n  -> {reason}")
+                raw["_handled"] = True
                 continue
         elif mt == "sgm":
             reason = "SGM, place by hand"
@@ -20315,16 +20415,19 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
             reason = "not an auto-placeable market"
         log.info(f"[{channel_name}] NBL manual: {desc.splitlines()[0]} -> {reason}")
         manual.append(f"- {desc}\n  -> {reason}")
+        manual_raws.append(raw)
 
     # v6.39 (Wilson: "there wasnt a dedicated manual bet msg for hickey o26.5 pra"): ONE
     # alert PER unplaced bet, like NFL, instead of one combined list per post. Legs that
     # were tried on Sportsbet but not fully placed (`short`) already got their own
     # fan-out alert (BET FAILED / PARTIAL FILL), so they are not repeated here.
     _ctx = _post_context(text)
-    for entry in manual:
+    for entry, _mraw in zip(manual, manual_raws):
         body = entry[2:] if entry.startswith("- ") else entry
         try:
             notifier.notify_text_manual_alert(channel_name, f"{body}\n{_ctx}", header="NBL, MANUAL")
+            if isinstance(_mraw, dict):
+                _mraw["_handled"] = True
         except Exception as e:
             log.error(f"[{channel_name}] NBL manual alert failed: {e}")
     log.info(f"[{channel_name}] NBL post done: {placed_or_handled} fully placed, "
@@ -20340,6 +20443,787 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
                 header="NBL, CHECK THE FULL POST")
         except Exception as e:
             log.error(f"[{channel_name}] NBL repaired-parse alert failed: {e}")
+
+
+# ── The Bettors Edge - NBL betslip IMAGES (2026-10-10) ────────────────
+# Wilson: since 10 Oct he posts Sportsbet betslip screenshots (no caption), then a units
+# text ("1.5 and 0.5"). His rules: units come FIRST from the stake typed in the slip
+# ("$1.50" = 1.5 units, dollars == units) and the SLIP wins over a disagreeing message; the
+# follow-up message is only a fallback, its numbers map IN ORDER to the images still
+# waiting for units; an image waits at most BETTORSEDGE_IMAGE_UNITS_WAIT_SEC for it, then a
+# manual alert; a count mismatch is manual, never a guess. Caps: BETTORSEDGE_IMAGE_MAX_UNITS
+# units and BETTORSEDGE_IMAGE_MAX_PROFIT profit per bet. Every resolved bet then goes through
+# _route_bettorsedge_nbl_legs, the text route's own code (same resend keys, resolver, odds
+# guard, never in-play, fan-out, alerts). Off unless BETTORSEDGE_IMAGES_ENABLED.
+#
+# Telegram delivers two images either as separate messages or as an album (one message
+# event per item, same grouped_id), so both reach the dispatch as separate images. A slot is
+# registered SYNCHRONOUSLY in arrival order (before any download/parse await), so "in order"
+# is message order even when the parses finish out of order.
+_NBL_TIPSTER = "bettorsedge_nbl"
+_NBL_UNITS_NUM = r"(?:\d+(?:\.\d+)?|\.\d+)"
+_NBL_UNITS_MSG_RE = re.compile(
+    rf"^\s*{_NBL_UNITS_NUM}\s*(?:units?|u)?"
+    rf"(?:\s*(?:,|&|\+|and)\s*{_NBL_UNITS_NUM}\s*(?:units?|u)?)*\s*[.!]*\s*$",
+    re.IGNORECASE)
+_NBL_IMG_REAL_LOG_DIR = LOG_DIR.resolve()
+_NBL_IMG_PLACEABLE = ("player_prop", "h2h", "spread", "total")
+
+
+class _NblImageSlot:
+    """One betslip image from arrival until it is placed, sent to manual, or expired.
+    status: "parsing" (download/vision parse in flight) -> "waiting" (parsed, no stake on
+    the slip, waiting for the units message) -> "done"."""
+
+    def __init__(self, msg_id, grouped_id, arrived: float):
+        self.msg_id = msg_id or 0
+        self.grouped_id = grouped_id
+        self.arrived = arrived
+        self.status = "parsing"
+        self.raws: list = []
+        self.expired = False
+        self.path = ""
+        self.note = ""
+        self.slip_units: list = []   # the units its slip stake(s) set, once it placed on them
+        # its live bets in card order: ("slip", units) placed on a verified slip stake, or
+        # ("wait", tip) still waiting for a units number
+        self.entries: list = []
+        # True once its waiting bets went to manual because no units arrived in time: a
+        # later units message must not be matched past it (see _nbl_units_process)
+        self.expired_waiting = False
+        self.expired_at = 0.0     # when that happened (a window filter, see _nbl_window)
+        self.had_manual = False   # any bet of it went to a manual alert (set by _nbl_image_manual)
+        self.unreadable = False   # nothing could be read off it: how many cards it held is unknown
+        self.parsed = asyncio.Event()
+
+
+_nbl_img_slots: list = []
+_nbl_img_tasks: set = set()
+_nbl_albums: dict = {}     # grouped_id -> a multi-number album caption waiting to be applied
+_nbl_img_cfg_err_logged = False
+_nbl_last_units_ts = 0.0   # when the previous pure units message arrived
+_nbl_window_poisoned = False   # the 1-hour cap dropped an image that still had unplaced cards
+_NBL_IMG_HARD_CAP_SEC = 3600   # the only age limit on tracking an image
+_NBL_ALBUM_SETTLE_SEC = 2.0   # an album's caption numbers are claimed this long after its last image
+
+
+def _nbl_units_message(text) -> "list | None":
+    """The numbers of a PURE units message ("1.5 and 0.5", "2.5, 0.5, 0.5", "2.5 units",
+    "2.5u"), else None. Anything with other words in it is not one."""
+    t = (text or "").strip()
+    if not t or not _NBL_UNITS_MSG_RE.match(t):
+        return None
+    return [float(x) for x in re.findall(_NBL_UNITS_NUM, t)]
+
+
+def _nbl_slip_stake(v) -> "float | None":
+    """The dollar stake read off the slip as a positive number, else None."""
+    try:
+        f = float(str(v).replace("$", "").replace(",", "").strip()) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+    return f if (f is not None and f == f and 0 < f < float("inf")) else None
+
+
+def _nbl_img_live_slots() -> list:
+    """Slots still in play: parsing or waiting for units, and inside the wait window."""
+    now = time.time()
+    wait = float(BETTORSEDGE_IMAGE_UNITS_WAIT_SEC)
+    return [s for s in _nbl_img_slots
+            if s.status in ("parsing", "waiting") and now - s.arrived < wait]
+
+
+def _nbl_card_unreadable(t: dict) -> str:
+    """"" for a card with everything a plain single needs (market, selection, odds), else
+    why it is not placeable: a card cut off at the top or bottom loses its player, market
+    or odds, and a bet is never completed from a guess."""
+    missing = []
+    mt = (t.get("market_type") or "").strip().lower()
+    try:
+        if float(t.get("odds") or 0) <= 1.0:
+            missing.append("odds")
+    except (TypeError, ValueError):
+        missing.append("odds")
+    if mt == "player_prop":
+        if not (t.get("player") or "").strip():
+            missing.append("player")
+        if not (t.get("stat") or "").strip():
+            missing.append("market")
+        if (t.get("stat") or "").strip().lower() in ("double_double", "triple_double"):
+            pass    # 'To Record A Double Double': no line, side over (as the text path)
+        elif t.get("threshold") is None and not (t.get("side") and t.get("line") is not None):
+            missing.append("line")
+    elif mt in ("h2h", "spread"):
+        if not (t.get("team") or "").strip():
+            missing.append("team")
+        if mt == "spread" and t.get("line") is None:
+            missing.append("line")
+    elif mt == "total":
+        if not (t.get("side") and t.get("line") is not None):
+            missing.append("line")
+    return (f"the card is partly cut off or unclear on the screenshot (no {', '.join(missing)}), "
+            f"place by hand") if missing else ""
+
+
+def _nbl_images_config_unsafe() -> str:
+    """Why image bets must go to manual (a cap that is not a positive number would let a
+    bet through uncapped), else "". Logs an error once."""
+    global _nbl_img_cfg_err_logged
+    try:
+        mu, mp = float(BETTORSEDGE_IMAGE_MAX_UNITS), float(BETTORSEDGE_IMAGE_MAX_PROFIT)
+    except (TypeError, ValueError):
+        mu = mp = 0.0
+    if mu > 0 and mp > 0:
+        return ""
+    if not _nbl_img_cfg_err_logged:
+        _nbl_img_cfg_err_logged = True
+        log.error("BETTORSEDGE_IMAGE_MAX_UNITS / BETTORSEDGE_IMAGE_MAX_PROFIT must both be "
+                  "positive: every Bettors Edge image bet is sent to manual until fixed")
+    return ("BETTORSEDGE_IMAGE_MAX_UNITS / BETTORSEDGE_IMAGE_MAX_PROFIT is not positive, "
+            "image bets are manual")
+
+
+def _nbl_slip_check(stake: float, odds, to_win, slip_return) -> str:
+    """"" when the slip stake fits the slip's own numbers, else the reason (with both
+    numbers). Return ("Potential Returns", what Sportsbet shows) = stake x odds; To Win =
+    stake x (odds - 1); tolerance $0.02 plus 1% of the expected figure. Every figure the
+    slip shows must fit; none shown -> the stake is accepted as is."""
+    tw, rt = _nbl_slip_stake(to_win), _nbl_slip_stake(slip_return)
+    if tw is None and rt is None:
+        return ""
+    try:
+        o = float(odds)
+    except (TypeError, ValueError):
+        o = 0.0
+    if o <= 1.0:
+        shown = f"return ${rt:g}" if rt is not None else f"to win ${tw:g}"
+        return (f"slip stake ${stake:g} cannot be checked: the slip shows {shown} "
+                f"but no usable odds")
+    bad = []
+    if rt is not None:
+        exp = stake * o
+        if abs(rt - exp) > 0.02 + 0.01 * exp:
+            bad.append(f"return ${rt:g} (expected ${exp:.2f})")
+    if tw is not None:
+        exp = stake * (o - 1.0)
+        if abs(tw - exp) > 0.02 + 0.01 * exp:
+            bad.append(f"to win ${tw:g} (expected ${exp:.2f})")
+    if not bad:
+        return ""
+    return (f"slip stake ${stake:g} does not fit odds {o:g} and the slip's " + " and ".join(bad)
+            + ", check by hand")
+
+
+def _nbl_save_image(img: bytes, msg_id) -> str:
+    """Audit copy: logs/bettorsedge_images/<UTC timestamp>_<msg id>.<ext>. Returns the
+    path, or "" if it could not be written. NEVER raises (a full disk must not cost a bet)."""
+    try:
+        import tempfile
+        from groq_parser import _image_mime
+        ext = {"image/png": "png", "image/webp": "webp"}.get(_image_mime(img), "jpg")
+        d = Path(LOG_DIR) / "bettorsedge_images"
+        if os.getenv("TIPBOT_TESTING") and Path(LOG_DIR).resolve() == _NBL_IMG_REAL_LOG_DIR:
+            d = Path(tempfile.gettempdir()) / "tipbot_test_bettorsedge_images"
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(_dt_timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        p = d / f"{stamp}_{msg_id}.{ext}"
+        p.write_bytes(img)
+        return str(p)
+    except Exception as e:
+        log.warning(f"NBL image: audit copy not saved: {e}")
+        return ""
+
+
+def _nbl_image_parse(image_bytes: bytes):
+    """Vision-parse one betslip screenshot (blocking; run in an executor). Claude only,
+    with the same model the other image parses use (CLAUDE_FALLBACK_MODEL). RAISES on a
+    hard failure so the caller sends the image to a manual alert."""
+    import claude_parser
+    from config import CLAUDE_FALLBACK_MODEL
+    return claude_parser.parse_bettorsedge_nbl_image_claude(
+        image_bytes, tipster=_NBL_TIPSTER, model=CLAUDE_FALLBACK_MODEL)
+
+
+def _nbl_image_manual(channel_name: str, slot: "_NblImageSlot", tips: list, reason: str) -> None:
+    """One 'NBL, MANUAL' alert per bet on the image (or one for an unreadable image),
+    carrying the parsed bet text and why it was not placed. NEVER raises."""
+    slot.had_manual = True
+    ctx = f"From post: Betslip image {slot.msg_id}" + (
+        f" (saved {Path(slot.path).name})" if slot.path else "")
+    bodies = []
+    for t in tips or []:
+        try:
+            desc = _describe_nbl_leg(t)
+        except Exception as e:
+            desc = f"(render failed: {e}; raw={t!r})"
+        bodies.append(f"{desc}\n  -> {reason}\n{ctx}")
+    if not bodies:
+        bodies.append(f"(betslip image, no bet read)\n  -> {reason}\n{ctx}")
+    for body in bodies:
+        log.info(f"[{channel_name}] NBL image manual: {body.splitlines()[0]} -> {reason}")
+        try:
+            notifier.notify_text_manual_alert(channel_name, body, header="NBL, MANUAL")
+        except Exception as e:
+            log.error(f"[{channel_name}] NBL image manual alert failed: {e}")
+
+
+def _nbl_expiry_reason(t: dict) -> str:
+    w = f"{float(BETTORSEDGE_IMAGE_UNITS_WAIT_SEC):g}s"
+    if t.get("_slip_expect") is not None:
+        return (f"slip stake ${t['_slip_expect']:g} could not be verified (no Potential Returns "
+                f"or To Win readable) and no units message confirmed it within {w}")
+    return f"no stake on the slip and no units message within {w}"
+
+
+async def _nbl_image_place(slot: "_NblImageSlot", tips: list, units: list, channel_name: str,
+                           unit_size: float, source: str) -> None:
+    """Place the bets of one image at `units` each, through the text route's own per-leg
+    code. Units above BETTORSEDGE_IMAGE_MAX_UNITS are NOT clipped: Wilson never bets more,
+    so such a number is a misread and that bet goes to manual. A card whose slip stake could
+    not be verified (`_slip_expect`) places only when its units number EQUALS that stake. The
+    profit cap rides on each leg (`_max_profit`) and is applied in _attempt_nbl_auto_place
+    once the live odds are known (it refuses, rather than placing uncapped, when no price is
+    usable)."""
+    unsafe = _nbl_images_config_unsafe()
+    if unsafe:
+        _nbl_image_manual(channel_name, slot, tips, unsafe)
+        return
+    legs = []
+    cap_units = float(BETTORSEDGE_IMAGE_MAX_UNITS)
+    for raw, u in zip(tips, units):
+        exp = raw.get("_slip_expect")
+        if exp is not None and abs(u - exp) > 1e-9:
+            _nbl_image_manual(channel_name, slot, [raw],
+                              f"slip stake ${exp:g} could not be verified and the units message "
+                              f"says {u:g}, place manually")
+            continue
+        if u > cap_units + 1e-9:
+            _nbl_image_manual(channel_name, slot, [raw],
+                              f"units {u:g} above the {cap_units:g}u cap, place manually")
+            continue
+        r = dict(raw)
+        r.pop("_slip_expect", None)
+        r["units"] = u
+        r["_max_profit"] = float(BETTORSEDGE_IMAGE_MAX_PROFIT)
+        r["_post_has_header"] = True
+        legs.append(r)
+    if not legs:
+        return
+    if source.startswith("slip"):
+        slot.slip_units = [r["units"] for r in legs]
+    log.info(f"[{channel_name}] NBL image {slot.msg_id}: placing {len(legs)} bet(s), units "
+             f"{[r['units'] for r in legs]} from the {source}")
+    ctx = f"Betslip image {slot.msg_id} ({source})" + (
+        f", saved {Path(slot.path).name}" if slot.path else "")
+    try:
+        await _route_bettorsedge_nbl_legs(legs, _NBL_TIPSTER, channel_name, unit_size, ctx)
+    except Exception as e:
+        log.error(f"[{channel_name}] NBL image {slot.msg_id} routing crashed: {e}")
+        # only the bets the routing had not already placed or alerted
+        left = [r for r in legs if not r.get("_handled")]
+        if left:
+            _nbl_image_manual(channel_name, slot, left,
+                              f"routing error ({e}); check HyperBot pending_bets before "
+                              f"placing by hand")
+
+
+async def _nbl_image_process(slot: "_NblImageSlot", event, channel_name: str,
+                             unit_size: float, caption_units) -> None:
+    """Download + vision-parse one image, then place each card now (verified stake on the
+    slip, or a units caption), send it to manual, or park it as "waiting" for the units
+    message."""
+    pending: list = []      # cards not yet placed, alerted or parked as waiting
+    parsed_ok = False
+    try:
+        try:
+            img = await event.download_media(file=bytes)
+        except Exception as e:
+            slot.status = "done"
+            slot.unreadable = True
+            _nbl_image_manual(channel_name, slot, [], f"image download failed ({e})")
+            return
+        if not img:
+            slot.status = "done"
+            slot.unreadable = True
+            _nbl_image_manual(channel_name, slot, [], "image could not be downloaded")
+            return
+        slot.path = _nbl_save_image(img, slot.msg_id)
+        try:
+            raw_tips, _el = await asyncio.get_running_loop().run_in_executor(
+                None, _nbl_image_parse, img)
+        except Exception as e:
+            log.error(f"[{channel_name}] NBL image {slot.msg_id} parse failed: {e}")
+            slot.status = "done"
+            slot.unreadable = True
+            _nbl_image_manual(channel_name, slot, [], f"image parse failed ({e})")
+            return
+
+        tips, stakes, to_wins, returns = [], [], [], []
+        for t in raw_tips or []:
+            if not isinstance(t, dict):
+                continue
+            t = dict(t)
+            stakes.append(_nbl_slip_stake(t.pop("slip_stake", None)))
+            to_wins.append(t.pop("slip_to_win", None))
+            returns.append(t.pop("slip_return", None))
+            # The slip is Sportsbet's and the model never decides units: both come from us.
+            t.pop("bookie", None)
+            t.pop("units", None)
+            # Never game-inferred from "tonight's only game": a card scrolled off the top can
+            # belong to an earlier game. A headless player prop resolves by roster team only.
+            t["_post_has_header"] = True
+            t["_img_card"] = True       # resolver: a headless prop must not be ambiguous
+            tips.append(t)
+        if not tips:
+            slot.status = "done"
+            slot.unreadable = True
+            _nbl_image_manual(channel_name, slot, [], "no bet could be read off the image")
+            return
+        pending = list(tips)
+        parsed_ok = True
+
+        def _done(card):
+            pending[:] = [x for x in pending if x is not card]
+
+        mts = [(t.get("market_type") or "").strip().lower() for t in tips]
+        unsafe = _nbl_images_config_unsafe()
+        if unsafe:
+            slot.status = "done"
+            slot.entries = [("manual", t) for t in tips]
+            _nbl_image_manual(channel_name, slot, tips, unsafe)
+            return
+        # One screenshot can hold several single-bet cards (own stake box each). Each card
+        # is its own bet: a card with a stake on its slip places on it when that stake fits
+        # the slip's own Return / To Win and the odds; a stake nothing on the slip can verify
+        # waits for the units message to CONFIRM it; a card that is not a plain single, is
+        # cut off, or has a doubtful stake goes to manual; a card with no stake waits.
+        now_cards, waiting_cards = [], []
+        manual_cards: list = []
+        order: list = []        # (card, "slip" | "wait" | "manual", stake) in card order
+        for t, st, tw, rt, m in zip(tips, stakes, to_wins, returns, mts):
+            if m not in _NBL_IMG_PLACEABLE:
+                manual_cards.append((t, "SGM / multi, place by hand" if m == "sgm"
+                                     else "not an auto-placeable market"))
+                order.append((t, "manual", st))
+            elif _nbl_card_unreadable(t):
+                manual_cards.append((t, _nbl_card_unreadable(t)))
+                order.append((t, "manual", st))
+            elif m in ("total", "spread", "h2h") and not (t.get("game_team_1") and t.get("game_team_2")):
+                # a card scrolled off the top may belong to an earlier game: never guessed
+                manual_cards.append((t, "game header cut off on the screenshot, place manually"))
+                order.append((t, "manual", st))
+            elif st:
+                why = _nbl_slip_check(st, t.get("odds"), tw, rt)
+                if why:
+                    manual_cards.append((t, why))
+                    order.append((t, "manual", st))
+                elif _nbl_slip_stake(tw) is None and _nbl_slip_stake(rt) is None:
+                    # nothing on the slip to check the stake against: not placed unverified
+                    t["_slip_expect"] = st
+                    waiting_cards.append(t)
+                    order.append((t, "wait", st))
+                else:
+                    now_cards.append((t, st, "slip stake"))
+                    order.append((t, "slip", st))
+            else:
+                waiting_cards.append(t)
+                order.append((t, "wait", st))
+        if waiting_cards and caption_units is not None and slot.grouped_id is None:
+            # a caption on a single (non-album) image: its numbers are for THIS image's cards
+            if len(caption_units) == len(waiting_cards):
+                now_cards += [(t, u, "caption units") for t, u in zip(waiting_cards, caption_units)]
+            else:
+                manual_cards += [(t, f"the caption has {len(caption_units)} number(s) for "
+                                     f"{len(waiting_cards)} bet(s) on this image, not guessing")
+                                 for t in waiting_cards]
+            waiting_cards = []
+        if waiting_cards and (slot.expired or time.time() - slot.arrived
+                              >= float(BETTORSEDGE_IMAGE_UNITS_WAIT_SEC)):
+            manual_cards += [(t, _nbl_expiry_reason(t)) for t in waiting_cards]
+            waiting_cards = []
+            slot.expired_waiting = True
+            slot.expired_at = time.time()
+        # EVERY card takes a position for a later units message (see _nbl_plan_numbers):
+        # "slip" = placed on a stake / caption number, its number must equal it; "wait" =
+        # still waiting for its number; "manual" = sent to manual, its number is consumed
+        # and ignored.
+        wait_ids = {id(t) for t in waiting_cards}
+        caption_u = {id(t): u for t, u, src in now_cards if src == "caption units"}
+        entries = []
+        for t, kind, st in order:
+            if kind == "slip":
+                entries.append(("slip", st))
+            elif kind == "wait" and id(t) in wait_ids:
+                entries.append(("wait", t))
+            elif kind == "wait" and id(t) in caption_u:
+                entries.append(("slip", caption_u[id(t)]))
+            else:
+                entries.append(("manual", t))
+        # No await between here and the status change: a units message sees the final state.
+        for t, why in manual_cards:
+            _nbl_image_manual(channel_name, slot, [t], why)
+            _done(t)
+        slot.entries = entries
+        if waiting_cards:
+            slot.raws = waiting_cards
+            slot.status = "waiting"
+            for t in waiting_cards:
+                _done(t)
+            log.info(f"[{channel_name}] NBL image {slot.msg_id}: {len(waiting_cards)} bet(s) with "
+                     f"no verified stake on the slip, waiting for the units message")
+        else:
+            slot.status = "done"
+        for source in ("slip stake", "caption units"):
+            group = [(t, u) for t, u, src in now_cards if src == source]
+            if group:
+                for t, _ in group:
+                    _done(t)
+                await _nbl_image_place(slot, [t for t, _ in group], [u for _, u in group],
+                                       channel_name, unit_size, source)
+    except Exception as e:
+        log.error(f"[{channel_name}] NBL image {slot.msg_id} crashed: {e}")
+        if slot.status == "parsing":
+            slot.status = "done"
+        # alert only the cards not yet placed, alerted or parked as waiting
+        if not parsed_ok:
+            slot.unreadable = True
+            _nbl_image_manual(channel_name, slot, [], f"image handling error ({e})")
+        elif pending:
+            _nbl_image_manual(channel_name, slot, list(pending), f"image handling error ({e})")
+    finally:
+        slot.parsed.set()
+        if slot.grouped_id is not None:
+            try:
+                _nbl_album_try(slot.grouped_id)
+            except Exception as e:
+                log.error(f"[{channel_name}] NBL album units check crashed: {e}")
+
+
+async def _nbl_image_expire(slot: "_NblImageSlot", channel_name: str) -> None:
+    """The wait window for this image's units is over."""
+    if slot.status == "waiting":
+        slot.status = "done"
+        slot.expired_waiting = True
+        slot.expired_at = time.time()
+        slot.entries = [e for e in slot.entries if e[0] == "slip"]
+        for t in slot.raws:
+            _nbl_image_manual(channel_name, slot, [t],
+                              _nbl_expiry_reason(t) + (f" ({slot.note})" if slot.note else ""))
+    elif slot.status == "parsing":
+        slot.expired = True   # _nbl_image_process decides once its parse lands
+
+
+def _nbl_warn_slip_disagree(slots: list, numbers: list, text: str, channel_name: str) -> None:
+    """A units message arrived for images whose slip stake already set their units: the
+    slip wins; log (no alert) where the message disagrees. NEVER raises."""
+    try:
+        cands = sorted((s for s in slots if s.slip_units), key=lambda s: (s.msg_id, s.arrived))
+        if not cands:
+            return
+        flat = [(s, u) for s in cands for u in s.slip_units]
+        if len(flat) == len(numbers):
+            for (s, u), n in zip(flat, numbers):
+                if abs(u - n) > 1e-9:
+                    log.warning(f"[{channel_name}] NBL image {s.msg_id}: slip stake says "
+                                f"{u:g}u but the units message {text.strip()[:40]!r} "
+                                f"says {n:g}u -> the slip wins")
+        else:
+            log.warning(f"[{channel_name}] NBL units message {text.strip()[:40]!r} arrived for "
+                        f"{len(cands)} image(s) already placed on their slip stakes "
+                        f"{[s.slip_units for s in cands]} -> the slips win")
+    except Exception as e:
+        log.warning(f"NBL slip-vs-message check failed: {e}")
+
+
+def _nbl_slot_unplaced(s: "_NblImageSlot") -> bool:
+    """Did this image have bets that were not (or not yet) placed? Used by the hard cap."""
+    return s.status in ("parsing", "waiting") or s.had_manual or s.unreadable or s.expired_waiting
+
+
+def _nbl_prune_slots(now: float) -> None:
+    """Forget images that can no longer be in any window. An image is NEVER dropped while a
+    later units message could still use it: a placed / manual / expired image stays until a
+    units message has come after it (its arrival and its expiry), and an image that is still
+    parsing or waiting stays until then too. The 1-hour cap (_NBL_IMG_HARD_CAP_SEC) is the
+    only age limit; if it ever drops an image that had unplaced cards, the next units message
+    is refused (_nbl_window_poisoned), the same as an expired image: its numbers could
+    otherwise be matched over the remaining images as if the dropped one never existed."""
+    global _nbl_window_poisoned
+    keep = []
+    for sl in _nbl_img_slots:
+        if now - sl.arrived >= _NBL_IMG_HARD_CAP_SEC:
+            if _nbl_slot_unplaced(sl):
+                _nbl_window_poisoned = True
+                log.warning(f"NBL image {sl.msg_id} dropped from tracking after "
+                            f"{_NBL_IMG_HARD_CAP_SEC}s with bets not placed: the next units "
+                            f"message will not be matched to images")
+            continue
+        if sl.status == "done" and max(sl.arrived, sl.expired_at) <= _nbl_last_units_ts:
+            continue    # a units message came after it: it is in no later window
+        keep.append(sl)
+    _nbl_img_slots[:] = keep
+
+
+def _nbl_window(prev_ts: float, mid) -> list:
+    """THE window every units message and album caption is matched over: every Bettors Edge
+    image tracked now that was posted after the previous units message (`prev_ts`) and before
+    this message (`mid`, its message id; 0 = unknown), whatever its status (parsing, waiting,
+    placed, manual or expired). An image whose bets went to manual for want of units counts
+    when that happened after the previous units message, even if it arrived before it (a slow
+    parse can leave an image unclaimed by that message). In message order. Images are tracked
+    (_nbl_prune_slots) until a units message has come after them, so nothing that can belong
+    to a window has been dropped, except by the 1-hour cap (which refuses the next message)."""
+    return sorted((s for s in _nbl_img_slots
+                   if (not mid or s.msg_id < mid)
+                   and (s.arrived > prev_ts or s.expired_at > prev_ts)),
+                  key=lambda s: (s.msg_id, s.arrived))
+
+
+def _nbl_plan_numbers(window: list, numbers: list, label: str):
+    """Match a units message's (or album caption's) numbers over the window. Returns
+    (plan, "") with plan = [(slot, tips, units)] for the images that take numbers, or
+    (None, why) and every waiting bet of the window goes to manual with `why`. The rule:
+      * if any image in the window had bets sent to manual for want of units, could not be
+        read at all, is still unread, or is waiting past its time, nothing more is placed
+        (the numbers cannot be lined up with the cards safely);
+      * else the message must hold exactly ONE number per card of the window, in order
+        (image order, then top to bottom), EVERY card counted: a card already placed on a
+        stake (slip or caption) must get a number equal to it; a card sent to manual for any
+        other reason (cut off, SGM, over 4 units, a slip that did not fit...) has its number
+        consumed and ignored and stays manual; a waiting card takes its number. With nothing
+        but waiting cards in the window that is simply one number per waiting card.
+    Pure: claims nothing."""
+    now, wait = time.time(), float(BETTORSEDGE_IMAGE_UNITS_WAIT_SEC)
+    bad = [x for x in window if x.expired_waiting or x.unreadable or x.status == "parsing"
+           or (x.status == "waiting" and now - x.arrived >= wait)]
+    if bad:
+        return None, (f"image(s) {', '.join(str(x.msg_id) for x in bad)} had bets sent to manual "
+                      f"for want of units (or could not be read, or are still unread), so {label} "
+                      f"cannot be matched to the images safely, not guessing")
+    entries = [(x, e) for x in window for e in x.entries]
+    n_wait = sum(1 for x, e in entries if e[0] == "wait" and x.status == "waiting")
+    if len(numbers) != len(entries):
+        n_other = len(entries) - n_wait
+        return None, (f"{label} has {len(numbers)} number(s) for {n_wait} bet(s) waiting for units"
+                      + (f" and {n_other} card(s) already placed or sent to manual" if n_other else "")
+                      + ", not guessing")
+    per: dict = {}
+    for (x, e), n in zip(entries, numbers):
+        if e[0] == "slip":
+            if abs(e[1] - n) > 1e-9:
+                return None, (f"{label} gives {n:g} for a card already placed on its stake "
+                              f"{e[1]:g}, not guessing")
+        elif e[0] == "wait" and x.status == "waiting":
+            per.setdefault(id(x), (x, [], []))
+            per[id(x)][1].append(e[1])
+            per[id(x)][2].append(n)
+        # "manual" (and a card already placed by an earlier message): number consumed, ignored
+    return list(per.values()), ""
+
+
+async def _nbl_units_process(text: str, numbers: list, window: list, channel_name: str,
+                             unit_size: float, refuse: str = "") -> None:
+    """A pure units message arrived while images were in play. `window` is _nbl_window()
+    taken synchronously when it arrived (a later image never takes its numbers). Parses still
+    in flight are awaited first, then _nbl_plan_numbers decides. No waiting bet -> the message
+    is handled as before (the text route). Otherwise every waiting bet either takes its
+    number or goes to manual with the reason."""
+    plan, why, waiting = None, "", []
+    try:
+        for s in [x for x in window if x.status == "parsing"]:
+            remaining = max(0.5, float(BETTORSEDGE_IMAGE_UNITS_WAIT_SEC) - (time.time() - s.arrived))
+            try:
+                await asyncio.wait_for(s.parsed.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                pass
+        # No await from here to the status change: two units messages cannot take the same slot.
+        now, wait = time.time(), float(BETTORSEDGE_IMAGE_UNITS_WAIT_SEC)
+        waiting = [s for s in window if s.status == "waiting" and now - s.arrived < wait]
+        if waiting and refuse:
+            plan, why = None, refuse
+        elif waiting:
+            plan, why = _nbl_plan_numbers(window, numbers,
+                                          f"the units message {text.strip()[:40]!r}")
+        for s in waiting:
+            s.status = "done"
+    except Exception as e:
+        log.error(f"[{channel_name}] NBL units message handling crashed: {e}")
+        waiting, plan, why = [], None, ""
+    _nbl_warn_slip_disagree(window, numbers, text, channel_name)
+    if not waiting:
+        log.info(f"[{channel_name}] NBL units message with no image waiting for units "
+                 f"(a slip stake already set it) -> handled as before: {text[:60]!r}")
+        await _route_bettorsedge_nbl_text(text, _NBL_TIPSTER, channel_name, unit_size)
+        return
+    if plan is None:
+        for s in waiting:
+            _nbl_image_manual(channel_name, s, s.raws, why)
+        return
+    for s, tips, nums in plan:
+        await _nbl_image_place(s, tips, nums, channel_name, unit_size, "units message")
+
+
+def _nbl_album_try(gid) -> None:
+    """E: an album's caption carried units ("1.5 and 0.5"). Once the album has SETTLED (no
+    new image for _NBL_ALBUM_SETTLE_SEC) and no image of it is still parsing, its caption
+    numbers map onto the album's own cards (_nbl_plan_numbers over the album's members: the same
+    rules as a units message; any member whose bets expired refuses the plan). Only that album's images may take them. Any other count waits and, failing
+    that, the normal expiry sends each bet to manual. Claims the slots synchronously and
+    places in a task."""
+    rec = _nbl_albums.get(gid)
+    if not rec:
+        return
+    members = sorted((s for s in _nbl_img_slots if s.grouped_id == gid),
+                     key=lambda s: (s.msg_id, s.arrived))
+    if any(s.status == "parsing" for s in members):
+        return
+    since = time.time() - rec.get("last", rec["arrived"])
+    if since < _NBL_ALBUM_SETTLE_SEC:
+        if not rec.get("recheck"):
+            rec["recheck"] = True
+
+            def _again():
+                rec["recheck"] = False
+                try:
+                    _nbl_album_try(gid)
+                except Exception as e:
+                    log.error(f"NBL album units recheck crashed: {e}")
+            asyncio.get_running_loop().call_later(_NBL_ALBUM_SETTLE_SEC - since + 0.05, _again)
+        return
+    now, wait = time.time(), float(BETTORSEDGE_IMAGE_UNITS_WAIT_SEC)
+    waiting = [s for s in members if s.status == "waiting" and now - s.arrived < wait]
+    if not waiting:
+        return
+    numbers = rec["numbers"]
+    plan, why = _nbl_plan_numbers(members, numbers,
+                                  f"the album caption {rec['text'].strip()[:40]!r}")
+    if plan is None:
+        for s in waiting:
+            s.note = why
+        return
+    _nbl_albums.pop(gid, None)
+    for s in waiting:
+        s.status = "done"
+
+    async def _place():
+        for s, tips, nums in plan:
+            await _nbl_image_place(s, tips, nums, rec["channel"], rec["unit_size"],
+                                   "album caption units")
+    _nbl_spawn(_place())
+
+
+def _bettorsedge_nbl_image_dispatch(event, text: str, channel_name: str,
+                                    unit_size: float) -> bool:
+    """The Bettors Edge NBL handler's image hook. Returns True when it took the message
+    (a betslip image, or a pure units message while images wait for units), False to fall
+    through to today's handling. Always False with BETTORSEDGE_IMAGES_ENABLED off. Must run
+    inside the event loop; the slow work is spawned as tasks. NEVER raises."""
+    global _nbl_last_units_ts, _nbl_window_poisoned
+    if not BETTORSEDGE_IMAGES_ENABLED:
+        # Still keep an audit copy of each screenshot (samples to validate the parser on
+        # before the switch is turned on). Best-effort, never blocks today's handling.
+        try:
+            doc = getattr(event, "document", None)
+            if bool(getattr(event, "photo", None)) or (
+                    doc is not None and _doc_mime_is_image(getattr(doc, "mime_type", ""))):
+                _nbl_spawn(_nbl_save_only(event, channel_name))
+        except Exception as e:
+            log.warning(f"[{channel_name}] NBL image: sample not saved: {e}")
+        return False
+    try:
+        now = time.time()
+        _w = float(BETTORSEDGE_IMAGE_UNITS_WAIT_SEC)
+        _nbl_prune_slots(now)
+        for _g in [g for g, r in _nbl_albums.items() if now - r["arrived"] > 2 * _w]:
+            del _nbl_albums[_g]
+        doc = getattr(event, "document", None)
+        is_image = bool(getattr(event, "photo", None)) or (
+            doc is not None and _doc_mime_is_image(getattr(doc, "mime_type", "")))
+        if is_image:
+            caption_units = _nbl_units_message(text) if text else None
+            if text and caption_units is None:
+                # an image with a caption that is not a units message: nothing is parsed or
+                # placed, Wilson gets the caption and the saved screenshot (the caption on
+                # its own is usually chatter the text route would drop silently)
+                _nbl_spawn(_nbl_image_caption_manual(event, text, channel_name))
+                return True
+            slot = _NblImageSlot(getattr(event, "id", 0), getattr(event, "grouped_id", None), now)
+            _nbl_img_slots.append(slot)
+            if slot.grouped_id is not None and slot.grouped_id in _nbl_albums:
+                _nbl_albums[slot.grouped_id]["last"] = now
+            if caption_units is not None and slot.grouped_id is not None:
+                _nbl_albums[slot.grouped_id] = {
+                    "numbers": caption_units, "text": text, "arrived": now, "last": now,
+                    "channel": channel_name, "unit_size": unit_size}
+            log.info(f"[{channel_name}] NBL betslip image {slot.msg_id} "
+                     f"(album {slot.grouped_id}): downloading for vision parse")
+            loop = asyncio.get_running_loop()
+            loop.call_later(
+                float(BETTORSEDGE_IMAGE_UNITS_WAIT_SEC),
+                lambda s=slot: _nbl_spawn(_nbl_image_expire(s, channel_name)))
+            _nbl_spawn(_nbl_image_process(slot, event, channel_name, unit_size, caption_units))
+            return True
+        numbers = _nbl_units_message(text) if text else None
+        if numbers is not None:
+            mid = getattr(event, "id", 0) or 0
+            prev_units_ts, _nbl_last_units_ts = _nbl_last_units_ts, now
+            # ONE window for the message: every image since the previous units message and
+            # before this one, whatever its status (see _nbl_window / _nbl_plan_numbers)
+            window = _nbl_window(prev_units_ts, mid)
+            refuse = ""
+            if _nbl_window_poisoned:
+                _nbl_window_poisoned = False       # this message starts a new window
+                refuse = ("an image from over an hour ago with bets not placed was dropped from "
+                          "tracking, so this message cannot be matched to the images safely, "
+                          "not guessing")
+            if any(s.status in ("parsing", "waiting") and now - s.arrived < _w for s in window):
+                _nbl_spawn(_nbl_units_process(text, numbers, window, channel_name, unit_size,
+                                              refuse))
+                return True
+            _nbl_warn_slip_disagree(window, numbers, text, channel_name)
+    except Exception as e:
+        log.error(f"[{channel_name}] NBL image dispatch failed, falling back to the old "
+                  f"handling: {e}")
+    return False
+
+
+async def _nbl_image_caption_manual(event, text: str, channel_name: str) -> None:
+    """Switch on, an image whose caption is not a units message: save the screenshot and
+    send the caption + saved path to manual. Places nothing."""
+    path = ""
+    try:
+        img = await event.download_media(file=bytes)
+        if img:
+            path = _nbl_save_image(img, getattr(event, "id", 0))
+    except Exception as e:
+        log.warning(f"[{channel_name}] NBL image with caption: download failed: {e}")
+    log.info(f"[{channel_name}] NBL image with a non-units caption -> manual: {text[:80]!r}")
+    try:
+        notifier.notify_text_manual_alert(
+            channel_name,
+            f"{text}\n(screenshot with a caption, not read: "
+            f"{('saved ' + path) if path else 'image not saved'})",
+            header="NBL, MANUAL")
+    except Exception as e:
+        log.error(f"[{channel_name}] NBL image caption alert failed: {e}")
+
+
+async def _nbl_save_only(event, channel_name: str) -> None:
+    """Switch off: download and save the screenshot only (audit/samples), nothing else."""
+    try:
+        img = await event.download_media(file=bytes)
+        if img:
+            path = _nbl_save_image(img, getattr(event, "id", 0))
+            if path:
+                log.info(f"[{channel_name}] NBL image saved for review (images switched off): {path}")
+    except Exception as e:
+        log.warning(f"[{channel_name}] NBL image: sample download failed: {e}")
+
+
+def _nbl_spawn(coro) -> None:
+    t = asyncio.ensure_future(coro)
+    _nbl_img_tasks.add(t)
+    t.add_done_callback(_nbl_img_tasks.discard)
 
 
 def _describe_nfl_image_tip(raw: dict) -> str:
@@ -23027,6 +23911,11 @@ async def main():
         # (parse every leg, place each on Sportsbet, one manual alert for the rest).
         # Before the generic media/_process_tip paths below, like A1.
         if channel_cfg.get("parser") == "bettorsedge_nbl":
+            # 2026-10-10: betslip screenshots + the units text that follows them
+            # (BETTORSEDGE_IMAGES_ENABLED, default off -> falls through to the old code).
+            if _bettorsedge_nbl_image_dispatch(
+                    event, text, channel_name, channel_cfg.get("unit_size", 0.0)):
+                return
             if text:
                 asyncio.create_task(
                     _route_bettorsedge_nbl_text(
