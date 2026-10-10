@@ -6,6 +6,7 @@ Uses ESPN's free scoreboard API for daily schedules and the roster module
 for player -> team mapping.
 """
 
+import re
 import requests
 import logging
 from datetime import datetime, timedelta, timezone
@@ -391,6 +392,24 @@ def resolve_nba_event(
         # AEST afternoon/evening: US today's games starting soon
         check_order = [today, tomorrow, yesterday]
 
+    # v6.58: a "Team1/Team2" pair (a game total) must resolve to the ONE game both
+    # teams are in. It used to take the first team's game, whoever they played, so a
+    # misread pair or a back-to-back bound the total to the wrong game.
+    if len(teams_to_try) == 2:
+        aliases = NBL_TEAM_ALIASES if sport == "nbl" else NBA_TEAM_ALIASES
+        a, b = teams_to_try
+        for check_date in check_order:
+            for game in _fetch_schedule(sport, check_date):
+                h, w = game["home"], game["away"]
+                if ((_team_is(a, h, aliases) and _team_is(b, w, aliases))
+                        or (_team_is(a, w, aliases) and _team_is(b, h, aliases))):
+                    event = f"{game['home']} v {game['away']}"
+                    log.info(f"Resolved '{search_team}' -> '{event}' on {check_date} (both teams)")
+                    return event
+        log.warning(f"No {sport.upper()} game with both '{teams_to_try[0]}' and "
+                    f"'{teams_to_try[1]}' found")
+        return None
+
     for check_date in check_order:
         games = _fetch_schedule(sport, check_date)
         for try_team in teams_to_try:
@@ -404,6 +423,48 @@ def resolve_nba_event(
 
     log.warning(f"No {sport.upper()} game found for '{search_team}'")
     return None
+
+
+def _team_is(query: str, espn_name: str, aliases: dict) -> bool:
+    q = (query or "").strip().lower()
+    full = aliases.get(q, "")
+    name = espn_name.lower()
+    if full:
+        return full.lower() == name
+    return bool(q) and (q in name or name in q)
+
+
+def expected_starts(event: str, sport: str = "nba") -> Optional[list]:
+    """v6.57: UTC epoch starts of the real games between the two teams of an
+    'A v B' event string, from ESPN, yesterday through two days ahead (either
+    home/away order). None = no ground truth (unparsable name or every fetch
+    failed); [] = ESPN answered and no such game is in the window.
+
+    Sportsbet answers a team pair with whichever game it lists: on 2026-10-07
+    'Dallas Mavericks v Houston Rockets' (preseason, 9 Oct) returned the
+    regular-season game on 22 Oct. Comparing its start with these is the check."""
+    parts = re.split(r"\s+(?:v|vs\.?|@|at)\s+", event or "", flags=re.IGNORECASE)
+    if len(parts) != 2:
+        return None
+    a, b = parts[0].strip(), parts[1].strip()
+    aliases = NBL_TEAM_ALIASES if sport == "nbl" else NBA_TEAM_ALIASES
+    starts, answered = [], False
+    for off in (-1, 0, 1, 2):
+        day = (datetime.now() + timedelta(days=off)).strftime("%Y-%m-%d")
+        games = _fetch_schedule(sport, day)
+        if games or f"{sport}_{day}" not in _schedule_fetch_failed:
+            answered = True
+        for g in games:
+            pair = (g["home"], g["away"])
+            if ((_team_is(a, pair[0], aliases) and _team_is(b, pair[1], aliases))
+                    or (_team_is(a, pair[1], aliases) and _team_is(b, pair[0], aliases))):
+                try:
+                    ts = datetime.fromisoformat(g["start"].replace("Z", "+00:00")).timestamp()
+                except (ValueError, AttributeError):
+                    continue
+                if ts not in starts:
+                    starts.append(ts)
+    return starts if answered else None
 
 
 def resolve_mlb_event(team: str = "") -> Optional[str]:

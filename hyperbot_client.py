@@ -40,6 +40,24 @@ log = logging.getLogger(__name__)
 _ALLOW_TEST_TRANSPORT = False
 
 
+# v6.57: per-thread record of event-guard time, so a caller's placement timer can
+# subtract it (the guard runs inside place_*; placement and its timer share a thread).
+_guard_tls = threading.local()
+
+
+def _record_guard_span(start: float, end: float) -> None:
+    spans = getattr(_guard_tls, "spans", None)
+    if spans is None:
+        spans = _guard_tls.spans = []
+    spans.append((start, end))
+    del spans[:-50]
+
+
+def guard_seconds_since(t0: float) -> float:
+    """Seconds this thread spent in the event guard since `t0`."""
+    return sum(e - s for s, e in getattr(_guard_tls, "spans", ()) if s >= t0)
+
+
 def _blocked_by_test_guard() -> bool:
     """True when this process must not make a real HyperBot API call
     (real money placement or a real balance/session read). Checks
@@ -186,6 +204,40 @@ class HyperBotClient:
         self.headers = {
             "X-API-Key": self.api_key,
             "Content-Type": "application/json",
+        }
+        # v6.57: optional pre-placement fixture check, installed by main.py.
+        # guard(session_id, sport, event) -> "" to place, or the reason the event
+        # name binds the WRONG game (NBA preseason v regular season, 2026-10-07).
+        self.event_guard = None
+
+    def _event_guard_refusal(self, session_id, sport: str, event: str):
+        """None to place, or a clean pre-placement failure envelope. The error
+        carries "not carried" so every caller treats it like an event the bookie
+        does not carry: nothing was submitted, route to manual, never ambiguous.
+        The time it takes is recorded (guard_seconds_since) so callers' bookie
+        latency timers can leave it out: a slow check followed by a fast reject
+        must not look like a slow, maybe-landed reject."""
+        guard = self.event_guard
+        if guard is None:
+            return None
+        t0 = time.time()
+        try:
+            reason = guard(session_id, sport, event)
+        except Exception as e:   # a broken guard must not block betting
+            log.warning(f"event guard error for {event!r} ({sport}): {e}")
+            return None
+        finally:
+            _record_guard_span(t0, time.time())
+        if not reason:
+            return None
+        log.error(f"WRONG FIXTURE, not placing: {sport} {event!r} on session {session_id}: {reason}")
+        return {
+            "success": False,
+            "outcome_code": "event_wrong_fixture",
+            "error": (f"[event_wrong_fixture] wrong fixture: {reason}. Sports event not carried "
+                      f"at the tipped time: {event}"),
+            "event": event, "sport": sport, "session_id": session_id,
+            "category": "sports", "session_answered": True,
         }
 
     def _post(self, path: str, payload: dict, timeout: int = 30,
@@ -943,7 +995,8 @@ class HyperBotClient:
     # ── Price Check ─────────────────────────────────────────────────
 
     def price_check_sports(self, session_id: str, sport: str, event: str,
-                           markets_filter: list[str] = None) -> dict:
+                           markets_filter: list[str] = None,
+                           max_attempts: int = None) -> dict:
         """Single-session sports price check.
 
         v4.2: migrated to /v3/price async (deprecation headers appeared
@@ -964,9 +1017,10 @@ class HyperBotClient:
         if markets_filter:
             payload["markets_filter"] = markets_filter
         # Idempotent read, safe to retry on transient 5xx / timeout.
+        # max_attempts: v6.57 fixture guard asks once (it runs before a placement).
         poll_result = self._post_v3_async(
             "/v3/price", payload,
-            initial_post_max_attempts=_RETRY_ATTEMPTS,
+            initial_post_max_attempts=max_attempts or _RETRY_ATTEMPTS,
         )
         if poll_result.get("success") is False and "statuses" not in poll_result:
             return poll_result
@@ -1024,6 +1078,10 @@ class HyperBotClient:
         place_racing_bet docstring for the Erasmus regression that
         forced this. Same retry-unsafe class applies to sports.
         """
+        # v6.57: fixture check first, so a refused bet never uses a daily-cap slot.
+        _refused = self._event_guard_refusal(session_id, sport, event)
+        if _refused:
+            return _refused
         _ok, stake, _gov = _placement_governor(stake)  # SAFE-MODE cap (place-only)
         if not _ok:
             return {"success": False, "error": _gov}
@@ -1095,6 +1153,10 @@ class HyperBotClient:
         2026-05-03: max_attempts=1 to prevent retry-driven overstaking.
         See place_racing_bet docstring.
         """
+        # v6.57: fixture check first, so a refused bet never uses a daily-cap slot.
+        _refused = self._event_guard_refusal(session_id, sport, event)
+        if _refused:
+            return _refused
         _ok, stake, _gov = _placement_governor(stake)  # SAFE-MODE cap (place-only)
         if not _ok:
             return {"success": False, "error": _gov}

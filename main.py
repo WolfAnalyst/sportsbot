@@ -1093,6 +1093,114 @@ def _afl_catalog_ok(pc, event: str, bookie: str, sid, what: str) -> bool:
     return False
 
 
+# ── v6.57: NBA/NBL wrong-fixture guard (preseason v regular season) ─────────
+# Wilson 2026-10-07, before AusBets preseason auto-place went live: check that HB
+# binds the right game. MEASURED: Sportsbet keeps NBA preseason on competition 14085
+# and the regular season on 19476 under the same sport, and HyperBot picks the game
+# by team pair alone (home/away order ignored, no date): "Dallas Mavericks v Houston
+# Rockets", the 9 Oct preseason game, returned the 22 Oct regular-season game. 23 of
+# the 55 preseason games left share a pair with a listed regular-season game, and the
+# same applies all season (teams meet 2-4 times; NBL teams 3-4). Installed on
+# hb.event_guard so EVERY NBA/NBL bet (singles, SGMs, blind fan-out) is checked
+# before /v3/place_bet. Same rule as the AFL guard: refuse ONLY on positive evidence
+# (ESPN knows the game AND HB's start is off by more than the tolerance); no ground
+# truth or no start time -> place as before.
+NBA_EVENT_VERIFY = os.getenv("NBA_EVENT_VERIFY", "true").strip().lower() == "true"
+NBA_EVENT_START_TOLERANCE_SEC = int(os.getenv("NBA_EVENT_START_TOLERANCE_SEC", "3600"))
+NBA_EVENT_CACHE_SEC = 600
+_NBA_GUARD_SPORTS = {"nba", "nbl"}
+_NBA_GUARD_IN_TESTS = False       # tests switch it on explicitly
+_nba_fixture_cache: dict = {}     # (session, event) -> (fetched_at, start or None)
+_nba_expected_cache: dict = {}    # (sport, event) -> (fetched_at, ESPN starts)
+_nba_fixture_locks: dict = {}
+_nba_fixture_locks_guard = threading.Lock()
+
+
+def _net_elapsed(t0: float) -> float:
+    """Seconds since `t0` minus time spent in the v6.57 fixture guard on this
+    thread. Every bookie-latency timer around hb.place_* uses this: the slow-
+    rejection rule (>= 5 s = maybe landed) is about the BOOKIE, and a guard price
+    check before the POST must not turn a fast clean reject into a false
+    'maybe landed' (debit, blocklist, CRITICAL)."""
+    from hyperbot_client import guard_seconds_since
+    return round(max(0.0, time.time() - t0 - guard_seconds_since(t0)), 2)
+
+
+def _nba_expected_starts_cached(event: str, sport: str):
+    """nba_resolver.expected_starts, cached 10 minutes per (sport, event),
+    including an empty answer (the resolver never caches an empty ESPN day)."""
+    key = (sport, event)
+    hit = _nba_expected_cache.get(key)
+    if hit and time.time() - hit[0] < NBA_EVENT_CACHE_SEC:
+        return hit[1]
+    from nba_resolver import expected_starts
+    val = expected_starts(event, sport)
+    # No ground truth (ESPN down) is cached for 60 s too: otherwise every leg of every
+    # bet re-tries up to four 10 s fetches while ESPN is out.
+    _nba_expected_cache[key] = (time.time() if val is not None
+                                else time.time() - NBA_EVENT_CACHE_SEC + 60, val)
+    return val
+
+
+def _nba_fixture_start(session_id, sport: str, event: str):
+    """HB's start_time_iso for the game `event` binds on this session (cached:
+    one price check per session+event per 10 minutes; ladder rungs, rebets and
+    retries on that session reuse it, each fan-out account asks once)."""
+    key = (str(session_id), sport, event)
+    with _nba_fixture_locks_guard:
+        lock = _nba_fixture_locks.setdefault(key, threading.Lock())
+    with lock:
+        hit = _nba_fixture_cache.get(key)
+        if hit and time.time() - hit[0] < NBA_EVENT_CACHE_SEC:
+            return hit[1]
+        start = None
+        try:
+            pc = hb.price_check_sports(session_id=session_id, sport=sport, event=event,
+                                       markets_filter=["head_to_head"], max_attempts=1)
+        except Exception as e:
+            log.warning(f"NBA fixture check: price check failed for {event!r}: {e}")
+            return None                    # not cached: next leg tries again
+        if not isinstance(pc, dict):
+            return None
+        if pc.get("success") is not False:
+            try:
+                start = float(pc["start_time_iso"]) if pc.get("start_time_iso") else None
+            except (TypeError, ValueError):
+                start = None
+        elif not pc.get("session_answered"):
+            # Transport trouble (5xx, timeout, unresolved cid): no answer about the
+            # game at all. Not cached, so the next leg asks again rather than the
+            # check being off for 10 minutes.
+            return None
+        _nba_fixture_cache[key] = (time.time(), start)
+        return start
+
+
+def _nba_wrong_fixture_reason(session_id, sport: str, event: str) -> str:
+    """hb.event_guard: "" to place, else why `event` binds the wrong game."""
+    try:
+        if not NBA_EVENT_VERIFY or (sport or "").lower() not in _NBA_GUARD_SPORTS:
+            return ""
+        if (os.getenv("TIPBOT_TESTING") or "pytest" in sys.modules) and not _NBA_GUARD_IN_TESTS:
+            return ""
+        expected = _nba_expected_starts_cached(event, sport.lower())
+        if not expected:
+            return ""                      # no ground truth -> previous behaviour
+        st = _nba_fixture_start(session_id, sport, event)
+        if st is None:
+            return ""                      # not carried / no start: HB will say so
+        drift = min(abs(st - e) for e in expected)
+        if drift <= NBA_EVENT_START_TOLERANCE_SEC:
+            return ""
+        bound = datetime.fromtimestamp(st, tz=_dt_timezone.utc).strftime("%d %b %H:%MZ")
+        real = ", ".join(datetime.fromtimestamp(e, tz=_dt_timezone.utc).strftime("%d %b %H:%MZ")
+                         for e in expected)
+        return f"the bookie's game starts {bound}, the real game is {real}"
+    except Exception as e:
+        log.debug(f"NBA fixture check skipped: {e}")
+        return ""
+
+
 def _price_check_afl_verified(*, session_id, sport, event, bookie, markets_filter=None):
     """price_check_sports for AFL, but PROVING the response is the fixture we asked for.
 
@@ -1498,6 +1606,8 @@ SAME_BOOKIE_FATAL_PATTERNS = [
                                 # vs Sportsbet name mismatch. Without this
                                 # all 4 Sportsbet sessions failed identically
                                 # before the blocklist could short-circuit.
+    "event_wrong_fixture",      # v6.57: the event name binds another game on this
+                                # bookie; every session would refuse the same way.
 ]
 
 # Stake errors are the ONLY ones we keep retrying with smaller stakes for.
@@ -2206,6 +2316,7 @@ def route_message(
 # ── HyperBot Client ─────────────────────────────────────────────────
 
 hb = HyperBotClient()
+hb.event_guard = _nba_wrong_fixture_reason   # v6.57: NBA/NBL wrong-fixture check before every bet
 
 
 # ── Event Resolution ────────────────────────────────────────────────
@@ -2322,6 +2433,17 @@ def _nfl_seen_key(tipster: str, raw: dict) -> str:
                 _st = "touchdowns"
             return (f"NFL|{tipster}|pp|{who}|{_st}|{side}|"
                     f"{_seen_num(raw.get('line'), whole_over_half=(side == 'over'))}")
+        if mt == "most_stat":
+            # v6.59: a 'MOST RUSHING YARDS' tip's summary repost ('- Tyler Goodson most
+            # rushing yards $34') must key the same as the original ('Tyler Goodson MOST
+            # RUSHING YARDS $34'), even though the free-text description differs -- the
+            # 2026-10-08 4th&EV resend that 'other' keyed on description would have
+            # missed. No line/side to fold in (it's a proposition, not an O/U).
+            who = _seen_name(raw.get("player"))
+            if not who:
+                return ""
+            _st = (raw.get("stat") or "").strip().lower()
+            return f"NFL|{tipster}|most|{_st}|{who}"
         if mt in ("h2h", "spread", "team_total", "margin"):
             team = canonical_nfl_team(raw.get("team") or "").lower()
             if not team:
@@ -7251,8 +7373,10 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
             # AMBIGUOUS/maybe-landed already stopped above and is NEVER retried.)
             # v6.47: a 422 is HyperBot refusing the request itself (validation), not a
             # transient: retrying it is one more wasted call per account.
+            # v6.57: a wrong-fixture refusal is not transient either (same answer from cache).
             if (AFL_FANOUT_PREPLACEMENT_RETRY and _is_definitely_pre_placement(r.error or "")
-                    and "422 client error" not in (r.error or "").lower()):
+                    and "422 client error" not in (r.error or "").lower()
+                    and "event_wrong_fixture" not in (r.error or "")):
                 _orig_err = r.error or ""
                 _el = _orig_err.lower()
                 # v5.92 (Wilson): short problem label for the bet-log / manual note.
@@ -10618,7 +10742,7 @@ def _match_handicap_in_catalog(team_selection: str, tipped_line, markets: dict):
     return None
 
 
-def _match_total_in_catalog(side: str, tipped_line, markets: dict):
+def _match_total_in_catalog(side: str, tipped_line, markets: dict, exact_only: bool = False):
     """Resolve a match-TOTAL leg (Over/Under) against the live catalog.
 
     1. Standard `total_points` market: Over/Under at the tipped line within
@@ -10652,7 +10776,9 @@ def _match_total_in_catalog(side: str, tipped_line, markets: dict):
         except (TypeError, ValueError):
             continue
         gap = abs(ln - tip)
-        if gap <= 1.0 and (best is None or gap < best[0]):
+        # v6.58: NBA/NBL totals are EXACT only (no tolerance was ever chosen for them;
+        # the ±1.0 was Eddie's AFL rule and would place a worse 229.5 for a 228.5 tip).
+        if gap <= (0.0 if exact_only else 1.0) and (best is None or gap < best[0]):
             best = (gap, {
                 "market": "total_points", "selection": s.get("selection"),
                 "line": ln, "proposition_id": s.get("proposition_id"),
@@ -10671,7 +10797,7 @@ def _match_total_in_catalog(side: str, tipped_line, markets: dict):
         except (TypeError, ValueError):
             continue
         gap = abs(ln - tip)
-        if gap <= _HC_LINE_TOLERANCE and (best is None or gap < best[0]):
+        if gap <= (0.0 if exact_only else _HC_LINE_TOLERANCE) and (best is None or gap < best[0]):
             best = (gap, {
                 "market": "pick_own_total", "selection": s.get("selection"),
                 "line": None, "proposition_id": s.get("proposition_id"),
@@ -11338,7 +11464,7 @@ def _place_sgm(tip: ParsedTip) -> list[BetResult]:
                     session_id=sid, sport=tip.sport, event=event_for_hb,
                     legs=session_hb_legs, stake=mid, target_odds=target_odds,
                 )
-                _sgm_bs_elapsed = round(time.time() - _sgm_bs_t0, 2)
+                _sgm_bs_elapsed = _net_elapsed(_sgm_bs_t0)
                 if test_resp.get("success"):
                     best_stake = mid
                     result = BetResult(
@@ -12017,7 +12143,7 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
                     legs=session_hb_legs, stake=step_stake, target_odds=target_odds,
                     use_boost=True,
                 )
-                _sgm_elapsed = round(_sgm_time_mod.time() - _sgm_t_start, 2)
+                _sgm_elapsed = _net_elapsed(_sgm_t_start)
                 _sgm_last_elapsed = _sgm_elapsed
                 last_resp = resp
                 if resp.get("success"):
@@ -12080,7 +12206,7 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
                         legs=session_hb_legs, stake=step_stake, target_odds=target_odds,
                         use_boost=False,
                     )
-                    _sgm_retry_elapsed = round(_sgm_time_mod.time() - _sgm_t_retry, 2)
+                    _sgm_retry_elapsed = _net_elapsed(_sgm_t_retry)
                     _sgm_last_elapsed = _sgm_retry_elapsed
                     last_resp = resp
                     if resp.get("success"):
@@ -12123,7 +12249,7 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
                     session_id=sid, sport=tip.sport, event=event_for_hb,
                     legs=session_hb_legs, stake=step_stake, target_odds=target_odds,
                 )
-                _sgm_elapsed = round(_sgm_time_mod.time() - _sgm_t_start, 2)
+                _sgm_elapsed = _net_elapsed(_sgm_t_start)
                 _sgm_last_elapsed = _sgm_elapsed
                 last_resp = resp
                 if resp.get("success"):
@@ -12322,9 +12448,7 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
                             if alt_resp.get("success"):
                                 # Time only THIS alt attempt (per-attempt reset),
                                 # not since the initial place call.
-                                _alt_elapsed = round(
-                                    _sgm_time_mod.time() - _alt_t_start, 2
-                                )
+                                _alt_elapsed = _net_elapsed(_alt_t_start)
                                 # Auto-cap detection (mirror the H4 branches):
                                 # read the actual placed stake so a silent
                                 # bookie cap debits the real amount and spillover
@@ -12382,9 +12506,7 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
                             # never spill/ladder. Mirrors the initial-place guard
                             # above. A slow "did not match" / "line moved" is
                             # definitely pre-placement, so it correctly walks on.
-                            _alt_fail_elapsed = round(
-                                _sgm_time_mod.time() - _alt_t_start, 2
-                            )
+                            _alt_fail_elapsed = _net_elapsed(_alt_t_start)
                             _alt_slow = _alt_fail_elapsed >= STAKE_REJECT_LATENCY_THRESHOLD_SEC
                             if (
                                 (_alt_slow or bool(alt_resp.get("ambiguous")))
@@ -12591,7 +12713,7 @@ def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
             session_id=sid, sport=tip.sport, event=event_for_hb,
             legs=session_hb_legs, stake=step, target_odds=target_odds,
         )
-        _el = round(_t.time() - _t0, 2)
+        _el = _net_elapsed(_t0)
         if resp.get("success"):
             try:
                 actual = float(resp.get("stake", step))
@@ -12666,7 +12788,7 @@ def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
                     session_id=sid, sport=tip.sport, event=event_for_hb,
                     legs=session_hb_legs, stake=step, target_odds=target_odds,
                 )
-                _el = round(_t.time() - _t0, 2)
+                _el = _net_elapsed(_t0)
                 if resp.get("success"):
                     try:
                         actual = float(resp.get("stake", step))
@@ -12735,7 +12857,7 @@ def _sgm_fanout_place_account(tip, sess: dict, ladder: list,
                     session_id=sid, sport=tip.sport, event=event_for_hb,
                     legs=session_hb_legs, stake=_mx, target_odds=target_odds,
                 )
-                _el = round(_t.time() - _t0, 2)
+                _el = _net_elapsed(_t0)
                 if resp.get("success"):
                     try:
                         actual = float(resp.get("stake", _mx))
@@ -13197,7 +13319,7 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
                 stake=step_stake, target_odds=target_odds,
                 proposition_id=m["proposition_id"],
             )
-            _el = round(_t.time() - _t0, 2)
+            _el = _net_elapsed(_t0)
             if resp.get("success"):
                 try:
                     actual = float(resp.get("stake", step_stake))
@@ -13727,6 +13849,14 @@ def _resolve_leg_for_hyperbot(
     # ── Market normalization ────────────────────────────────────────
     if market in ("ml", "moneyline", "money_line"):
         market = "h2h"
+    # v6.58 (live $1 test 2026-10-08, Bulls v Suns Over 228.5): a SINGLE game total
+    # sent as market 'total' is refused by HyperBot ("[market_not_carried] 'total' not
+    # offered"); Sportsbet's market is total_points, which also routes the leg through
+    # the total_points catalog match (main line ±1.0, then pick_own_total). SGM legs
+    # keep 'total' (HyperBot takes it there; team+total SGMs are manual anyway).
+    if (market in ("total", "game_total", "match_total") and not for_sgm
+            and (sport or "").lower() in ("nba", "nbl")):
+        market = "total_points"
 
     # For H2H: selection must be team name
     if market == "h2h" and (not selection or selection.upper() == "ML"):
@@ -14515,6 +14645,7 @@ def _resolve_single_for_placement(
                         price_resp, tip.event, bookie, sid, "team total"):
                     _tm = _match_total_in_catalog(
                         selection, line, price_resp.get("markets") or {},
+                        exact_only=(tip.sport or "").lower() in ("nba", "nbl"),
                     )
                     if _tm:
                         if _tm["market"] != market or _tm["line"] != line:
@@ -14764,7 +14895,7 @@ def _execute_bet(
         max_odds=_max_odds,
         period=_period,
     )
-    _elapsed = round(_time_mod.time() - _t_place_start, 2)
+    _elapsed = _net_elapsed(_t_place_start)
 
     # v6.36 PLAYER-LESS RETRY: HyperBot matched our `player` against a catalog row whose
     # player field is None and refused ([selection_not_carried]), despite the exact
@@ -14799,7 +14930,7 @@ def _execute_bet(
             max_odds=_max_odds,
             period=_period,
         )
-        _elapsed = round(_time_mod.time() - _t_place_start, 2)
+        _elapsed = _net_elapsed(_t_place_start)
 
     # v6.38 STAT-LESS RETRY: HyperBot filters candidates by our `stat` and Sportsbet's
     # rows carry none, so e.g. NBL 'doubles' (a double-double AND a triple-double row,
@@ -14838,7 +14969,7 @@ def _execute_bet(
             max_odds=_max_odds,
             period=_period,
         )
-        _elapsed = round(_time_mod.time() - _t_place_start, 2)
+        _elapsed = _net_elapsed(_t_place_start)
 
     # v5.9x MAX-STAKE REBET (shared chokepoint for every sports-singles caller:
     # AFL fan-out, singles_v4, spillover, name-variants). On a Sportsbet
@@ -14893,7 +15024,7 @@ def _execute_bet(
             proposition_id=_resolved_prop_id,
             period=_period,
         )
-        _elapsed = round(_time_mod.time() - _t_place_start, 2)
+        _elapsed = _net_elapsed(_t_place_start)
         # Reassign `stake` so the auto-cap check + BetResult reflect the true
         # (max) amount we requested — not a spurious "auto-cap" vs the original.
         stake = _mx_target
@@ -18156,6 +18287,162 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
         return None
 
 
+_NFL_MOST_STAT_MARKET = {
+    "rushing_yards": "most_rushing_yards",
+    "receiving_yards": "most_receiving_yards",
+    "passing_yards": "most_passing_yards",
+}
+
+
+def _nfl_most_row(player: str, market: dict, event: str):
+    """v6.59 (Wilson 2026-10-10: "pls hook up most rushing/most receiving markets").
+    (player name, row) for `player` in this game-level 'most_<stat>' market, or
+    (name, None). Mirrors _nfl_atd_row exactly: exact token match first, then the
+    same guarded typo correction as every other NFL prop (_nfl_fix_player_name --
+    game-scoped, roster team check, never renames a real roster player). Unlike
+    touchdown_scorer, these rows carry no direction/line to filter on -- one row
+    per player, highest-yardage-wins proposition, so every row is a candidate."""
+    rows = [s for s in (market or {}).get("selections", []) or [] if s.get("selection")]
+    if not rows:
+        return player, None
+
+    def _pick(name):
+        want = _nfl_slug_tokens(name)
+        hits = [s for s in rows if _nfl_slug_tokens(s.get("selection") or "") == want]
+        return hits[0] if len(hits) == 1 else None
+
+    row = _pick(player)
+    if row is not None:
+        return row.get("selection") or player, row
+    pseudo = {f"{(s.get('selection') or '').lower().replace(' ', '_')}_-_most": {} for s in rows}
+    fixed = _nfl_fix_player_name(player, pseudo, event)
+    if fixed:
+        row = _pick(fixed)
+        if row is not None:
+            return row.get("selection") or fixed, row
+    return player, None
+
+
+def _resolve_nfl_most_market(player: str, team: str, stat: str, priority_sessions: list,
+                              tipster: str = "", tipster_odds=None):
+    """Read-only: resolve a 'MOST RUSHING/RECEIVING/PASSING YARDS' tip against the
+    LIVE Sportsbet board. Sibling of _resolve_nfl_market -- same fail-safe-to-
+    manual philosophy, same return dict shape so _place_nfl_fanout places it
+    unchanged -- see that function's docstring for the design notes this one
+    doesn't repeat.
+
+    v6.59 (Wilson 2026-10-10, 4th&EV's 2026-10-08 'Tyler Goodson MOST RUSHING
+    YARDS $34 / 0.25 units' went manual as market_type "other" and was placed by
+    hand). Live read-only price check confirmed Sportsbet carries this as ONE
+    game-level market per stat ('most_rushing_yards' etc, keys
+    hb.price_check_sports(...)["markets"] already returns), one row per player,
+    no line/direction -- a proposition, not an Over/Under -- so the exact-match
+    row picker mirrors _nfl_atd_row's 'touchdown_scorer' handling rather than
+    _find_nfl_market's line-tolerance comparison (there is no line here at all).
+
+    Odds guard: the SAME _nfl_odds_guard_refuses every other NFL resolver uses
+    (ceiling/floor against the tipster's own price when usable, else the flat
+    1.6 no-comparison floor) -- no new threshold invented for this market."""
+    try:
+        market_key = _NFL_MOST_STAT_MARKET.get((stat or "").strip().lower())
+        if not market_key:
+            log.info(f"NFL auto-place: most_stat {stat!r} has no live-market mapping -> manual")
+            return None
+        if not player:
+            log.info("NFL auto-place: most_stat tip has no player -> manual")
+            return None
+        if not priority_sessions:
+            return None
+
+        _collision_event = None
+        collision_teams = is_nfl_name_collision(player)
+        if collision_teams:
+            # v6.43's same-name collision rule (see _resolve_nfl_market): settled only
+            # by the tip's own team when that team is one of the colliding ones and
+            # none of the others plays in its game, else refuse rather than guess.
+            _ct = canonical_nfl_team(team) if team else ""
+            _ev = resolve_nfl_event(_ct) if _ct in collision_teams else None
+            _others = [t for t in collision_teams if t != _ct]
+            if _ev and not any(o and o in _ev for o in _others):
+                log.info(f"NFL auto-place: {player!r} same-name collision {collision_teams} "
+                         f"settled by the tip's team {_ct!r} ({_ev!r})")
+                team, _collision_event = _ct, _ev
+            else:
+                log.warning(
+                    f"NFL auto-place: {player!r} is a roster-known same-name "
+                    f"collision {collision_teams} -> manual (never guess)"
+                )
+                return None
+
+        resolve_team = (team or "").strip()
+        if not resolve_team:
+            resolve_team = get_player_team(player, "nfl")
+        if not resolve_team:
+            log.info(f"NFL auto-place: no team resolved for {player!r} -> manual")
+            return None
+
+        event = _collision_event or resolve_nfl_event(resolve_team)
+        if not event:
+            log.info(f"NFL auto-place: no event found for {resolve_team!r} -> manual")
+            return None
+
+        pc = None
+        probe_sid = None
+        for _sid in priority_sessions:
+            if _session_stalled(_sid):
+                continue
+            _pc = hb.price_check_sports(session_id=str(_sid), sport="nfl", event=event)
+            if _pc.get("success"):
+                pc, probe_sid = _pc, str(_sid)
+                break
+            log.info(
+                f"NFL auto-place: price-check failed on session {_sid} for "
+                f"{event!r} ({_pc.get('error', 'unknown')}) -- trying next session"
+            )
+        if pc is None:
+            log.info(f"NFL auto-place: price-check failed on every priority session for {event!r} -> manual")
+            return None
+
+        markets_all = pc.get("markets") or {}
+        market = markets_all.get(market_key)
+        name, row = _nfl_most_row(player, market, event)
+        if row is None:
+            log.info(f"NFL auto-place: {market_key}: {player!r} not in Sportsbet's "
+                     f"'{market_key}' market for {event!r} -> manual")
+            return None
+        player = name
+
+        live_odds = row.get("odds")
+        _refuse, _reason = _nfl_odds_guard_refuses(tipster, tipster_odds, live_odds)
+        if _refuse:
+            log.info(f"NFL auto-place: {player!r} {market_key} {_reason} -> manual")
+            return None
+
+        probe_meta = session_priority.get_session_meta(probe_sid)
+        probe_bookie = probe_meta.bookmaker if probe_meta else ""
+        if not probe_bookie:
+            log.warning(
+                f"NFL auto-place: no sessions.yaml metadata for probe session "
+                f"{probe_sid!r} -- cannot verify its bookie, refusing to place "
+                f"against an unverified catalog"
+            )
+            return None
+        return {
+            "event": event, "market": market_key, "selection": row.get("selection") or "",
+            "line": None, "odds": live_odds,
+            "proposition_id": row.get("proposition_id"), "direction": None,
+            "team": resolve_team, "probe_session_id": probe_sid, "bookie": probe_bookie,
+            "player": player,
+            # v6.59: a 'most X yards' row carries no stat/line of its own; the
+            # proposition_id pins it, same as anytime TD's touchdown_scorer row.
+            "hb_no_stat": True, "hb_omit_line": True,
+            "period": "full_game",
+        }
+    except Exception as e:
+        log.error(f"NFL auto-place: most_stat resolve crashed for {player!r} {stat!r}: {e}")
+        return None
+
+
 # v6.26 (2026-09-16, Wilson: "i need it to parse the mass tips msg to able to
 # extract the proper tips one by one and then place them" -- the real 4th&EV
 # text build, following the xhigh audit that found he'd switched to text with
@@ -19063,6 +19350,10 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         if market_type_norm == "player_prop":
             match = _resolve_nfl_market(player, team, stat, side, tipster_line, priority,
                                          tipster, tipster_odds, exact_line_only=exact_line_only)
+        elif market_type_norm == "most_stat":
+            # v6.59: 'MOST RUSHING/RECEIVING/PASSING YARDS' -- a game-level proposition
+            # (one row per player, no line/direction), not an Over/Under line match.
+            match = _resolve_nfl_most_market(player, team, stat, priority, tipster, tipster_odds)
         elif market_type_norm in _NFL_TEAM_MARKET_KEY:
             match = _resolve_nfl_team_market(team, market_type_norm, tipster_line, side,
                                               priority, tipster, tipster_odds)
@@ -19073,7 +19364,7 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
             return False
         # v6.43: the resolver may have corrected a misspelt name ('Garret Wilson' ->
         # 'Garrett Wilson'); bet, label and dedup key all use the corrected one.
-        if market_type_norm == "player_prop" and match.get("player"):
+        if market_type_norm in ("player_prop", "most_stat") and match.get("player"):
             player = match["player"]
 
         # v6.26: one readable label reused in every alert/log line below --
@@ -19082,6 +19373,8 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         # empty; player props leave team-level fields unused).
         if market_type_norm == "player_prop":
             _bet_label = f"{player} {side} {tipster_line} {stat}"
+        elif market_type_norm == "most_stat":
+            _bet_label = f"{player} most {stat}"
         elif market_type_norm == "h2h":
             _bet_label = f"{match['team']} moneyline"
         elif market_type_norm == "spread":
@@ -19215,6 +19508,11 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         # 538, and owns every alert/ledger/audit write from here on.
         if market_type_norm == "player_prop":
             _cap_market = (_place_stat or "").strip().lower()
+        elif market_type_norm == "most_stat":
+            # v6.59: cap on the actual HyperBot market key ('most_rushing_yards'), not
+            # the literal market_type string -- matches KNOWN_NFL_MARKETS and whatever
+            # cap, if any, Wilson later adds to sessions.yaml for this market.
+            _cap_market = (match.get("market") or "").strip().lower()
         elif market_type_norm == "spread":
             _cap_market = "line"
         else:
@@ -19501,6 +19799,17 @@ def _nbl_pick_team(markets: dict, raw: dict, team: str, main_total_only: bool = 
     if mt == "total":
         if side not in ("over", "under") or line is None:
             return None, None, "a total with no over/under side or line"
+        # v6.59 (Wilson: "why did o199.5 totals not get placed. it is under alternative
+        # totals"): an inferred game may use an ALTERNATE total too when the tip carries
+        # its price. The odds guard after this (floor tipped x0.9, ceiling x1.25) then
+        # proves the row: 'over 199.5 $3.5' cannot pass on any line but the tipped one.
+        # With no price, the main total only, as v6.53 set.
+        try:
+            _has_price = float(raw.get("odds") or 0) > 1.0
+        except (TypeError, ValueError):
+            _has_price = False
+        if main_total_only and _has_price:
+            main_total_only = False
         for key, raw_name in ((("total_points", "total points"),) if main_total_only else
                               (("total_points", "total points"),
                                ("alternate_total", "alternate total points"))):
@@ -20052,6 +20361,11 @@ def _describe_nfl_image_tip(raw: dict) -> str:
             f"{player}" + (f" ({team})" if team else "")
             + f": {side} {_or_q(line)} {stat}"
         )
+    elif mt == "most_stat":
+        player = raw.get("player") or "?"
+        team = raw.get("team")
+        stat = raw.get("stat") or "?"
+        lines.append(f"{player}" + (f" ({team})" if team else "") + f": most {stat}")
     elif mt == "h2h":
         lines.append(f"{raw.get('team') or '?'}: moneyline/H2H")
     elif mt == "spread":
@@ -20086,7 +20400,7 @@ def _describe_nfl_image_tip(raw: dict) -> str:
         lines.append("  " + " / ".join(tail))
     # v6.37: the full post is no longer attached, so keep this bet's own note
     # ('take up to 74.5', 'bet down to $1.80') with it.
-    if mt in ("player_prop", "h2h", "spread", "total") and raw.get("description"):
+    if mt in ("player_prop", "most_stat", "h2h", "spread", "total") and raw.get("description"):
         lines.append(f"  Note: {raw.get('description')}")
     return "\n".join(lines)
 
@@ -20138,7 +20452,7 @@ async def _route_image_nfl_tips(raw_tips: list, tipster: str, channel_name: str,
         # never let them reach auto-place, so any team-market bet on a real
         # 4th&EV card fell to manual even though _resolve_nfl_team_market
         # now exists to resolve it.
-        if _mt in ("player_prop", "h2h", "spread", "total", "team_total", "margin"):
+        if _mt in ("player_prop", "most_stat", "h2h", "spread", "total", "team_total", "margin"):
             raw_text_for_alert = desc + (f"\n\n---- caption ----\n{raw_caption}" if raw_caption else "")
             # v6.22 code review: _attempt_nfl_auto_place makes genuinely
             # blocking HyperBot HTTP calls -- MUST run off the event loop,
@@ -20198,22 +20512,25 @@ _A1_ANNOUNCEMENT_RE = re.compile(
 def _describe_a1_nfl_tip(raw: dict) -> str:
     """Render one text-extracted A1 NFL raw tip dict as a short headline for
     the manual alert. Never raises. Mirrors _describe_nfl_image_tip's
-    player_prop rendering; A1's parser only ever emits player_prop/h2h/other
-    (see TEXT_PROMPT_A1_NFL), so this is intentionally smaller than the
-    image-side renderer."""
+    player_prop rendering; A1's parser only ever emits
+    player_prop/most_stat/h2h/other (see TEXT_PROMPT_A1_NFL), so this is
+    intentionally smaller than the image-side renderer."""
     mt = (raw.get("market_type") or "other").strip().lower()
-    if mt == "player_prop":
+    if mt in ("player_prop", "most_stat"):
         player = raw.get("player") or "?"
         team = raw.get("team")
         stat = raw.get("stat") or "?"
-        side = raw.get("side") or "?"
-        line = raw.get("line")
         units = raw.get("units")
         fd_odds = raw.get("fd_odds")
-        headline = (
-            f"{player}" + (f" ({team})" if team else "")
-            + f": {side} {line if line is not None else '?'} {stat}"
-        )
+        if mt == "most_stat":
+            headline = f"{player}" + (f" ({team})" if team else "") + f": most {stat}"
+        else:
+            side = raw.get("side") or "?"
+            line = raw.get("line")
+            headline = (
+                f"{player}" + (f" ({team})" if team else "")
+                + f": {side} {line if line is not None else '?'} {stat}"
+            )
         if units is not None:
             headline += f" ({units}u)"
         if fd_odds is not None:
@@ -20315,7 +20632,8 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
         except Exception as e:
             headline = f"(headline render failed: {e})"
 
-        if (raw.get("market_type") or "").strip().lower() == "player_prop":
+        _a1_mt = (raw.get("market_type") or "").strip().lower()
+        if _a1_mt in ("player_prop", "most_stat"):
             # v6.28 (Wilson: "Sportsbet copies FD prices, so we can just
             # compare off of that"). raw.get("odds") was always None here --
             # A1's schema never had a generic odds field, so this call was a
@@ -20334,7 +20652,7 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
                 raw.get("stat"), raw.get("side"), raw.get("line"),
                 raw.get("units"), unit_size,
                 f"{headline}\n{_ctx}",
-                _tipster_odds, None, "player_prop", bool(raw.get("_ladder")),
+                _tipster_odds, None, _a1_mt, bool(raw.get("_ladder")),
             )
             if handled:
                 continue
@@ -20448,7 +20766,7 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
             desc = f"(description render failed: {e}; raw={raw!r})"
 
         _mt = (raw.get("market_type") or "").strip().lower()
-        if _mt in ("player_prop", "h2h", "spread", "total", "team_total", "margin"):
+        if _mt in ("player_prop", "most_stat", "h2h", "spread", "total", "team_total", "margin"):
             handled = await _run_in_placement_executor(
                 _attempt_nfl_auto_place,
                 tipster, channel_name, raw.get("player"), raw.get("team"),

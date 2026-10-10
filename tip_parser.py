@@ -505,4 +505,5 @@ def build_tips_from_parsed(parsed, text, tipster, sport, unit_size, default_unit
     # Deterministic "/" = SGM: a single "/"-line wrongly split into separate
     # tips is merged back into one SGM ticket.
     tips = _merge_slash_line_into_sgm(tips, text)
+    tips = groq_parser._check_team_legs_against_text(tips, text)   # v6.58
     return tips

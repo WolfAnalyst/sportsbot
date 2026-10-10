@@ -98,8 +98,14 @@ KNOWN_MLB_MARKETS = {
 # keys today (Sportsbet doesn't carry rush_attempts/pass_attempts/completions/
 # longest_reception/longest_rush/interceptions/sacks/tackles as markets at
 # all, verified live); h2h/line/total listed for when team markets are added.
+# v6.59: most_rushing_yards/most_receiving_yards/most_passing_yards (the
+# HyperBot market keys main._resolve_nfl_most_market caps against) added for
+# the 'MOST RUSHING/RECEIVING/PASSING YARDS' proposition markets -- no yaml
+# cap exists for them yet (NFL has no caps at all, Wilson's rule), this is
+# only so a future sessions.yaml entry validates instead of warning.
 KNOWN_NFL_MARKETS = {
     "receiving_yards", "rushing_yards", "passing_yards", "receptions",
+    "most_rushing_yards", "most_receiving_yards", "most_passing_yards",
     "h2h", "line", "total",
 }
 
@@ -274,9 +280,38 @@ def load_sessions_yaml(path: str | Path) -> dict[str, SessionMeta]:
             liability=liability,
         )
 
+    _add_new_sb_accounts(parsed)
     _session_meta = parsed
     log.info(f"Loaded sessions.yaml: {len(parsed)} session(s) configured")
     return parsed
+
+
+def _add_new_sb_accounts(parsed: dict) -> None:
+    """v6.59: each filled NEW_SB_ACCOUNT_<n> slot (config.new_sb_accounts) with no
+    sessions.yaml block of its own gets a copy of the template account's (Daniel
+    Sportsbet 68723) limits. A block in sessions.yaml always wins."""
+    try:
+        import copy
+        import config
+        accounts = config.new_sb_accounts()
+        template = parsed.get(config.NEW_SB_TEMPLATE_SESSION)
+    except Exception as e:
+        log.error(f"new Sportsbet accounts not loaded: {e}")
+        return
+    for sid, name in accounts:
+        if sid in parsed:
+            log.info(f"new SB account {sid} ({name}): sessions.yaml has its own block, using it")
+            continue
+        if template is None:
+            log.error(f"new SB account {sid} ({name}): template session "
+                      f"{config.NEW_SB_TEMPLATE_SESSION} is not in sessions.yaml, not added")
+            continue
+        parsed[sid] = SessionMeta(
+            session_id=sid, name=name, bookmaker="sportsbet",
+            boost_eligible=False, liability=copy.deepcopy(template.liability),
+        )
+        log.info(f"new SB account {sid} ({name}) added with {template.name} "
+                 f"({template.session_id}) limits")
 
 
 _VALID_DAY_KEYS = {

@@ -566,6 +566,253 @@ def _slash_leg_dir(sel: str) -> str:
     return "under" if "under" in s else ("over" if "over" in s else s)
 
 
+# ── v6.58: team legs checked against the message text ─────────────────────────
+# MEASURED 2026-10-07 (Claude sonnet-5 primary parser, 5 parses per post): inside an
+# SGM's raw_legs the model DROPS the minus on a handicap about 1 parse in 3 ("Lakers
+# -4.5 / LeBron Over 24.5 P" -> Lakers 4.5 in 4/5; "Spurs -3.5 / Kornet Over 3.5 PR" ->
+# 3.5 in 2/5). Never the other way (a + never became -), never on a single (0/40), and
+# tipbot's own post-processing kept whatever the model gave. It is not "the better
+# odds side": the sign is stripped. The raw_legs schema also has no `team` field, so an
+# SGM handicap leg arrived with no team, and a bare total ("Pacers/Wolves Over 235.5")
+# had no team at all, so neither could find its game.
+#
+# Deliberately narrow (Opus review round 1 found every looser rule could CREATE a wrong
+# bet): a number only counts when its own segment of the message (between '/' and line
+# breaks) names THIS team with a word no other team in the league shares. The line is
+# rewritten only for the measured failure (an SGM leg parsed +N, the text gives this
+# team -N); any other disagreement goes to manual and is never rewritten. A bare
+# total only gets a game when exactly one "A/B over|under N" in the text carries the
+# leg's own side and number and A and B are two different teams.
+_SIGNED_NUM = re.compile(
+    r"(?<![\d.$])([+-])(\d+(?:\.\d+)?)(?![\d.])(?!\s*(?:u\b|units?\b|%))", re.I)
+_HALF_RE = re.compile(
+    r"\b(?:1st|first)[\s-]*half\b|\b1h\b|\bh1\b|\bhalf[\s-]*time\b|\bht\b", re.I)
+_OTHER_PERIOD_RE = re.compile(
+    r"\b(?:2nd|second)[\s-]*half\b|\b2h\b|\bh2\b"
+    r"|\b(?:1st|2nd|3rd|4th|first|second|third|fourth)[\s-]*(?:qtr|quarter|q)\b"
+    r"|\bq(?:tr|uarter)?\s*[1-4]\b|\b[1-4]\s*q(?:tr|uarter)?\b", re.I)
+_TOTAL_PAIR_RE = re.compile(
+    r"([A-Za-z][A-Za-z .'&]*?)\s*(?:/|\s(?:v|vs\.?|@)\s)\s*([A-Za-z][A-Za-z .'&]*?)\s+"
+    r"(over|under|o|u)\s*(\d+(?:\.\d+)?)", re.I)
+_TEAM_LINE_MARKETS = ("line", "first_half_line")
+
+
+def _league_aliases(sport: str) -> dict:
+    """{alias lower: canonical} for the sport's teams. {} for any sport without its
+    own table (MLB/NFL/...): the NBA table would turn 'Chicago' into the Bulls."""
+    if sport not in ("nba", "nbl", "afl"):
+        return {}
+    try:
+        if sport == "afl":
+            from config import AFL_TEAMS
+            out = {k.lower(): v for k, v in AFL_TEAMS.items()}
+            out.update({v.lower(): v for v in AFL_TEAMS.values()})
+            return out
+        from nba_resolver import NBA_TEAM_ALIASES, NBL_TEAM_ALIASES
+        src = NBL_TEAM_ALIASES if sport == "nbl" else NBA_TEAM_ALIASES
+        out = dict(src)
+        out.update({v.lower(): v for v in src.values()})
+        return out
+    except Exception:
+        return {}
+
+
+def _canonical_team(name: str, aliases: dict) -> str:
+    n = (name or "").strip().lower()
+    if not n:
+        return ""
+    if n in aliases:
+        return aliases[n]
+    hits = {c for a, c in aliases.items() if len(a) >= 4 and (a == n or a in n.split())}
+    return hits.pop() if len(hits) == 1 else ""
+
+
+def _distinct_words(canonical: str, aliases: dict) -> set:
+    """Words that name this team and no other team in the league: its own aliases
+    (3+ letters) and the words of its full name, minus any word found in another
+    team's name or aliases ("new", "melbourne", "coast", "los"...)."""
+    mine, others = set(), set()
+    for alias, c in aliases.items():
+        toks = set(re.findall(r"[a-z0-9]+", alias.lower()))
+        if c == canonical:
+            if len(alias) >= 3:
+                mine.add(alias.lower())
+            mine |= {t for t in toks if len(t) >= 3}
+        else:
+            others |= toks | {alias.lower()}
+    other_names = [a.lower() for a, c in aliases.items() if c != canonical]
+    out = set()
+    for w in mine:
+        if w in others:
+            continue
+        # 'los angeles' (Lakers) sits inside 'los angeles clippers'
+        if " " in w and any(re.search(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", o)
+                            for o in other_names):
+            continue
+        out.add(w)
+    return out
+
+
+def _segments(text: str):
+    """(start, segment) for each '/'- or line-separated piece of the message."""
+    pos = 0
+    for part in re.split(r"(/|\n)", text):
+        if part not in ("/", "\n"):
+            yield pos, part
+        pos += len(part)
+
+
+def _names_team(segment: str, words: set) -> bool:
+    """3-letter codes count only in capitals ('WAS', 'PER'): as lower-case words
+    ('was', 'per', 'new') they are ordinary English. Longer words any case."""
+    low = segment.lower()
+    for w in words:
+        if len(w) <= 3:
+            if re.search(rf"(?<![A-Za-z0-9]){re.escape(w.upper())}(?![A-Za-z0-9])", segment):
+                return True
+        elif re.search(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", low):
+            return True
+    return False
+
+
+def _to_manual(tip, reason: str) -> None:
+    tip.alert_reason = f"{tip.alert_reason}; {reason}" if tip.alert_only and tip.alert_reason else reason
+    tip.alert_only = True
+    log.warning(f"Team-leg text check -> MANUAL: {reason}")
+
+
+def _fill_team_from_selection(leg) -> None:
+    sel = (leg.selection or "").strip()
+    if not leg.team_full and sel and sel.lower() not in (
+            "over", "under", "o", "u", "ml", "moneyline", "draw", "tie", "home", "away", "yes", "no"):
+        leg.team_full = sel                    # raw_legs carry no team field
+
+
+def _check_handicap_leg(tip, leg, text: str, sport: str, aliases: dict) -> None:
+    sel = (leg.selection or "").strip()
+    _fill_team_from_selection(leg)
+    if not aliases:
+        return                                 # no team table for this sport
+    try:
+        line = float(leg.line)
+    except (TypeError, ValueError):
+        return
+    if line == 0:
+        return
+    canon = _canonical_team(leg.team_full or sel, aliases)
+    words = _distinct_words(canon, aliases) if canon else set()
+    if not words:
+        return                                 # cannot tell this team's words apart
+    mag = abs(line)
+    hits = []                                  # (printed line, segment) for THIS team
+    for _start, seg in _segments(text):
+        if not _names_team(seg, words):
+            continue
+        for m in _SIGNED_NUM.finditer(seg):
+            if abs(float(m.group(2)) - mag) < 1e-9:
+                hits.append((mag if m.group(1) == "+" else -mag, seg))
+    if not hits:
+        return                                 # not printed signed next to this team
+    printed = {h[0] for h in hits}
+    if len(printed) > 1:
+        _to_manual(tip, f"handicap {sel} {line:+g}: the message gives this team both "
+                        f"+{mag:g} and -{mag:g}, place manually")
+        return
+    want_line = printed.pop()
+    if want_line != line:
+        if tip.is_sgm and line > 0 and want_line < 0:
+            log.warning(f"Handicap sign corrected from the message: {sel} {line:+g} -> "
+                        f"{want_line:+g} ({sport}, SGM leg; the parser dropped the minus)")
+            leg.line = want_line
+        else:
+            _to_manual(tip, f"handicap {sel}: parsed {line:+g} but the message says "
+                            f"{want_line:+g}, place manually")
+            return
+    mkt = (leg.market or "").lower()
+    if any(_OTHER_PERIOD_RE.search(h[1]) for h in hits):
+        _to_manual(tip, f"handicap {sel} {leg.line:+g} is a quarter/2nd-half line, place manually")
+        return
+    periods = {"first_half_line" if _HALF_RE.search(h[1]) else "line" for h in hits}
+    if len(periods) > 1:
+        _to_manual(tip, f"handicap {sel} {leg.line:+g}: the message has this team at "
+                        f"{mag:g} for both the 1st half and the game, place manually")
+        return
+    want_mkt = periods.pop()
+    if mkt != want_mkt:
+        _to_manual(tip, f"handicap {sel} {leg.line:+g}: the message says "
+                        f"{'1st half' if want_mkt != 'line' else 'full game'}, the parse said {mkt}")
+
+
+def _total_game_from_text(leg, text: str, aliases: dict, sport: str = "nba") -> str:
+    """'A/B' when exactly one 'A/B over|under N' in the text has this leg's side and
+    number, A and B are two different known teams, and ESPN has them playing EACH
+    OTHER (resolve_nba_event would otherwise bind team A's game, whoever it plays);
+    else ''."""
+    side = (leg.selection or "").strip().lower()[:1]
+    try:
+        line = float(leg.line)
+    except (TypeError, ValueError):
+        return ""
+    found = set()
+    for m in _TOTAL_PAIR_RE.finditer(text):
+        if m.group(3).lower()[:1] != side or abs(float(m.group(4)) - line) > 1e-9:
+            continue
+        a_raw = re.sub(r"^u\s+", "", m.group(1).strip(), flags=re.I).strip()   # "1U Knicks" -> "Knicks"
+        a = _canonical_team(a_raw.split()[-1] if a_raw else "", aliases) or _canonical_team(a_raw, aliases)
+        b_raw = m.group(2).strip()
+        b = _canonical_team(b_raw, aliases) or _canonical_team(b_raw.split()[0] if b_raw else "", aliases)
+        if a and b and a != b:
+            found.add((a, b))
+    if len(found) != 1:
+        return ""
+    a, b = next(iter(found))
+    try:
+        from nba_resolver import expected_starts
+        if not expected_starts(f"{a} v {b}", sport):
+            log.info(f"Total: '{a}/{b}' are not playing each other in the window -> manual")
+            return ""
+    except Exception as e:
+        log.warning(f"Total: game check failed for '{a}/{b}': {e}")
+        return ""
+    return f"{a}/{b}"
+
+
+def _check_team_legs_against_text(tips: list, text: str) -> list:
+    """Handicap sign/period/team and bare-total game, checked against the message
+    text (v6.58). Narrow by design: see the block comment above. No text (image
+    path), or nothing attributable to the team, leaves a leg exactly as parsed."""
+    if not text:
+        return tips
+    text = text.split("CURRENT MESSAGE:", 1)[-1]   # Shook: older posts are context only
+    for tip in tips:
+        try:
+            sport = (getattr(tip, "sport", "") or "").lower()
+            aliases = _league_aliases(sport)
+            for leg in tip.legs:
+                if (leg.market or "").lower() == "h2h":
+                    _fill_team_from_selection(leg)
+                if (leg.market or "").lower() in _TEAM_LINE_MARKETS:
+                    _check_handicap_leg(tip, leg, text, sport, aliases)
+                    if tip.alert_only:
+                        break
+            if sport in ("nba", "nbl") and not tip.alert_only:
+                teams = [l.team_full for l in tip.legs
+                         if (l.market or "").lower() in _TEAM_LINE_MARKETS + ("h2h",) and l.team_full]
+                for leg in tip.legs:
+                    if (leg.market or "").lower() not in ("total", "total_points") or leg.team_full:
+                        continue
+                    if teams:
+                        leg.team_full = teams[0]
+                        continue
+                    pair = _total_game_from_text(leg, text, aliases, sport)
+                    if pair:
+                        leg.team_full = pair
+                        log.info(f"Total: game taken from the message: '{pair}'")
+        except Exception as e:
+            log.warning(f"Team-leg text check skipped for a tip: {e}")
+    return tips
+
+
 def _merge_slash_line_into_sgm(tips: list, text: str) -> list:
     """Deterministic "/" = SGM (Wilson 2026-05-31).
 
@@ -1128,6 +1375,21 @@ NEW_STATS_IMG = (
     "anytime TDs: market_type='other' with a `description`. '2+ TDs' is touchdowns over 1.5. "
     "A quarterback's 'over 0.5 TDs' / '1+ TD' with no other word is passing_touchdowns. "
 )
+# v6.59 (Wilson 2026-10-10: "pls hook up most rushing/most receiving markets" --
+# 4th&EV's 2026-10-08 'Tyler Goodson MOST RUSHING YARDS $34' had parsed as
+# market_type="other" and went manual, once even with the player missing). Shared by
+# the NFL image, 4th&EV text and A1 prompts, same pattern as NEW_STATS_IMG.
+MOST_STAT_PROMPT = (
+    "MOST RUSHING/RECEIVING/PASSING YARDS ('MOST RUSHING YARDS', 'most receiving yards', "
+    "'top rusher', 'leading rusher', 'leading receiver'): this is a single named player to "
+    "have the MOST of that stat in the game (a proposition, not an over/under line) -- "
+    'market_type="most_stat", `player`=the player\'s full name exactly as printed (NEVER '
+    "null for this market_type -- if no player is named, this is not a most_stat bet, use "
+    'market_type="other" instead), `stat`=one of rushing_yards, receiving_yards, '
+    "passing_yards (map 'most rushing'/'top rusher'/'leading rusher' -> rushing_yards, "
+    "'most receiving'/'leading receiver' -> receiving_yards, 'most passing' -> "
+    "passing_yards), `side`=null, `line`=null. "
+)
 TEAM_MARKETS_PROMPT = (
     "TEAM TOTAL, a single team's OWN full-game points total ('49ers Team Total Over "
     "24.5', 'Jets team total under 20.5', 'Lions over 27.5 team points'): "
@@ -1148,8 +1410,8 @@ IMAGE_PROMPT_NFL = (
     '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
     '"side": "over"|"under"|null, "line": number|null, "odds": number|null, '
     '"bookie": str|null, "units": number|null, '
-    '"market_type": "player_prop"|"h2h"|"spread"|"total"|"team_total"|"margin"|"other", '
-    '"description": str|null} ]}. '
+    '"market_type": "player_prop"|"most_stat"|"h2h"|"spread"|"total"|"team_total"|"margin"|'
+    '"other", "description": str|null} ]}. '
     "4th AND +EV BRANDED CARD FORMAT: this tipster posts a black-and-gold "
     "graphic card headed '4TH AND +EV BETTING PICKS' with EXPLICIT labelled "
     "fields: a 'BET:' line naming the player and the exact market (e.g. 'BET: "
@@ -1207,7 +1469,7 @@ IMAGE_PROMPT_NFL = (
     "elsewhere on the image/card if it is not printed directly on this line. "
     "A SEPARATE, DIFFERENT bet is a single TEAM's own point total -- NOT "
     "market_type=\"total\" (that is only the whole-game combined total). "
-    + TEAM_MARKETS_PROMPT +
+    + MOST_STAT_PROMPT + TEAM_MARKETS_PROMPT +
     "MONEYLINE / head-to-head (a SINGLE team to win outright, e.g. 'Chiefs ML', "
     "'Chiefs to win'): market_type=\"h2h\", `team`=the ONE team backed, "
     "`odds`=the price, `units`=the stake if shown, player/stat/line/side null. "
@@ -1464,7 +1726,7 @@ TEXT_PROMPT_A1_NFL = (
     '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
     '"side": "over"|"under"|null, "line": number|null, "units": number|null, '
     '"fd_odds": number|null, '
-    '"market_type": "player_prop"|"h2h"|"other", "description": str|null} ]}. '
+    '"market_type": "player_prop"|"most_stat"|"h2h"|"other", "description": str|null} ]}. '
     "CRITICAL: A1 posts a short ANNOUNCEMENT message before every real play, in the "
     "shape '<N>u play coming, <TEAM> vs <TEAM>' or '<N>u NFL play coming, <TEAM> vs "
     "<TEAM>' (e.g. '0.65u play coming, IND vs BAL', '0.75u NFL play coming, MIA vs "
@@ -1492,6 +1754,7 @@ TEXT_PROMPT_A1_NFL = (
     "'Dolphins.' line) -- else null; the caller resolves the team from the roster, "
     "do NOT guess a team from the announcement message's 'TEAM vs TEAM' (that was a "
     "separate, earlier message about a different game slate context). "
+    + MOST_STAT_PROMPT +
     "PRICES: A1 lists several US bookies' American odds in parentheses after the "
     "play, e.g. '(-114 FD)', '(-118 FD/-120 365/-125 Fliff)', '(-127 NVG/-130 HR, "
     "FD/-131 Kalshi)', '(-122 DK, FD/-125 TS)'. IGNORE every book except FD -- "
@@ -1654,8 +1917,8 @@ TEXT_PROMPT_FOURTHANDEV_NFL = (
     '{"tips": [ {"player": str|null, "team": str|null, "stat": str|null, '
     '"side": "over"|"under"|null, "line": number|null, "odds": number|null, '
     '"bookie": str|null, "units": number|null, '
-    '"market_type": "player_prop"|"h2h"|"spread"|"total"|"team_total"|"margin"|"other", '
-    '"description": str|null} ]}. '
+    '"market_type": "player_prop"|"most_stat"|"h2h"|"spread"|"total"|"team_total"|"margin"|'
+    '"other", "description": str|null} ]}. '
     "REAL FORMAT: each bet is numbered/labelled -- 'BET;', 'BET 1:', 'Bet 1:', or a "
     "bare '1:' all mark the START of a new leg. A message headed 'Part 1'/'Part 2' "
     "is a CONTINUATION of the SAME slate (the numbering carries on, e.g. Part 1 "
@@ -1698,7 +1961,7 @@ TEXT_PROMPT_FOURTHANDEV_NFL = (
     "is not about that team, it is the combined score) -- infer it from the "
     "'Team:' field if present, or from another leg in the same slate/message "
     "naming the game, if it is not stated directly on this line. "
-    + TEAM_MARKETS_PROMPT +
+    + MOST_STAT_PROMPT + TEAM_MARKETS_PROMPT +
     "A TEAM-level yardage/stat total (e.g. 'team rushing yards', 'team total "
     "yards') fits no market_type above: market_type=\"other\" with a plain-English "
     "`description`, all other fields null. Do not force these into spread/total. "
@@ -2223,6 +2486,7 @@ def parse_with_groq(
         # Deterministic "/" = SGM: a single "/"-line that Groq wrongly split
         # into separate tips is merged back into one SGM ticket.
         tips = _merge_slash_line_into_sgm(tips, text)
+        tips = _check_team_legs_against_text(tips, text)   # v6.58
 
         log.info(f"Groq parsed {len(tips)} tip(s) in {elapsed:.2f}s")
         return tips, elapsed
