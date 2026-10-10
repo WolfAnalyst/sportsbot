@@ -8678,6 +8678,7 @@ def _place_etr_nba_fanout(tip: ParsedTip) -> list[BetResult]:
         if str(s.get("session_id", "")) in _ids
         and (s.get("bookie", "") or "").lower() == "sportsbet"
     ]
+    sessions = session_priority.drop_fillup_when_others(sessions, "nba")   # v6.61
     if not sessions:
         log.warning("ETR fan-out: no active sportsbet sessions from ETR_NBA_SESSION_IDS — manual")
         notifier.notify_bet_failed(BetResult(
@@ -18785,6 +18786,7 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
             continue
         sessions.append(sess)
 
+    sessions = session_priority.drop_fillup_when_others(sessions, sport)   # v6.61
     if not sessions:
         log.warning(f"[{channel_name}] {_S} fan-out: no active {priced_bookie or '?'} session "
                     f"in {_S}_SESSION_PRIORITY for {bet_label} -> manual")

@@ -559,6 +559,28 @@ def is_placeable_session(session_id: str) -> bool:
     return str(session_id).strip() in ids
 
 
+def sports_fillup_ids() -> set:
+    """v6.61: SPORTS_FILLUP_SESSIONS (Wilson SB 53522)."""
+    return {s.strip() for s in os.getenv("SPORTS_FILLUP_SESSIONS", "53522").split(",") if s.strip()}
+
+
+def drop_fillup_when_others(sessions: list, sport: str) -> list:
+    """v6.61 (Wilson 2026-10-10): for SPORTS, a fill-up account is used only when no
+    other account is available: "total wager / active accounts (5) because exclude all
+    old accounts" and "wilson can be used but only as a fill up". So the fill-up
+    sessions are dropped whenever at least one other session is present, and the split
+    is over the others. Racing is never touched. Order is kept."""
+    if (sport or "").lower() == "racing":
+        return sessions
+    fill = sports_fillup_ids()
+    others = [s for s in sessions if str(s.get("session_id", "")) not in fill]
+    if others and len(others) != len(sessions):
+        log.info(f"fill-up rule ({sport}): {len(sessions) - len(others)} fill-up session(s) "
+                 f"held back, {len(others)} account(s) used")
+        return others
+    return sessions
+
+
 def filter_and_order_sessions(
     sessions: list[dict], sport: str, is_sgm: bool = False,
 ) -> list[dict]:
@@ -577,7 +599,8 @@ def filter_and_order_sessions(
         return sessions
 
     by_id = {str(s.get("session_id", "")): s for s in sessions}
-    ordered = [by_id[pid] for pid in priority if pid in by_id]
+    ordered = drop_fillup_when_others(
+        [by_id[pid] for pid in priority if pid in by_id], sport)
 
     listed = set(priority)
     dropped = [
