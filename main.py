@@ -17950,6 +17950,37 @@ def _nfl_fix_player_name(player: str, markets: dict, event: str):
         return None
 
 
+_NFL_KNOWN_TEAMS = frozenset(NFL_TEAM_ALIASES.values())
+
+
+def _nfl_text_names_a_team(text: str) -> bool:
+    """True when any word of the tipped team text is a known NFL alias, mascot or city word."""
+    import nba_resolver as _nr
+    for w in " ".join((text or "").lower().replace(".", "").split()).split():
+        if w in _nr.NFL_TEAM_ALIASES or w in _nr._NFL_MASCOTS or w in _nr._NFL_CITY_WORDS:
+            return True
+    return False
+
+
+def _nfl_prop_team(team, player) -> str:
+    """The team a player prop resolves its game by. v6.64 (4th&EV 2026-10-11 'Brayshul
+    Tuten ... Team - Jaxonville Jags' went manual 'no event found'): a tipped team that is
+    not a known NFL team carries nothing to contradict, so the player's roster team is used.
+    A recognised tipped team is kept as before."""
+    tipped = (team or "").strip()
+    if tipped and canonical_nfl_team(tipped) in _NFL_KNOWN_TEAMS:
+        return tipped
+    if tipped and _nfl_text_names_a_team(tipped):
+        # 'Jacksonville', 'Chicago Jaguars': it names a team, just not one we can pin;
+        # never swap it for the roster team (a traded player), keep the old behaviour.
+        return tipped
+    roster_team = get_player_team(player, "nfl") if player else ""
+    if tipped and roster_team:
+        log.info(f"NFL auto-place: tipped team {tipped!r} is not a known NFL team, "
+                 f"using {player!r}'s roster team {roster_team!r}")
+    return roster_team or tipped
+
+
 def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
                          tipster_line, priority_sessions: list, tipster: str = "",
                          tipster_odds=None, exact_line_only: bool = False):
@@ -18033,9 +18064,7 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
                     )
                     return None
 
-        resolve_team = (team or "").strip()
-        if not resolve_team and player:
-            resolve_team = get_player_team(player, "nfl")
+        resolve_team = _nfl_prop_team(team, player)
         if not resolve_team:
             log.info(f"NFL auto-place: no team resolved for {player!r} -> manual")
             return None
@@ -18382,9 +18411,7 @@ def _resolve_nfl_most_market(player: str, team: str, stat: str, priority_session
                 )
                 return None
 
-        resolve_team = (team or "").strip()
-        if not resolve_team:
-            resolve_team = get_player_team(player, "nfl")
+        resolve_team = _nfl_prop_team(team, player)
         if not resolve_team:
             log.info(f"NFL auto-place: no team resolved for {player!r} -> manual")
             return None

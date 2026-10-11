@@ -143,6 +143,7 @@ def _build_nfl_team_aliases() -> dict:
         "pats": "New England Patriots", "skins": "Washington Commanders",
         "bucs": "Tampa Bay Buccaneers", "cards": "Arizona Cardinals",
         "hawks": "Seattle Seahawks", "big blue": "New York Giants",
+        "jags": "Jacksonville Jaguars",
     })
     return aliases
 
@@ -150,6 +151,8 @@ def _build_nfl_team_aliases() -> dict:
 NFL_TEAM_ALIASES = _build_nfl_team_aliases()
 _NFL_FULL_NAMES = {v.lower(): v for v in NFL_TEAM_ALIASES.values()}
 _NFL_MASCOTS = {full.rsplit(" ", 1)[-1].lower(): full for full in NFL_TEAM_ALIASES.values()}
+# v6.64 (4th&EV 2026-10-11 'Team - Jaxonville Jags' went manual): a nickname as the last word.
+_NFL_MASCOTS["jags"] = "Jacksonville Jaguars"
 _NFL_CITY_WORDS: dict = {}
 for _full in set(NFL_TEAM_ALIASES.values()):
     for _w in _full.lower().split()[:-1]:
