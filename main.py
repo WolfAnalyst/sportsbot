@@ -18820,7 +18820,9 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
             continue
         sessions.append(sess)
 
+    _before_fillup = list(sessions)
     sessions = session_priority.drop_fillup_when_others(sessions, sport)   # v6.61
+    _held_fillups = [x for x in _before_fillup if x not in sessions]       # v6.65
     if not sessions:
         log.warning(f"[{channel_name}] {_S} fan-out: no active {priced_bookie or '?'} session "
                     f"in {_S}_SESSION_PRIORITY for {bet_label} -> manual")
@@ -18983,6 +18985,12 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
                 f, tip, _s, _sh, channel_name, raw_message, bet_label, _S, _t0))
 
     try:
+        results.extend(_nfl_fanout_spill(tip, jobs, results, intended_stake, presolved,
+                                         _held_fillups, channel_name, _S, sport, cap_market))
+    except Exception as e:
+        log.error(f"[{channel_name}] {_S} fan-out: spill of the unfilled remainder crashed "
+                  f"({e}); the remainder goes to manual")
+    try:
         _nfl_fanout_rollup(tip, jobs, results, intended_stake, channel_name,
                            raw_message, bet_label, _time_mod.time() - _t_start,
                            sport=sport)
@@ -19059,6 +19067,87 @@ def _fanout_late_result(fut, tip, sess: dict, share: float, channel_name: str,
             header=f"{S}: ${share:.2f} did not place on {_acct}, place by hand")
     except Exception as e:
         log.error(f"[{channel_name}] {S} late-result handling failed for {bk}:{sid}: {e}")
+
+
+def _nfl_fanout_spill(tip, jobs, results, intended_stake, presolved, held_fillups,
+                      channel_name, _S, sport, cap_market) -> list:
+    """v6.65 (Wilson 2026-10-12: "when tarken is accepted for less ... the remaining doesnt get
+    spilled onto another sportsbet"; 4th&EV Justice Hill placed $776.40 of $800, Tarken capped
+    at $136.40, $23.60 to manual). The NFL/NBL fan-out's unfilled remainder is offered, one
+    account at a time, to the accounts that placed their FULL share (an even slice of what is
+    left each), then to the held-back fill-up account (Wilson SB, v6.61). Each account is tried
+    once, never above its sessions.yaml cap headroom (resolve_max_stake), with no blind ladder
+    (the Sportsbet max-stake rebet in _execute_bet is the only step down). A capped, failed or
+    maybe-placed account is never a target, and maybe-placed stake counts as committed, so
+    the unit can never be exceeded; a maybe-placed spill stops the spill."""
+    share_by_sid = {str(sx.get("session_id", "")): ladder[0] for (sx, ladder) in jobs}
+    sess_by_sid = {str(sx.get("session_id", "")): sx for (sx, _l) in jobs}
+    odds = presolved.get("target_odds") or 0
+
+    def _committed(rs):
+        return round(sum((r.stake or 0) for r in rs if r.success) + sum(
+            (r.stake or getattr(r, "_requested_stake", None)
+             or share_by_sid.get(str(r.session_id), 0.0) or 0.0)
+            for r in rs if not r.success and _is_ambiguous_result(r)), 2)
+
+    def _headroom(sid, placed_already, want):
+        try:
+            capped, _why = session_priority.resolve_max_stake(
+                sid, sport, cap_market, odds, round(placed_already + want, 2))
+        except Exception as e:
+            log.error(f"[{channel_name}] {_S} spill: resolve_max_stake crashed for {sid} ({e})")
+            return 0.0
+        return round(max(0.0, min(want, capped - placed_already)), 2)
+
+    out: list = []
+    unfilled = round(max(0.0, intended_stake - _committed(results)), 2)
+    if unfilled <= AFL_FANOUT_MIN_STAKE:
+        return out
+    targets = []
+    for r in results:
+        sid = str(r.session_id)
+        if (r.success and sid in sess_by_sid and sid not in [t[0] for t in targets]
+                and (r.stake or 0) >= share_by_sid.get(sid, 0.0) - 0.01
+                and not _session_stalled(sid)):
+            targets.append((sid, sess_by_sid[sid], float(r.stake or 0)))
+    targets += [(str(fs.get("session_id", "")), fs, 0.0) for fs in held_fillups]
+    n_full = len(targets) - len(held_fillups)
+    log.info(f"[{channel_name}] {_S} fan-out: ${unfilled:.2f} unfilled -> spilling over "
+             f"{n_full} full-share account(s), then {len(held_fillups)} fill-up account(s)")
+    for k, (sid, sess, placed_already) in enumerate(targets):
+        if unfilled <= AFL_FANOUT_MIN_STAKE:
+            break
+        if _session_stalled(sid):
+            continue
+        left_full = max(0, n_full - k)
+        slice_ = round(unfilled / left_full, 2) if left_full else unfilled
+        amt = _headroom(sid, placed_already, slice_)
+        if amt < AFL_FANOUT_MIN_STAKE:
+            continue
+        log.info(f"[{channel_name}] {_S} spill: {sess.get('bookie')}:{sid} +${amt:.2f}")
+        try:
+            r = _fanout_place_account(tip, sess, [amt], presolved)
+        except Exception as e:
+            # review: keep the spills that already fired and count this one as maybe placed
+            log.error(f"[{channel_name}] {_S} spill: placement on {sid} raised: {e}")
+            r = BetResult(success=False, tip=tip, session_id=sid,
+                          bookie=sess.get("bookie", "unknown"), stake=amt,
+                          error=f"{_S} spill placement exception: {e}", timestamp=datetime.now())
+            r.is_ambiguous = True
+            try:
+                r._requested_stake = amt
+            except Exception:
+                pass
+        out.append(r)
+        if not r.success and _is_ambiguous_result(r):
+            log.warning(f"[{channel_name}] {_S} spill: {sid} maybe placed, stopping the spill")
+            break
+        unfilled = round(max(0.0, intended_stake - _committed(results + out)), 2)
+    if out:
+        log.info(f"[{channel_name}] {_S} spill: placed "
+                 f"${sum((r.stake or 0) for r in out if r.success):.2f} more, "
+                 f"${unfilled:.2f} still unfilled")
+    return out
 
 
 def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake: float,
