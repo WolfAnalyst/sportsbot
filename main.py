@@ -20627,9 +20627,19 @@ def _nbl_units_message(text) -> "list | None":
     """The numbers of a PURE units message ("1.5 and 0.5", "2.5, 0.5, 0.5", "2.5 units",
     "2.5u"), else None. Anything with other words in it is not one."""
     t = (text or "").strip()
+    # v6.68 (Bettors Edge 2026-10-11 image 138, caption "2.5 x 2" for two $2.50 cards, went
+    # manual as a non-units caption): "<units> x <count>" is that many bets at those units.
+    m = _NBL_UNITS_TIMES_RE.match(t)
+    if m:
+        n, u = int(m.group(2)), float(m.group(1))
+        return [u] * n if (n >= 1 and u > 0) else None
     if not t or not _NBL_UNITS_MSG_RE.match(t):
         return None
     return [float(x) for x in re.findall(_NBL_UNITS_NUM, t)]
+
+
+_NBL_UNITS_TIMES_RE = re.compile(
+    r"^\s*(\d+(?:\.\d+)?)\s*(?:u|units?)?\s*[x×*]\s*(\d+)\s*$", re.IGNORECASE)
 
 
 def _nbl_slip_stake(v) -> "float | None":
