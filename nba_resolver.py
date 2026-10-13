@@ -470,6 +470,47 @@ def expected_starts(event: str, sport: str = "nba") -> Optional[list]:
     return starts if answered else None
 
 
+def resolve_nba_game(team: str, opp: str, start_utc, window_minutes: float = 180.0) -> Optional[dict]:
+    """The ONE NBA game that is `team` v `opp` (ESPN spellings, e.g. "LA Clippers") starting
+    within `window_minutes` of `start_utc` (an aware datetime), or None.
+
+    The NBA model's contract carries the exact tip-off (`start`) and both clubs, so the
+    fixture can be PINNED instead of guessed: resolve_nba_event picks the first of
+    yesterday/today/tomorrow that has the team, which is wrong on a back-to-back, and never
+    looks at the opponent. Here both clubs must be in the game, the game must be on the
+    schedule within the window, and exactly one game may qualify. Blank `opp` falls back to
+    "team plays in exactly one game in the window".
+
+    Returns {"home", "away", "start", "event": "Home v Away"} (the same event-string shape
+    resolve_nba_event returns), or None for no game, an ambiguous match or a failed schedule
+    fetch: the caller refuses, it never guesses."""
+    if start_utc is None or not team:
+        return None
+    base = start_utc.astimezone(timezone.utc)
+    want = {team.strip().lower()} | ({opp.strip().lower()} if opp else set())
+    matches = []
+    for delta in (-1, 0, 1):
+        day = (base + timedelta(days=delta)).strftime("%Y-%m-%d")
+        for g in _fetch_schedule("nba", day):
+            if want - {g["home"].lower(), g["away"].lower()}:
+                continue
+            ks = _parse_kickoff(g.get("start"))
+            if ks is None:
+                continue
+            if abs((ks - base).total_seconds()) > window_minutes * 60.0:
+                continue
+            entry = {"home": g["home"], "away": g["away"], "start": g.get("start", ""),
+                     "event": f"{g['home']} v {g['away']}"}
+            if entry["event"] not in {m["event"] for m in matches}:
+                matches.append(entry)
+    if len(matches) != 1:
+        log.warning(f"NBA game for {team} v {opp or '?'} at {base.isoformat()}: "
+                    f"{len(matches)} match(es) in the schedule, need exactly 1")
+        return None
+    log.info(f"Resolved NBA game {team} v {opp or '?'} @ {base.isoformat()} -> {matches[0]['event']}")
+    return matches[0]
+
+
 def resolve_mlb_event(team: str = "") -> Optional[str]:
     """Resolve an MLB team name to a 'Home v Away' event string via ESPN's MLB
     scoreboard (baseball/mlb). TEAM-based only for now — there's no MLB roster

@@ -133,11 +133,27 @@ try:
     from parsers import disposals_model as disposals_model_parser
 except ImportError:
     disposals_model_parser = None
+try:
+    # nba-v3: the NBA props model machine feed (contract v3). Same absence tolerance as the
+    # DisposalsModel import above. The feed is OFF unless config.NBA_MODEL_ENABLED.
+    from parsers import nba_model as nba_model_parser
+except Exception as _e:   # v6.69 review: not only ImportError, the bot must boot regardless
+    logging.getLogger("tipbot").warning(f"nba-v3: parsers.nba_model not loaded ({_e!r})")
+    nba_model_parser = None
+try:
+    # nba-v3: the NBA money-safety core. Guarded like the parsers above so a fork that was
+    # synced without it still boots; every use is behind `tip.tipster == NBA_MODEL_TIPSTER`
+    # or the NBA channel flags, neither of which exists on such a fork.
+    import nba_model_core as nba_core
+except Exception as _e:   # v6.69 review: ZoneInfoNotFoundError (a KeyError) at import without tzdata
+    logging.getLogger("tipbot").warning(f"nba-v3: nba_model_core not loaded ({_e!r})")
+    nba_core = None
 from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
 from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
 from nba_resolver import resolve_nba_event, resolve_mlb_event, resolve_nfl_event, NFL_TEAM_ALIASES, canonical_nfl_team
 from nba_resolver import resolve_nbl_event, canonical_nbl_team, nbl_only_game_today
+from nba_resolver import resolve_nba_game
 from roster import resolve_player_name, get_player_team, afl_surname_candidates, afl_fuzzy_surname_candidates
 from roster import is_nfl_name_collision
 from roster import exact_match_player
@@ -272,6 +288,26 @@ async def _run_in_placement_executor(fn, *args):
     """Await a synchronous placement fn on the dedicated placement pool so it does
     NOT block the event loop. Mirrors the racing/Leroy run_in_executor offload."""
     return await asyncio.get_running_loop().run_in_executor(_PLACEMENT_EXECUTOR, fn, *args)
+
+
+# The NBA ledger commit (the one that follows placed money) has its OWN single worker, so it can
+# never queue behind, or be starved by, eight hung placements on the shared pool, and commits
+# serialise.
+_LEDGER_EXECUTOR = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="nbaledger")
+
+
+async def _run_in_ledger_executor(fn, *args):
+    """Run a blocking ledger call on the single ledger worker, off the event loop. If THIS task
+    is cancelled while it waits, the call is NOT abandoned or repeated (that would double-book
+    the money): the result is waited for (bounded by the call's own lock budget) and returned, so
+    the caller can still write its record."""
+    cf = _LEDGER_EXECUTOR.submit(fn, *args)
+    try:
+        # shield: cancelling THIS task must not cancel the queued ledger future, or a commit
+        # still waiting behind another one on the worker would silently never run.
+        return await asyncio.shield(asyncio.wrap_future(cf))
+    except BaseException:
+        return cf.result()
 
 
 def _log_jsonl(path: Path, entry: dict):
@@ -479,6 +515,10 @@ TIPSTERS_FORCE_BOOKIE["dello_afl"] = "sportsbet"
 # SB session must route to manual rather than shop elsewhere.
 DISPOSALS_MODEL_TIPSTER = "disposals_model"
 TIPSTERS_FORCE_BOOKIE[DISPOSALS_MODEL_TIPSTER] = "sportsbet"
+# NBA props model (nba-v3): Sportsbet-only for the same reason. The measured edge is on
+# SPORTSBET's posted lines and price (PIPELINE-DESIGN 3.3 prices every signal off Sportsbet).
+NBA_MODEL_TIPSTER = "nba_model"      # == nba_model_core.TIPSTER (a test pins it)
+TIPSTERS_FORCE_BOOKIE[NBA_MODEL_TIPSTER] = "sportsbet"
 
 # ── Max-odds CEILING (wrong-selection sanity guard) ────────────────
 # Applies to ALL sports tipsters via the global MAX_ODDS_MULT (default 1.25×).
@@ -1255,6 +1295,73 @@ def _price_check_afl_verified(*, session_id, sport, event, bookie, markets_filte
         f"AFL event verify: NO name form resolved {event!r} to its real fixture "
         f"(tried {cands}). Refusing to price a different competition — routing to manual.")
     return None, None
+
+
+# Only these failure texts mean "HyperBot found no such event under THIS name" (so the next name
+# form is worth asking). Anything else (a timeout, a transport error, a poll ceiling) means the
+# session is unhealthy: retrying other names would only stack more hung calls.
+_NBA_EVENT_NOT_FOUND = ("could not find event", "event not found", "no event found",
+                        "no matching event", "not found. available")
+
+
+def _nba_event_not_found(pc) -> bool:
+    err = str((pc or {}).get("error") or "").lower() if isinstance(pc, dict) else ""
+    return any(p in err for p in _NBA_EVENT_NOT_FOUND)
+
+
+def _price_check_nba_verified(*, session_id, sport, event, pinned_epoch, markets_filter=None):
+    """price_check_sports for the NBA model, PROVING the response is the pinned night's game.
+
+    HyperBot matches the event by TEAM NAMES only, so the same string can return another
+    night's game (measured 2026-10: a preseason game's name returned the regular-season game
+    of 2026-10-21). Tries `nba_core.event_name_candidates` in order; the first response that
+    succeeds AND whose `start_time_iso` is within tolerance of the pinned tip-off wins.
+
+      * A response with NO usable start time cannot be verified, and the first such response is
+        used (the caller logs it loudly), UNLESS an earlier name form has already shown a wrong
+        night: then the board is known to be ambiguous and every later candidate must PROVE its
+        night, so a missing start means manual.
+      * Retries continue only after a proven wrong night or an explicit could-not-find-event
+        response. A timeout, a transport error or any other failure STOPS the search (a hung
+        session would otherwise cost one poll ceiling per name form).
+
+    Returns (response, event_string_used, why): on failure the event is None and `why` says
+    what was wrong, so the caller routes to manual."""
+    first_ok, why, wrong_night = None, "", False
+    for cand in nba_core.event_name_candidates(event):
+        try:
+            pc = hb.price_check_sports(session_id=session_id, sport=sport, event=cand,
+                                       markets_filter=markets_filter)
+        except Exception as e:
+            log.warning(f"[nba_model] price check failed for {cand!r}: {e}: not trying "
+                        f"other name forms")
+            return first_ok, None, why or f"price check failed: {e}"
+        if not isinstance(pc, dict) or not pc.get("success"):
+            if _nba_event_not_found(pc):
+                continue
+            log.warning(f"[nba_model] price check for {cand!r} failed "
+                        f"({(pc or {}).get('error') if isinstance(pc, dict) else pc!r}): not "
+                        f"trying other name forms")
+            return first_ok, None, why or "price check failed"
+        if first_ok is None:
+            first_ok = pc
+        bad = nba_core.fixture_start_refusal(pc.get("start_time_iso"), pinned_epoch)
+        if bad:
+            wrong_night = True
+            why = bad
+            log.warning(f"[nba_model] event verify: {cand!r}: {bad}: trying the next name form")
+            continue
+        if wrong_night and pinned_epoch is not None and not nba_core.fixture_start_checkable(
+                pc.get("start_time_iso")):
+            why = ("an earlier name form matched a different night and this one carries no "
+                   "usable start_time_iso, so it cannot be verified")
+            log.warning(f"[nba_model] event verify: {cand!r}: {why}")
+            continue
+        if cand != event:
+            log.warning(f"[nba_model] {event!r} matched the WRONG night's game; {cand!r} "
+                        f"resolves to the pinned one: using it")
+        return pc, cand, ""
+    return first_ok, None, why or "no price-check response"
 
 
 def _bookie_event(event: str, bookie: str, sport: str) -> str:
@@ -4846,7 +4953,10 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
     # resolve_sec here. If the handler didn't stamp t0 (a direct place_tip call /
     # test), the notifier ignores the phase split — resolve_sec is then unused.
     _t_resolve = time.time()
-    event = resolve_event(tip)
+    # nba-v3: the NBA model's fixture is PINNED before the claim (team + opponent + exact
+    # tip-off, nba_resolver.resolve_nba_game) and carried on the tip. Every other tipster has
+    # no such attribute and resolves exactly as before.
+    event = getattr(tip, "_presolved_event", None) or resolve_event(tip)
     _tm = getattr(tip, "_timing", None)
     if not isinstance(_tm, dict):
         _tm = {}
@@ -4959,6 +5069,12 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
                 return _place_sgm_fanout(tip)
             return _place_sgm_v4(tip)
         return _place_sgm(tip)
+
+    # nba-v3 NBA props model: ONLY ever placed through the guarded fan-out below (exact
+    # line, price gates, even split, the rebounds ladder). Never reaches the generic singles
+    # path, which snaps the line and walks alt lines.
+    if tip.tipster == NBA_MODEL_TIPSTER:
+        return _place_nba_model_tip(tip)
 
     # v6.08 DisposalsModel: its exact-line, price-floor and even-split guards all live
     # inside _place_afl_fanout, so they are scoped to the PATH rather than to the
@@ -5440,7 +5556,7 @@ def _compute_alt_line_candidates(tip: ParsedTip) -> list[float]:
     # alt line is a helpful fill; here the line IS the trigger and this function
     # deliberately moves an under UP by 1.0, which is a materially different bet the
     # model never selected. Exact line or nothing.
-    if getattr(tip, "tipster", "") == DISPOSALS_MODEL_TIPSTER:
+    if getattr(tip, "tipster", "") in (DISPOSALS_MODEL_TIPSTER, NBA_MODEL_TIPSTER):
         return []
     leg = tip.legs[0]
     market = leg.market or ""
@@ -7856,16 +7972,20 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     raw_sessions = _v4_get_active_sessions_unfiltered(tip)
     if not raw_sessions:
         log.warning("AFL fan-out: no active sessions after sport filter")
-        notifier.notify_bet_failed(BetResult(
+        _not_placed_notifier(tip)(BetResult(
             success=False, tip=tip, error="No active HyperBot sessions",
             timestamp=datetime.now()))
         return [BetResult(success=False, tip=tip, error="No active sessions",
                           timestamp=datetime.now())]
 
-    configured_priority = session_priority.get_priority_for(sport, is_sgm=False)
+    # nba-v3: the NBA props model has its OWN optional account list (NBA_MODEL_SESSION_PRIORITY,
+    # falling back to the shared NBA_SESSION_PRIORITY); every other tipster is untouched.
+    _is_nba_model = tip.tipster == NBA_MODEL_TIPSTER
+    _prio_kw = {"nba_model": True} if _is_nba_model else {}
+    configured_priority = session_priority.get_priority_for(sport, is_sgm=False, **_prio_kw)
     if not configured_priority:
         log.info(f"AFL fan-out: no priority list for {sport} — routing to manual")
-        notifier.notify_bet_failed(BetResult(
+        _not_placed_notifier(tip)(BetResult(
             success=False, tip=tip,
             error=f"No auto-placement configured for {sport} singles (manual only)",
             timestamp=datetime.now()))
@@ -7874,13 +7994,13 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                           timestamp=datetime.now())]
 
     sessions = session_priority.filter_and_order_sessions(
-        raw_sessions, sport, is_sgm=False,
+        raw_sessions, sport, is_sgm=False, **_prio_kw,
     )
     if not sessions:
         log.warning(
             f"AFL fan-out: no priority sessions for {sport} — routing to manual"
         )
-        notifier.notify_bet_failed(BetResult(
+        _not_placed_notifier(tip)(BetResult(
             success=False, tip=tip,
             error=f"No priority sessions configured for {sport} singles",
             timestamp=datetime.now()))
@@ -7965,7 +8085,9 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # PARITY. Raise one account's cap for any unrelated reason and the split silently
     # re-skews toward it, with no error and no test failing. The contract requires an
     # equal 1:1 share, so take the even path deliberately rather than by coincidence.
-    _force_even_split = tip.tipster == DISPOSALS_MODEL_TIPSTER
+    # nba-v3: the NBA model is even-split for the same reason, and has no sessions.yaml
+    # capacity weights to weight by (its ladder is the single config ladder).
+    _force_even_split = tip.tipster in (DISPOSALS_MODEL_TIPSTER, NBA_MODEL_TIPSTER)
     fanout_targets, fanout_decay = (
         _afl_fanout_targets(sessions, sport, liability_market, intended_stake,
                             tip.tipster, tip.units)
@@ -8014,6 +8136,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         # line, which is a different bet. Caught in review; the docstring had
         # claimed this was already forced when it was not.
         _exact_only = (_no_tipster_odds or tip.tipster == DISPOSALS_MODEL_TIPSTER
+                       or tip.tipster == NBA_MODEL_TIPSTER
                        or bool(getattr(tip, '_saiyan_topup', False)))
         _resolved, _manual = _resolve_single_for_placement(
             tip, sess, apply_ceiling=True, apply_floor=False,
@@ -8066,6 +8189,30 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                 manual_by_bookie.setdefault(_bk, BetResult(
                     success=False, tip=tip, bookie=_bk,
                     error=f"disposals price gate: {_dm_reason}",
+                    timestamp=datetime.now(),
+                ))
+
+    # nba-v3 NBA model price gates: the same two floors as the DisposalsModel block above
+    # (absolute NBA_MODEL_MIN_ODDS, and no more than NBA_MODEL_WORSE_GATE below the posted
+    # price), applied to the LIVE Sportsbet price. Either -> the WHOLE tip routes to manual.
+    # A tip with NO live price on its exact line is also manual, never a blind placement.
+    if tip.tipster == NBA_MODEL_TIPSTER:
+        _nb_live = next((r.get("live_odds") for r in resolved_by_bookie.values()
+                         if r and r.get("live_odds")), None)
+        try:
+            _nb_live = float(_nb_live) if _nb_live is not None else None
+        except (TypeError, ValueError):
+            _nb_live = None
+        _nb_reason = nba_core.price_gate_refusal(
+            _nb_live, tip.suggested_odds,
+            any(r for r in resolved_by_bookie.values() if r))
+        if _nb_reason:
+            log.info(f"[nba_model] price gate -> WHOLE TIP MANUAL: {_nb_reason}")
+            for _bk in list(resolved_by_bookie):
+                resolved_by_bookie[_bk] = None
+                manual_by_bookie.setdefault(_bk, BetResult(
+                    success=False, tip=tip, bookie=_bk,
+                    error=f"nba price gate: {_nb_reason}",
                     timestamp=datetime.now(),
                 ))
 
@@ -8122,7 +8269,9 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             "AFL fan-out: line not carried on any eligible bookie — routing to manual"
         )
         _example = next(iter(manual_by_bookie.values()), None)
-        notifier.notify_bet_failed(_example or BetResult(
+        # nba-v3: _not_placed_notifier is notify_bet_failed for every tipster except the NBA
+        # model, which gets an info notice instead of a Manual Bets page.
+        _not_placed_notifier(tip)(_example or BetResult(
             success=False, tip=tip,
             error="AFL fan-out: line not carried in catalog — routing to manual",
             timestamp=datetime.now()))
@@ -8143,6 +8292,24 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     jobs: list[tuple[dict, list, dict]] = []  # (session, ladder, resolved)
     seen_sids: set[str] = set()
     allocated = 0.0
+    # nba-v3: what each account already carries on THIS selection (confirmed stake at its fill
+    # odds + maybe-landed stake at the highest allowed fill), so the ladder caps an account's
+    # liability over the life of the bet, not just one placement. An unreadable ledger fails
+    # closed: nothing is sized without knowing.
+    _nba_used: dict = {}
+    _nba_capped_n = 0
+    _nba_sized_n = 0
+    if tip.tipster == NBA_MODEL_TIPSTER:
+        try:
+            _nba_used = nba_core.account_liability(getattr(tip, "_nba_sel_id", "") or "")
+        except Exception as _e:
+            log.error(f"[nba_model] cannot read per-account liability ({_e}): placing nothing")
+            _nba_notice_fail = _not_placed_notifier(tip)
+            _nba_notice_fail(BetResult(
+                success=False, tip=tip, error=f"per-account liability unreadable: {_e}",
+                timestamp=datetime.now()))
+            return [BetResult(success=False, tip=tip, error="per-account liability unreadable",
+                              timestamp=datetime.now())]
     for sess in sessions:
         sid = str(sess.get("session_id", ""))
         if sid in seen_sids:
@@ -8189,6 +8356,27 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                 _s *= fanout_decay
             cap_reason = f"eddie-big decay {int(round((1 - fanout_decay) * 100))}%/step from ${acct_target:.2f}"
             is_list_mode = True
+        elif tip.tipster == NBA_MODEL_TIPSTER:
+            # nba-v3: the rebounds ladder is the CONFIG ladder (NBA_REB_LIABILITY_LADDER),
+            # not sessions.yaml, and the same for every account. EMPTY (so no stake, so
+            # manual) while the ladder is unconfirmed or the live price cannot size a
+            # liability: it never falls back to an uncapped or percentage ladder.
+            _nb_market = (getattr(tip, "_nba_row", None) or {}).get("market", "")
+            _nb_used = float(_nba_used.get(sid, 0.0))
+            steps = nba_core.ladder_stake_steps(
+                _nb_market, sizing_odds, acct_target,
+                max_odds=_nba_max_odds(tip), used_liability=_nb_used)
+            ladder_cfg, _confirmed = nba_core.ladder_for(_nb_market)
+            _nba_sized_n += 1
+            # The per-account floor must NEVER raise a stake above what the liability cap allows:
+            # if the cap leaves less than AFL_FANOUT_MIN_STAKE, the account is capped (no ask).
+            if nba_core.is_capped(_nb_market, sizing_odds, _nba_max_odds(tip), _nb_used,
+                                  min_stake=AFL_FANOUT_MIN_STAKE):
+                steps = []
+                _nba_capped_n += 1
+            cap_reason = (f"nba config ladder {list(ladder_cfg or ())} "
+                          f"(confirmed={_confirmed}, account liability used ${_nb_used:.2f})")
+            is_list_mode = True
         else:
             steps, cap_reason, is_list_mode = session_priority.resolve_stake_steps(
                 sid, sport, liability_market,
@@ -8225,17 +8413,56 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         )
         jobs.append((sess, ladder, resolved))
 
+    if not jobs and _nba_sized_n and _nba_capped_n == _nba_sized_n:
+        # every account is at its per-selection liability cap: not a failure, a distinct
+        # outcome ("capped") the producers do not retry
+        tip._nba_capped = True
+        log.info("[nba_model] every account is at its liability cap on this selection")
+        _nba_not_placed_notice(tip, "every account is at its liability cap on this selection")
+        return [BetResult(success=False, tip=tip, error="every account at its liability cap",
+                          timestamp=datetime.now())]
     if not jobs:
         log.warning(
             "AFL fan-out: no placeable accounts after sizing — routing to manual"
         )
-        notifier.notify_bet_failed(BetResult(
+        _not_placed_notifier(tip)(BetResult(
             success=False, tip=tip,
             error="AFL fan-out: no placeable accounts (caps/odds) — manual",
             timestamp=datetime.now()))
         return [BetResult(success=False, tip=tip,
                           error="no placeable accounts — manual",
                           timestamp=datetime.now())]
+
+    # nba-v3: what Sportsbet is actually ASKED for (the sum of the top rungs), recorded on the
+    # tip so the fills record's `requested` is 0.0 when nothing was sent (every early return
+    # above) rather than the full stake. The model's acceptance stop counts requested > 0.
+    if tip.tipster == NBA_MODEL_TIPSTER:
+        # The last check before the POSTs: never fire inside the minimum lead before the
+        # EARLIEST tip-off any source gave.
+        _es = getattr(tip, "_nba_earliest_epoch", None)
+        if _es is not None and nba_core.too_late(time.time(), _es):
+            log.warning("[nba_model] inside the minimum lead before tip-off: NOT firing")
+            _not_placed_notifier(tip)(BetResult(
+                success=False, tip=tip, error="inside the minimum lead before tip-off",
+                timestamp=datetime.now()))
+            return [BetResult(success=False, tip=tip,
+                              error="inside the minimum lead before tip-off",
+                              timestamp=datetime.now())]
+        _asks = {str(_s.get("session_id", "")): l[0] for (_s, l, _r) in jobs}
+        # Persist what is about to be sent BEFORE any POST: a crash after this is recoverable
+        # (the asks become ambiguous exposure at the next startup), a crash before it is
+        # provably nothing sent. If it cannot be saved, nothing is sent.
+        if not nba_core.note_intent(getattr(tip, "_nba_row", None) or {},
+                                    list(_asks.items()), _nba_max_odds(tip)):
+            log.error("[nba_model] could not record the fan-out intent: NOT firing")
+            _not_placed_notifier(tip)(BetResult(
+                success=False, tip=tip, error="could not record the placement intent",
+                timestamp=datetime.now()))
+            return [BetResult(success=False, tip=tip,
+                              error="could not record the placement intent",
+                              timestamp=datetime.now())]
+        tip._nba_asks = _asks
+        tip._attempted_stake = round(sum(_asks.values()), 2)
 
     # ── Fire all accounts CONCURRENTLY ─────────────────────────────────
     # HTTP client is thread-safe (fresh requests.post per call, immutable
@@ -8339,7 +8566,11 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # won't recover mid-tip). SAFE: total placed can never exceed the unit (remainder only
     # decreases by actual placed stake).
     _noncap_fail = any(not _is_stake_error(r.error or "") for r in failed_results)
+    # nba-v3: never for the NBA model. The redistribution re-fans onto sibling accounts
+    # sized off sessions.yaml caps, which have no NBA rebounds ladder (a missing cap reads
+    # "unlimited"). The model re-offers its own shortfall as a retry instead.
     if (AFL_DISPOSALS_REDISTRIBUTE and unfilled > AFL_FANOUT_MIN_STAKE and placed_results
+            and tip.tipster != NBA_MODEL_TIPSTER
             and (_is_afl_disposals_over(tip) or _noncap_fail)):
         _sess_by_sid = {str(s.get("session_id", "")): s for (s, _l, _r) in jobs}
         _res_by_sid = {str(s.get("session_id", "")): _r for (s, _l, _r) in jobs}
@@ -8487,10 +8718,22 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         except Exception as _e:
             log.warning(f"[disposals_model] could not read prior fills for the alert "
                         f"gate ({_e}) — alerting, which is the safe direction")
-    if (unfilled > 1.0 and tip.tipster == DISPOSALS_MODEL_TIPSTER
+    # nba-v3: the same selection-alive test, read from the NBA ledger.
+    if tip.tipster == NBA_MODEL_TIPSTER:
+        try:
+            _nsid = getattr(tip, "_nba_sel_id", None)
+            if _nsid:
+                _nsel = nba_core.selection_snapshot(_nsid)
+                _selection_on_book = round(
+                    float(_nsel.get("committed") or 0.0)
+                    - float(_nsel.get("ambiguous") or 0.0), 2)
+        except Exception as _e:
+            log.warning(f"[nba_model] could not read prior fills for the alert "
+                        f"gate ({_e}): alerting, which is the safe direction")
+    if (unfilled > 1.0 and tip.tipster in (DISPOSALS_MODEL_TIPSTER, NBA_MODEL_TIPSTER)
             and (total_placed > 0 or _selection_on_book > 0)):
         log.info(
-            f"[disposals_model] ${unfilled:.2f} unfilled of ${display_intended:.2f} "
+            f"[{tip.tipster}] ${unfilled:.2f} unfilled of ${display_intended:.2f} "
             f"— NOT alerting for a hand-place (the model re-offers the shortfall and "
             f"the exposure ledger caps the top-up at the tranche target)"
         )
@@ -8529,7 +8772,10 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         # shortfall always reaches Wilson, and it would mean a silently failed queue is a
         # silently lost bet. Instead the alert stands and a second message says the
         # remainder is queued and not to hand-place it. Information, not silence.
-        notifier.notify_tip_unfilled_with_placements(
+        # nba-v3: _unfilled_notifier is notify_tip_unfilled_with_placements for every tipster
+        # except the NBA model, whose total miss is an info notice (its retry would land on
+        # a hand-place).
+        _unfilled_notifier(tip)(
             tip, display_intended, total_placed, unfilled,
             placed_results, failed_results,
             session_timing=session_timing,
@@ -14196,6 +14442,10 @@ def _resolve_single_for_placement(
     """
     if getattr(tip, "tipster", "") == DISPOSALS_MODEL_TIPSTER and not exact_only:
         exact_only = True
+    # nba-v3: the same invariant for the NBA model (the exact-line rule is a money invariant;
+    # its catalog block below is exact-or-manual regardless of this flag).
+    if getattr(tip, "tipster", "") == NBA_MODEL_TIPSTER and not exact_only:
+        exact_only = True
     # v6.08p: a Saiyan TOP-UP is same-line-or-nothing (Wilson). Forced HERE as well as in
     # the fan-out, because this is the choke point every placement passes through and the
     # whole point of the v6.08 pattern is that a caller cannot bypass it. A test that
@@ -14285,6 +14535,14 @@ def _resolve_single_for_placement(
                         f"so accepting a fill under it would place a bet the strategy "
                         f"rejected)")
                     target_odds = _dm_floor
+            # nba-v3: the same one-directional raise for the NBA model's own price floor.
+            if tip.tipster == NBA_MODEL_TIPSTER and target_odds is not None:
+                _nb_floor = round(float(nba_core.cfg("NBA_MODEL_MIN_ODDS")), 2)
+                if target_odds < _nb_floor:
+                    log.info(
+                        f"Target odds: raising {target_odds} -> {_nb_floor} "
+                        f"(NBA_MODEL_MIN_ODDS; the model itself refuses below this)")
+                    target_odds = _nb_floor
     else:
         log.info("Target odds: omitted (price-change retry, accepting current market)")
 
@@ -14387,6 +14645,92 @@ def _resolve_single_for_placement(
                 placed_leg_summary=_format_tip_placement_summary(tip),
             ))
 
+    # ── nba-v3: NBA model player prop, EXACT line or manual ──────────
+    # The model's line is the trigger. This replaces the generic NBA block below for this
+    # tipster only: no nearest-line snap, no legacy "closest line" fallback, and a price-check
+    # outage or a catalog miss routes to MANUAL instead of falling through to a blind POST.
+    # Sportsbet's own spelling of the player comes from the live catalog (folded-exact and
+    # unique, nba_core.canonical_catalog_player), so an accent or a "Jr." difference between
+    # the roster and the book cannot cost the bet or, worse, pick a different player.
+    # Unconditional for the tipster: if the leg did not resolve to a player_* market the
+    # block routes to manual, so neither this block nor the generic one can be silently
+    # skipped and leave an unchecked "resolved" leg.
+    if tip.tipster == NBA_MODEL_TIPSTER:
+        _nb_name = player or leg.player or ""
+        _nb_miss = ""
+        try:
+            if not (market.startswith("player_") and market != "player_prop" and _nb_name):
+                raise ValueError(f"leg did not resolve to a player market ({market!r})")
+            # HyperBot matches events by team names only, so this asks, checks the matched
+            # game's start_time_iso against the pinned tip-off, and retries other name forms
+            # (away v home, LA / Los Angeles, nicknames) until one is the pinned night's game.
+            price_resp, _nb_event_used, _nb_why = _price_check_nba_verified(
+                session_id=sid, sport=tip.sport, event=tip.event,
+                pinned_epoch=getattr(tip, "_nba_start_epoch", None),
+                markets_filter=["player_props"])
+            if price_resp is None:
+                _nb_miss = "price check failed"
+            elif _nb_event_used is None:
+                raise ValueError(_nb_why)
+            else:
+                # the POST must go out under the name that was PROVED to reach the pinned game
+                _event_verified = _nb_event_used
+                # The catalog must be the PINNED night's board: HyperBot re-matches the event
+                # NAME, and one name can match two nights (playoffs). start_time_iso is epoch
+                # seconds; positive evidence of a different night -> manual. No start time on
+                # the envelope cannot be verified: proceed, loudly.
+                _pinned = getattr(tip, "_nba_start_epoch", None)
+                _fx = nba_core.fixture_start_refusal(price_resp.get("start_time_iso"), _pinned)
+                if _fx:
+                    raise ValueError(_fx)
+                if _pinned is not None and not nba_core.fixture_start_checkable(
+                        price_resp.get("start_time_iso")):
+                    # OPEN QUESTION (reported to Wilson): does HyperBot supply start_time_iso
+                    # for NBA markets at all? Until that is known this proceeds, but loudly.
+                    log.error(f"[nba_model] {bookie}:{sid}: the catalog envelope carries no "
+                              f"usable start_time_iso "
+                              f"({price_resp.get('start_time_iso')!r}), so the fixture "
+                              f"could NOT be verified against the pinned tip-off "
+                              f"(proceeding)")
+                elif _pinned is not None:
+                    # HyperBot's own start joins the in-play guard: the EARLIEST source wins.
+                    _hb_start = float(price_resp.get("start_time_iso"))
+                    tip._nba_earliest_epoch = nba_core.earliest_start(
+                        getattr(tip, "_nba_earliest_epoch", None), _hb_start)
+                    if nba_core.too_late(time.time(), tip._nba_earliest_epoch):
+                        raise ValueError("the HyperBot catalog start is past or inside the "
+                                         "minimum lead before tip-off")
+                markets_data = price_resp.get("markets", {}) or {}
+                _mdata = markets_data.get(market)
+                _sels = (_mdata.get("selections", []) if isinstance(_mdata, dict)
+                         else (_mdata if isinstance(_mdata, list) else [])) or []
+                _canon = nba_core.canonical_catalog_player(
+                    _nb_name, [s.get("player") for s in _sels])
+                _nm, _nm_why = (nba_core.exact_catalog_match(_sels, _canon, line, market)
+                                if _canon else (None, "no catalog player"))
+                if _nm:
+                    _resolved_live_odds = _nm.get("odds")
+                    market = _nm["market"]
+                    line = _nm["line"]
+                    selection = _nm["selection"]
+                    player = _nm.get("player") or _canon
+                else:
+                    _nb_miss = (f"no exact under {line} on {market} for "
+                                f"{_nb_name!r} (catalog player: {_canon or 'none'}): {_nm_why}")
+        except Exception as e:
+            _nb_miss = str(e) if isinstance(e, ValueError) else f"catalog lookup raised: {e}"
+        if _nb_miss:
+            log.info(f"[nba_model] {_nb_name} {market} line={line} not carried on "
+                     f"{bookie}:{sid}: {_nb_miss}; routing to manual (no blind POST)")
+            return (None, BetResult(
+                success=False, tip=tip, session_id=sid, bookie=bookie,
+                error=f"nba player-prop not carried exactly: {_nb_miss}; routing to manual",
+                timestamp=datetime.now(),
+                placed_market=market, placed_player=player, placed_stat=stat,
+                placed_line=line, placed_selection=selection,
+                placed_leg_summary=_format_tip_placement_summary(tip),
+            ))
+
     # ── Price check + within-1.0 line auto-adjust ───────────────────
     # Player props use the per-player markets_filter and look up by
     # player name. Team handicap (`line`) and totals (`total_points`) use
@@ -14396,7 +14740,8 @@ def _resolve_single_for_placement(
     # meant team handicap never got auto-adjusted and the bookie was
     # blocklisted. AFL player props are handled by the catalog block above,
     # so this within-1.0 path is NBA/NBL (and team markets) only.
-    if market.startswith("player_") and player and (tip.sport or "").lower() != "afl":
+    if (market.startswith("player_") and player and (tip.sport or "").lower() != "afl"
+            and tip.tipster != NBA_MODEL_TIPSTER):
         try:
             price_resp = hb.price_check_sports(
                 session_id=sid, sport=tip.sport, event=tip.event,
@@ -22469,6 +22814,683 @@ async def _place_one_disposals_row(row: dict, msg_time, channel_name: str):
     )
 
 
+# ── nba-v3: NBA props model (contract v3) ───────────────────────────────────────────
+# The NBA twin of the DisposalsModel block above. The money-safety core (ledger, ladder,
+# identity, gates, fills) is in nba_model_core.py; this is the glue that builds the tip and
+# drives the shared guarded fan-out. EVERYTHING below is unreachable unless
+# config.NBA_MODEL_ENABLED (the channel is not even registered then).
+
+def _build_nba_model_tip(row: dict, msg_time) -> ParsedTip:
+    """Build a ParsedTip DIRECTLY from a validated BET|v3 row (no LLM round-trip).
+
+    `market` on the leg is the literal "player_prop" (the BET| `market=player_rebounds` is a
+    schema assertion; the resolver derives player_rebounds from the stat), the player and team
+    are the ROSTER spellings the row handler resolved (`player_roster` / `team_roster`; the
+    contract spelling "Los Angeles Clippers" is "LA Clippers" to the roster and ESPN), and
+    the stake arrives as DOLLARS (units=1.0 x unit_size)."""
+    leg = ParsedLeg(
+        market="player_prop",
+        team_full=row.get("team_roster") or nba_core.roster_team(row["team"]),
+        player=row.get("player_roster") or row["player"],
+        stat=nba_model_parser.MARKET_TO_STAT[row["market"]],
+        line=float(row["line"]),
+        selection="under",
+        raw_text=row["raw"],
+    )
+    tip = ParsedTip(
+        tipster=NBA_MODEL_TIPSTER,
+        sport="nba",
+        is_sgm=False,
+        legs=[leg],
+        units=1.0,
+        unit_size=float(row["stake"]),
+        raw_message=row["raw"],
+        timestamp=msg_time,
+        suggested_bookie="sportsbet",
+        suggested_odds=float(row["price"]),
+        units_explicit=True,
+    )
+    tip._nba_row = row
+    return tip
+
+
+def _apply_nba_model_stake(tip: ParsedTip) -> None:
+    """Clamp an NBA model tip's stake in the PLACING process (the $600 lesson: the clamp
+    lives where the bet is placed, not in the parse). TEST MODE forces the flat test stake
+    (never above what the ledger just reserved); otherwise NBA_MODEL_MAX_STAKE is a hard
+    per-message cap (the accidental-extra-zero guard). No-op for any other tipster."""
+    if tip.tipster != NBA_MODEL_TIPSTER:
+        return
+    posted = round(float(tip.unit_size or 0), 2)
+    if nba_core.cfg("NBA_MODEL_TEST_MODE"):
+        if not nba_core.test_stake_usable():
+            # Test mode is ON but there is no usable test stake: place NOTHING. (Falling
+            # through to the production cap turned "small test bets" into $1,500 bets.)
+            log.error("[nba_model] TEST MODE is ON but NBA_MODEL_TEST_STAKE is not a positive "
+                      "number: stake forced to $0, nothing will be placed")
+            tip.units = 1.0
+            tip.unit_size = 0.0
+            return
+        flat = round(float(nba_core.cfg("NBA_MODEL_TEST_STAKE")), 2)
+        flat = min(flat, posted) if posted > 0 else flat
+        if abs(posted - flat) > 0.001:
+            log.warning(f"[nba_model] TEST MODE: posted stake ${posted} -> forcing "
+                        f"${flat} (NBA_MODEL_TEST_MODE=true; set it false + RESTART "
+                        f"for production stakes)")
+        tip.units = 1.0
+        tip.unit_size = flat
+        return
+    capped = min(posted, round(float(nba_core.cfg("NBA_MODEL_MAX_STAKE")), 2))
+    if capped <= 0:
+        return
+    if abs(posted - capped) > 0.001:
+        log.warning(f"[nba_model] posted stake ${posted} exceeds the "
+                    f"${nba_core.cfg('NBA_MODEL_MAX_STAKE'):.0f} cap -> capping to "
+                    f"${capped} (accidental-extra-zero guard)")
+    tip.units = 1.0
+    tip.unit_size = capped
+
+
+def _place_nba_model_tip(tip: ParsedTip) -> list[BetResult]:
+    """Dispatch an NBA model tip (called from place_tip after the fixture is set).
+
+    Defence in depth: the row handler has already checked the flag and the ladder before
+    claiming, and the fan-out sizes from the same ladder (empty while it is unconfirmed),
+    but a direct caller must not be able to bypass either. Only the guarded concurrent
+    fan-out is ever used."""
+    # No `_nba_row` means no market, and a blank market has no ladder: refused below.
+    market = (getattr(tip, "_nba_row", None) or {}).get("market", "")
+    if not nba_core.cfg("NBA_MODEL_ENABLED"):
+        log.error("[nba_model] NBA_MODEL_ENABLED is false: refusing to place")
+        return [BetResult(success=False, tip=tip, error="NBA model disabled",
+                          timestamp=datetime.now())]
+    why = nba_core.placement_refusal(market)
+    if why:
+        log.error(f"[nba_model] {why}")
+        return [BetResult(success=False, tip=tip, error=why, timestamp=datetime.now())]
+    if USE_LEGACY_PLACEMENT or not AFL_CONCURRENT_FANOUT:
+        log.error("[nba_model] AFL_CONCURRENT_FANOUT/USE_LEGACY_PLACEMENT would route this "
+                  "tip to an UNGUARDED singles path (no exact-line lock, no price floor, "
+                  "an alt-line walk) -> routing to MANUAL instead")
+        tip.alert_only = True
+        tip.alert_reason = (
+            "NBA model requires the concurrent fan-out (exact-line lock + price gates + "
+            "ladder). AFL_CONCURRENT_FANOUT=false / USE_LEGACY_PLACEMENT=true: place by "
+            "hand at the EXACT line or re-enable the fan-out.")
+        notifier.notify_manual_alert(tip)
+        return []
+    return _place_afl_fanout(tip)
+
+
+_nba_ladder_alerted: set = set()
+
+
+def _unfilled_notifier(tip: ParsedTip):
+    """notify_tip_unfilled_with_placements for every tipster except the NBA model, whose
+    total miss (every account rejected) is an INFO notice: the model re-offers the tranche
+    itself, so a "BET FAILED, remaining $X" page invites a hand-place that would land on top
+    of the retry."""
+    if tip.tipster == NBA_MODEL_TIPSTER:
+        def _info(t, intended, placed, unfilled, placed_results, failed_results, **kw):
+            last = (failed_results[-1].error if failed_results else "") or "no account placed"
+            _nba_not_placed_notice(
+                t, f"${placed:.2f} of ${intended:.2f} placed, ${unfilled:.2f} unfilled "
+                   f"({str(last)[:120]})")
+        return _info
+    return notifier.notify_tip_unfilled_with_placements
+
+
+def _not_placed_notifier(tip: ParsedTip):
+    """The callable that reports a tip the fan-out could not place at all: the usual
+    notifier.notify_bet_failed for every tipster, an INFO notice for the NBA model.
+
+    A Manual Bets page invites a hand-place, and the model re-offers an unplaced tranche
+    itself (kind=retry), so the page can land on top of the next auto-placement."""
+    if tip.tipster == NBA_MODEL_TIPSTER:
+        return lambda r: _nba_not_placed_notice(
+            tip, (getattr(r, "error", "") or "not placed"))
+    return notifier.notify_bet_failed
+
+
+def _drain_nba_alerts() -> None:
+    """Alert on anything the ledger raised on its own while claiming: a DEAD process's
+    reservation converted into ambiguous exposure ("may have landed, check the book by hand")."""
+    try:
+        msgs = nba_core.pop_alerts()
+    except Exception:
+        return
+    if not msgs:
+        return
+    try:
+        notifier.notify_critical(
+            "⚠️ NBA model ledger alert (a placement left by a process that died was converted "
+            "at a claim, or the quarantine file had a problem). If money may have landed, "
+            "check the book by hand.\n" + "\n".join(msgs[:10]))
+    except Exception:
+        pass
+
+
+def _nba_startup_recover() -> list:
+    """At startup: convert reservations left by a process that died mid-placement into ambiguous
+    exposure, and rebuild any outcome the ledger holds that never reached the fills file as a
+    new revision of its key. Critical alert if it had anything to do. [] when the feed is off."""
+    if nba_core is None or not nba_core.cfg("NBA_MODEL_ENABLED"):
+        return []
+    msgs = nba_core.recover_pending()
+    if msgs:
+        log.critical("[nba_model] startup recovery: " + " | ".join(msgs))
+        try:
+            notifier.notify_critical("⚠️ NBA model startup recovery:\n" + "\n".join(msgs[:10]))
+        except Exception:
+            pass
+    return msgs
+
+
+def _nba_startup_notice() -> str:
+    """Tell Wilson, once at startup, whether the NBA feed is on and whether TEST MODE is ON or
+    OFF (test mode ON = a flat small stake whatever the model sends). Returns the text sent;
+    "" when the feed is off (log only). Sent through the normal notifier, which is a no-op
+    under tests."""
+    if not nba_core.cfg("NBA_MODEL_ENABLED"):
+        log.info("[nba_model] NBA_MODEL_ENABLED=false: the NBA feed is OFF")
+        return ""
+    test_on = bool(nba_core.cfg("NBA_MODEL_TEST_MODE"))
+    why = nba_core.placement_refusal("player_rebounds")
+    monitored = any(c.get("nba_model") or c.get("nba_model_shared")
+                    for c in TIPSTER_CHANNELS.values())
+    msg = (f"ℹ️ NBA model is ENABLED. TEST MODE is {'ON' if test_on else 'OFF'}: "
+           + (f"every bet is a flat ${nba_core.cfg('NBA_MODEL_TEST_STAKE')} whatever the model "
+              f"sends." if test_on else
+              f"REAL STAKES (cap ${nba_core.cfg('NBA_MODEL_MAX_STAKE'):.0f} per message).")
+           + (f"\nPlacement is currently REFUSED: {why}" if why else
+              "\nPlacement is armed.")
+           + ("" if monitored else
+              "\nNOT MONITORED: no NBA channel is registered (check NBA_MODEL_TG_CHANNEL and "
+              "NBA_MODEL_SENDER_ID), so no NBA message will be read."))
+    log.warning(msg.replace("\n", " "))
+    try:
+        notifier.notify_info(msg)
+    except Exception:
+        pass
+    return msg
+
+
+def _nba_not_placed_notice(tip: ParsedTip, why: str) -> None:
+    """An INFO notice (not a Manual Bets page) that an NBA model tip was not placed.
+
+    The model re-offers an unplaced tranche itself (kind=retry on its next tick), so a page
+    that invites a hand-place can land on top of that retry. Wilson still sees it."""
+    row = getattr(tip, "_nba_row", None) or {}
+    log.info(f"[nba_model] not placed: {why}")
+    try:
+        notifier.notify_info(
+            f"ℹ️ NBA model NOT placed: {row.get('player', '?')} UNDER {row.get('line', '?')} "
+            f"({row.get('kind', '?')}): {why}.\n"
+            f"The model re-offers this selection itself, so do NOT hand-place it unless you "
+            f"accept both landing.")
+    except Exception:
+        pass
+
+
+def _sender_allowed(channel_cfg: dict, sender_id) -> bool:
+    """The sender lock, as a pure function the telethon handler calls FIRST (before any
+    routing). A channel with a bot_id accepts only that sender. An NBA channel (dedicated or
+    shared) with NO usable bot_id accepts nobody: the lock may never be skipped for it."""
+    expected = channel_cfg.get("bot_id")
+    if expected:
+        return sender_id == expected
+    if channel_cfg.get("nba_model") or channel_cfg.get("nba_model_shared"):
+        return False
+    return True
+
+
+def _nba_route(channel_cfg: dict, text: str) -> bool:
+    """True when a message from this channel belongs to the NBA path. A dedicated NBA channel
+    sends everything there; the AFL feed's channel (flagged `nba_model_shared` only when NBA
+    is enabled and uses the same locked sender) sends ONLY a `BET|v3|` message there, so a v2
+    message stays on the AFL path."""
+    if channel_cfg.get("nba_model"):
+        return True
+    return bool(channel_cfg.get("nba_model_shared")) and "BET|v3|" in (text or "")
+
+
+def _nba_max_odds(tip: ParsedTip) -> float:
+    """The highest price HyperBot may fill an NBA placement at: the max_odds that is actually
+    SENT (_bookie_max_odds off the reference price), or, when none is sent (kill-switch), the
+    same ceiling computed here. Liability is priced at this, so it survives a permitted upward
+    price move between the quote and the fill."""
+    ref = float(tip.suggested_odds or 0)
+    sent = _bookie_max_odds(tip.tipster, ref, None)
+    if sent:
+        return float(sent)
+    mult = TIPSTERS_MAX_ODDS_MULT.get(tip.tipster, MAX_ODDS_MULT)
+    return round(ref * mult, 2) if (mult and mult > 1.0 and ref > 1.0) else ref
+
+
+def _nba_classify_results(results, tip: ParsedTip):
+    """Split a placement's BetResults into (confirmed, ambiguous) account lists.
+
+    confirmed: [{session_id, stake, odds, bet_id}] with a REAL stake and a REAL price (> 1).
+    ambiguous: [{session_id, stake, max_odds}] money that MAY be on the book, priced for
+    liability at the highest fill HyperBot was allowed. A "success" with no usable stake or
+    price is ambiguous at the rung that was asked (never silently confirmed, and never booked
+    as the whole remainder); a "success" with nothing to book at all is logged and ignored.
+    A maybe-landed result that reports no measurable stake books the full remainder, so
+    nothing re-offers against it."""
+    max_odds = _nba_max_odds(tip)
+    confirmed, amb = [], []
+    unknown = []
+    for r in results:
+        sid = str(getattr(r, "session_id", "") or "")
+        asked = float(getattr(r, "_requested_stake", 0) or 0)
+        if getattr(r, "success", False):
+            try:
+                stake, odds = float(r.stake or 0), float(r.odds)
+            except (TypeError, ValueError):
+                stake, odds = 0.0, 0.0
+            if stake > 0 and odds > 1.0 and stake < float("inf") and odds < float("inf"):
+                confirmed.append({"session_id": sid, "stake": round(stake, 2), "odds": odds,
+                                  "bet_id": str(getattr(r, "bet_id", "") or "")})
+                continue
+            if asked > 0:
+                log.error(f"[nba_model] a 'success' on {sid} with no usable stake/price "
+                          f"(stake={getattr(r, 'stake', None)!r} odds={getattr(r, 'odds', None)!r}):"
+                          f" booked as AMBIGUOUS ${asked:.2f}")
+                amb.append({"session_id": sid, "stake": round(asked, 2), "max_odds": max_odds})
+            else:
+                log.error(f"[nba_model] a 'success' on {sid} with no usable stake and no asked "
+                          f"rung: nothing booked")
+            continue
+        if (_is_ambiguous_result(r) or getattr(r, "is_ambiguous", False)
+                or getattr(r, "cid_unresolved", False)):
+            stake = float(r.stake or asked or 0)
+            entry = {"session_id": sid, "stake": round(stake, 2), "max_odds": max_odds}
+            amb.append(entry)
+            if stake <= 0:
+                unknown.append(entry)
+    if unknown:
+        known = sum(a["stake"] for a in confirmed) + sum(a["stake"] for a in amb)
+        remainder = round(max(0.0, float(tip.stake_dollars) - known), 2)
+        unknown[0]["stake"] = remainder
+        log.warning(f"[nba_model] {len(unknown)} ambiguous result(s) reported no measurable "
+                    f"stake: booking the full ${remainder:.2f} remainder as at-risk so "
+                    f"nothing re-offers against it")
+    return confirmed, [a for a in amb if a["stake"] > 0]
+
+
+async def _process_nba_model_tip(text: str, msg_time, channel_name: str):
+    """Ingest one NBA model message (contract v3). Regex-only. A message with no BET| line is
+    chatter and drops silently (with a log breadcrumb); a message WITH one that fails
+    validation is REFUSED LOUDLY; each valid row goes through _place_one_nba_row."""
+    if nba_model_parser is None:
+        log.error(f"[{channel_name}] NBA parser module missing: cannot process")
+        return
+    if not nba_core.cfg("NBA_MODEL_ENABLED"):
+        log.info(f"[{channel_name}] NBA_MODEL_ENABLED is false: message ignored")
+        return
+    try:
+        parsed = nba_model_parser.parse(
+            text, markets=nba_core.cfg("NBA_MODEL_MARKETS"),
+            tags=nba_core.cfg("NBA_MODEL_TAGS"))
+    except Exception as e:
+        log.exception(f"[{channel_name}] NBA parse crashed: {e}")
+        notifier.notify_image_alert(
+            channel_name, f"NBA model parse CRASHED, place by hand:\n{text[:400]}")
+        return
+    if parsed is None:
+        first = next((l.strip() for l in text.splitlines() if l.strip()), "")
+        log.info(f"[{channel_name}] chatter: no BET| line -> NOTHING PLACED "
+                 f"({len(text.splitlines())} line(s)) :: {first[:110]}")
+        return
+
+    for (raw_line, reason), salv in zip(parsed.refusals, parsed.refusal_rows):
+        log.warning(f"[{channel_name}] REFUSED BET| line: {reason} :: {raw_line}")
+        # Answer the key in the fills file when the refused line still carries a well-formed
+        # one (the model counts an unanswered key as a full-target loss). `salv` was taken from
+        # the FULL line before it was truncated for this alert, and its selection comes from
+        # the KEY, never from the refused fields. Never for a key already in the ledger
+        # (the model keeps the latest record per key, so it would overwrite the real one).
+        try:
+            if salv and nba_core.key_state(salv["key"]) == nba_core.UNSEEN:
+                nba_core.write_fill(salv, requested=0.0, placed=0.0, ambiguous=0.0,
+                                    manual=False, accounts=[], outcome="refused")
+        except Exception as _e:
+            log.error(f"[{channel_name}] could not answer a refused key: {_e}")
+        try:
+            # Plain text: the notifier escapes HTML, so tags would show up literally.
+            notifier.notify_critical(
+                f"⚠️ NBA model REFUSED a bet line\n\n{reason}\n\n{raw_line}\n\n"
+                f"Nothing was placed. This is a feed/schema problem, not a market one.")
+        except Exception:
+            pass
+
+    for row in parsed.rows:
+        try:
+            await _place_one_nba_row(row, msg_time, channel_name)
+        except Exception as e:
+            log.exception(f"[{channel_name}] NBA row failed: {e}")
+            try:
+                notifier.notify_critical(
+                    f"⚠️ NBA model row CRASHED after parse, check whether it placed "
+                    f"before re-sending\n\n{row.get('key', '?')}\n{e}")
+            except Exception:
+                pass
+
+
+async def _place_one_nba_row(row: dict, msg_time, channel_name: str):
+    """Gate + place a single validated BET|v3 row. Every PROCESSED message writes exactly one
+    fills record, including the ones that place nothing (absence of feedback must mean
+    "assume it is on"); a REPEATED key writes none."""
+    key = row["key"]
+    if not nba_core.cfg("NBA_MODEL_ENABLED"):
+        log.error(f"[{channel_name}] {key}: NBA_MODEL_ENABLED is false: not processing")
+        return
+
+    # A repeated key is an upstream bug and gets NO record and NO further gate: the model
+    # keeps the latest record per key, so any record written here (a "refused" from the start
+    # gate, the blackout, the ladder, identity, the fixture, a gate exception) would overwrite
+    # the real record of the original send.
+    key_state_ = nba_core.key_state(key)
+    if key_state_ == nba_core.SEEN:
+        log.warning(f"[{channel_name}] {key}: repeat key, dropped before any gate (no record)")
+        try:
+            notifier.notify_critical(
+                f"⚠️ NBA model: repeat key dropped, not placed\n\n{key}")
+        except Exception:
+            pass
+        return
+    if key_state_ == nba_core.UNKNOWN:
+        # NOT a repeat: the ledger could not be read or locked, so nothing can be said about
+        # this key. Write nothing, say what actually happened, fail fast.
+        log.error(f"[{channel_name}] {key}: the exposure ledger could not be read or locked: "
+                  f"key NOT processed (not a repeat), nothing written")
+        try:
+            notifier.notify_critical(
+                f"⚠️ NBA model: the exposure ledger could not be read or locked, so this key "
+                f"was NOT processed and nothing was written (it is not a repeat).\n\n{key}")
+        except Exception:
+            pass
+        return
+
+    def _fill_nothing(outcome: str, event: str = "") -> None:
+        # requested=0.0: NOTHING WAS SENT on any path that calls this, and the producers'
+        # acceptance stop counts every record with requested > 0 as a bet.
+        nba_core.write_fill(row, requested=0.0, placed=0.0, ambiguous=0.0,
+                            manual=False, accounts=[], outcome=outcome, event=event)
+
+    # The first price this selection was ever seen at, noted before ANY refusal so a later
+    # retry is gated against the signal's price even if the base never reached the claim.
+    nba_core.note_price(row)
+
+    def _refuse_timing(why: str) -> None:
+        log.warning(f"[{channel_name}] {key}: {why} -> REFUSED (never place in-play)")
+        _fill_nothing("refused")
+        notifier.notify_image_alert(
+            channel_name,
+            f"NBA model: {row['player']} UNDER {row['line']}: tip-off has PASSED or is inside "
+            f"the minimum lead, refused (tipbot never places this feed in-play).")
+
+    # Every processed message with a well-formed key gets a fills record. An exception in the
+    # gates below must not leave the key unanswered: the model counts an unanswered key as a
+    # full-target loss in its loss stop. Terminal ("refused"): a bug wants a human, not a retry.
+    try:
+        # 1. START-TIME GATE. Never place at or after tip-off.
+        start_utc = nba_core.parse_start_utc(row["start"])
+        if start_utc is None:
+            log.warning(f"[{channel_name}] {key}: unparseable start {row['start']!r} -> refused")
+            _fill_nothing("refused")
+            notifier.notify_critical(
+                f"⚠️ NBA model: unparseable start time {row['start']} "
+                f"for {row['player']}: refused, nothing placed.")
+            return
+        now_utc = datetime.now(_dt_timezone.utc)
+        if nba_core.too_late(now_utc.timestamp(), start_utc.timestamp()):
+            # Past tip-off, or inside the minimum lead before it (NBA_MODEL_MIN_LEAD_SEC, every
+            # kind including retries): a placement takes seconds to minutes across accounts.
+            _refuse_timing(f"start {start_utc.isoformat()} is past or inside the "
+                           f"{nba_core.min_lead_sec():.0f}s minimum lead (now "
+                           f"{now_utc.isoformat()})")
+            return
+
+        # 2. HYPERBOT BLACKOUT (23:00-07:00 Sydney). Stop BEFORE claiming the key.
+        if nba_core.in_quiet_window():
+            log.info(f"[{channel_name}] {key}: inside the HyperBot blackout: not placing "
+                     f"{row['player']} UNDER {row['line']} (no alert raised)")
+            _fill_nothing("none")
+            return
+
+        # 3. THE PLACEMENT GATE (config errors, test mode, the rebounds ladder). While the
+        #    ladder is unconfirmed the model places NOTHING (Wilson has not set it). Refused
+        #    before the claim, so no key is consumed; one critical alert per process.
+        ladder_why = nba_core.placement_refusal(row["market"])
+        if ladder_why:
+            log.error(f"[{channel_name}] {key}: {ladder_why}")
+            _fill_nothing("refused")
+            if ladder_why not in _nba_ladder_alerted:
+                _nba_ladder_alerted.add(ladder_why)
+                try:
+                    notifier.notify_critical(
+                        f"⚠️ NBA model refused to place: {ladder_why}\n\n"
+                        f"(Alerted once per restart; every further message is logged only.)")
+                except Exception:
+                    pass
+            return
+
+        # 4. PLAYER IDENTITY. Roster-exact (no fuzzy) and on the team the message names.
+        player_roster, team_roster, why = nba_core.resolve_player(row["player"], row["team"])
+        if why:
+            log.warning(f"[{channel_name}] {key}: {why}")
+            _fill_nothing("refused")
+            notifier.notify_critical(
+                f"⚠️ NBA model refused {row['player']} ({row['team']}): {why}\n\n"
+                f"{key}\nNothing placed.")
+            return
+
+        # 5. FIXTURE, pinned by both clubs and the exact tip-off. No opponent guessing.
+        game = await _run_in_placement_executor(
+            resolve_nba_game, nba_core.roster_team(row["team"]),
+            nba_core.roster_team(row["opp"]) if row["opp"] else "", start_utc)
+        if not game:
+            log.warning(f"[{channel_name}] {key}: no unique NBA game for {row['team']} v "
+                        f"{row['opp'] or '?'} at {row['start']} -> refused")
+            # "none", not "refused": the schedule lookup can fail transiently (ESPN), and the
+            # model retries a tranche whose last outcome is partial or none, never refused.
+            _fill_nothing("none")
+            # An INFO notice, not a Manual Bets page: the model retries a "none" tranche, so an
+            # invitation to hand-place would land on top of that retry once ESPN recovers.
+            try:
+                notifier.notify_info(
+                    f"ℹ️ NBA model NOT placed: no unique game for {row['player']} "
+                    f"({row['team']} v {row['opp'] or '?'}, tip-off {row['start']}).\n"
+                    f"The model re-offers this selection itself, so do NOT hand-place it unless "
+                    f"you accept both landing.")
+            except Exception:
+                pass
+            return
+
+        # The IN-PLAY GUARD gates on the EARLIEST tip-off the sources give: the message, the
+        # ESPN schedule, and (in the catalog resolver) HyperBot's start time.
+        espn_start = nba_core.parse_start_utc(game.get("start") or "")
+        earliest = nba_core.earliest_start(
+            start_utc.timestamp(), espn_start.timestamp() if espn_start else None)
+        if nba_core.too_late(now_utc.timestamp(), earliest):
+            _refuse_timing(f"the earliest tip-off (ESPN {game.get('start')!r}) is past or "
+                           f"inside the {nba_core.min_lead_sec():.0f}s minimum lead")
+            return
+    except Exception:
+        _fill_nothing("refused")
+        raise
+
+    # 6. EXPOSURE LEDGER. Claims the key permanently BEFORE placing.
+    allowed, refuse_reason = nba_core.claim(row)
+    _drain_nba_alerts()
+    if allowed <= 0:
+        log.warning(f"[{channel_name}] {key}: not placing: {refuse_reason}")
+        if "repeat key" in refuse_reason:
+            # Cannot normally get here (key_seen above); kept as the claim's own backstop.
+            # NO record: it would overwrite the real record of the original send.
+            try:
+                notifier.notify_critical(
+                    f"⚠️ NBA model: repeat key dropped, not placed\n\n{refuse_reason}\n\n{key}")
+            except Exception:
+                pass
+            return
+        # a claim that failed only because the ledger could not be saved or locked consumed
+        # no key and is retryable; every other ledger refusal is terminal
+        transient = ("could not persist" in refuse_reason
+                     or "could not lock" in refuse_reason)
+        _fill_nothing("none" if transient else "refused", game["event"])
+        # "Nothing left to place" is the ledger working on a fully-filled selection: it
+        # fires every tick until tip-off, so it must not page.
+        if "nothing left to place" in refuse_reason:
+            log.info(f"[{channel_name}] {key}: benign refusal, no alert")
+        else:
+            try:
+                notifier.notify_critical(
+                    f"⚠️ NBA model refused an offer\n\n{refuse_reason}\n\n"
+                    f"{key}\nNothing placed.")
+            except Exception:
+                pass
+        return
+
+    sel_id = nba_core.selection_id(row)
+    row = dict(row)
+    row["stake"] = allowed
+    row["player_roster"] = player_roster
+    row["team_roster"] = team_roster
+    try:
+        tip = _build_nba_model_tip(row, msg_time)
+        _apply_nba_model_stake(tip)
+        tip._presolved_event = game["event"]
+        tip.event = game["event"]
+        tip._nba_sel_id = sel_id
+        tip._nba_start_epoch = start_utc.timestamp()
+        tip._nba_earliest_epoch = earliest
+        # Gate against the price the selection was FIRST posted at, not a retry's re-posted
+        # quote (see nba_core.claim): drives the worse-than-posted gate, the 1.25x ceiling
+        # and the floor sent to HyperBot.
+        tip.suggested_odds = nba_core.reference_price(row)
+    except BaseException:
+        # Nothing was sent anywhere: release the reservation (a leak would block the
+        # selection for good), leave a record, and let the caller alert.
+        nba_core.commit(row, 0.0, 0.0, False, reserved=float(allowed),
+                        lock_timeout=nba_core.LOCK_TIMEOUT_SEC)
+        _fill_nothing("none", game["event"])
+        raise
+
+    # Re-check the clock JUST BEFORE place_tip: the lookups above take seconds, and the
+    # fan-out re-checks once more right before it fires.
+    if nba_core.too_late(time.time(), earliest):
+        nba_core.commit(row, 0.0, 0.0, False, reserved=float(allowed),
+                        lock_timeout=nba_core.LOCK_TIMEOUT_SEC)
+        _refuse_timing("the clock moved inside the minimum lead while this was prepared")
+        return
+
+    log.info(f"[{channel_name}] NBAModel PLACING {row['player']} ({row['team']}) UNDER "
+             f"{row['line']} rebounds @ posted {row['price']}: ${tip.stake_dollars} "
+             f"[kind={row['kind']} key={key} sel={sel_id} event={game['event']}]")
+
+    results = []
+    placed = ambiguous = 0.0
+    manual = False
+    confirmed, amb_accounts = [], []
+    requested = float(tip.stake_dollars)
+    event_name = getattr(tip, "event", "") or ""
+    tip._attempted_stake = 0.0          # the fan-out sets these once it actually sends
+    tip._nba_asks = {}
+
+    def _commit_blocking(p, a, m, conf, amb_acc, outcome_, requested_):
+        """The ledger commit, which must NEVER stop the fills record from being written: a
+        lock or disk failure after money was placed is logged CRITICAL and alerted (the core
+        also QUARANTINES the selection), and the record then carries the best-known state.
+        Returns (committed total or None, the selection's post-commit numbers). Blocking, so
+        the normal path runs it on the placement executor, off the event loop."""
+        nums: dict = {}
+        try:
+            c = nba_core.commit(row, p, a, m, reserved=float(allowed), accounts=conf,
+                                amb_accounts=amb_acc, event=event_name, outcome=outcome_,
+                                requested=requested_, numbers_out=nums)
+        except Exception as _e:
+            log.critical(f"[nba_model] COMMIT RAISED for {key}: {_e}")
+            c = None
+        if c is None:
+            log.critical(f"[nba_model] {key}: the ledger commit FAILED after placement "
+                         f"(placed ${p:.2f}, ambiguous ${a:.2f}); the ledger is behind the book")
+            try:
+                notifier.notify_critical(
+                    f"⚠️ NBA model: the ledger could not record {key} (placed ${p:.2f}, "
+                    f"ambiguous ${a:.2f}). The selection is QUARANTINED: no further offer is "
+                    f"placed on it until you reconcile it by hand and clear it. The fills record "
+                    f"carries the best-known state.")
+            except Exception:
+                pass
+        return c, nums
+
+    try:
+        results = await _run_in_placement_executor(place_tip, tip) or []
+        confirmed, amb_accounts = _nba_classify_results(results, tip)
+        placed = round(sum(a["stake"] for a in confirmed), 2)
+        ambiguous = round(sum(a["stake"] for a in amb_accounts), 2)
+        # MANUAL is sticky and means exactly "we told a human to place it" (alert_only).
+        manual = bool(getattr(tip, "alert_only", False))
+    except BaseException:
+        # Crash or cancellation mid-placement: the bet MAY have landed. Book the amount
+        # actually ATTEMPTED as ambiguous so nothing ever re-offers against it.
+        ambiguous = round(float(requested), 2)
+        amb_acc = [{"session_id": "unknown", "stake": ambiguous,
+                    "max_odds": _nba_max_odds(tip)}]
+        c, nums = await _run_in_ledger_executor(
+            _commit_blocking, 0.0, ambiguous, False, [], amb_acc, "none", requested)
+        nba_core.write_fill(row, requested=requested, placed=0.0, ambiguous=ambiguous,
+                            manual=False, accounts=[], outcome="none", event=event_name,
+                            selection=nums if c is not None else None,
+                            add_selection=None if c is not None else (0.0, ambiguous))
+        raise
+
+    capped = bool(getattr(tip, "_nba_capped", False))
+    if capped:
+        outcome = "capped"
+    elif placed >= requested - 0.01:
+        outcome = "filled"
+    elif placed > 0:
+        outcome = "partial"
+    elif manual:
+        outcome = "manual"
+    else:
+        outcome = "none"
+    # `requested` is what Sportsbet was actually ASKED for on this key: the fan-out's first
+    # asks, minus any whose single attempt never reached Sportsbet (a proxy 403, a HyperBot
+    # outage: provably pre-placement), so those cannot latch the producer's acceptance stop.
+    # 0.0 when nothing was sent. The outcome above is judged against the message stake, so a
+    # capped fill reads `partial`.
+    asks = dict(getattr(tip, "_nba_asks", {}) or {})
+    if asks:
+        unsent = set()
+        for r in results:
+            sid = str(getattr(r, "session_id", "") or "")
+            if (not getattr(r, "success", False) and sid in asks
+                    and not _is_ambiguous_result(r)
+                    and _is_definitely_pre_placement(getattr(r, "error", "") or "")
+                    and abs(float(getattr(r, "_requested_stake", 0) or 0) - asks[sid]) < 0.005):
+                unsent.add(sid)
+        attempted = round(sum(v for sid, v in asks.items() if sid not in unsent), 2)
+    else:
+        attempted = float(getattr(tip, "_attempted_stake", 0.0) or 0.0)
+    asked = 0.0 if capped else round(max(attempted, placed + ambiguous), 2)
+    # The commit stores the outcome and `requested` with the key, so a crash before the fills
+    # append rebuilds the record exactly. It runs OFF the event loop with its own long lock
+    # budget, and hands back the post-commit selection numbers the record needs.
+    committed, nums = await _run_in_ledger_executor(
+        _commit_blocking, placed, ambiguous, manual, confirmed, amb_accounts, outcome, asked)
+    nba_core.write_fill(row, requested=asked, placed=placed, ambiguous=ambiguous,
+                        manual=manual, accounts=confirmed, outcome=outcome, event=event_name,
+                        selection=nums if committed is not None else None,
+                        add_selection=None if committed is not None else (placed, ambiguous))
+    log.info(f"[{channel_name}] NBAModel {key}: outcome={outcome} "
+             f"placed=${placed:.2f}/{requested:.2f} ambiguous=${ambiguous:.2f} "
+             f"selection_committed=${(committed or 0.0):.2f}")
+
+
 async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
                                    default_units: float, msg_time,
                                    channel_name: str):
@@ -23792,7 +24814,7 @@ async def main():
         # pair at INFO so a bot_id flip is grep-able without spamming on
         # every human message in chats that have casual chatter.
         expected_bot = channel_cfg.get("bot_id")
-        if expected_bot and sender_id != expected_bot:
+        if not _sender_allowed(channel_cfg, sender_id):
             key = (chat_id, sender_id)
             if key not in _unexpected_senders_seen:
                 _unexpected_senders_seen.add(key)
@@ -23828,6 +24850,21 @@ async def main():
         # drops silently inside the processor; a malformed BET| line alerts loudly.
         # The bot_id sender filter above has already run, so a message from any other
         # group member never gets here.
+        # nba-v3 NBA props model MACHINE FEED. A dedicated NBA channel carries the
+        # `nba_model` flag; the AFL feed's channel carries `nba_model_shared` when NBA
+        # signals share it (same channel, same locked sender), and then only a `BET|v3|`
+        # message is routed here: a v2 message stays on the AFL path below, untouched.
+        # Handled and RETURNED, never reaching the LLM text path. The bot_id sender filter
+        # above has already run. Neither flag exists unless NBA_MODEL_ENABLED.
+        if _nba_route(channel_cfg, text):
+            if text:
+                asyncio.create_task(
+                    _process_nba_model_tip(text, msg_time, channel_name)
+                )
+            else:
+                log.info(f"[{channel_name}] NBA machine-feed post with no text -> ignored")
+            return
+
         if channel_cfg.get("machine_feed"):
             # v6.08e LIVENESS STAMP. Every message from this channel's locked sender is
             # proof the model is alive AND that telethon is delivering — a bet, a watch
@@ -24157,6 +25194,13 @@ async def main():
             _process_tip(text, tipster, sport, unit_size, default_units, msg_time, channel_name)
         )
 
+    # nba-v3: recover what a dead process left (ambiguous exposure, missing fills rows) BEFORE
+    # the client starts reading messages, so nothing is claimed against an unrecovered ledger.
+    try:
+        if nba_core is not None:
+            _nba_startup_recover()
+    except Exception as _e:
+        log.error(f"[nba_model] startup recovery failed: {_e}")
     await client.start(phone=TELEGRAM_PHONE)
     log.info("Telethon client started")
     notifier.notify_startup()
@@ -24287,6 +25331,14 @@ async def main():
     elif DISPOSALS_MODEL_LIVENESS_ENABLED:
         log.info("[disposals_model] liveness detector idle (DISPOSALS_MODEL_ENABLED=false, "
                  "so the channel is not registered and there is nothing to watch)")
+
+    # nba-v3: one INFO notice at startup saying whether the NBA feed is on and whether its
+    # TEST MODE is ON or OFF. A no-op (log only) while NBA_MODEL_ENABLED is false.
+    try:
+        if nba_core is not None:
+            _nba_startup_notice()
+    except Exception as _e:
+        log.warning(f"[nba_model] startup notice failed: {_e}")
 
     # v6.07 (sweep #29): report priority sessions that were DEAD at startup. The
     # watchdog above can only see TRANSITIONS out of the already-active set, so a

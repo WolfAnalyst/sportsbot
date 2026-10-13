@@ -143,6 +143,18 @@ class PriorityConfig:
     # v6.32: The Bettors Edge NBL fan-out. Empty -> NBL singles use the NBA list
     # (the pre-v6.32 behaviour), so an unset env var changes nothing.
     nbl_singles: list[str] = field(default_factory=list)
+    # nba-v3: an OPTIONAL dedicated list for the NBA props MODEL only (NBA_MODEL_SESSION_PRIORITY).
+    # Empty -> the model uses nba_singles (shared with the human NBA tipsters).
+    nba_model_singles: list[str] = field(default_factory=list)
+    # True when that env var was set but malformed: the model then has NO accounts (manual).
+    nba_model_singles_bad: bool = False
+
+    def nba_model_priority(self) -> list[str]:
+        """The account list for the NBA model: its own list if set, else the shared NBA singles
+        list. A malformed own list fails CLOSED (no accounts), never falling back."""
+        if self.nba_model_singles_bad:
+            return []
+        return self.nba_model_singles or self.nba_singles
 
     def for_sport(self, sport: str, is_sgm: bool = False) -> list[str]:
         """
@@ -451,6 +463,9 @@ def load_priority_from_env() -> PriorityConfig:
                                     line-within-2 match only)
       NBL_SESSION_PRIORITY        (v6.32 -- Bettors Edge NBL singles fan-out;
                                     empty -> falls back to NBA_SESSION_PRIORITY)
+      NBA_MODEL_SESSION_PRIORITY  (nba-v3 -- the NBA props model ONLY; optional,
+                                    empty -> falls back to NBA_SESSION_PRIORITY;
+                                    malformed -> no accounts and a config error)
 
     Sessions not in the relevant list are excluded from auto-placement
     for that (sport, kind) — manual alert only.
@@ -466,7 +481,12 @@ def load_priority_from_env() -> PriorityConfig:
         racing=_parse_priority_env("RACING_SESSION_PRIORITY"),
         nfl_singles=_parse_priority_env("NFL_SESSION_PRIORITY"),
         nbl_singles=_parse_priority_env("NBL_SESSION_PRIORITY"),
+        nba_model_singles=_parse_priority_env("NBA_MODEL_SESSION_PRIORITY"),
     )
+    _raw_model = os.getenv("NBA_MODEL_SESSION_PRIORITY", "").strip()
+    if _raw_model:
+        cfg.nba_model_singles_bad = (
+            not cfg.nba_model_singles or not all(t.isdigit() for t in cfg.nba_model_singles))
     _priority_config = cfg
     return cfg
 
@@ -520,8 +540,12 @@ def get_priority_config() -> PriorityConfig:
     return _priority_config
 
 
-def get_priority_for(sport: str, is_sgm: bool = False) -> list[str]:
-    """Convenience: priority list for a (sport, is_sgm) combo."""
+def get_priority_for(sport: str, is_sgm: bool = False, nba_model: bool = False) -> list[str]:
+    """Convenience: priority list for a (sport, is_sgm) combo. `nba_model=True` (set ONLY by the
+    NBA props model's fan-out) selects NBA_MODEL_SESSION_PRIORITY, falling back to the shared
+    NBA singles list when it is empty."""
+    if nba_model and not is_sgm and (sport or "").lower() == "nba":
+        return _priority_config.nba_model_priority()
     return _priority_config.for_sport(sport, is_sgm)
 
 
@@ -537,10 +561,18 @@ def all_priority_session_ids() -> set[str]:
     the FIX 4 inert-crash severity partition (main.py watchdog +
     check_session_health)."""
     cfg = _priority_config
+    # v6.69 review: the NBA model's own list counts only while its feed is on, so its accounts
+    # are not "placeable" (health relaunch, crash severity) with NBA_MODEL_ENABLED=false.
+    try:
+        import config as _cfg_mod
+        _model_on = bool(getattr(_cfg_mod, "NBA_MODEL_ENABLED", False))
+    except Exception:
+        _model_on = False
     return set(
         cfg.nba_singles + cfg.nba_sgm + cfg.afl_singles
         + cfg.afl_sgm + cfg.mlb_singles + cfg.mlb_sgm + cfg.racing
         + cfg.nfl_singles + cfg.nbl_singles
+        + (cfg.nba_model_singles if _model_on else [])
     )
 
 
@@ -584,7 +616,7 @@ def drop_fillup_when_others(sessions: list, sport: str) -> list:
 
 
 def filter_and_order_sessions(
-    sessions: list[dict], sport: str, is_sgm: bool = False,
+    sessions: list[dict], sport: str, is_sgm: bool = False, nba_model: bool = False,
 ) -> list[dict]:
     """
     Filter active sessions to only those in the relevant priority list,
@@ -596,7 +628,12 @@ def filter_and_order_sessions(
     If no priority list is configured for the sport, returns sessions
     unchanged (no regression — caller can fall back to legacy behaviour).
     """
-    priority = get_priority_for(sport, is_sgm)
+    if nba_model:
+        priority = get_priority_for(sport, is_sgm, nba_model=True)
+        if not priority:
+            return []            # the model never falls through to "every session"
+    else:
+        priority = get_priority_for(sport, is_sgm)
     if not priority:
         return sessions
 
