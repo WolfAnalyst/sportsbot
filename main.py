@@ -56,6 +56,7 @@ from config import (
     STARTUP_PENDING_RECONCILE_ENABLED, STARTUP_PENDING_RECONCILE_LOOKBACK_SEC,
     STARTUP_DEAD_SESSION_ALERT, STARTUP_DEAD_SESSION_GRACE_SEC, STARTUP_DEAD_SESSION_MAX,
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
+    LEGUP_ENABLED, LEGUP_MAX_UNITS,
     SPORTSBET_MAX_STAKE_REBET,
     HB_SEND_MAX_ODDS, HB_SEND_DIRECTION, HB_RETRY_WITHOUT_PLAYER, NFL_WORSE_LINE_STAKE_MULT,
     NFL_RUSH_ATT_FALLBACK_STAKE_MULT,
@@ -158,6 +159,7 @@ from roster import resolve_player_name, get_player_team, afl_surname_candidates,
 from roster import is_nfl_name_collision
 from roster import exact_match_player
 import seen_bets
+import units_cap
 from roster import _GEN_SUFFIXES as _ROSTER_GEN_SUFFIXES, _fold_accents as _roster_fold_accents
 from roster import _team_matches as _roster_team_matches
 import notifier
@@ -4248,6 +4250,175 @@ def _disposals_liveness_tick() -> None:
     so a single alert can pin whatever thread it is on for ~45s. On the event loop that
     stalls every tip in flight, which is a steep price for a diagnostic."""
     _disposals_send_liveness_alerts(_disposals_liveness_check())
+
+
+# ── v6.71 NBA model liveness (Wilson 2026-10-18: heartbeat like the AFL model, 2h) ──────────
+# The NBA model sends `NOOP|v3|...` every run (even with no bets) and BET|v3| lines; every
+# message from its locked sender stamps "last seen" here. On an NBA GAME DAY, from the end of
+# the Sydney quiet window until the day's last tip-off, silence longer than
+# NBA_MODEL_SILENCE_HOURS (measured from the later of the last message and the window start)
+# sends ONE alert per outage to the maintenance chat, plus one "back" note when it resumes.
+# The latch is kept in memory AND in the state file (the file can be unwritable; see the
+# DisposalsModel note above), so one outage is one alert across polls and restarts.
+_NBA_LIVENESS_LOCK = threading.Lock()
+_NBA_LIVENESS_MEM = {"last_seen": None, "alerted_for": None}
+
+
+def _nba_liveness_path() -> str:
+    import config as _c
+    p = getattr(_c, "NBA_MODEL_LIVENESS_PATH", "logs/nba_model_liveness.json")
+    return p if os.path.isabs(p) else os.path.join(os.path.dirname(os.path.abspath(__file__)), p)
+
+
+def _nba_liveness_load() -> dict:
+    try:
+        with open(_nba_liveness_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}                      # no money state here: a lost file is a clean slate
+
+
+def _nba_liveness_save(state: dict) -> None:
+    path = _nba_liveness_path()
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning(f"[nba_model] liveness state not saved ({e})")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _nba_liveness_stamp(kind: str, now=None) -> list:
+    """Record a message from the model. Returns a "back" alert when it ends an alerted outage."""
+    now_ts = now if now is not None else time.time()
+    out = []
+    with _NBA_LIVENESS_LOCK:
+        st = _nba_liveness_load()
+        alerted = st.get("alerted_for")
+        if alerted is None:
+            alerted = _NBA_LIVENESS_MEM.get("alerted_for")
+        if alerted is not None:
+            out.append(("info", f"NBA model feed is back ({kind} received) after the "
+                                f"silence alert."))
+        st.update({"last_seen": now_ts, "last_kind": kind, "alerted_for": None})
+        _NBA_LIVENESS_MEM.update({"last_seen": now_ts, "alerted_for": None})
+        _nba_liveness_save(st)
+    return out
+
+
+def _nba_game_day_window(now_syd):
+    """(window_start_epoch, last_tipoff_epoch) for today's NBA games in Sydney time, or None
+    when there is no NBA game today (or ESPN cannot be read: no alert on no evidence)."""
+    from zoneinfo import ZoneInfo as _ZI
+    from nba_resolver import _fetch_schedule
+    import config as _c
+    syd = now_syd.tzinfo
+    day = now_syd.date()
+    starts = []
+    from datetime import timedelta as _td
+    us_today = now_syd.astimezone(_ZI("America/New_York")).date()
+    for off in (-1, 0):     # ESPN files a game under its US date, a day behind Sydney's
+        d = (us_today + _td(days=off)).strftime("%Y-%m-%d")
+        for g in _fetch_schedule("nba", d) or []:
+            try:
+                ts = datetime.fromisoformat(str(g.get("start")).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+            if ts.tzinfo is None:
+                continue
+            if ts.astimezone(syd).date() == day:
+                starts.append(ts.timestamp())
+    if not starts:
+        return None
+    end_h = int(getattr(_c, "NBA_MODEL_QUIET_END_HOUR", 7))
+    win_start = now_syd.replace(hour=end_h, minute=0, second=0, microsecond=0).timestamp()
+    return win_start, max(starts)
+
+
+def _nba_liveness_check(now=None) -> list:
+    """(level, text) alerts. Silent outside game days, inside the quiet window, and after the
+    day's last tip-off."""
+    import config as _c
+    if nba_core is None:
+        return []
+    now_syd = now if now is not None else datetime.now(nba_core.SYDNEY)
+    if nba_core.in_quiet_window(now_syd):
+        return []
+    try:
+        win = _nba_game_day_window(now_syd)
+    except Exception as e:
+        log.debug(f"[nba_model] liveness: schedule not readable ({e})")
+        return []
+    if not win:
+        return []
+    win_start, last_tip = win
+    now_ts = now_syd.timestamp()
+    if now_ts > last_tip:
+        return []
+    with _NBA_LIVENESS_LOCK:
+        st = _nba_liveness_load()
+        last = st.get("last_seen")
+        mem_last = _NBA_LIVENESS_MEM.get("last_seen")
+        if isinstance(mem_last, (int, float)) and (
+                not isinstance(last, (int, float)) or mem_last > last):
+            last = mem_last
+        ref = max(last if isinstance(last, (int, float)) else 0.0, win_start)
+        quiet_h = (now_ts - ref) / 3600.0
+        if quiet_h < float(getattr(_c, "NBA_MODEL_SILENCE_HOURS", 2)):
+            return []
+        if ref in (st.get("alerted_for"), _NBA_LIVENESS_MEM.get("alerted_for")):
+            return []
+        st["alerted_for"] = ref
+        _NBA_LIVENESS_MEM["alerted_for"] = ref
+        _nba_liveness_save(st)
+    seen = (datetime.fromtimestamp(last, nba_core.SYDNEY).strftime("%a %H:%M")
+            if isinstance(last, (int, float)) and last > 0 else "nothing yet today")
+    tip = datetime.fromtimestamp(last_tip, nba_core.SYDNEY).strftime("%H:%M")
+    return [("critical",
+             f"NBA model feed SILENT for {quiet_h:.1f}h on a game day (last message: {seen}; "
+             f"last tip-off today {tip} Sydney). It should send a NOOP heartbeat every run. "
+             f"Check the NBA model's scheduled task and its Telegram bot.")]
+
+
+def _nba_liveness_unlatch() -> None:
+    """A silence alert that could not be sent must not hold the one-per-outage latch."""
+    with _NBA_LIVENESS_LOCK:
+        st = _nba_liveness_load()
+        st["alerted_for"] = None
+        _NBA_LIVENESS_MEM["alerted_for"] = None
+        _nba_liveness_save(st)
+
+
+def _nba_liveness_tick() -> None:
+    for _level, text in _nba_liveness_check() or []:
+        sent = False
+        try:
+            sent = notifier.notify_info(text) is not False   # maintenance chat, like the AFL model's
+        except Exception as e:
+            log.error(f"[nba_model] liveness alert failed to send: {e}")
+        if not sent:
+            log.warning("[nba_model] liveness alert not sent: will retry on the next poll")
+            _nba_liveness_unlatch()
+
+
+async def _nba_liveness_loop():
+    import config as _c
+    poll = max(60, int(getattr(_c, "NBA_MODEL_LIVENESS_POLL_SEC", 900)))
+    log.info(f"[nba_model] liveness detector started (poll {poll}s, silence "
+             f"{getattr(_c, 'NBA_MODEL_SILENCE_HOURS', 2)}h on NBA game days)")
+    while True:
+        await asyncio.sleep(poll)
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, _nba_liveness_tick)
+        except Exception as e:
+            log.error(f"[nba_model] liveness loop error: {e}")
 
 
 async def _disposals_liveness_loop():
@@ -15836,12 +16007,11 @@ async def _process_tip(text: str, tipster: str, sport: str,
                 + (timing.get("regex_parse", 0) or 0), 3),
         }
 
-        # Cap at max units
+        # Cap at max units. v6.72: the rest goes to a manual alert (sent below, once the
+        # resend guard has passed, so a re-sent tip doesn't alert twice).
+        _units_tipped = float(tip.units or 0)
         if tip.units > MAX_UNITS:
-            notifier.notify_info(
-                f"Unit cap: {tip.tipster} tipped {tip.units}u, capped to {MAX_UNITS}u\n"
-                f"Raw: {tip.raw_message[:200]}"
-            )
+            log.info(f"Unit cap: {tip.tipster} tipped {tip.units}u, capped to {MAX_UNITS}u")
             tip.units = MAX_UNITS
 
         # MLB flat stake (ignore the recommended unit; $1 while gated, prod $).
@@ -15916,6 +16086,15 @@ async def _process_tip(text: str, tipster: str, sport: str,
                 "tipster framed this message as NO bet ('nothin today' / "
                 "'none quite' phrasing) — review manually, do not place"
             )
+
+        # v6.72 (units_cap.py): over MAX_UNITS places the cap, the rest is a manual alert.
+        # Not for a tip already going to manual (its own alert carries it) or one a flat
+        # stake re-sized (Dello, self-bet, MLB).
+        if (_units_tipped > float(MAX_UNITS) + 1e-9 and not getattr(tip, "alert_only", False)
+                and abs(float(tip.units) - float(MAX_UNITS)) < 1e-9):
+            units_cap.alert(notifier, channel_name, channel_name,
+                            (tip.raw_message or "").strip()[:300], _units_tipped, MAX_UNITS,
+                            tip.unit_size, log)
 
         # Time the resolve + place step
         resolve_start = time.time()
@@ -16454,7 +16633,8 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
     # both). Tag the discipline so racing_placer caps these against the flat
     # per-account `racing.thoroughbreds` cap (win 1000 / place 500) and BYPASSES
     # the per-track harness caps. Day-before tips have no MBL.
-    discipline = "thoroughbred" if tipster in ("zak_racing", "trial_sniper") else ""
+    # v6.72: The Leg Up (email) tips thoroughbreds too.
+    discipline = "thoroughbred" if tipster in ("zak_racing", "trial_sniper", "legup") else ""
     # Race-type code (R=thoroughbred, H=harness, G=greyhound). Vision rarely
     # prints it. For Zak/Trial THOROUGHBRED tipsters, default an empty type to
     # "(R)" so bookies can disambiguate MULTI-DISCIPLINE venues: Geelong has BOTH
@@ -16726,11 +16906,25 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
             # (Zak/Trial-specific gate; does NOT affect Eddie AFL). Enforced
             # here in the placing process by design (the $600 lesson). v5.15:
             # use unit_size, not default_units (the old bug capped prod to ~$1).
-            units_capped = min(parsed["units"], MAX_UNITS, IMAGE_RACING_MAX_UNITS)
-            if IMAGE_RACING_TEST_MODE:
-                intended_stake = round(units_capped * IMAGE_TIPS_TEST_UNIT_SIZE, 2)
+            # v6.72: The Leg Up has its own cap (LEGUP_MAX_UNITS, 10u: Wilson "if over, bet
+            # max 10U and then send remaining to manual and make it clear"). Every racing cap
+            # now places the cap and sends the rest as a manual alert (units_cap.py); it used
+            # to be clipped silently.
+            if tipster == "legup":
+                _ucap = float(LEGUP_MAX_UNITS)
             else:
-                intended_stake = round(units_capped * float(unit_size), 2)
+                _ucap = min(float(MAX_UNITS), float(IMAGE_RACING_MAX_UNITS))
+            units_capped, _uleft, _ = units_cap.split(parsed["units"], _ucap)
+            _per_unit = (float(IMAGE_TIPS_TEST_UNIT_SIZE) if IMAGE_RACING_TEST_MODE
+                         else float(unit_size))
+            if _uleft > 0:
+                units_cap.alert(
+                    notifier, channel_name, channel_name,
+                    f"{parsed.get('track') or '?'} R{parsed.get('race_num')} {parsed.get('title')} "
+                    f"{(parsed.get('market') or 'win').upper()} @ "
+                    f"{parsed.get('tipster_odds') or 'best'}",
+                    parsed["units"], _ucap, _per_unit, log)
+            intended_stake = round(units_capped * _per_unit, 2)
 
             jobs.append((idx, parsed, intended_stake))
         except Exception as e:
@@ -17739,6 +17933,7 @@ async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                     f"over-staked $1000 guess on each"
                 )
 
+            _units_tipped = float(tip.units or 0)  # v6.72: the rest is alerted below
             if tip.units > MAX_UNITS:
                 tip.units = MAX_UNITS
             _apply_mlb_flat_stake(tip)       # no-op for AFL
@@ -17759,6 +17954,12 @@ async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                                    f"{seen_bets.age_text(_gprev)} ago)")
                 continue
             _batch_fps.add(_dupe_fp)
+            # v6.72 (units_cap.py): over MAX_UNITS places the cap, the rest is a manual alert
+            if (_units_tipped > float(MAX_UNITS) + 1e-9 and not getattr(tip, "alert_only", False)
+                    and abs(float(tip.units) - float(MAX_UNITS)) < 1e-9):
+                units_cap.alert(notifier, channel_name, channel_name,
+                                f"{_tip_fingerprint(tip)}", _units_tipped, MAX_UNITS,
+                                tip.unit_size, log)
 
             # v5.37: stamp arrival t0 + vision parse so the summary reconciles a
             # true end-to-end. place_tip ADDS resolve_sec; the fan-out price_check_sec.
@@ -20626,8 +20827,15 @@ def _attempt_nbl_auto_place(tipster: str, channel_name: str, raw: dict, unit_siz
             units_f = 0.0
         if units_f <= 0:
             return False, "no units on the leg"
-        if units_f > _NBL_MAX_UNITS:
-            return False, f"{units_f}u is above the {_NBL_MAX_UNITS:g}u sanity cap (misparse?)"
+        # v6.72 (units_cap.py): up to twice the cap places the cap and the rest is a manual
+        # alert (sent once the duplicate check below passes); above twice is a misread.
+        # An image leg carries its own cap (BETTORSEDGE_IMAGE_MAX_UNITS) in `_units_cap`.
+        _units_tipped = units_f
+        _ucap = float(raw.get("_units_cap") or _NBL_MAX_UNITS)
+        units_f, _units_left, _within_2x = units_cap.split(units_f, _ucap)
+        if not _within_2x:
+            return False, (f"{_units_tipped:g}u is more than twice the {_ucap:g}u cap "
+                           f"(misparse?), place by hand")
         bookie_tag = (raw.get("bookie") or "").strip().lower()
         if bookie_tag and bookie_tag != "sportsbet":
             try:
@@ -20739,6 +20947,10 @@ def _attempt_nbl_auto_place(tipster: str, channel_name: str, raw: dict, unit_siz
             except Exception as e:
                 log.error(f"NBL auto-place: duplicate-alert failed: {e}")
             return True, "duplicate"
+        if _units_left > 0:
+            units_cap.alert(notifier, channel_name, channel_name,
+                            f"{_bet_label} [{match['event']}]", _units_tipped, _ucap,
+                            unit_size, log)
 
         _leg_market = {"h2h": "h2h", "spread": "line", "total": "total"}.get(mt, "player_prop")
         leg = ParsedLeg(
@@ -21179,8 +21391,9 @@ def _nbl_expiry_reason(t: dict) -> str:
 async def _nbl_image_place(slot: "_NblImageSlot", tips: list, units: list, channel_name: str,
                            unit_size: float, source: str) -> None:
     """Place the bets of one image at `units` each, through the text route's own per-leg
-    code. Units above BETTORSEDGE_IMAGE_MAX_UNITS are NOT clipped: Wilson never bets more,
-    so such a number is a misread and that bet goes to manual. A card whose slip stake could
+    code. Units above BETTORSEDGE_IMAGE_MAX_UNITS place the cap and the rest goes to a manual
+    alert; above twice the cap the number is a misread and that bet goes to manual (v6.72,
+    was: any units above the cap went to manual). A card whose slip stake could
     not be verified (`_slip_expect`) places only when its units number EQUALS that stake. The
     profit cap rides on each leg (`_max_profit`) and is applied in _attempt_nbl_auto_place
     once the live odds are known (it refuses, rather than placing uncapped, when no price is
@@ -21198,13 +21411,17 @@ async def _nbl_image_place(slot: "_NblImageSlot", tips: list, units: list, chann
                               f"slip stake ${exp:g} could not be verified and the units message "
                               f"says {u:g}, place manually")
             continue
-        if u > cap_units + 1e-9:
+        # v6.72 (units_cap.py): up to twice the cap places the cap (the leg handler splits
+        # it and sends the rest as a manual alert); above twice is a misread -> manual.
+        if u > 2 * cap_units + 1e-9:
             _nbl_image_manual(channel_name, slot, [raw],
-                              f"units {u:g} above the {cap_units:g}u cap, place manually")
+                              f"units {u:g} more than twice the {cap_units:g}u cap "
+                              f"(misread?), place manually")
             continue
         r = dict(raw)
         r.pop("_slip_expect", None)
         r["units"] = u
+        r["_units_cap"] = cap_units
         r["_max_profit"] = float(BETTORSEDGE_IMAGE_MAX_PROFIT)
         r["_post_has_header"] = True
         legs.append(r)
@@ -23081,7 +23298,8 @@ def _nba_route(channel_cfg: dict, text: str) -> bool:
     message stays on the AFL path."""
     if channel_cfg.get("nba_model"):
         return True
-    return bool(channel_cfg.get("nba_model_shared")) and "BET|v3|" in (text or "")
+    return bool(channel_cfg.get("nba_model_shared")) and (
+        "BET|v3|" in (text or "") or "NOOP|v3|" in (text or ""))
 
 
 def _nba_max_odds(tip: ParsedTip) -> float:
@@ -23606,6 +23824,125 @@ async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
     )
 
 
+LEGUP_MAX_DAYS_AHEAD = 3  # same window as the undated-racing lookahead (RACING_UNDATED_LOOKAHEAD_DAYS)
+
+
+def _legup_date_problem(race_date: "str|None", today: "_date", track: str = "",
+                        schedule=None) -> str:
+    """Why a Leg Up tip's date can't be trusted for auto-placement, or "" if it can.
+    The date is the email SUBJECT's ("SATURDAY TIPS | OCT 17"). Two emails both said
+    "OCT 8" (received 8 and 9 Oct), so a past date is never re-pointed at a later
+    meeting: it goes to manual. With a fresh Racing Australia calendar that knows the
+    track, the track must race that day."""
+    if not race_date:
+        return "no race date in the email subject"
+    try:
+        d = _date.fromisoformat(race_date)
+    except ValueError:
+        return f"unreadable race date {race_date!r}"
+    if d < today:
+        return f"the email is for {race_date}, a day that has passed"
+    if (d - today).days > LEGUP_MAX_DAYS_AHEAD:
+        return f"the email is for {race_date}, more than {LEGUP_MAX_DAYS_AHEAD} days ahead"
+    if track and schedule:
+        try:
+            import racing_schedule
+            dates = racing_schedule.meeting_dates(track, schedule)
+        except Exception:
+            dates = []
+        if dates and race_date not in dates:
+            return f"the Racing Australia calendar has no {track} meeting on {race_date}"
+    return ""
+
+
+async def _process_legup_post(text, cfg, msg_time, channel_name):
+    """v6.72 The Leg Up (Wilson 2026-10-18). The post is gmail_watcher.py's compact copy of
+    the tips email (parsers/legup.py). Fixed-price Pro Tips place through the racing
+    pipeline at their units (our own price shop, the email's bookie is ignored; over
+    LEGUP_MAX_UNITS places the max and the rest is a manual alert, in
+    _route_image_racing_tips). Everything else goes to ONE manual alert: TO+ (best tote)
+    tips, which Wilson places himself, Future Tips, unreadable lines, and tips whose date
+    can't be trusted. Scratched runners are skipped."""
+    t0 = time.time()
+    try:
+        from parsers import legup as _lu
+        post = _lu.parse_forward(text)
+    except Exception as e:
+        log.exception(f"[{channel_name}] Leg Up parse crashed: {e}")
+        notifier.notify_text_manual_alert(channel_name, f"(parse error: {e}) place manually:\n{text}",
+                                          header="LEG UP, MANUAL")
+        return
+    if post is None:
+        log.info(f"[{channel_name}] not a Leg Up tips post -> ignored: {text[:80]!r}")
+        return
+    unit_size = float(cfg.get("unit_size") or 0)
+    today = _au_east_day(msg_time)
+    try:
+        import racing_schedule
+        schedule = racing_schedule.load()
+    except Exception as e:
+        log.warning(f"[{channel_name}] racing schedule unavailable ({e})")
+        schedule = None
+    if not schedule:
+        log.warning(f"[{channel_name}] no fresh racing schedule: the Leg Up meeting check is "
+                    f"skipped, trusting the subject date")
+
+    def _desc(t):
+        u = t.get("units")
+        stake = f" {u:g}u (${u * unit_size:,.0f})" if u else ""
+        bk = f" [tipped at {t['bookie']}]" if t.get("bookie") else ""
+        return (f"{t['track']} R{t['race_num']} #{t['saddle'] if t['saddle'] is not None else '?'} "
+                f"{t['runner']} {(t.get('market') or '?').upper()} @ {t.get('price_text') or '?'}"
+                f"{stake}{bk}")
+
+    raw_tips, tote, cant, bad_date = [], [], [], []
+    for t in post["pro"]:
+        if t["scratched"]:
+            log.info(f"[{channel_name}] Leg Up {t['runner']} scratched -> skipped")
+            continue
+        if not t.get("fixed_price"):
+            tote.append(_desc(t))
+            continue
+        if not t.get("market") or not t.get("units") or t["units"] <= 0:
+            cant.append(f"{t['raw']} (no market or units read)")
+            continue
+        why = _legup_date_problem(post["date"], today, t["track"], schedule)
+        if why:
+            bad_date.append(f"{_desc(t)} ({why})")
+            continue
+        raw_tips.append({"track": t["track"], "date": post["date"], "race": t["race_num"],
+                         "saddle": t["saddle"], "runner": t["runner"], "odds": t["odds"],
+                         "units": t["units"], "market": t["market"], "race_type": "(R)"})
+    cant += post["unparsed"]
+
+    sections = []
+    if tote:
+        sections.append("TO+ (best tote) tips, place these yourself:\n" + "\n".join(f"- {x}" for x in tote))
+    if bad_date:
+        sections.append("NOT auto-placed, date check failed:\n" + "\n".join(f"- {x}" for x in bad_date))
+    if post["future"] or post["future_unparsed"]:
+        fl = [f"- {f['race'] or '?'}: {f['raw']}" + (f" (first sent {f['sent']})" if f["sent"] else "")
+              for f in post["future"]] + [f"- {x}" for x in post["future_unparsed"]]
+        sections.append("Future Tips, place yourself:\n" + "\n".join(fl))
+    if cant:
+        sections.append("Could not read, check the email:\n" + "\n".join(f"- {x}" for x in cant))
+    if sections:
+        head = f"{post['subject'] or 'Leg Up tips'} (race date {post['date'] or 'unknown'})"
+        try:
+            notifier.notify_text_manual_alert(channel_name, head + "\n\n" + "\n\n".join(sections),
+                                              header="LEG UP, MANUAL")
+        except Exception as e:
+            log.error(f"[{channel_name}] Leg Up manual alert failed: {e}")
+
+    log.info(f"[{channel_name}] Leg Up {post['subject']!r} date={post['date']}: "
+             f"{len(raw_tips)} to place, {len(tote)} TO+ manual, {len(bad_date)} bad date, "
+             f"{len(post['future'])} future, {len(cant)} unreadable")
+    if raw_tips:
+        await _route_image_racing_tips(
+            raw_tips, "legup", channel_name, unit_size, float(cfg.get("default_units") or 1.0),
+            msg_time, pipeline_start=t0, parse_sec=time.time() - t0)
+
+
 async def _process_leroy_betfair_tip(text, cfg, msg_time, channel_name):
     """v5.93 crash-guard + dispatcher for a Late Mail Leroy post. A create_task'd
     coroutine's exception is otherwise swallowed by asyncio (logged late, never
@@ -23779,6 +24116,10 @@ async def _leroy_place_race(parsed_race, date_str, channel_name):
             _leroy_recent_fps[fp] = _now
 
             capped = min(units, LEROY_MAX_UNITS)   # 4u CAP per bet (Wilson)
+            if capped < units:  # v6.72 (units_cap.py): the rest is a manual alert
+                units_cap.alert(notifier, channel_name, channel_name,
+                                f"{track} R{race_num} #{saddle} {name} {market.upper()} @ BSP",
+                                units, LEROY_MAX_UNITS, LEROY_UNIT_SIZE, log)
             size = round(capped * LEROY_UNIT_SIZE, 2)
             _t0 = datetime.now()
             try:
@@ -24872,6 +25213,16 @@ async def main():
                 log.info(f"[{channel_name}] Betfair BSP post with no text -> ignored")
             return
 
+        # v6.72 The Leg Up: gmail_watcher.py's compact post of the tips email. Pro Tips go
+        # through the racing pipeline; TO+ / Future / unreadable lines go to manual.
+        if channel_cfg.get("parser") == "legup":
+            if not LEGUP_ENABLED:
+                log.info(f"[{channel_name}] LEGUP_ENABLED=false -> skipped: {text[:80]}")
+            elif text:
+                asyncio.create_task(
+                    _process_legup_post(text, channel_cfg, msg_time, channel_name))
+            return
+
         # v6.08 DisposalsModel MACHINE FEED. The post IS the bet, as a fixed 18-field
         # `BET|v2|...` line. Handled here and RETURNED so it never reaches the LLM
         # text path below: for this strategy the line IS the trigger, and an LLM
@@ -24887,6 +25238,19 @@ async def main():
         # Handled and RETURNED, never reaching the LLM text path. The bot_id sender filter
         # above has already run. Neither flag exists unless NBA_MODEL_ENABLED.
         if _nba_route(channel_cfg, text):
+            # v6.71: a message routed here from the locked sender is proof of life (BET or NOOP
+            # on a shared channel; anything on the dedicated NBA channel). The "back" note is
+            # sent off the event loop so it can never delay the BET dispatched below.
+            try:
+                _kind = ("BET" if "BET|v3|" in (text or "")
+                         else "NOOP" if "NOOP|v3|" in (text or "") else "message")
+                for _lvl, _txt in _nba_liveness_stamp(_kind):
+                    asyncio.get_running_loop().run_in_executor(None, notifier.notify_info, _txt)
+            except Exception as _e:
+                log.debug(f"[nba_model] liveness stamp failed: {_e}")
+            if text and text.lstrip().startswith("NOOP|v3|") and "BET|v3|" not in text:
+                log.info(f"[{channel_name}] NBA model heartbeat: {text.strip()[:120]}")
+                return
             if text:
                 asyncio.create_task(
                     _process_nba_model_tip(text, msg_time, channel_name)
@@ -25355,6 +25719,14 @@ async def main():
     # forever about a feed nobody has switched on.
     if DISPOSALS_MODEL_LIVENESS_ENABLED and DISPOSALS_MODEL_ENABLED:
         asyncio.create_task(_disposals_liveness_loop())
+    # v6.71: NBA model liveness, only while the NBA feed is on (its channel only exists then).
+    try:
+        import config as _c71
+        if (getattr(_c71, "NBA_MODEL_ENABLED", False)
+                and getattr(_c71, "NBA_MODEL_LIVENESS_ENABLED", True)):
+            asyncio.create_task(_nba_liveness_loop())
+    except Exception as _e71:
+        log.error(f"[nba_model] liveness loop not started: {_e71}")
     # v6.08p: re-ask Sportsbet for unfilled Saiyan stake as its to-win cap rises.
     if SAIYAN_TOPUP_ENABLED:
         asyncio.create_task(_saiyan_topup_loop())
