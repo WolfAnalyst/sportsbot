@@ -8196,6 +8196,23 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         _deduped.append(s)
     sessions = _deduped
 
+    # v6.73: NBA model TEST MODE places each bet on ONE account, rotating through the list,
+    # and counts it against NBA_MODEL_TEST_MAX_BETS (the counter is saved before the bet, so a
+    # crash can only under-use the budget, never exceed it).
+    if tip.tipster == NBA_MODEL_TIPSTER and nba_core is not None and nba_core.cfg("NBA_MODEL_TEST_MODE"):
+        _pick = nba_core.take_test_account([str(s.get("session_id", "")) for s in sessions])
+        if _pick is None:
+            _why = (nba_core.test_budget_refusal()
+                    or "NBA test mode: no account could be picked (counter not saved)")
+            log.warning(f"[nba_model] {_why}")
+            _not_placed_notifier(tip)(BetResult(success=False, tip=tip, error=_why,
+                                                timestamp=datetime.now()))
+            return [BetResult(success=False, tip=tip, error=_why, timestamp=datetime.now())]
+        sessions = [s for s in sessions if str(s.get("session_id", "")) == _pick]
+        log.info(f"[nba_model] TEST MODE: this bet goes to account {_pick} only "
+                 f"({nba_core.test_bets_used()}/{nba_core.cfg('NBA_MODEL_TEST_MAX_BETS')} "
+                 f"test bets used)")
+
     n_accounts = len(sessions)
     per_account_target = round(intended_stake / n_accounts, 2)
 
@@ -23470,13 +23487,17 @@ async def _place_one_nba_row(row: dict, msg_time, channel_name: str):
     # retry is gated against the signal's price even if the base never reached the claim.
     nba_core.note_price(row)
 
-    def _refuse_timing(why: str) -> None:
-        log.warning(f"[{channel_name}] {key}: {why} -> REFUSED (never place in-play)")
+    def _refuse_timing(why: str, early: bool = False) -> None:
+        log.warning(f"[{channel_name}] {key}: {why} -> REFUSED")
         _fill_nothing("refused")
         notifier.notify_image_alert(
             channel_name,
-            f"NBA model: {row['player']} UNDER {row['line']}: tip-off has PASSED or is inside "
-            f"the minimum lead, refused (tipbot never places this feed in-play).")
+            (f"NBA model: {row['player']} UNDER {row['line']}: tip-off is more than "
+             f"{nba_core.max_lead_sec() / 3600:.0f}h away, refused (the model should only send "
+             f"bets within {nba_core.max_lead_sec() / 3600:.0f}h of tip-off; a re-send inside "
+             f"that window can still place).") if early else
+            (f"NBA model: {row['player']} UNDER {row['line']}: tip-off has PASSED or is inside "
+             f"the minimum lead, refused (tipbot never places this feed in-play)."))
 
     # Every processed message with a well-formed key gets a fills record. An exception in the
     # gates below must not leave the key unanswered: the model counts an unanswered key as a
@@ -23498,6 +23519,13 @@ async def _place_one_nba_row(row: dict, msg_time, channel_name: str):
             _refuse_timing(f"start {start_utc.isoformat()} is past or inside the "
                            f"{nba_core.min_lead_sec():.0f}s minimum lead (now "
                            f"{now_utc.isoformat()})")
+            return
+        if nba_core.too_early(now_utc.timestamp(), start_utc.timestamp()):
+            # v6.73: more than NBA_MODEL_MAX_LEAD_SEC (12h) before tip-off, every kind.
+            _refuse_timing(f"start {start_utc.isoformat()} is more than "
+                           f"{nba_core.max_lead_sec() / 3600:.0f}h away (now "
+                           f"{now_utc.isoformat()}): the model only bets within "
+                           f"{nba_core.max_lead_sec() / 3600:.0f}h of tip-off", early=True)
             return
 
         # 2. HYPERBOT BLACKOUT (23:00-07:00 Sydney). Stop BEFORE claiming the key.

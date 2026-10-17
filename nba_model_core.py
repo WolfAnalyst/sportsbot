@@ -232,7 +232,7 @@ def test_stake_usable() -> bool:
     return math.isfinite(v) and v > 0
 
 
-def placement_refusal(market: str) -> str:
+def placement_refusal(market: str, check_budget: bool = True) -> str:
     """"" when the model may place this market at all; otherwise why not. The one gate every
     placement path asks (the row handler, the place_tip dispatch, the fan-out sizing):
 
@@ -248,6 +248,10 @@ def placement_refusal(market: str) -> str:
     if cfg("NBA_MODEL_TEST_MODE") and not test_stake_usable():
         return ("NBA test mode is ON but NBA_MODEL_TEST_STAKE is not a positive number: "
                 "nothing is placed (it would otherwise fall through to the production cap)")
+    if check_budget:
+        budget = test_budget_refusal()
+        if budget:
+            return budget
     return ladder_refusal(market)
 
 
@@ -271,7 +275,7 @@ def is_capped(market: str, odds, max_odds, used_liability: float,
     liability cap: the config is valid and the price can size a liability, yet even an unlimited
     request leaves no whole dollar (floor(remaining / (max_odds - 1)) < 1) or less than
     `min_stake` (the fan-out's per-account floor, which must never raise a stake above the cap)."""
-    if placement_refusal(market):
+    if placement_refusal(market, check_budget=False):
         return False
     try:
         if not (math.isfinite(float(odds)) and float(odds) > 1.0):
@@ -297,7 +301,7 @@ def ladder_stake_steps(market: str, odds, intended: float, max_odds=None,
         stake at its fill odds plus maybe-landed stake priced at max_odds). The first rung is
         the account's REMAINING cap, `top rung - used`; the lower rungs are the fallback on a
         stake-too-high reject, and are never above the remaining cap either."""
-    if placement_refusal(market):
+    if placement_refusal(market, check_budget=False):
         return []
     try:
         odds = float(odds or 0)
@@ -558,6 +562,102 @@ def min_lead_sec() -> float:
     except (TypeError, ValueError):
         return 90.0
     return v if math.isfinite(v) and v >= 0 else 90.0
+
+
+def max_lead_sec() -> float:
+    """v6.73: seconds before tip-off beyond which a message is refused (0 = no limit)."""
+    try:
+        v = float(cfg("NBA_MODEL_MAX_LEAD_SEC"))
+    except (TypeError, ValueError, AttributeError):
+        return 43200.0
+    return v if math.isfinite(v) and v >= 0 else 43200.0
+
+
+def too_early(now_ts: float, start_ts: float) -> bool:
+    """v6.73: True when tip-off is more than NBA_MODEL_MAX_LEAD_SEC away (every kind)."""
+    lead = max_lead_sec()
+    return lead > 0 and (start_ts - now_ts) > lead
+
+
+# ── v6.73 test-mode rotation: one account per test bet, at most NBA_MODEL_TEST_MAX_BETS ──
+_TEST_LOCK = threading.Lock()
+
+
+def _test_state_path() -> str:
+    p = str(getattr(_config, "NBA_MODEL_TEST_STATE_PATH", "logs/nba_model_test_rotation.json"))
+    return p if os.path.isabs(p) else os.path.join(os.path.dirname(os.path.abspath(__file__)), p)
+
+
+def _test_state_load() -> dict:
+    try:
+        with open(_test_state_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            raise ValueError("not a JSON object")
+        int(d.get("count", 0) or 0)
+        int(d.get("next", 0) or 0)
+        return d
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        # A corrupt counter must not reopen the budget: treat it as spent (fail closed).
+        return {"count": 10 ** 9, "corrupt": True}
+
+
+def _test_state_save(d: dict) -> bool:
+    path = _test_state_path()
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def test_bets_used() -> int:
+    with _TEST_LOCK:
+        return int(_test_state_load().get("count", 0) or 0)
+
+
+def test_budget_refusal() -> str:
+    """"" while test mode may still place; otherwise why not (test mode only)."""
+    if not cfg("NBA_MODEL_TEST_MODE"):
+        return ""
+    cap = int(cfg("NBA_MODEL_TEST_MAX_BETS"))
+    used = test_bets_used()
+    if used >= cap:
+        return (f"NBA test mode has used its {cap} test bets ({used} attempted): nothing more is "
+                f"placed until NBA_MODEL_TEST_MODE=false (or the counter "
+                f"{_test_state_path()} is reset) and tipbot is restarted")
+    return ""
+
+
+def take_test_account(session_ids: list) -> "str | None":
+    """Pick the ONE account for the next test bet, rotating through `session_ids`, and count
+    the bet. None when the budget is spent, the list is empty, or the counter cannot be saved
+    (fail closed: an unrecorded test bet could exceed the budget)."""
+    ids = [str(x) for x in session_ids if str(x)]
+    if not ids:
+        return None
+    cap = int(cfg("NBA_MODEL_TEST_MAX_BETS"))
+    with _TEST_LOCK:
+        st = _test_state_load()
+        used = int(st.get("count", 0) or 0)
+        if used >= cap:
+            return None
+        idx = int(st.get("next", 0) or 0)
+        sid = ids[idx % len(ids)]
+        st.update({"count": used + 1, "next": idx + 1, "last": sid})
+        if not _test_state_save(st):
+            return None
+    return sid
 
 
 def too_late(now_ts: float, start_ts: float) -> bool:
