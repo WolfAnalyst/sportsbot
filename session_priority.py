@@ -594,8 +594,8 @@ def is_placeable_session(session_id: str) -> bool:
 
 
 def sports_fillup_ids() -> set:
-    """v6.61: SPORTS_FILLUP_SESSIONS (Wilson SB 53522)."""
-    return {s.strip() for s in os.getenv("SPORTS_FILLUP_SESSIONS", "53522").split(",") if s.strip()}
+    """v6.61: SPORTS_FILLUP_SESSIONS (empty since v6.70: Wilson SB is racing only, v6.66)."""
+    return {s.strip() for s in os.getenv("SPORTS_FILLUP_SESSIONS", "").split(",") if s.strip()}
 
 
 def drop_fillup_when_others(sessions: list, sport: str) -> list:

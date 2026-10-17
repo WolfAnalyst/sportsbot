@@ -1221,6 +1221,8 @@ def _nba_fixture_start(session_id, sport: str, event: str):
 def _nba_wrong_fixture_reason(session_id, sport: str, event: str) -> str:
     """hb.event_guard: "" to place, else why `event` binds the wrong game."""
     try:
+        if getattr(_GUARD_TLS, "skip_nba_fixture", False):
+            return ""                      # v6.70: an NBA model bet, its game is already proven
         if not NBA_EVENT_VERIFY or (sport or "").lower() not in _NBA_GUARD_SPORTS:
             return ""
         if (os.getenv("TIPBOT_TESTING") or "pytest" in sys.modules) and not _NBA_GUARD_IN_TESTS:
@@ -15125,7 +15127,35 @@ def _resolve_single_for_placement(
     )
 
 
+_GUARD_TLS = threading.local()   # v6.70: per-thread "skip the v6.57 fixture guard" for model bets
+
+
 def _execute_bet(
+    tip: ParsedTip, session: dict, stake: float, presolved: dict | None = None,
+) -> BetResult:
+    """v6.70 (nba-v3 merge review): an NBA model bet already proved its game and start
+    (resolve_nba_game + the earliest of three starts, _price_check_nba_verified), so the v6.57
+    hb.event_guard, which runs inside place_single_sports_bet AFTER the model's last too-late
+    gate and can stall on a cache-miss price check, is skipped for it, and the minimum-lead
+    check is repeated right here, in the placing thread, before anything is sent. Every other
+    tip goes straight through unchanged."""
+    if getattr(tip, "tipster", "") != NBA_MODEL_TIPSTER:
+        return _execute_bet_inner(tip, session, stake, presolved)
+    _es = getattr(tip, "_nba_earliest_epoch", None)
+    if nba_core is not None and _es is not None and nba_core.too_late(time.time(), _es):
+        log.warning("[nba_model] inside the minimum lead before tip-off at send time: NOT firing")
+        return BetResult(success=False, tip=tip, session_id=str(session.get("session_id", "")),
+                         bookie=session.get("bookie", "unknown"),
+                         error="inside the minimum lead before tip-off", timestamp=datetime.now())
+    _prev = getattr(_GUARD_TLS, "skip_nba_fixture", False)
+    _GUARD_TLS.skip_nba_fixture = True
+    try:
+        return _execute_bet_inner(tip, session, stake, presolved)
+    finally:
+        _GUARD_TLS.skip_nba_fixture = _prev
+
+
+def _execute_bet_inner(
     tip: ParsedTip, session: dict, stake: float, presolved: dict | None = None,
 ) -> BetResult:
     """Execute a single bet on a specific session.
