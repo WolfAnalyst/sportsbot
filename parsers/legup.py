@@ -282,8 +282,12 @@ def parse_forward(text: str):
 
 
 def future_key(f: dict) -> str:
-    """Stable identity of a Future Tip across the daily emails that repeat it."""
+    """Stable identity of a Future Tip across the daily emails that repeat it. v6.74: the
+    units are part of it, so a Future Tip re-sent with MORE units reaches main.py, whose
+    units ledger turns it into a top-up (same units = the daily repeat, dropped)."""
     norm = lambda s: re.sub(r"[^a-z0-9]", "", (s or "").lower())
     race = (f.get("race") or "").split("(")[0]
     race = re.split(rf"\s+{_DASH}\s+", race)[0]
-    return f"{norm(race)}|{norm(f.get('runner'))}|{norm(f.get('sent'))}"
+    sm = _STAKE_RE.search(f.get("rest") or "")
+    units = f"{float(sm.group(1)):g}u" if sm else ""
+    return f"{norm(race)}|{norm(f.get('runner'))}|{norm(f.get('sent'))}|{units}"

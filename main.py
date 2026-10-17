@@ -16828,6 +16828,13 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
                 last_race_num = race_num
 
             parsed = _build_racing_tip_dict(raw, tipster, default_units, idx, msg_time)
+            # v6.74: The Leg Up's own units ledger (legup_ledger, in _process_legup_post) has
+            # already decided new tip vs resend vs top-up, and `units` is the units to ADD.
+            # The units-keyed resend guards below would call a second +2u top-up a resend of
+            # the first, so they stand aside for it; the dup-runner guard does too for a top-up.
+            _legup_ok = tipster == "legup" and bool(raw.get("_legup_skip_resend"))
+            if raw.get("_legup_topup"):
+                parsed["_legup_topup"] = True
 
             # Guard 2: no race number (and none to inherit) -> can't price-check
             # the right race safely. Route to manual rather than risk the wrong race.
@@ -16880,7 +16887,7 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
             # add-on/re-add (a different message, both with explicit, different units), so
             # a re-delivered message re-parsed with other units stays a duplicate.
             import tiptitans_processor as _ttp_meta
-            if _rfp in _racing_recent_fps and not _ttp_meta._is_add_on(
+            if not _legup_ok and _rfp in _racing_recent_fps and not _ttp_meta._is_add_on(
                     _racing_recent_meta.get(_rfp), _ttp_meta._bet_meta(parsed)):
                 log.info(f"[{channel_name}] DUPLICATE racing tip (seen <{DUPE_WINDOW_SECS}s "
                          f"ago) -> skipped (no double-bet): {parsed.get('runner')} "
@@ -16906,8 +16913,8 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
             _rkey = f"{_rbase}|{_seen_num(parsed.get('units'))}|{parsed.get('date') or ''}"
             _rlabel = (f"{parsed.get('runner')} {parsed.get('track') or '?'} "
                        f"R{parsed.get('race_num')} {parsed.get('market')} {parsed.get('units')}u")
-            _rprev = _racing_resend_prev(_rbase, parsed.get("units"), parsed.get("date"),
-                                         parsed.get("units_explicit", True))
+            _rprev = None if _legup_ok else _racing_resend_prev(
+                _rbase, parsed.get("units"), parsed.get("date"), parsed.get("units_explicit", True))
             if not _rprev:
                 seen_bets.mark(_rkey, _rlabel)
             if _rprev:
@@ -16931,16 +16938,22 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
                 _ucap = float(LEGUP_MAX_UNITS)
             else:
                 _ucap = min(float(MAX_UNITS), float(IMAGE_RACING_MAX_UNITS))
-            units_capped, _uleft, _ = units_cap.split(parsed["units"], _ucap)
+            units_capped, _uleft, _within2 = units_cap.split(parsed["units"], _ucap)
             _per_unit = (float(IMAGE_TIPS_TEST_UNIT_SIZE) if IMAGE_RACING_TEST_MODE
                          else float(unit_size))
-            if _uleft > 0:
-                units_cap.alert(
-                    notifier, channel_name, channel_name,
-                    f"{parsed.get('track') or '?'} R{parsed.get('race_num')} {parsed.get('title')} "
+            _sel = (f"{parsed.get('track') or '?'} R{parsed.get('race_num')} {parsed.get('title')} "
                     f"{(parsed.get('market') or 'win').upper()} @ "
-                    f"{parsed.get('tipster_odds') or 'best'}",
-                    parsed["units"], _ucap, _per_unit, log)
+                    f"{parsed.get('tipster_odds') or 'best'} {raw.get('_legup_note') or ''}").strip()
+            if tipster == "legup" and not _within2:
+                # v6.74 (Wilson: "only if >20u then whole bet is sent to manual"). Normally
+                # caught in _process_legup_post; this is the backstop.
+                notifier.notify_text_manual_alert(
+                    channel_name, f"{_sel}: {parsed['units']:g}u is more than twice the "
+                    f"{_ucap:g}u max, the whole bet is yours to place", header="LEG UP, MANUAL")
+                continue
+            if _uleft > 0:
+                units_cap.alert(notifier, channel_name, channel_name, _sel,
+                                parsed["units"], _ucap, _per_unit, log)
             intended_stake = round(units_capped * _per_unit, 2)
 
             jobs.append((idx, parsed, intended_stake))
@@ -23923,37 +23936,137 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
                 f"{t['runner']} {(t.get('market') or '?').upper()} @ {t.get('price_text') or '?'}"
                 f"{stake}{bk}")
 
+    # v6.74 (Wilson 2026-10-18): The Leg Up's units ledger. A horse tipped again for the same
+    # race day only ever adds the EXTRA units ("5u Wednesday, 7u Saturday -> 2 more"); the
+    # same units again is a resend (nothing placed); fewer units is an error alert; above
+    # twice LEGUP_MAX_UNITS the whole bet is manual. An unreadable ledger can't tell a resend
+    # from a new tip, so everything goes to manual (never a blind double-up).
+    import legup_ledger
+    ledger = legup_ledger.load()
+    seen_on = today.isoformat()
+    cap = float(LEGUP_MAX_UNITS)
+
     raw_tips, tote, cant, bad_date = [], [], [], []
+    resent, fewer, over, topups, futures = [], [], [], [], []
     for t in post["pro"]:
         if t["scratched"]:
             log.info(f"[{channel_name}] Leg Up {t['runner']} scratched -> skipped")
-            continue
-        if not t.get("fixed_price"):
-            tote.append(_desc(t))
             continue
         if not t.get("market") or not t.get("units") or t["units"] <= 0:
             cant.append(f"{t['raw']} (no market or units read)")
             continue
         why = _legup_date_problem(post["date"], today, t["track"], schedule)
         if why:
-            bad_date.append(f"{_desc(t)} ({why})")
+            (bad_date if t.get("fixed_price") else tote).append(f"{_desc(t)} ({why})")
             continue
+        if ledger is None:
+            (bad_date if t.get("fixed_price") else tote).append(
+                f"{_desc(t)} (the Leg Up units ledger is unreadable, so a resend can't be told "
+                f"from a new tip: check logs/legup_units.json)")
+            continue
+        prev_e = legup_ledger.lookup(ledger, t["runner"], post["date"], t["track"], t["race_num"])
+        prev = prev_e["units"] if prev_e else None
+        d = legup_ledger.decide(t["units"], prev, cap)
+        was = (f"already tipped {prev:g}u ({prev_e.get('source')}, first {prev_e.get('first_seen')})"
+               if prev_e else "")
+        if d["action"] == "resend":
+            resent.append(f"{_desc(t)} ({was}, same units: nothing more placed)")
+            continue
+        if d["action"] == "fewer":
+            fewer.append(f"{_desc(t)} ({was}; now FEWER units. Nothing placed or taken off, "
+                         f"check the email)")
+            continue
+        # Saved BEFORE anything is placed, and a failed save places nothing (review v6.74 #1):
+        # unsaved, a resend of this tip would look new and place again. The returned ledger is
+        # the one the next line is checked against (#2: one horse twice in one email).
+        upd = legup_ledger.record(t["runner"], post["date"], t["units"],
+                                  "pro" if t.get("fixed_price") else "pro TO+", seen_on,
+                                  t["track"], t["race_num"])
+        if upd is None:
+            (bad_date if t.get("fixed_price") else tote).append(
+                f"{_desc(t)} (the Leg Up units ledger could not be saved, so this is NOT "
+                f"auto-placed: place it yourself)")
+            ledger = None  # nothing more auto-places from this post
+            continue
+        ledger = upd
+        add, place, rest = d["new_units"], d["place_units"], d["manual_units"]
+        if d["action"] == "manual_all":
+            over.append(f"{_desc(t)}" + (f" ({was})" if prev_e else "")
+                        + f": {t['units']:g}u is more than twice the {cap:g}u max, place the "
+                          f"{add:g}u yourself (${add * unit_size:,.0f})")
+            continue
+        if not t.get("fixed_price"):
+            tote.append(f"{_desc(t)}" + (f" (top-up: {was}, place {add:g}u more)" if prev_e else ""))
+            continue
+        if rest > 0:
+            over.append(f"{_desc(t)}" + (f" ({was})" if prev_e else "")
+                        + (f"\n   1. Auto-placing: {place:g}u (${place * unit_size:,.0f})" if place > 0
+                           else f"\n   1. Auto-placing: nothing more ({prev:g}u already tipped)")
+                        + f"\n   2. Left for you to place manually: {rest:g}u (${rest * unit_size:,.0f})"
+                          f"\n   3. Why: the max for The Leg Up is {cap:g}u per horse")
+        if place <= 0:
+            continue
+        topup = (f"top-up: {was}, now {t['units']:g}u, auto-placing {place:g}u (assumes the "
+                 f"earlier {prev:g}u is on: placed by TipBot, or by you from its alert)"
+                 if prev_e else "")
+        if topup:
+            topups.append(f"{_desc(t)}: {topup}")
         raw_tips.append({"track": t["track"], "date": post["date"], "race": t["race_num"],
                          "saddle": t["saddle"], "runner": t["runner"], "odds": t["odds"],
-                         "units": t["units"], "market": t["market"], "race_type": "(R)"})
+                         "units": place, "market": t["market"], "race_type": "(R)",
+                         "_legup_topup": bool(prev_e), "_legup_skip_resend": True,
+                         "_legup_note": f"(top-up of {prev:g}u)" if prev_e else ""})
     cant += post["unparsed"]
+
+    # Future Tips are Wilson's to place, but they go in the ledger under their race date and
+    # track so the race-day Pro Tip only adds the extra units.
+    from parsers import legup as _lu2
+    for f in post["future"]:
+        line = f"{f['race'] or '?'}: {f['raw']}" + (f" (first sent {f['sent']})" if f["sent"] else "")
+        sm = _lu2._STAKE_RE.search(f.get("rest") or "")
+        fdate = legup_ledger.future_race_date(f.get("race") or "", today)
+        ftrack = legup_ledger.future_track(f.get("race") or "")
+        if not sm or not fdate or ledger is None:
+            futures.append(line + ("" if ledger is not None else
+                                   " (ledger unavailable: the race-day Pro Tip won't know about it)"))
+            continue
+        fu = float(sm.group(1))
+        prev_e = legup_ledger.lookup(ledger, f["runner"], fdate.isoformat(), ftrack)
+        prev = prev_e["units"] if prev_e else None
+        d = legup_ledger.decide(fu, prev, cap)
+        if d["action"] == "resend":
+            continue  # already sent to Wilson
+        if d["action"] == "fewer":
+            fewer.append(f"Future Tip {line} (already tipped {prev:g}u; now FEWER units, check)")
+            continue
+        upd = legup_ledger.record(f["runner"], fdate.isoformat(), fu, "future", seen_on, ftrack)
+        if upd is not None:
+            ledger = upd
+        futures.append(line + (f" (top-up: was {prev:g}u, place {fu - prev:g}u more)" if prev_e else "")
+                       + ("" if upd is not None else
+                          " (ledger not saved: the race-day Pro Tip won't know about these units)"))
+    futures += post["future_unparsed"]
 
     sections = []
     if tote:
         sections.append("TO+ (best tote) tips, place these yourself:\n" + "\n".join(f"- {x}" for x in tote))
+    if over:
+        sections.append(f"Over the {cap:g}u max per horse, the rest is yours to place:\n"
+                        + "\n".join(f"- {x}" for x in over))
+    if fewer:
+        sections.append("FEWER UNITS than already tipped (error, nothing placed):\n"
+                        + "\n".join(f"- {x}" for x in fewer))
     if bad_date:
-        sections.append("NOT auto-placed, date check failed:\n" + "\n".join(f"- {x}" for x in bad_date))
-    if post["future"] or post["future_unparsed"]:
-        fl = [f"- {f['race'] or '?'}: {f['raw']}" + (f" (first sent {f['sent']})" if f["sent"] else "")
-              for f in post["future"]] + [f"- {x}" for x in post["future_unparsed"]]
-        sections.append("Future Tips, place yourself:\n" + "\n".join(fl))
+        sections.append("NOT auto-placed, check failed:\n" + "\n".join(f"- {x}" for x in bad_date))
+    if futures:
+        sections.append("Future Tips, place yourself:\n" + "\n".join(f"- {x}" for x in futures))
     if cant:
         sections.append("Could not read, check the email:\n" + "\n".join(f"- {x}" for x in cant))
+    if topups:
+        sections.append("For info, auto-placing only the EXTRA units:\n" + "\n".join(f"- {x}" for x in topups))
+    if resent:
+        sections.append("For info, already tipped (resend, not placed again):\n"
+                        + "\n".join(f"- {x}" for x in resent))
     if sections:
         head = f"{post['subject'] or 'Leg Up tips'} (race date {post['date'] or 'unknown'})"
         try:
@@ -23963,7 +24076,8 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
             log.error(f"[{channel_name}] Leg Up manual alert failed: {e}")
 
     log.info(f"[{channel_name}] Leg Up {post['subject']!r} date={post['date']}: "
-             f"{len(raw_tips)} to place, {len(tote)} TO+ manual, {len(bad_date)} bad date, "
+             f"{len(raw_tips)} to place ({len(topups)} top-up), {len(tote)} TO+ manual, "
+             f"{len(bad_date)} bad date, {len(resent)} resent, {len(fewer)} fewer, {len(over)} over 2x, "
              f"{len(post['future'])} future, {len(cant)} unreadable")
     if raw_tips:
         await _route_image_racing_tips(
