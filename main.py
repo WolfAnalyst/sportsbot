@@ -57,7 +57,7 @@ from config import (
     STARTUP_PENDING_RECONCILE_ENABLED, STARTUP_PENDING_RECONCILE_LOOKBACK_SEC,
     STARTUP_DEAD_SESSION_ALERT, STARTUP_DEAD_SESSION_GRACE_SEC, STARTUP_DEAD_SESSION_MAX,
     LEROY_UNIT_SIZE, LEROY_MAX_UNITS, LEROY_BETFAIR_SESSION, LEROY_ENABLED,
-    LEGUP_ENABLED, LEGUP_MAX_UNITS,
+    LEGUP_ENABLED, LEGUP_MAX_UNITS, LEGUP_FUZZY_NAME_MIN,
     SPORTSBET_MAX_STAKE_REBET,
     HB_SEND_MAX_ODDS, HB_SEND_DIRECTION, HB_RETRY_WITHOUT_PLAYER, NFL_WORSE_LINE_STAKE_MULT,
     NFL_RUSH_ATT_FALLBACK_STAKE_MULT,
@@ -16760,6 +16760,9 @@ def _build_racing_tip_dict(raw: dict, tipster: str, default_units: float, idx: i
         "track": track,
         "track_inferred": track_inferred,  # v5.59: forward-filled from memory
         "track_claude_resolved": track_claude_resolved,  # v5.80/81: NAME-or-manual gate
+        # v6.75: The Leg Up's hand-typed names: racing_placer's saddle pass also accepts a
+        # name this similar when the saddle and race agree (0 = off; other tipsters unchanged)
+        "_fuzzy_name_min": float(LEGUP_FUZZY_NAME_MIN) if tipster == "legup" else 0.0,
         "race_num": race_num,
         "race_type": race_type,
         "runner": runner,
