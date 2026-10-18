@@ -1918,7 +1918,7 @@ TEXT_PROMPT_FOURTHANDEV_NFL = (
     '"side": "over"|"under"|null, "line": number|null, "odds": number|null, '
     '"bookie": str|null, "units": number|null, '
     '"market_type": "player_prop"|"most_stat"|"h2h"|"spread"|"total"|"team_total"|"margin"|'
-    '"other", "description": str|null} ]}. '
+    '"other", "description": str|null, "multi": bool, "multi_group": int|null} ]}. '
     "REAL FORMAT: each bet is numbered/labelled -- 'BET;', 'BET 1:', 'Bet 1:', or a "
     "bare '1:' all mark the START of a new leg. A message headed 'Part 1'/'Part 2' "
     "is a CONTINUATION of the SAME slate (the numbering carries on, e.g. Part 1 "
@@ -1971,6 +1971,11 @@ TEXT_PROMPT_FOURTHANDEV_NFL = (
     "separate bet and does NOT change the headline `line`/`odds` -- append it "
     "verbatim to `description` on that SAME leg's tip object, never drop it, "
     "never act on it yourself. "
+    "MULTIS: a parlay / multi / SGM / same-game multi (e.g. 'Parlay:\\n- Buffalo Bills ML\\n"
+    "- NE Patriots ML\\n$1.79') is ONE bet. Return each of its legs as its own tip object "
+    "with `multi`=true and the same `multi_group` number (1 for the first multi in the "
+    "message, 2 for the next), the multi's COMBINED price in `odds` and its units in `units` "
+    "on every leg. A standalone single has `multi`=false and `multi_group`=null. "
     "CHATTER -- return NO tip for these, never force a match: scheduling/timing "
     "announcements ('12.45 (SA TIME)...', 'tips today will be between 12 and 1'), "
     "results/recap commentary ('Loss on the game...', 'Diabolical start...'), "

@@ -19,6 +19,7 @@ import re
 import sys
 import random
 import threading
+import re as _re_mod
 import time
 import unicodedata
 from datetime import datetime, date as _date, timedelta as _timedelta, timezone as _dt_timezone
@@ -7671,7 +7672,13 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
             # v6.47: a 422 is HyperBot refusing the request itself (validation), not a
             # transient: retrying it is one more wasted call per account.
             # v6.57: a wrong-fixture refusal is not transient either (same answer from cache).
-            if (AFL_FANOUT_PREPLACEMENT_RETRY and _is_definitely_pre_placement(r.error or "")
+            # v6.79 (2026-10-18 Waardenburg o11.5: all five accounts got "HTTP 535: price has
+            # changed" within 2s and the whole $600 went manual): a 535 is Sportsbet refusing a
+            # slip whose price moved, nothing placed, so it gets the same ONE retry; the bet's
+            # target_odds floor still stops a worse price.
+            _price_moved = _is_price_moved_error(r.error)
+            if (AFL_FANOUT_PREPLACEMENT_RETRY
+                    and (_is_definitely_pre_placement(r.error or "") or _price_moved)
                     and "422 client error" not in (r.error or "").lower()
                     and "event_wrong_fixture" not in (r.error or "")):
                 _orig_err = r.error or ""
@@ -19373,9 +19380,30 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
         return None
 
 
+def _fanout_target_odds(live, tipped):
+    """v6.79: the HyperBot target_odds floor for an NFL/NBL fan-out bet: the live quote, but
+    never above the tipster's own price (a 1-cent move below our quote is still the tip)."""
+    try:
+        lv = float(live) if live else 0.0
+        tp = float(tipped) if tipped else 0.0
+    except (TypeError, ValueError):
+        return live
+    if lv > 1.0 and tp > 1.0:
+        return round(min(lv, tp), 2)
+    return live
+
+
+def _is_price_moved_error(err) -> bool:
+    """v6.79: Sportsbet's 535 "price has changed": a clean reject, nothing placed. Matched
+    on the message or an anchored HTTP/code 535, never a bare "535" (a ticket number)."""
+    e = (err or "")
+    return (_is_price_change_error(e)
+            or bool(_re_mod.search(r"\b(?:http|code)[\s=:]*535\b", e, _re_mod.IGNORECASE)))
+
+
 def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stake: float,
                       cap_market: str, channel_name: str, raw_message: str,
-                      bet_label: str, sport: str = "nfl") -> list[BetResult]:
+                      bet_label: str, sport: str = "nfl", reresolve=None) -> list[BetResult]:
     """v6.31 NFL concurrent fan-out (Wilson 2026-09-22: "fan out to all available
     sportsbet accounts and then place and then ladder down if needed").
 
@@ -19505,7 +19533,10 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
         "stat": _stat,
         "period": _period,
         "line": None if match.get("hb_omit_line") else match["line"],
-        "target_odds": match.get("odds"),
+        # v6.79 (2026-10-18 Mathias o13.5: tipped 1.89, the bot's own quote 1.90 became the
+        # floor, Sportsbet showed 1.89 at placement -> "odds below target" and $600 to manual):
+        # the floor is never above the tipster's own price.
+        "target_odds": _fanout_target_odds(match.get("odds"), getattr(tip, "suggested_odds", None)),
         "proposition_id": match.get("proposition_id"),
         "live_odds": match.get("odds"),
     }
@@ -19635,6 +19666,81 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
             lambda f, _s=sess, _sh=share, _t0=_t_start: _fanout_late_result(
                 f, tip, _s, _sh, channel_name, raw_message, bet_label, _S, _t0))
 
+    # v6.79 (Wilson 2026-10-18, Waardenburg o11.5: every account got "535 price has changed"
+    # while Sportsbet moved the line to 10.5, and the bet should have "just placed at 10.5"
+    # like AFL disposals takes a better line): when EVERY account failed on a price move and
+    # nothing is maybe-placed, the caller's resolver looks at the board ONCE more (the exact
+    # line, else a better line within the usual limit, under the usual price guard) and the
+    # same shares are fired again on what it finds. Nothing had landed, so nothing can double.
+    if (reresolve is not None and results and not pending
+            and not any(r.success for r in results)
+            and not any(_is_ambiguous_result(r) for r in results)
+            and all(_is_price_moved_error(r.error) for r in results)):
+        try:
+            _new = reresolve()
+        except Exception as e:
+            log.error(f"[{channel_name}] {_S} fan-out: re-resolve after a price move crashed ({e})")
+            _new = None
+        if (_new and _new.get("proposition_id")
+                and all(k in _new for k in ("market", "selection"))
+                and _new.get("event") == match.get("event")
+                and (_new.get("player") or "") == (match.get("player") or "")):
+            log.info(f"[{channel_name}] {_S} fan-out: every account hit a price move; board "
+                     f"re-read: line {match.get('line')} -> {_new.get('line')} @ "
+                     f"{_new.get('odds')} ({_new.get('selection')}), firing again")
+            try:
+                if match.get("line") is not None and _new.get("line") is not None:
+                    bet_label = bet_label.replace(f"{match.get('line')}", f"{_new.get('line')}")
+            except Exception:
+                pass
+            match = _new
+            presolved.update({
+                "market": _new["market"], "selection": _new["selection"],
+                "line": None if _new.get("hb_omit_line") else _new.get("line"),
+                "target_odds": _fanout_target_odds(_new.get("odds"),
+                                                   getattr(tip, "suggested_odds", None)),
+                "proposition_id": _new.get("proposition_id"), "live_odds": _new.get("odds"),
+            })
+            try:
+                if tip.legs and _new.get("line") is not None:
+                    tip.legs[0].line = _new.get("line")
+            except Exception:
+                pass
+            _rex = concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs))
+            try:
+                _rfuts = [_rex.submit(_fanout_place_account, tip, sx, ladder, presolved)
+                          for (sx, ladder) in jobs]
+                _d1, _nd = concurrent.futures.wait(
+                    _rfuts, return_when=concurrent.futures.FIRST_COMPLETED)
+                if _nd:
+                    concurrent.futures.wait(_nd, timeout=FANOUT_STRAGGLER_GRACE_SEC)
+                _again = []
+                for _f, (sx, ladder) in zip(_rfuts, jobs):
+                    if not _f.done():
+                        # same as the first round: maybe placed, never re-staked
+                        _ph = BetResult(
+                            success=False, tip=tip, session_id=str(sx.get("session_id", "")),
+                            bookie=sx.get("bookie", "unknown"), stake=float(ladder[0]),
+                            error="no answer from HyperBot on the re-fire; it may yet land",
+                            timestamp=datetime.now())
+                        _ph.is_ambiguous = True
+                        _ph.cid_unresolved = True
+                        _again.append(_ph)
+                        continue
+                    try:
+                        _again.append(_f.result())
+                    except Exception as e:
+                        _again.append(BetResult(
+                            success=False, tip=tip, session_id=str(sx.get("session_id", "")),
+                            bookie=sx.get("bookie", "unknown"), stake=float(ladder[0]),
+                            error=f"{_S} re-fire exception: {e}", timestamp=datetime.now()))
+                        _again[-1].is_ambiguous = True
+                results = _again
+            finally:
+                _rex.shutdown(wait=False)
+        else:
+            log.info(f"[{channel_name}] {_S} fan-out: price moved on every account and the "
+                     f"board re-read found no placeable line under the guard")
     try:
         results.extend(_nfl_fanout_spill(tip, jobs, results, intended_stake, presolved,
                                          _held_fillups, channel_name, _S, sport, cap_market))
@@ -21051,6 +21157,7 @@ def _attempt_nbl_auto_place(tipster: str, channel_name: str, raw: dict, unit_siz
         results = _place_nfl_fanout(
             tip, priority, match, intended_stake, _cap_market,
             channel_name, raw_message, _bet_label, sport="nbl",
+            reresolve=lambda: _resolve_nbl_leg(raw, tipster, priority)[0],
         )
         if not results:
             # Nothing fired, so a later re-post of this bet must not be blocked as
@@ -21067,6 +21174,106 @@ def _attempt_nbl_auto_place(tipster: str, channel_name: str, raw: dict, unit_siz
 _NBL_PRICE_RE = re.compile(r"\$\s*\d")
 
 
+# v6.79: the NBL player-prop legs routed today, by player, for line follow-ups.
+_NBL_RECENT_LEGS: dict = {}
+_NBL_FOLLOWUP_MAX_AGE_SEC = 12 * 3600        # same session of play; the 12h of an NBL slate
+_NBL_FU_LINE_RE = re.compile(r"(?<![\d.])(\d{1,2}\.5)(?![\d.])")
+_NBL_FU_UNITS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:units?|u)\b", re.IGNORECASE)
+_NBL_FU_RESULT_RE = re.compile(
+    r"\b(cash(?:ed|es|ing)?|hit|hits|won|win(?:ner|s)?|profit|lost|loss|push(?:ed)?|"
+    r"void(?:ed)?|graded|result)\b|[+-]\s*\d+(?:\.\d+)?\s*(?:units?|u)\b|\u2705|\u274c",
+    re.IGNORECASE)
+
+
+def _nbl_remember_leg(raw: dict) -> None:
+    try:
+        player = (raw.get("player") or "").strip()
+        if not player or raw.get("line") is None:
+            return
+        _NBL_RECENT_LEGS[player.lower()] = {"raw": dict(raw), "ts": time.time()}
+    except Exception:
+        pass
+
+
+def _nbl_units_placed_today(tipster: str, player, side, unit_size):
+    """Units already on this player and side in the last NBL session (12h) for this tipster,
+    from the bets ledger (stake / unit size, every line). None when the ledger cannot be read
+    (the caller fails closed)."""
+    try:
+        import csv as _csv
+        cutoff = (datetime.now() - _timedelta(seconds=_NBL_FOLLOWUP_MAX_AGE_SEC)).isoformat()
+        p_low = (player or "").lower()
+        side_low = (side or "").lower()
+        us = float(unit_size or 0)
+        if not p_low or us <= 0:
+            return 0.0
+        path = os.path.join(LOG_DIR, "bets_placed.csv")
+        total = 0.0
+        with open(path, encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                if ((row.get("placed_at") or "") >= cutoff and row.get("tipster") == tipster
+                        and p_low in (row.get("selection") or "").lower()
+                        and (not side_low or (row.get("side") or "").lower() == side_low)):
+                    try:
+                        total += float(row.get("stake") or 0)
+                    except ValueError:
+                        pass
+        return round(total / us, 2)
+    except Exception as e:
+        log.warning(f"NBL follow-up: could not read units placed today ({e})")
+        return None
+
+
+def _nbl_followup_leg(text: str):
+    """(leg, "") for a line follow-up to a player bet earlier today: the post names that
+    player (surname, small typos allowed), a .5 line and a units number. (None, why) when it
+    names such a player but the line or units cannot be read (send to manual, never drop);
+    (None, "") when it is not about a recent bet at all."""
+    import difflib
+    now = time.time()
+    words = [w for w in re.split(r"[^a-z']+", (text or "").lower()) if len(w) > 2]
+    hit = None
+    for key, rec in list(_NBL_RECENT_LEGS.items()):
+        if now - rec["ts"] > _NBL_FOLLOWUP_MAX_AGE_SEC:
+            _NBL_RECENT_LEGS.pop(key, None)
+            continue
+        surname = key.split()[-1]
+        if any(w == surname or difflib.SequenceMatcher(None, w, surname).ratio() >= 0.85
+               for w in words):
+            if hit is not None and hit[0] != key:
+                return None, (f"the post names two recent players ({hit[0]}, {key}); "
+                              f"not guessing which line update it is")
+            hit = (key, rec)
+    if hit is None:
+        return None, ""
+    key, rec = hit
+    if _NBL_FU_RESULT_RE.search(text or ""):
+        return None, ""                       # a result / recap post, not a line update
+    lines = _NBL_FU_LINE_RE.findall(text or "")
+    units = _NBL_FU_UNITS_RE.findall(text or "")
+    if len({float(x) for x in lines}) != 1 or not units:
+        return None, (f"looks like a line update for {rec['raw'].get('player')} but the new "
+                      f"line or units could not be read exactly")
+    try:
+        u = float(units[-1])
+    except ValueError:
+        return None, f"units for {rec['raw'].get('player')} unreadable"
+    if u <= 0:
+        return None, f"units {u:g} for {rec['raw'].get('player')}"
+    try:
+        if abs(float(lines[0]) - float(rec["raw"].get("line"))) < 1e-9:
+            return None, ""                   # the same line again: not a line update
+    except (TypeError, ValueError):
+        pass
+    leg = {k: v for k, v in rec["raw"].items()
+           if not k.startswith("_") and not k.startswith("slip_")}
+    leg["line"] = float(lines[0])
+    leg["units"] = u
+    leg["_post_has_header"] = bool(leg.get("game_team_1") and leg.get("game_team_2"))
+    leg["description"] = f"line follow-up: {(text or '').strip()[:120]}"
+    return leg, ""
+
+
 async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str,
                                       unit_size: float = 0.0) -> None:
     """Route one Bettors Edge NBL post: parse every leg, auto-place each one that
@@ -21078,6 +21285,57 @@ async def _route_bettorsedge_nbl_text(text: str, tipster: str, channel_name: str
     is untested."""
     _archive_tip_post(channel_name, text)
     if not _NBL_PRICE_RE.search(text or ""):
+        # v6.79 (Wilson 2026-10-18, Waardenburg: "Can get Waardenburg 10.5 now. If you get the
+        # 10.5, that's 4 units" was dropped as chatter): a no-price post that names a player
+        # this tipster bet earlier today, with a new line and units, is a LINE FOLLOW-UP. It
+        # places at the live price through the normal route, with the original tip's price
+        # as the reference (the usual guard: live no more than 10% below it).
+        fu, why = _nbl_followup_leg(text)
+        if fu is not None:
+            # Wilson: "only for the extra units, eg if 3u already placed at 11.5, only 1u
+            # extra would be placed".
+            _have = _nbl_units_placed_today(tipster, fu.get("player"), fu.get("side"), unit_size)
+            if _have is None or _have <= 0:
+                # Unknown (ledger unreadable) or the earlier bet never auto-placed (Wilson may
+                # have placed it by hand): never stack units blind -> manual with the reason.
+                _w = ("the bets ledger could not be read" if _have is None else
+                      f"the earlier {fu.get('player')} bet did not auto-place, so the units "
+                      f"already on (by hand?) are unknown")
+                log.info(f"[{channel_name}] NBL follow-up -> manual: {_w}")
+                try:
+                    notifier.notify_text_manual_alert(
+                        channel_name, f"WHY: {_w}\n{text}", header="NBL LINE UPDATE, MANUAL")
+                except Exception as e:
+                    log.error(f"[{channel_name}] NBL follow-up alert failed: {e}")
+                return
+            _extra = round(float(fu.get("units") or 0) - _have, 2)
+            if _extra <= 0:
+                log.info(f"[{channel_name}] NBL follow-up {fu.get('player')}: "
+                         f"{fu.get('units')}u wanted, {_have:g}u already placed -> nothing extra")
+                try:
+                    notifier.notify_info(
+                        f"NBL line update for {fu.get('player')}: {fu.get('units'):g}u wanted, "
+                        f"{_have:g}u already on, nothing extra placed.")
+                except Exception:
+                    pass
+                return
+            if _have > 0:
+                fu["description"] = (fu.get("description", "") +
+                                     f" ({fu['units']:g}u total, {_have:g}u already on)")
+            fu["units"] = _extra
+            log.info(f"[{channel_name}] NBL line follow-up: {fu.get('player')} "
+                     f"{fu.get('side')} {fu.get('line')} {fu.get('units')}u "
+                     f"(reference price {fu.get('odds')})")
+            await _route_bettorsedge_nbl_legs([fu], tipster, channel_name, unit_size, text, 0.0)
+            return
+        if why:
+            log.info(f"[{channel_name}] NBL possible follow-up -> manual: {why}")
+            try:
+                notifier.notify_text_manual_alert(
+                    channel_name, f"WHY: {why}\n{text}", header="NBL LINE UPDATE, MANUAL")
+            except Exception as e:
+                log.error(f"[{channel_name}] NBL follow-up alert failed: {e}")
+            return
         # Every real bet in the channel's history carries a $ price; timing notes,
         # results and admin posts never do. Dropped without an LLM call or alert.
         log.info(f"[{channel_name}] NBL: no $ price in post, chatter -> dropped: {text[:80]!r}")
@@ -21155,6 +21413,7 @@ async def _route_bettorsedge_nbl_legs(raw_tips: list, tipster: str, channel_name
             manual.append(f"- (unreadable parsed leg: {raw!r})")
             manual_raws.append(None)
             continue
+        _nbl_remember_leg(raw)
         try:
             desc = _describe_nbl_leg(raw)
         except Exception as e:
@@ -21287,10 +21546,35 @@ _NBL_IMG_HARD_CAP_SEC = 3600   # the only age limit on tracking an image
 _NBL_ALBUM_SETTLE_SEC = 2.0   # an album's caption numbers are claimed this long after its last image
 
 
+class _NBLEach(list):
+    """v6.79: a "<n> units on each / all" caption: one number for every card of the image.
+    Its length is 1, so any path that needs an exact count (a units window, an album) refuses
+    it; the single-image caption path expands it to the image's card count."""
+    each = None
+
+
+_NBL_UNITS_SPREAD_RE = re.compile(
+    rf"^\s*({_NBL_UNITS_NUM})\s*(?:units?|u)?\s*(?:on|for|to|x)?\s*"
+    rf"(both|each|all|every\s*(?:one|bet|card)?)\b(?:\s*(?:bets?|cards?|legs?|of them))?\s*[.!]*\s*$",
+    re.IGNORECASE)
+
+
 def _nbl_units_message(text) -> "list | None":
     """The numbers of a PURE units message ("1.5 and 0.5", "2.5, 0.5, 0.5", "2.5 units",
     "2.5u"), else None. Anything with other words in it is not one."""
     t = (text or "").strip()
+    # v6.79 (Bettors Edge 2026-10-18 13:47, caption "3 units on both" sent the image to manual
+    # unread): "<n> units on both" is two bets at n; "<n> on each / all" is n on every card.
+    _m = _NBL_UNITS_SPREAD_RE.match(t)
+    if _m:
+        n = float(_m.group(1))
+        if n <= 0:
+            return None
+        if _m.group(2).lower() == "both":
+            return [n, n]
+        out = _NBLEach([n])
+        out.each = n
+        return out
     # v6.68 (Bettors Edge 2026-10-11 image 138, caption "2.5 x 2" for two $2.50 cards, went
     # manual as a non-units caption): "<units> x <count>" is that many bets at those units.
     m = _NBL_UNITS_TIMES_RE.match(t)
@@ -21625,11 +21909,30 @@ async def _nbl_image_process(slot: "_NblImageSlot", event, channel_name: str,
                 order.append((t, "wait", st))
         if waiting_cards and caption_units is not None and slot.grouped_id is None:
             # a caption on a single (non-album) image: its numbers are for THIS image's cards
+            if isinstance(caption_units, _NBLEach):
+                caption_units = [caption_units.each] * len(order)
             if len(caption_units) == len(waiting_cards):
                 now_cards += [(t, u, "caption units") for t, u in zip(waiting_cards, caption_units)]
+            elif len(caption_units) == len(order):
+                # v6.79 (2026-10-18 image 169: 3 numbers for 3 cards, 2 already on their slip
+                # stake, was refused as "3 numbers for 1 bet"): one number per card of the
+                # image in card order. A card placed on its slip stake must get the same
+                # number, a manual card's number is ignored, a waiting card takes its number.
+                _bad = [f"{u:g} vs the slip's {float(st):g}" for (t, kind, st), u
+                        in zip(order, caption_units)
+                        if kind == "slip" and abs(float(u) - float(st)) > 0.001]
+                if _bad:
+                    manual_cards += [(t, "the caption disagrees with a slip stake ("
+                                         + ", ".join(_bad) + "), not guessing")
+                                     for t in waiting_cards]
+                else:
+                    _waits = {id(t) for t in waiting_cards}
+                    now_cards += [(t, u, "caption units") for (t, kind, st), u
+                                  in zip(order, caption_units) if id(t) in _waits]
             else:
                 manual_cards += [(t, f"the caption has {len(caption_units)} number(s) for "
-                                     f"{len(waiting_cards)} bet(s) on this image, not guessing")
+                                     f"{len(order)} card(s) on this image ({len(waiting_cards)} "
+                                     f"without a stake on the slip), not guessing")
                                  for t in waiting_cards]
             waiting_cards = []
         if waiting_cards and (slot.expired or time.time() - slot.arrived
@@ -21996,8 +22299,10 @@ async def _nbl_image_caption_manual(event, text: str, channel_name: str) -> None
     try:
         notifier.notify_text_manual_alert(
             channel_name,
-            f"{text}\n(screenshot with a caption, not read: "
-            f"{('saved ' + path) if path else 'image not saved'})",
+            f"WHY: the caption is not a units message the bot understands (it reads "
+            f"'3', '1.5 and 0.5', '2 x 2', '3 units on both', '2u each'), so the "
+            f"screenshot was not read or placed.\nCaption: {text}\n"
+            f"({('saved ' + path) if path else 'image not saved'})",
             header="NBL, MANUAL")
     except Exception as e:
         log.error(f"[{channel_name}] NBL image caption alert failed: {e}")
@@ -22348,6 +22653,93 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
             log.error(f"[{channel_name}] A1 NFL tip {idx} alert failed: {e}")
 
 
+_NFL_MULTI_HEAD_RE = re.compile(
+    r"^\s*[-*]?\s*(?:\d+\s*[- ]?\s*legs?\s*)?(parlay|multi|sgm|sgp|same[\s-]*game"
+    r"(?:\s*(?:multi|parlay))?|treble|trixie|double\s*:|leg\s+multi)\b",
+    re.IGNORECASE | re.MULTILINE)
+_NFL_MULTI_WORD_RE = re.compile(
+    r"\b(parlay|multi|sgm|sgp|same[\s-]*game|treble|trixie|\d+\s*[- ]?legs?)\b", re.IGNORECASE)
+
+
+def _nfl_multi_blocks(text: str) -> list:
+    """v6.79: the blank-line separated blocks of a post with a Parlay / Multi / SGM / SGP /
+    Same game / N-leg header on any of their lines, each with the blocks that follow it up to
+    the next price ("$1.79") when the header block itself carries no price (a blank line
+    between the legs must not break the multi apart)."""
+    blocks = [b for b in re.split(r"\n\s*\n", text or "") if b.strip()]
+    out = []
+    i = 0
+    while i < len(blocks):
+        if _NFL_MULTI_HEAD_RE.search(blocks[i]):
+            grp = blocks[i]
+            j = i + 1
+            while "$" not in grp and j < len(blocks) and j <= i + 6:
+                grp += "\n" + blocks[j]
+                j += 1
+            out.append(grp)
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def _nfl_post_mentions_multi(text: str) -> bool:
+    return bool(_NFL_MULTI_WORD_RE.search(text or ""))
+
+
+def _nfl_multi_group(raw: dict, multi_blocks: list):
+    """The multi this parsed leg belongs to, or None for a single. The parser's own flag
+    counts; so does the leg's player (props) or team (team markets) appearing in a multi block,
+    so a missed flag can never turn a parlay leg into a single."""
+    if raw.get("multi") is True or str(raw.get("multi")).strip().lower() in ("true", "yes", "1"):
+        return f"p{raw.get('multi_group') or 1}"
+    mt = (raw.get("market_type") or "").strip().lower()
+    names = []
+    if raw.get("player"):
+        names.append(str(raw["player"]))
+    if mt != "player_prop" and raw.get("team"):
+        names.append(str(raw["team"]))
+    for i, blk in enumerate(multi_blocks):
+        low = blk.lower()
+        for n in names:
+            words = [w for w in re.split(r"\W+", n.lower()) if len(w) > 2]
+            # a team: its nickname ("bills", "patriots"); a player: the surname
+            key = words[-1] if words else (n.lower().split()[-1] if n.split() else "")
+            if key and re.search(rf"\b{re.escape(key)}\b", low):
+                return f"b{i}"
+    return None
+
+
+def _with_manual_reason(fn, *args, **kwargs):
+    """Run a placement attempt and return (result, reason): the reason is the last
+    "... -> manual" (or "-> MANUAL") line this thread logged during the attempt, so the
+    manual alert can say WHY instead of a bare "check and place manually"."""
+    captured = []
+    me = threading.get_ident()
+
+    class _Grab(logging.Handler):
+        def emit(self, record):
+            if record.thread != me:
+                return
+            try:
+                msg = record.getMessage()
+            except Exception:
+                return
+            if "-> manual" in msg or "-> MANUAL" in msg or "REFUSED" in msg:
+                captured.append(msg)
+
+    h = _Grab(level=logging.INFO)
+    log.addHandler(h)
+    try:
+        res = fn(*args, **kwargs)
+    finally:
+        log.removeHandler(h)
+    why = captured[-1] if captured else ""
+    why = re.sub(r"^NFL auto-place:\s*", "", why)
+    why = re.sub(r"\s*->\s*(manual|MANUAL).*$", "", why)
+    return res, why[:300]
+
+
 async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str,
                                        unit_size: float = 0.0) -> None:
     """Route a 4th and +EV NFL TEXT message (his image-card format's real-
@@ -22440,16 +22832,70 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
     log.info(f"[{channel_name}] 4th&EV NFL text extracted {len(raw_tips)} tip(s) in {elapsed:.2f}s")
     raw_tips = _drop_resent(tipster, channel_name, raw_tips, _nfl_seen_key,
                             _describe_nfl_image_tip, NFL_DEDUP_TTL_SEC)
-    for idx, raw in enumerate(raw_tips):
+    # v6.79 (Wilson 2026-10-18: "i want multis to be manual ... group the manual bet msgs
+    # together ... as it is technically meant to be parsed as 1 bet"). The Bills/Patriots
+    # parlay was parsed as two h2h SINGLES carrying the parlay price, and only the price guard
+    # kept them off the book. A multi leg is NEVER auto-placed: one grouped manual alert per
+    # multi. Flagged by the parser (`multi`) AND, as a backstop, by the post's own
+    # parlay/multi/SGM block naming the leg's team or player.
+    _multi_blocks = _nfl_multi_blocks(text)
+    _multis: dict = {}
+    _singles = []
+    for raw in raw_tips:
+        grp = _nfl_multi_group(raw, _multi_blocks)
+        if grp is not None:
+            _multis.setdefault(grp, []).append(raw)
+        else:
+            _singles.append(raw)
+    # A post that mentions a parlay / multi / SGM but where fewer than 2 legs could be tied to
+    # it is never guessed: every leg of the post goes to manual (a missed leg would otherwise
+    # be placed as a single at the multi's price).
+    _tied = sum(len(v) for v in _multis.values())
+    _stated = [int(x) for x in re.findall(r"\b(\d+)\s*[- ]?\s*legs?\b", text or "", re.I)]
+    if _nfl_post_mentions_multi(text) and (_tied < 2 or (_stated and _tied not in _stated)):
+        log.warning(f"[{channel_name}] 4th&EV NFL post mentions a multi but its legs could not "
+                    f"be identified ({_tied} tied, stated {_stated or 'none'}) -> the WHOLE "
+                    f"post to manual")
+        _multis = {"post": list(raw_tips)}
+        _singles = []
+    elif _nfl_post_mentions_multi(text):
+        # A TEAM leg (h2h / line / total ...) left untied in a post with a multi could be one
+        # of its legs: never placed as a single. Player-prop singles in the post still place.
+        _team_mts = ("h2h", "spread", "total", "team_total", "margin")
+        _loose = [r for r in _singles
+                  if (r.get("market_type") or "").strip().lower() in _team_mts]
+        if _loose:
+            _multis.setdefault(next(iter(_multis)), []).extend(_loose)
+            _singles = [r for r in _singles if r not in _loose]
+    for grp, legs in _multis.items():
+        try:
+            descs = []
+            for leg in legs:
+                try:
+                    descs.append(_describe_nfl_image_tip(leg))
+                except Exception:
+                    descs.append(str(leg))
+            log.info(f"[{channel_name}] 4th&EV NFL multi ({len(legs)} legs) -> manual, "
+                     f"never placed as singles")
+            notifier.notify_text_manual_alert(
+                channel_name,
+                f"MULTI ({len(legs)} legs, one bet), multis are placed by hand:\n- "
+                + "\n- ".join(descs) + f"\n{_post_context(text)}",
+                header="4TH&EV NFL MULTI, MANUAL",
+            )
+        except Exception as e:
+            log.error(f"[{channel_name}] 4th&EV NFL multi alert failed: {e}")
+    for idx, raw in enumerate(_singles):
         try:
             desc = _describe_nfl_image_tip(raw)
         except Exception as e:
             desc = f"(description render failed: {e}; raw={raw!r})"
 
+        _why = ""
         _mt = (raw.get("market_type") or "").strip().lower()
         if _mt in ("player_prop", "most_stat", "h2h", "spread", "total", "team_total", "margin"):
-            handled = await _run_in_placement_executor(
-                _attempt_nfl_auto_place,
+            handled, _why = await _run_in_placement_executor(
+                _with_manual_reason, _attempt_nfl_auto_place,
                 tipster, channel_name, raw.get("player"), raw.get("team"),
                 raw.get("stat"), raw.get("side"), raw.get("line"),
                 raw.get("units"), unit_size,
@@ -22462,11 +22908,12 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
             # v6.43: this branch was silent (2026-09-27 15:43, 2nd leg of the Texans post).
             log.info(f"[{channel_name}] 4th&EV NFL tip {idx}: market_type {_mt!r} is not "
                      f"auto-placed -> manual: {desc[:160]!r}")
+            _why = f"market type {_mt or 'unknown'!r} is not auto-placed"
 
         try:
             notifier.notify_text_manual_alert(
                 channel_name,
-                f"{desc}\n{_post_context(text)}",
+                (f"WHY: {_why}\n" if _why else "") + f"{desc}\n{_post_context(text)}",
                 header="4TH&EV NFL TEXT, MANUAL",
             )
         except Exception as e:
