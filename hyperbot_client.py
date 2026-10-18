@@ -1229,11 +1229,27 @@ class HyperBotClient:
             return poll_result
         return self._unwrap_v3_price_racing(poll_result)
 
+    def racing_promo_tokens(self, session_id: str, track: str, race_num: int,
+                            race_type: str = "(R)") -> dict:
+        """v6.90: the promo tokens BetDeluxe (or any bookie) offers on one race, READ-ONLY:
+        {"saver_tokens": [...], "price_boost": ..., "bonus_boost": ...}. {} on any failure."""
+        try:
+            r = self._post_v3_async("/v3/promo_tokens", {
+                "session_id": str(session_id), "track": track, "race_num": int(race_num),
+                "race_type": race_type or "(R)"}, place_timeout=5)
+            st = (r.get("statuses") or [{}])[0] if isinstance(r, dict) else {}
+            res = st.get("result") if isinstance(st, dict) else None
+            return res if isinstance(res, dict) and res.get("success") else {}
+        except Exception as e:
+            log.warning(f"promo_tokens failed for {session_id} {track} R{race_num}: {e}")
+            return {}
+
     def place_racing_bet(
         self, session_id: str, track: str, race_num: int,
         runner: str, stake: float, market: str = "win",
         race_type: str = "(R)", date: str = None,
         target_odds: float = None, use_bonus_bet: bool = False, use_boost: bool = False,
+        bet_type: str = None,
     ) -> dict:
         """Place a fixed-odds Win or Place bet on a single runner.
 
@@ -1279,6 +1295,9 @@ class HyperBotClient:
             # v6.86: HyperBot applies a bookie odds boost when one is available, else places
             # normally (skip_if_no_promo is NOT sent).
             payload["use_boost"] = True
+        if bet_type:
+            # v6.90: a promo token, e.g. a race saver "2/3" (stake back if 2nd or 3rd)
+            payload["bet_type"] = bet_type
         poll_result = self._post_v3_async("/v3/place_bet", payload)
         if poll_result.get("success") is False and "statuses" not in poll_result:
             return poll_result
