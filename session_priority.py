@@ -679,6 +679,23 @@ def group_by_bookmaker(sessions: list[dict]) -> dict[str, list[dict]]:
 
 # ── Liability + stake math ──────────────────────────────────────────
 
+def _lookup_in_block(sport_block: dict, market: str):
+    """The cap for `market` in one sport block (direct, the _afl threshold alias, then the
+    threshold fallbacks), or None. Same rules as lookup_liability_cap."""
+    if market in sport_block:
+        return _normalise_cap(sport_block[market])
+    norm = market[: -len("_afl")] if market.endswith("_threshold_afl") else market
+    if norm != market and norm in sport_block:
+        return _normalise_cap(sport_block[norm])
+    if norm.endswith("_threshold"):
+        if "player_threshold" in sport_block:
+            return _normalise_cap(sport_block["player_threshold"])
+        sibling = norm[: -len("_threshold")]
+        if sibling in sport_block:
+            return _normalise_cap(sport_block[sibling])
+    return None
+
+
 def lookup_liability_cap(
     session_id: str, sport: str, market: str,
 ) -> Optional[float | str]:
@@ -702,7 +719,14 @@ def lookup_liability_cap(
 
     sport_key = (sport or "").lower()
     if sport_key == "nbl":
-        sport_key = "nba"  # NBL caps fall under NBA in the yaml
+        # v6.81 (Wilson 2026-10-18: "set nbl limits as different from nba limits"): an
+        # account's own `nbl:` block wins KEY BY KEY; a market it does not list (or no nbl
+        # block at all) falls back to the account's NBA cap, never to uncapped.
+        if isinstance(meta.liability.get("nbl"), dict):
+            own = _lookup_in_block(meta.liability["nbl"], market)
+            if own is not None:
+                return own
+        sport_key = "nba"
     sport_block = meta.liability.get(sport_key)
     if not isinstance(sport_block, dict):
         return None

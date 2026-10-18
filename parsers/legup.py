@@ -47,7 +47,11 @@ _TIP_RE = re.compile(
     rf"(?:#\s*(?P<saddle>\d{{1,2}})\s+)?(?P<runner>\S.*?)\s+{_DASH}\s+(?P<rest>\S.*)$")
 _MARKET_RE = re.compile(r"^\s*(WIN|PLACE)\b", re.IGNORECASE)
 _PRICE_RE = re.compile(r"@\s*(\$?\s*\d+(?:\.\d+)?|[^\s(]+)")
-_STAKE_RE = re.compile(r"Stake\s*:\s*(\d+(?:\.\d+)?|\.\d+)\s*(?:units?|u)\b", re.IGNORECASE)
+# v6.79 (old emails): "(Stakes: 5 units)" (26 Sep) and "(Stake: 10) units" (4 Oct) too
+# ... and "(6 units)" with no "Stake:" (the OLIVEANOTHERDAY Future Tip, 26 Sep): its units must
+# reach the ledger, or the race-day Pro Tip would double up Wilson's manual bet
+_STAKE_RE = re.compile(r"(?:Stakes?\s*:\s*|\(\s*)(\d+(?:\.\d+)?|\.\d+)\s*\)?\s*(?:units?|u)\b",
+                       re.IGNORECASE)
 _BOOKIE_RE = re.compile(r"Bookie\s*:\s*([^)]+?)\s*\)", re.IGNORECASE)
 _SCRATCHED_RE = re.compile(r"^\s*scratch", re.IGNORECASE)
 
@@ -62,7 +66,12 @@ _FUT_START_RE = re.compile(r"^\s*FUTURE TIPS\s*:\s*$", re.IGNORECASE)
 # Section ends. Anything here closes the Pro Tips or Future Tips block.
 _SECTION_END_RE = re.compile(
     r"^\s*(BLACK BOOK|FUTURE TIPS|FULL PREVIEW|POST RACE|RESULTS\b|STAKING|"
-    r"[A-Z'’ ]*TIPS\s*\||PRO TIPS\s*:)", re.IGNORECASE)
+    r"(?:[A-Z'’]+\s+){1,3}TIPS\s*\||PRO TIPS\s*:)", re.IGNORECASE)
+# v6.79: a Future Tips block also ends at the feature-race previews that followed it on 3 Oct.
+# Not used for Pro/Early blocks: a marker there must stay a visible (manual) line, never cut
+# off the tips after it (review).
+_FUT_END_RE = re.compile(
+    _SECTION_END_RE.pattern[:-1] + r"|FEATURE RACE|🔍|📊|BOD\b)", re.IGNORECASE)
 
 _MONTHS = {m: i for i, m in enumerate(
     ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
@@ -138,14 +147,15 @@ def subject_race_date(subject: str, received: date):
         return None
 
 
-def _block_after(lines: list, start_re, from_idx: int = 0):
+def _block_after(lines: list, start_re, from_idx: int = 0, end_re=None):
     """Lines after the FIRST line (at or after from_idx) matching start_re, up to the next
     section header; None when there is no such line."""
+    end_re = end_re or _SECTION_END_RE
     for i in range(from_idx, len(lines)):
         if start_re.match(lines[i]):
             block = []
             for nxt in lines[i + 1:]:
-                if _SECTION_END_RE.match(nxt):
+                if end_re.match(nxt):
                     break
                 block.append(nxt)
             return block
@@ -156,10 +166,12 @@ def _block_after(lines: list, start_re, from_idx: int = 0):
 # Take" (today's races) and "EARLY TIPS | Quick Take" (tomorrow's, dated by the later
 # "EARLY TIPS | OCT 19" header), and an empty block reads "No Pro Tips today." / "No Early
 # Tips today.".
-_QT_EARLY_RE = re.compile(r"^\s*EARLY TIPS\s*\|\s*Quick Take", re.IGNORECASE)
-_QT_TODAY_RE = re.compile(r"^\s*(?!EARLY\b)[A-Z'’ ]*TIPS\s*\|\s*Quick Take", re.IGNORECASE)
+_QT_EARLY_RE = re.compile(r"^\s*(?:[A-Z]+(?:['’]S)?\s+){0,2}EARLY TIPS\s*\|\s*Quick Take", re.IGNORECASE)
+_QT_TODAY_RE = re.compile(r"^\s*(?!(?:\S+\s+){0,2}(?:EARLY|FUTURE)\b)(?:[A-Z]+(?:['’]S)?\s+){1,3}TIPS\s*\|\s*Quick Take\b",
+                          re.IGNORECASE)  # v6.79: 1-3 words (BJ's 26 Sep prose has 8), never EARLY/FUTURE
 _EARLY_DATE_RE = re.compile(r"^\s*EARLY TIPS\s*\|\s*(\S.*)$", re.IGNORECASE)
-_NONE_TODAY_RE = re.compile(r"^\s*No\b.*\b(today|pending)\b\.?\s*$", re.IGNORECASE)
+_NONE_TODAY_RE = re.compile(r"^\s*No\s+(?:[A-Za-z]+\s+){0,3}(?:tips?|runners?|additions?)"
+                            r"(?:\s+(?:today|pending))?\s*(?:\.\s*[^@()]*)?$", re.IGNORECASE)
 _EARLY_FWD_RE = re.compile(r"^\s*EARLY TIPS:\s*(\S+)\s*$", re.IGNORECASE)  # the forwarded post
 
 
@@ -219,9 +231,9 @@ def extract_sections(text: str) -> dict:
         # an EARLY Quick Take exists, or its tips would be read twice, as today's and as
         # tomorrow's (review v6.77 #1).
         pro = _block_after(lines, _PRO_START_RE)
-    future = _block_after(lines, _FUT_START_RE)
+    future = _block_after(lines, _FUT_START_RE, end_re=_FUT_END_RE)
     if future is None:
-        future = _block_after(lines, _FUT_PENDING_RE)
+        future = _block_after(lines, _FUT_PENDING_RE, end_re=_FUT_END_RE)
     future = _drop_boilerplate(future) if future is not None else None
     early_date_text = next((m.group(1).strip() for m in map(_EARLY_DATE_RE.match, lines)
                             if m and "quick take" not in m.group(1).lower()), "")
@@ -233,19 +245,56 @@ def extract_sections(text: str) -> dict:
             "found": (not broken) and (pro is not None or early is not None or future is not None)}
 
 
+_WEEKDAYS = {d: i for i, d in enumerate(
+    ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])}
+_WEEKDAY_RE = re.compile(r"^\s*(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*:?\s*$",
+                         re.IGNORECASE)
+
+
+def early_groups(lines: list, received, header_date=None) -> list:
+    """v6.79 (the old emails): EARLY TIPS lines grouped by their weekday label ("Saturday:",
+    "Wednesday:") -> [(race date or None, [tip lines])]. A weekday is the NEXT such day after
+    `received` (early tips are for a later day). The "EARLY TIPS | OCT 9" header is only the
+    fallback for lines with no weekday above them: on 9 Oct it said OCT 9 for Saturday's
+    (10 Oct) Rosehill tips."""
+    from datetime import timedelta
+    groups, cur_date, cur = [], header_date, []
+    for ln in lines or []:
+        wm = _WEEKDAY_RE.match(ln)
+        if wm:
+            if cur:
+                groups.append((cur_date, cur))
+            cur = []
+            cur_date = None
+            if received is not None:
+                ahead = (_WEEKDAYS[wm.group(1).lower()] - received.weekday()) % 7 or 7
+                cur_date = received + timedelta(days=ahead)
+            continue
+        cur.append(ln)
+    if cur:
+        groups.append((cur_date, cur))
+    return groups
+
+
 def build_forward(subject: str, received_text: str, race_date, sections: dict,
-                  early_date=None) -> str:
-    """The compact Telegram post main.py parses back with parse_forward()."""
+                  early_date=None, groups=None, subject_date=None) -> str:
+    """The compact Telegram post main.py parses back with parse_forward(). `groups` (from
+    early_groups) dates each early tip; without it they all take `early_date`."""
     out = [LEGUP_HEADER,
            f"date: {race_date.isoformat() if race_date else 'unknown'}",
            f"subject: {subject or ''}",
-           f"received: {received_text or ''}",
-           "PRO TIPS:"]
+           f"received: {received_text or ''}"]
+    if subject_date:  # v6.79: the TODAY typo rule moved the date; main checks the original too
+        out.append(f"subject_date: {subject_date.isoformat()}")
+    out.append("PRO TIPS:")
     out += _drop_none_lines(sections.get("pro"))
     early = _drop_none_lines(sections.get("early"))
     if early:
-        out.append(f"EARLY TIPS: {early_date.isoformat() if early_date else 'unknown'}")
-        out += early
+        for gdate, glines in (groups if groups is not None else [(early_date, early)]):
+            glines = [ln for ln in _drop_none_lines(glines) if not _WEEKDAY_RE.match(ln)]
+            if glines:
+                out.append(f"EARLY TIPS: {gdate.isoformat() if gdate else 'unknown'}")
+                out += glines
     fut = _drop_none_lines(sections.get("future"))
     if fut:
         out.append("FUTURE TIPS:")
@@ -311,10 +360,21 @@ def _parse_future(lines: list):
         fm = _FUT_RUNNER_RE.match(ln)
         if fm:
             out.append({"race": race, "runner": fm.group("runner").strip(),
-                        "rest": fm.group("rest").strip(), "sent": "", "raw": ln.strip()})
+                        "rest": fm.group("rest").strip(), "sent": "", "raw": ln.strip(),
+                        "note": ""})
+            continue
+        if out and not race_since_runner(out, race):
+            # v6.79: "Bet will be refunded - he didn't nominate." / "*Anything above $3 is a
+            # fair price" belong to the tip above, not to an unreadable-lines list
+            out[-1]["note"] = (out[-1].get("note", "") + " " + ln.strip()).strip()
             continue
         unparsed.append(ln.strip())
     return out, unparsed
+
+
+def race_since_runner(out: list, race: str) -> bool:
+    """True when a new race header came after the last runner (a note then has no tip)."""
+    return bool(out) and race != out[-1]["race"]
 
 
 def parse_forward(text: str):
@@ -322,9 +382,10 @@ def parse_forward(text: str):
     lines = _clean_lines(text)
     if not lines or lines[0].upper() != LEGUP_HEADER:
         return None
-    res = {"date": None, "subject": "", "received": "", "pro": [], "future": [],
+    res = {"date": None, "subject_date": None, "subject": "", "received": "", "pro": [], "future": [],
            "early": [], "early_date": None, "unparsed": [], "future_unparsed": []}
     section = None
+    cur_early = None
     fut_lines = []
     for ln in lines[1:]:
         low = ln.lower()
@@ -338,6 +399,10 @@ def parse_forward(text: str):
         if section is None and low.startswith("received:"):
             res["received"] = ln.split(":", 1)[1].strip()
             continue
+        if section is None and low.startswith("subject_date:"):
+            v = ln.split(":", 1)[1].strip()
+            res["subject_date"] = v if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v) else None
+            continue
         if _PRO_START_RE.match(ln):
             section = "pro"
             continue
@@ -345,7 +410,9 @@ def parse_forward(text: str):
         if em:
             section = "early"
             v = em.group(1)
-            res["early_date"] = v if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v) else None
+            cur_early = v if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v) else None
+            if res["early_date"] is None:
+                res["early_date"] = cur_early
             continue
         if _FUT_START_RE.match(ln):
             section = "future"
@@ -355,6 +422,8 @@ def parse_forward(text: str):
         if section in ("pro", "early"):
             tip = parse_tip_line(ln)
             if tip is not None:
+                if section == "early":
+                    tip["race_date"] = cur_early  # v6.79: per weekday group
                 res[section].append(tip)
             else:
                 # Every other line in the Quick Take block goes to the manual alert: a

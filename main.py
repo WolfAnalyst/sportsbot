@@ -8221,8 +8221,25 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                  f"({nba_core.test_bets_used()}/{nba_core.cfg('NBA_MODEL_TEST_MAX_BETS')} "
                  f"test bets used)")
 
+    # v6.80 (Wilson 2026-10-18: AFL game lines "random account and then spill over into another
+    # random account, not EVERY account needs to bet it, as it would be so sus"): an AFL game
+    # line (h2h / line / total, no player) goes WHOLE to one random account, up to its cap;
+    # what that cap cannot hold is given to the next random account, and a Sportsbet max-stake
+    # shortfall spills on after firing (below). The fixture verification above is unchanged.
+    _afl_game_line = bool(
+        sport == "afl" and first_leg is not None
+        and not (getattr(first_leg, "player", None) or "").strip()
+        and (getattr(first_leg, "market", "") or "").strip().lower() in _AFL_GAME_LINE_MARKETS
+        and tip.tipster not in (DISPOSALS_MODEL_TIPSTER, NBA_MODEL_TIPSTER))
+    if _afl_game_line and len(sessions) > 1:
+        sessions = list(sessions)
+        _GAME_LINE_RNG.shuffle(sessions)
+        log.info(f"AFL fan-out: game line -> random account order "
+                 f"{[x.get('session_id') for x in sessions]} (whole stake to the first)")
+
     n_accounts = len(sessions)
-    per_account_target = round(intended_stake / n_accounts, 2)
+    per_account_target = (round(intended_stake, 2) if _afl_game_line
+                          else round(intended_stake / n_accounts, 2))
 
     # ── Direction-aware OVER liability cap (Task A, 2026-06-07) ─────────
     # v5.69 (m6): this OVER->threshold flip MUST run BEFORE _afl_fanout_targets,
@@ -8291,6 +8308,8 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                             tip.tipster, tip.units)
         if (AFL_FANOUT_WEIGHTED and not _force_even_split) else ({}, None)
     )
+    if _afl_game_line:
+        fanout_targets = {}          # v6.80: a game line is never split by weight
     use_weighted = bool(fanout_targets)
     if use_weighted:
         _mode = (f"decay {int(round((1 - fanout_decay) * 100))}%/step"
@@ -8522,6 +8541,13 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
         if resolved is None:
             log.info(f"AFL fan-out: {bk} session {sid} skipped (line not carried)")
             continue
+        if _afl_game_line and session_priority.lookup_liability_cap(
+                sid, sport, liability_market) is None:
+            # v6.81: a game line puts the WHOLE stake on one account, so an account with no cap
+            # for this market is skipped, never treated as uncapped.
+            log.warning(f"AFL fan-out: {bk} session {sid} has no sessions.yaml cap for "
+                        f"{sport}.{liability_market}: skipped for this game line")
+            continue
         remaining_budget = round(intended_stake - allocated, 2)
         if remaining_budget <= 0:
             log.info(
@@ -8690,11 +8716,13 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                 results.append(fut.result())
             except Exception as e:
                 log.error(f"AFL fan-out: placement on {sid} raised: {e}")
-                results.append(BetResult(
+                _xr = BetResult(
                     success=False, tip=tip, session_id=sid,
                     bookie=sess.get("bookie", "unknown"),
                     error=f"fan-out placement exception: {e}",
-                    timestamp=datetime.now()))
+                    timestamp=datetime.now())
+                _xr.is_ambiguous = True     # v6.81: may have posted; never re-staked
+                results.append(_xr)
 
     # ── Roll up: notify + audit (mirrors _place_singles_v4 tail) ───────
     # Classify each result once into placed / ambiguous / failed. AMBIGUOUS
@@ -8794,6 +8822,52 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                 f"{sum(1 for r in _topups if r.success)}/{len(_topups)} top-up leg(s); "
                 f"unfilled now ${unfilled:.2f}"
             )
+
+    # v6.80: an AFL GAME LINE's shortfall (the random account hit Sportsbet's max) spills to
+    # the accounts not used yet, one at a time in the random order, each up to its own cap.
+    # Never after a maybe-placed result (that stake counts as committed), never above the unit.
+    if (_afl_game_line and unfilled > AFL_FANOUT_MIN_STAKE and not ambiguous_results):
+        _used = {str(getattr(r, "session_id", "") or "") for r in results}
+        for _sx in sessions:
+            if unfilled <= AFL_FANOUT_MIN_STAKE:
+                break
+            _sid = str(_sx.get("session_id", ""))
+            _res = resolved_by_bookie.get((_sx.get("bookie", "") or "").lower())
+            if _sid in _used or _res is None or _session_stalled(_sid):
+                continue
+            _used.add(_sid)
+            try:
+                _lo2 = float(_res.get("live_odds") or 0) or tipped_odds
+                _steps, _why2, _lm2 = session_priority.resolve_stake_steps(
+                    _sid, sport, liability_market, _lo2 if (_lo2 and _lo2 > 1.0) else 0,
+                    unfilled, _v4_ladder_steps)
+            except Exception as e:
+                log.error(f"AFL game-line spill: sizing {_sid} failed ({e})")
+                continue
+            _lad = [round(min(x, unfilled), 2) for x in _steps if x and x >= AFL_FANOUT_MIN_STAKE]
+            if not _lad:
+                continue
+            log.info(f"AFL game-line spill: ${unfilled:.2f} unfilled -> {_sid} ladder {_lad}")
+            try:
+                _r = _fanout_place_account(tip, _sx, _lad, _res)
+            except Exception as e:
+                _r = BetResult(success=False, tip=tip, session_id=_sid,
+                               bookie=_sx.get("bookie", "unknown"), stake=_lad[0],
+                               error=f"AFL game-line spill exception: {e}",
+                               timestamp=datetime.now())
+                _r.is_ambiguous = True
+            results.append(_r)
+            if _r.success:
+                placed_results.append(_r)
+            elif _is_ambiguous_result(_r):
+                ambiguous_results.append(_r)
+            else:
+                failed_results.append(_r)
+            total_placed = round(sum(x.stake or 0 for x in placed_results), 2)
+            ambiguous_total = round(sum(_at_risk_stake(x) for x in ambiguous_results), 2)
+            unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
+            if ambiguous_results:
+                break                     # may have landed: stop spilling
 
     # Displayed "intended" is the true unit, so the summary reads "placed $X of
     # $UNIT" + "Unfilled $Y" honestly (no longer lowered to what landed).
@@ -15331,6 +15405,10 @@ def _resolve_single_for_placement(
 
 
 _GAME_LINE_RNG = random.Random()   # v6.75 random account for game lines (tests patch it)
+# v6.80: AFL leg markets that are GAME LINES for the random-account rule.
+_AFL_GAME_LINE_MARKETS = frozenset({"h2h", "line", "total", "total_points", "first_half_line",
+                                    "first_half_h2h", "first_half_total", "handicap", "margin",
+                                    "team_total"})
 # v6.75: the NFL/NBL fan-out cap_market values that are GAME LINES (whole stake to one random
 # account, the rest spills); anything else (a player stat) keeps the even split.
 _GAME_LINE_CAP_MARKETS = frozenset({"h2h", "line", "spread", "total", "total_points",
@@ -19429,7 +19507,7 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     import concurrent.futures
     _t_start = _time_mod.time()
     # v6.32: shared with the Bettors Edge NBL fan-out; `sport` drives the log/alert
-    # label and the sessions.yaml cap lookup (NBL caps resolve to the nba block).
+    # label and the sessions.yaml cap lookup (NBL: the account's nbl block, else nba).
     _S = (sport or "nfl").upper()
     priced_bookie = (match.get("bookie") or "").strip().lower()
 
@@ -24447,8 +24525,8 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
     # through the same checks and units ledger under their own date, so a race-day Pro Tip
     # for the same horse only adds the extra units.
     _tips = [(t, post["date"]) for t in post["pro"]]
-    _tips += [(dict(t, _early=post.get("early_date") or "?"), post.get("early_date"))
-              for t in post.get("early") or []]
+    _tips += [(dict(t, _early=t.get("race_date") or "?"), t.get("race_date"))
+              for t in post.get("early") or []]  # v6.79: each early tip has its weekday's date
     for t, race_date in _tips:
         if t["scratched"]:
             log.info(f"[{channel_name}] Leg Up {t['runner']} scratched -> skipped")
@@ -24465,6 +24543,15 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
                 f"{_desc(t)} (the Leg Up units ledger is unreadable, so a resend can't be told "
                 f"from a new tip: check logs/legup_units.json)")
             continue
+        # v6.79 review: an email re-dated by the TODAY typo rule may really be YESTERDAY's
+        # email sent again; a horse already tipped on its subject date is that resend
+        if post.get("subject_date") and not t.get("_early"):
+            _old = legup_ledger.lookup(ledger, t["runner"], post["subject_date"], t["track"],
+                                       t["race_num"])
+            if _old:
+                resent.append(f"{_desc(t)} (already tipped {_old['units']:g}u for "
+                              f"{post['subject_date']}, this email's subject date: not placed)")
+                continue
         prev_e = legup_ledger.lookup(ledger, t["runner"], race_date, t["track"], t["race_num"])
         prev = prev_e["units"] if prev_e else None
         d = legup_ledger.decide(t["units"], prev, cap)
@@ -24523,7 +24610,8 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
     # track so the race-day Pro Tip only adds the extra units.
     from parsers import legup as _lu2
     for f in post["future"]:
-        line = f"{f['race'] or '?'}: {f['raw']}" + (f" (first sent {f['sent']})" if f["sent"] else "")
+        line = (f"{f['race'] or '?'}: {f['raw']}" + (f" (first sent {f['sent']})" if f["sent"] else "")
+                + (f" [{f['note']}]" if f.get("note") else ""))
         sm = _lu2._STAKE_RE.search(f.get("rest") or "")
         fdate = legup_ledger.future_race_date(f.get("race") or "", today)
         ftrack = legup_ledger.future_track(f.get("race") or "")
