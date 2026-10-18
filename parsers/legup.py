@@ -138,38 +138,115 @@ def subject_race_date(subject: str, received: date):
         return None
 
 
-def _block_after(lines: list, start_re) -> list:
-    """Lines after the FIRST line matching start_re, up to the next section header."""
-    for i, ln in enumerate(lines):
-        if start_re.match(ln):
+def _block_after(lines: list, start_re, from_idx: int = 0):
+    """Lines after the FIRST line (at or after from_idx) matching start_re, up to the next
+    section header; None when there is no such line."""
+    for i in range(from_idx, len(lines)):
+        if start_re.match(lines[i]):
             block = []
             for nxt in lines[i + 1:]:
                 if _SECTION_END_RE.match(nxt):
                     break
                 block.append(nxt)
             return block
-    return []
+    return None
+
+
+# v6.77 (the 18 Oct email): the Quick Take now has TWO Pro Tips blocks, "TODAY'S TIPS | Quick
+# Take" (today's races) and "EARLY TIPS | Quick Take" (tomorrow's, dated by the later
+# "EARLY TIPS | OCT 19" header), and an empty block reads "No Pro Tips today." / "No Early
+# Tips today.".
+_QT_EARLY_RE = re.compile(r"^\s*EARLY TIPS\s*\|\s*Quick Take", re.IGNORECASE)
+_QT_TODAY_RE = re.compile(r"^\s*(?!EARLY\b)[A-Z'’ ]*TIPS\s*\|\s*Quick Take", re.IGNORECASE)
+_EARLY_DATE_RE = re.compile(r"^\s*EARLY TIPS\s*\|\s*(\S.*)$", re.IGNORECASE)
+_NONE_TODAY_RE = re.compile(r"^\s*No\b.*\b(today|pending)\b\.?\s*$", re.IGNORECASE)
+_EARLY_FWD_RE = re.compile(r"^\s*EARLY TIPS:\s*(\S+)\s*$", re.IGNORECASE)  # the forwarded post
+
+
+def _quick_take_pro(lines: list, header_re):
+    """(block, header_seen) for the PRO TIPS block straight after a Quick Take header. block
+    is None when the header is missing OR when it has no PRO TIPS line just below it (then
+    header_seen is True: a changed layout the caller must alert on, review v6.77 #3)."""
+    for i, ln in enumerate(lines):
+        if header_re.match(ln):
+            for j in range(i + 1, min(i + 4, len(lines))):
+                if _PRO_START_RE.match(lines[j]):
+                    return _block_after(lines, _PRO_START_RE, j), True
+            return None, True
+    return None, False
+
+
+# The write-up's Future Tips header ("FUTURE TIPS | Pending"): the 18 Oct Quick Take had no
+# "FUTURE TIPS:" block, so pending Future Tips are read from here when it is missing.
+_FUT_PENDING_RE = re.compile(r"^\s*FUTURE TIPS\s*\|\s*Pending", re.IGNORECASE)
+_FUT_BOILERPLATE_RE = re.compile(r"^[\s_*]*These Future Tips\b", re.IGNORECASE)  # _md_ too
+
+
+def _drop_boilerplate(block: list) -> list:
+    """The block without the "These Future Tips count towards ..." sentence, including its
+    wrapped continuation lines in a text/plain part (up to the line ending the sentence, at
+    most 2 lines, and never a race header or runner line: a sentence missing its full stop
+    must not swallow the Future Tips after it)."""
+    out, skip_left = [], 0
+    ends = lambda s: s.rstrip().rstrip("_*").rstrip().endswith(".")
+    for ln in block or []:
+        if _FUT_BOILERPLATE_RE.match(ln):
+            skip_left = 0 if ends(ln) else 2
+            continue
+        if skip_left and "(date:" not in ln.lower() and not _FUT_RUNNER_RE.match(ln):
+            skip_left = 0 if ends(ln) else skip_left - 1
+            continue
+        skip_left = 0
+        out.append(ln)
+    return out
+
+
+def _drop_none_lines(block):
+    return [ln for ln in (block or []) if not _NONE_TODAY_RE.match(ln)]
 
 
 def extract_sections(text: str) -> dict:
-    """{"pro": [quick-take Pro Tip lines], "future": [quick-take Future Tip lines]}.
-    The FIRST "PRO TIPS:" is the Quick Take; the long write-up repeats it further down
-    and must not be read (every tip would be seen twice)."""
+    """{"pro": today's Quick Take Pro Tip lines, "early": tomorrow's (EARLY TIPS) lines,
+    "early_date_text": the "EARLY TIPS | OCT 19" header, "future": Future Tip lines,
+    "found": whether any tips block was found at all (an email that says "No Pro Tips today"
+    has found=True and nothing to bet; found=False means the format changed)}.
+    Only the Quick Take blocks are read: the long write-up below repeats every tip."""
     lines = _clean_lines(text)
-    return {"pro": _block_after(lines, _PRO_START_RE),
-            "future": _block_after(lines, _FUT_START_RE)}
+    pro, today_seen = _quick_take_pro(lines, _QT_TODAY_RE)
+    early, early_seen = _quick_take_pro(lines, _QT_EARLY_RE)
+    if pro is None and not today_seen and not early_seen:
+        # neither Quick Take header (an older layout): the first PRO TIPS block. Never when
+        # an EARLY Quick Take exists, or its tips would be read twice, as today's and as
+        # tomorrow's (review v6.77 #1).
+        pro = _block_after(lines, _PRO_START_RE)
+    future = _block_after(lines, _FUT_START_RE)
+    if future is None:
+        future = _block_after(lines, _FUT_PENDING_RE)
+    future = _drop_boilerplate(future) if future is not None else None
+    early_date_text = next((m.group(1).strip() for m in map(_EARLY_DATE_RE.match, lines)
+                            if m and "quick take" not in m.group(1).lower()), "")
+    # a Quick Take header without its PRO TIPS line is a changed layout: not "found", so the
+    # watcher alerts instead of calling it an empty email
+    broken = (today_seen and pro is None) or (early_seen and early is None)
+    return {"pro": _drop_none_lines(pro), "early": _drop_none_lines(early),
+            "early_date_text": early_date_text, "future": _drop_none_lines(future),
+            "found": (not broken) and (pro is not None or early is not None or future is not None)}
 
 
-def build_forward(subject: str, received_text: str, race_date, sections: dict) -> str:
+def build_forward(subject: str, received_text: str, race_date, sections: dict,
+                  early_date=None) -> str:
     """The compact Telegram post main.py parses back with parse_forward()."""
     out = [LEGUP_HEADER,
            f"date: {race_date.isoformat() if race_date else 'unknown'}",
            f"subject: {subject or ''}",
            f"received: {received_text or ''}",
            "PRO TIPS:"]
-    out += sections.get("pro") or []
-    fut = [ln for ln in (sections.get("future") or [])
-           if not re.match(r"^\s*No Future Tips", ln, re.IGNORECASE)]
+    out += _drop_none_lines(sections.get("pro"))
+    early = _drop_none_lines(sections.get("early"))
+    if early:
+        out.append(f"EARLY TIPS: {early_date.isoformat() if early_date else 'unknown'}")
+        out += early
+    fut = _drop_none_lines(sections.get("future"))
     if fut:
         out.append("FUTURE TIPS:")
         out += fut
@@ -246,7 +323,7 @@ def parse_forward(text: str):
     if not lines or lines[0].upper() != LEGUP_HEADER:
         return None
     res = {"date": None, "subject": "", "received": "", "pro": [], "future": [],
-           "unparsed": [], "future_unparsed": []}
+           "early": [], "early_date": None, "unparsed": [], "future_unparsed": []}
     section = None
     fut_lines = []
     for ln in lines[1:]:
@@ -264,13 +341,21 @@ def parse_forward(text: str):
         if _PRO_START_RE.match(ln):
             section = "pro"
             continue
+        em = _EARLY_FWD_RE.match(ln)
+        if em:
+            section = "early"
+            v = em.group(1)
+            res["early_date"] = v if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v) else None
+            continue
         if _FUT_START_RE.match(ln):
             section = "future"
             continue
-        if section == "pro":
+        if _NONE_TODAY_RE.match(ln):
+            continue  # "No Pro Tips today."
+        if section in ("pro", "early"):
             tip = parse_tip_line(ln)
             if tip is not None:
-                res["pro"].append(tip)
+                res[section].append(tip)
             else:
                 # Every other line in the Quick Take block goes to the manual alert: a
                 # format change ("Randwick Race 2 ...") must never vanish silently (review M4).

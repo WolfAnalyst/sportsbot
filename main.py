@@ -23979,7 +23979,8 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
         u = t.get("units")
         stake = f" {u:g}u (${u * unit_size:,.0f})" if u else ""
         bk = f" [tipped at {t['bookie']}]" if t.get("bookie") else ""
-        return (f"{t['track']} R{t['race_num']} #{t['saddle'] if t['saddle'] is not None else '?'} "
+        early = f"[EARLY TIP for {t['_early']}] " if t.get("_early") else ""
+        return (f"{early}{t['track']} R{t['race_num']} #{t['saddle'] if t['saddle'] is not None else '?'} "
                 f"{t['runner']} {(t.get('market') or '?').upper()} @ {t.get('price_text') or '?'}"
                 f"{stake}{bk}")
 
@@ -23995,14 +23996,20 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
 
     raw_tips, tote, cant, bad_date = [], [], [], []
     resent, fewer, over, topups, futures = [], [], [], [], []
-    for t in post["pro"]:
+    # v6.77: EARLY TIPS (tomorrow's races, the 18 Oct email's new Quick Take block) go
+    # through the same checks and units ledger under their own date, so a race-day Pro Tip
+    # for the same horse only adds the extra units.
+    _tips = [(t, post["date"]) for t in post["pro"]]
+    _tips += [(dict(t, _early=post.get("early_date") or "?"), post.get("early_date"))
+              for t in post.get("early") or []]
+    for t, race_date in _tips:
         if t["scratched"]:
             log.info(f"[{channel_name}] Leg Up {t['runner']} scratched -> skipped")
             continue
         if not t.get("market") or not t.get("units") or t["units"] <= 0:
             cant.append(f"{t['raw']} (no market or units read)")
             continue
-        why = _legup_date_problem(post["date"], today, t["track"], schedule)
+        why = _legup_date_problem(race_date, today, t["track"], schedule)
         if why:
             (bad_date if t.get("fixed_price") else tote).append(f"{_desc(t)} ({why})")
             continue
@@ -24011,7 +24018,7 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
                 f"{_desc(t)} (the Leg Up units ledger is unreadable, so a resend can't be told "
                 f"from a new tip: check logs/legup_units.json)")
             continue
-        prev_e = legup_ledger.lookup(ledger, t["runner"], post["date"], t["track"], t["race_num"])
+        prev_e = legup_ledger.lookup(ledger, t["runner"], race_date, t["track"], t["race_num"])
         prev = prev_e["units"] if prev_e else None
         d = legup_ledger.decide(t["units"], prev, cap)
         was = (f"already tipped {prev:g}u ({prev_e.get('source')}, first {prev_e.get('first_seen')})"
@@ -24026,7 +24033,7 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
         # Saved BEFORE anything is placed, and a failed save places nothing (review v6.74 #1):
         # unsaved, a resend of this tip would look new and place again. The returned ledger is
         # the one the next line is checked against (#2: one horse twice in one email).
-        upd = legup_ledger.record(t["runner"], post["date"], t["units"],
+        upd = legup_ledger.record(t["runner"], race_date, t["units"],
                                   "pro" if t.get("fixed_price") else "pro TO+", seen_on,
                                   t["track"], t["race_num"])
         if upd is None:
@@ -24058,7 +24065,7 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
                  if prev_e else "")
         if topup:
             topups.append(f"{_desc(t)}: {topup}")
-        raw_tips.append({"track": t["track"], "date": post["date"], "race": t["race_num"],
+        raw_tips.append({"track": t["track"], "date": race_date, "race": t["race_num"],
                          "saddle": t["saddle"], "runner": t["runner"], "odds": t["odds"],
                          "units": place, "market": t["market"], "race_type": "(R)",
                          "_legup_topup": bool(prev_e), "_legup_skip_resend": True,
