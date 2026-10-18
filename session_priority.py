@@ -104,9 +104,10 @@ KNOWN_MLB_MARKETS = {
 
 # NFL markets (v6.22, 2026-09-11). Only the four stats
 # main._NFL_AUTOPLACE_STAT_SUFFIX actually auto-places on are meaningful cap
-# keys today (Sportsbet doesn't carry rush_attempts/pass_attempts/completions/
-# longest_reception/longest_rush/interceptions/sacks/tackles as markets at
+# keys today (Sportsbet doesn't carry interceptions/sacks/tackles as markets at
 # all, verified live); h2h/line/total listed for when team markets are added.
+# v6.83: longest_rush/longest_reception/longest_pass ARE Sportsbet markets now; they cap
+# with the rushing/receiving/passing yards keys (main._NFL_CAP_MARKET_ALIAS).
 # v6.59: most_rushing_yards/most_receiving_yards/most_passing_yards (the
 # HyperBot market keys main._resolve_nfl_most_market caps against) added for
 # the 'MOST RUSHING/RECEIVING/PASSING YARDS' proposition markets -- no yaml

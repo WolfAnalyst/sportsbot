@@ -1233,7 +1233,7 @@ class HyperBotClient:
         self, session_id: str, track: str, race_num: int,
         runner: str, stake: float, market: str = "win",
         race_type: str = "(R)", date: str = None,
-        target_odds: float = None, use_bonus_bet: bool = False,
+        target_odds: float = None, use_bonus_bet: bool = False, use_boost: bool = False,
     ) -> dict:
         """Place a fixed-odds Win or Place bet on a single runner.
 
@@ -1275,6 +1275,10 @@ class HyperBotClient:
             payload["target_odds"] = target_odds
         if use_bonus_bet:
             payload["use_bonus_bet"] = True
+        if use_boost:
+            # v6.86: HyperBot applies a bookie odds boost when one is available, else places
+            # normally (skip_if_no_promo is NOT sent).
+            payload["use_boost"] = True
         poll_result = self._post_v3_async("/v3/place_bet", payload)
         if poll_result.get("success") is False and "statuses" not in poll_result:
             return poll_result

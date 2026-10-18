@@ -19622,6 +19622,11 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     _player = leg.player
     if (_stat or "").strip().lower() in ("double_double", "triple_double") and match.get("proposition_id"):
         _stat = None
+    if (_stat or "").strip().lower() in ("longest_rush", "longest_reception", "longest_pass")             and match.get("proposition_id"):
+        # v6.83 (live 2026-10-19: HyperBot "player='James Cook' did not match any of 1
+        # candidates"): Sportsbet's longest-play rows carry no player field, so neither player
+        # nor stat is sent; the proposition_id pins the row (as for quarter rows).
+        _stat, _player = None, None
     if match.get("hb_no_stat") and match.get("proposition_id"):
         _stat = None
     # v6.44: a quarter row has player=None and no stat, so HyperBot's player/stat filters
