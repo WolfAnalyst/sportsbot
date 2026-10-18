@@ -54,6 +54,9 @@ KNOWN_NBA_MARKETS = {
     "player_pra", "player_pts_rebs", "player_pts_asts", "player_asts_rebs",
     # shared cap for ALL NBA *_threshold markets
     "player_threshold",
+    # v6.84: game-line cap keys (314653 caps every game line)
+    "total", "team_total", "team_line", "margin", "handicap",
+    "first_half_h2h", "first_half_line", "first_half_total",
 }
 
 KNOWN_AFL_MARKETS = {
@@ -82,6 +85,9 @@ KNOWN_AFL_MARKETS = {
     "player_tackles_threshold", "player_kicks_threshold",
     "player_handballs_threshold", "player_clearances_threshold",
     "player_hitouts_threshold",
+    # v6.82: AFL game-line cap keys (main._AFL_GAME_LINE_MARKETS).
+    "total", "team_total", "margin", "handicap",
+    "first_half_h2h", "first_half_line", "first_half_total", "team_line",
 }
 
 # MLB markets (2026-06-01). For the gated rollout only `sgm` is reachable
@@ -91,6 +97,9 @@ KNOWN_AFL_MARKETS = {
 KNOWN_MLB_MARKETS = {
     "h2h", "money_line", "line", "total_points", "team_total", "sgm",
     "player_stats",
+    # v6.84: game-line cap keys (314653 caps every game line)
+    "total", "team_line", "margin", "handicap",
+    "first_half_h2h", "first_half_line", "first_half_total",
 }
 
 # NFL markets (v6.22, 2026-09-11). Only the four stats
@@ -107,6 +116,14 @@ KNOWN_NFL_MARKETS = {
     "receiving_yards", "rushing_yards", "passing_yards", "receptions",
     "most_rushing_yards", "most_receiving_yards", "most_passing_yards",
     "h2h", "line", "total",
+    # v6.82: every stat in main._NFL_AUTOPLACE_STAT_SUFFIX and the game-line
+    # cap markets, so a sessions.yaml cap for them validates.
+    "passing_touchdowns", "pass_attempts", "passing_attempts", "completions",
+    "rush_attempts", "rushing_receiving_yards", "passing_rushing_yards",
+    "1st_quarter_receiving_yards", "1st_quarter_rushing_yards",
+    "1st_quarter_passing_yards", "1st_quarter_rushing_receiving_yards",
+    "team_total", "team_line", "margin", "handicap", "first_half_h2h", "first_half_total",
+    "first_half_line", "total_points",   # v6.84
 }
 
 # Racing bet types we expect under per-track caps. AGS covered separately
@@ -925,31 +942,51 @@ def _normalise_cap(value) -> float | str | tuple[float, ...] | None:
     canonical cap. Strings inside the list are rejected (no 'unlimited'
     mid-list — use a single 'unlimited' value if no cap is wanted).
     """
+    # v6.82 (Wilson 2026-10-19 hand-fills the 314653 placeholders): a SPORTS value that
+    # IS written but cannot be read is "do not bet" (0.0), never None (= unlimited).
+    # A quoted number ("200") still reads as that number. A missing key never
+    # reaches here, so absent = unlimited is unchanged. Racing lookups skip a blank
+    # value before calling here (it falls back to the track / default / MBL cap).
+    if isinstance(value, bool):
+        log.warning(f"_normalise_cap: unreadable cap {value!r} -> 0 (do not bet)")
+        return 0.0
     if isinstance(value, (int, float)):
-        if value < 0:
-            return None  # negative makes no sense
+        if value < 0 or not math.isfinite(value):
+            log.warning(f"_normalise_cap: negative or non-finite cap {value!r} -> 0 (do not bet)")
+            return 0.0
         return float(value)  # 0.0 valid as "do not bet"
     if isinstance(value, str):
         v = value.lower().strip()
         if v in ("unlimited", "mbl"):
             return v
+        try:
+            num = float(v)
+        except ValueError:
+            num = None
+        if num is not None and num >= 0 and math.isfinite(num):
+            return num
+        log.warning(f"_normalise_cap: unreadable cap {value!r} -> 0 (do not bet)")
+        return 0.0
     if isinstance(value, list):
         # List cap: each entry must be a non-negative number. Reject
         # mixed content (strings, nested lists) rather than silently
         # dropping entries — better to surface a yaml typo than place
-        # bets on a half-parsed ladder.
+        # bets on a half-parsed ladder. v6.82: a rejected list is 0 (do not
+        # bet), not None (unlimited).
         out: list[float] = []
         for entry in value:
-            if isinstance(entry, (int, float)) and entry >= 0:
+            if (isinstance(entry, (int, float)) and not isinstance(entry, bool)
+                    and entry >= 0 and math.isfinite(entry)):
                 out.append(float(entry))
             else:
                 log.warning(
                     f"_normalise_cap: rejecting list with non-numeric entry "
-                    f"{entry!r} (full value: {value!r})"
+                    f"{entry!r} (full value: {value!r}) -> 0 (do not bet)"
                 )
-                return None
+                return 0.0
         if not out:
-            return None
+            log.warning("_normalise_cap: empty list cap -> 0 (do not bet)")
+            return 0.0
         return tuple(out)
     if isinstance(value, tuple):
         # Idempotent pass-through for already-normalised list caps. Real
@@ -958,9 +995,12 @@ def _normalise_cap(value) -> float | str | tuple[float, ...] | None:
         # Validate contents same as list path.
         for entry in value:
             if not isinstance(entry, (int, float)) or entry < 0:
-                return None
-        return value if value else None
-    return None
+                return 0.0   # v6.82: unreadable = do not bet
+        return value if value else 0.0
+    # v6.82: a key written with no value (`h2h:`) or any other unreadable value is
+    # "do not bet". The racing lookups drop a missing value before calling here.
+    log.warning(f"_normalise_cap: blank or unreadable cap {value!r} -> 0 (do not bet)")
+    return 0.0
 
 
 def pick_best_bookie_for_tip(
@@ -1115,6 +1155,12 @@ def resolve_max_stake(
     if isinstance(cap, tuple):
         cap = cap[0] if cap else 0.0
 
+    # v6.82 (Haiku review of the 314653 placeholders): a 0 cap is "do not bet" with or
+    # without odds. The no-odds branch below used to return the full intended stake for
+    # a scalar cap before the cap was ever looked at.
+    if cap <= 0:
+        return (0.0, "cap=$0 (do not bet)")
+
     # M17: guard None/zero live_odds to prevent TypeError in liability_to_max_stake.
     if not live_odds or live_odds <= 1.0:
         # M17/NEW fix (2026-05-30): for a LIST-cap market with no odds we must
@@ -1179,6 +1225,8 @@ def resolve_stake_steps(
     if isinstance(cap, tuple):
         steps: list[float] = []
         if not live_odds or live_odds <= 1.0:
+            if float(cap[0]) <= 0:
+                return ([], "list cap top $0 (do not bet)", True)   # v6.82
             # No odds -> can't convert liability to stake. The original code
             # used cap[0] directly as a raw single stake (H48: over-stakes at
             # long odds). The H48 fix then REFUSED entirely — but that blocked

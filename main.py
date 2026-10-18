@@ -12592,6 +12592,10 @@ def _place_sgm_v4(tip: ParsedTip, _orchestrated: bool = False) -> list[BetResult
                 max_stake, cap_reason = session_priority.resolve_max_stake(
                     sid, sport, "sgm", sizing_odds, intended_stake,
                 )
+            elif sgm_cap == 0:
+                # v6.82: a 0 yaml cap is "do not bet" even without odds.
+                max_stake = 0.0
+                cap_reason = "cap=$0 (do not bet)"
             else:
                 # No tipped odds — pass intended through, let bookie ladder it
                 max_stake = intended_stake
@@ -13807,6 +13811,10 @@ def _place_mlb_alex_single(tip: ParsedTip, cap_stake: float) -> list[BetResult]:
         bookie = sess.get("bookie", "sportsbet")
         # Per-account STAKE ladder from the yaml mlb.player_stats list cap.
         cap = session_priority.lookup_liability_cap(sid, "mlb", "player_stats")
+        if cap == 0:
+            # v6.82: a 0 yaml cap is "do not bet"; `if cap` read it as no cap.
+            log.info(f"MLB single: session {sid} mlb.player_stats cap is 0 — skipping")
+            continue
         ladder = list(cap) if isinstance(cap, tuple) else [float(cap)] if cap else [cap_stake]
         steps = _sgm_ladder_steps(ladder, min(remaining, max(ladder)))
         if not steps:
@@ -18260,6 +18268,12 @@ _NFL_AUTOPLACE_STAT_SUFFIX = {
     "1st_quarter_rushing_receiving_yards": "1st_qtr_rushing_+_receiving_yds",
     "rushing_receiving_yards": "rushing_+_receiving_yds",
     "passing_rushing_yards": "passing_+_rushing_yds",
+    # v6.83 (Wilson 2026-10-19: "yes please set it up now", after 4th&EV 'James Cook longest
+    # rush OVER 19.5' went manual "no live-market mapping"; live board 49ers v Commanders:
+    # '<player>_-_longest_rush' / '_longest_reception' / '_longest_pass', one O/U row each).
+    "longest_rush": "longest_rush",
+    "longest_reception": "longest_reception",
+    "longest_pass": "longest_pass",
 }
 # v6.35: Sportsbet's 'N+' ladders ('Jordan Love 3+ Passing Touchdowns', line 2.5,
 # direction over). Used only for an OVER whose exact line the main O/U market
@@ -18318,6 +18332,11 @@ _NFL_LINE_TOLERANCE_BY_STAT = {
     "interceptions": 0.0,
     "sacks": 0.0,
     "tackles": 0.0,
+    # v6.83: longest-play lines are small (15-35 yards): exact, or better (see
+    # _NFL_BETTER_ONLY_LINE_STATS), never a worse line.
+    "longest_rush": 0.0,
+    "longest_reception": 0.0,
+    "longest_pass": 0.0,
 }
 _NFL_LINE_TOLERANCE_DEFAULT = 0.0
 
@@ -18388,7 +18407,13 @@ _NFL_ALT_NEAR_RUNG_STATS = {"receiving_yards", "rushing_yards", "passing_yards"}
 # v6.44: 1st quarter yardage takes a BETTER line (up to _NFL_BETTER_LINE_MAX) at full
 # stake, never a worse one (Wilson's NBL choice, "better lines only").
 _NFL_BETTER_ONLY_LINE_STATS = {"1st_quarter_receiving_yards", "1st_quarter_rushing_yards",
-                               "1st_quarter_passing_yards", "1st_quarter_rushing_receiving_yards"}
+                               "1st_quarter_passing_yards", "1st_quarter_rushing_receiving_yards",
+                               "longest_rush", "longest_reception", "longest_pass"}
+# v6.83 (Wilson: "the limits on it can just be the rushing yards lines limits"): a longest-play
+# market is capped with the matching yardage cap key.
+_NFL_CAP_MARKET_ALIAS = {"longest_rush": "rushing_yards",
+                         "longest_reception": "receiving_yards",
+                         "longest_pass": "passing_yards"}
 
 
 def _nfl_count_line_shift(stat: str, side: str, tipped: float, live: float):
@@ -20470,6 +20495,7 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
         # 538, and owns every alert/ledger/audit write from here on.
         if market_type_norm == "player_prop":
             _cap_market = (_place_stat or "").strip().lower()
+            _cap_market = _NFL_CAP_MARKET_ALIAS.get(_cap_market, _cap_market)
         elif market_type_norm == "most_stat":
             # v6.59: cap on the actual HyperBot market key ('most_rushing_yards'), not
             # the literal market_type string -- matches KNOWN_NFL_MARKETS and whatever
