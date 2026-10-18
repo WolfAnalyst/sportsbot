@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import random
 import threading
 import time
 import unicodedata
@@ -9526,7 +9527,14 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
         else:
             # No price data — use first unused session in priority order.
             # live_odds = tipped_odds for liability math (good enough).
-            chosen_session = unused[0]
+            # v6.75 (Wilson 2026-10-18: game lines go to "1 random account out of all the
+            # available accounts ... other than a default assigned 1st priority account"): a
+            # team market (h2h, line, totals, halves ...) takes a RANDOM unused account; the
+            # loop below still fills it to its cap and spills the rest to another random one.
+            # A player prop keeps the priority order.
+            _has_player = bool(first_leg and (first_leg.player or "").strip())
+            chosen_session = (unused[0] if (is_player_prop or _has_player)
+                              else _GAME_LINE_RNG.choice(unused))
             chosen_bookie = (chosen_session.get("bookie", "") or "").lower()
             live_odds = tipped_odds or 0
             # Distinguish team markets (price-check intentionally skipped, not
@@ -9535,7 +9543,7 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
             # for h2h/line/total even though we never tried.
             if not is_player_prop:
                 log.info(
-                    f"v4: team market — placing on priority #1 "
+                    f"v4: team market — placing on a random account "
                     f"({chosen_bookie} session {chosen_session.get('session_id')})"
                 )
             else:
@@ -15315,6 +15323,11 @@ def _resolve_single_for_placement(
     )
 
 
+_GAME_LINE_RNG = random.Random()   # v6.75 random account for game lines (tests patch it)
+# v6.75: the NFL/NBL fan-out cap_market values that are GAME LINES (whole stake to one random
+# account, the rest spills); anything else (a player stat) keeps the even split.
+_GAME_LINE_CAP_MARKETS = frozenset({"h2h", "line", "spread", "total", "total_points",
+                                    "team_total", "margin"})
 _GUARD_TLS = threading.local()   # v6.70: per-thread "skip the v6.57 fixture guard" for model bets
 
 
@@ -19429,6 +19442,35 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     _before_fillup = list(sessions)
     sessions = session_priority.drop_fillup_when_others(sessions, sport)   # v6.61
     _held_fillups = [x for x in _before_fillup if x not in sessions]       # v6.65
+    # v6.75 (Wilson 2026-10-18): a GAME LINE (no player: h2h, spread, totals, team totals,
+    # margins, quarters) is not split evenly: the whole stake goes to ONE random account (up to
+    # its Sportsbet max / cap), and any shortfall spills to the others one at a time in random
+    # order (through _nfl_fanout_spill's sequential path). Player props keep the even split.
+    # Classified by the market KEY (the caller's cap_market: h2h, line, total(_points),
+    # team_total, margin), never by a parsed player field, which an LLM can fill for a team bet.
+    if sessions and len(sessions) > 1 and (cap_market or "").strip().lower() in _GAME_LINE_CAP_MARKETS:
+        _shuffled = list(sessions)
+        _GAME_LINE_RNG.shuffle(_shuffled)
+        # The first account that can take a stake at all (a zero yaml cap or a no-odds refusal
+        # is skipped) gets the whole stake, so one bad pick never strands the bet on manual.
+        _first = None
+        for _cand in _shuffled:
+            try:
+                _cap0, _ = session_priority.resolve_max_stake(
+                    str(_cand.get("session_id", "")), sport, cap_market,
+                    match.get("odds") or 0, intended_stake)
+            except Exception:
+                _cap0 = intended_stake
+            if _cap0 and _cap0 > 0:
+                _first = _cand
+                break
+        if _first is not None:
+            _rest = [x for x in _shuffled if x is not _first]
+            log.info(f"[{channel_name}] {sport.upper()} game line: whole stake to random account "
+                     f"{_first.get('session_id')}, spill order "
+                     f"{[x.get('session_id') for x in _rest]}")
+            sessions = [_first]
+            _held_fillups = _rest + _held_fillups
     if not sessions:
         log.warning(f"[{channel_name}] {_S} fan-out: no active {priced_bookie or '?'} session "
                     f"in {_S}_SESSION_PRIORITY for {bet_label} -> manual")
@@ -19762,6 +19804,8 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
     """Classify an NFL fan-out's results and send the placed / unfilled / ambiguous
     alerts plus the audit row. Mirrors _place_etr_nba_fanout's tail. Split out so
     _place_nfl_fanout can guard it with one try/except after bets have fired."""
+    # v6.75: a game line has ONE job and spills onto others, so count every account that took part.
+    _n_accts = len({str(getattr(r, "session_id", "") or "") for r in results} - {""}) or len(jobs)
     _S = (sport or "nfl").upper()
     placed_results: list[BetResult] = []
     ambiguous_results: list[BetResult] = []
@@ -19815,7 +19859,7 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
         "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
         "intended_stake": display_intended, "attempted_stake": attempted_stake,
         "placed_stake": total_placed, "ambiguous_stake": ambiguous_total,
-        "unfilled_stake": unfilled, "fanout": sport, "accounts": len(jobs),
+        "unfilled_stake": unfilled, "fanout": sport, "accounts": _n_accts,
         "placements": [
             {"session_id": r.session_id, "bookie": r.bookie, "stake": r.stake,
              "fill_odds": r.odds, "bet_id": r.bet_id}
@@ -19836,7 +19880,7 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
         log.warning(f"[{channel_name}] {_S} AUTO-PLACED: {bet_label} @ {r.odds} "
                     f"${r.stake} on {r.bookie}:{r.session_id} (bet_id={r.bet_id})")
     log.info(f"[{channel_name}] {_S} fan-out: placed ${total_placed:.2f} of "
-             f"${display_intended:.2f} across {len(placed_results)}/{len(jobs)} "
+             f"${display_intended:.2f} across {len(placed_results)}/{_n_accts} "
              f"account(s) ({len(failed_results)} failed, {len(ambiguous_results)} "
              f"ambiguous, ${unfilled:.2f} unfilled)")
 
