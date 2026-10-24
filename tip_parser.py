@@ -405,9 +405,38 @@ def build_tips_from_parsed(parsed, text, tipster, sport, unit_size, default_unit
                     f"alt lines={[a['line'] for a in demoted_alt_lines]}"
                 )
 
+        # v6.99: an SGM that repeats the same leg (groq_parser._sgm_duplicate_legs).
+        # "Team / Team Over N" -> the single game total it is; any other repeat -> manual.
+        _dup_reason = ""
+        if is_sgm and not is_pyo_sgm and len(legs) >= 2 and len(_raw_legs) == len(legs):
+            try:
+                from groq_parser import _sgm_duplicate_legs as _sdl
+                _dup = _sdl(_raw_legs, text)
+            except Exception as _de:
+                # fail CLOSED: an identical-leg SGM must never slip through on an error
+                log.error(f"SGM duplicate-leg check failed ({type(_de).__name__}: {_de}) -> MANUAL")
+                _dup = "duplicate"
+            if _dup == "game_total":
+                legs = [legs[0]]
+                is_sgm = False
+                legs[0].market = "total"
+                if not (legs[0].selection or "").strip():
+                    from groq_parser import _slash_leg_dir as _sld2
+                    legs[0].selection = _sld2(_raw_legs[0].get("selection") or _raw_legs[0].get("type") or "")
+                log.warning(
+                    f"SGM with {len(_raw_legs)} identical game-total legs "
+                    f"({legs[0].selection or _raw_legs[0].get('selection')} {legs[0].line}) "
+                    f"-> the SINGLE game total it is ('Team / Team Over N' names one game)")
+            elif _dup == "duplicate":
+                _dup_reason = "SGM has the same leg twice (parse error), place manually"
+                log.warning(f"SGM with duplicate legs -> MANUAL: {_raw_legs}")
+
         is_threshold = td.get("is_threshold", False)
         alert_only = td.get("alert_only", False)
         alert_reason = td.get("alert_reason", "")
+        if _dup_reason:
+            alert_only = True
+            alert_reason = f"{alert_reason}; {_dup_reason}" if alert_reason else _dup_reason
 
         # Shook unit transform: 0.3u-style conservative sizing scaled x3, rounded
         # to nearest 0.25u (matches our risk level). Provider-agnostic.

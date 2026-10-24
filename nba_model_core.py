@@ -128,6 +128,8 @@ def resolve_player(player: str, team_v3: str):
     roster._load_rosters()
     table = getattr(roster, "_nba_roster", None) or {}
     want_team = roster_team(team_v3)
+    if not str(want_team or "").strip():
+        return "", "", f"no team given for {player!r}, nothing placed"
     key = " ".join(str(player or "").split()).lower()
     if not key or len(key.split()) < 2:
         return "", "", f"player {player!r} is not a full name"
@@ -151,10 +153,47 @@ def resolve_player(player: str, team_v3: str):
         return "", "", (f"player {player!r} matches {len(hits)} roster entries "
                         f"({[h['name'] + ' / ' + h['team'] for h in hits][:4]}), ambiguous")
     hit = hits[0]
+    if not str(hit.get("team", "")).strip():
+        return "", "", (f"roster has {hit['name']!r} with no team (a team-less list), "
+                        f"nothing placed")
     if str(hit.get("team", "")).strip().lower() != want_team.strip().lower():
         return "", "", (f"roster has {hit['name']!r} on {hit.get('team')!r} but the message "
                         f"says team={team_v3!r}: roster or message is stale, nothing placed")
     return str(hit["name"]), str(hit["team"]), ""
+
+
+#: resolve_player reasons a fresh roster could cure: the player is missing (a rookie or a new
+#: signing) or the roster has him on another team (a trade). An ambiguous or one-word name
+#: is not retried.
+_REFRESHABLE = ("is not in the NBA roster", "roster or message is stale")
+
+
+def resolve_player_refreshing(player: str, team_v3: str, refresh=None):
+    """resolve_player, and when it misses for a reason a fresher roster could cure, ONE
+    refresh of the roster from NBA.com (the model's own source: commonallplayers, current
+    season) and ONE more exact lookup. v6.105 (2026-10-21): the model's first live bet,
+    Caleb Wilson (a 2026-27 Bulls rookie), was refused because the saved roster was July's
+    2025-26 list. The rules are unchanged: exact folded full name, unique, on the team the
+    message names; a miss after the refresh is still a refusal. BLOCKING when it refreshes
+    (a network call): main.py runs it off the event loop.
+
+    Returns (roster_name, roster_team, reason, refresh_status); refresh_status is "" when no
+    refresh was needed, else roster.refresh_nba_roster_now's answer."""
+    name, team, why = resolve_player(player, team_v3)
+    if not why or not any(m in why for m in _REFRESHABLE):
+        return name, team, why, ""
+    if refresh is None:
+        import roster
+        refresh = roster.refresh_nba_roster_now
+    try:
+        status = refresh()
+    except Exception as e:
+        log.error(f"NBA roster refresh for {player!r} failed: {e}")
+        status = "kept"
+    if status in ("kept", "busy"):
+        return name, team, why, status
+    name, team, why = resolve_player(player, team_v3)
+    return name, team, why, status
 
 
 def canonical_catalog_player(name: str, catalog_players) -> str:
@@ -1392,6 +1431,13 @@ def _convert_orphans(state: dict) -> list:
             if amb > 0:
                 sel["committed"] = round(float(sel.get("committed") or 0) + amb, 2)
                 sel["ambiguous"] = round(float(sel.get("ambiguous") or 0) + amb, 2)
+                if res.get("raise_to"):
+                    # the dead retry may have put raised-target money on: the raise stands, as
+                    # _commit_locked does for an ambiguous result
+                    sel["row_target"] = max(float(sel.get("row_target") or 0),
+                                            float(res["raise_to"]))
+                    sel["target"] = max(float(sel.get("target") or 0),
+                                        float(res.get("raise_eff") or res["raise_to"]))
                 accs = state.setdefault("accounts", {}).setdefault(sel_id, {})
                 for a in asks:
                     e = accs.setdefault(str(a["session_id"]),
@@ -1588,7 +1634,7 @@ def _claim(row: dict):
                          f"state (may have landed at the bookie after we stopped waiting): "
                          f"refusing a further offer (double-stake)")
 
-        if row["kind"] == "retry" and not cfg("NBA_MODEL_RETRY_ENABLED"):
+        if is_retry(row) and not cfg("NBA_MODEL_RETRY_ENABLED"):
             return 0.0, "kind=retry and NBA_MODEL_RETRY_ENABLED=false"
 
         # Per-fixture player cap (correlation bound). 0 disables it, which is the shipped
@@ -1616,16 +1662,38 @@ def _claim(row: dict):
         # retry with a bigger target raise the ceiling (base $500 filled, retry stake $1,000 /
         # target $1,500 admitted, committed reached $1,500). The ceiling is then
         # min(that fixed target, NBA_MODEL_MAX_SELECTION_STAKE), tipbot's own backstop.
+        #
+        # v6.110 (Wilson, via the NBA model session: re-size a bet UP when the edge grows): ONE
+        # exception. A kind=retry whose target is HIGHER than the selection's may raise the
+        # ceiling, still bounded by NBA_MODEL_MAX_SELECTION_STAKE. The raise is held in the
+        # reservation and written to the ledger only when money actually lands (commit), so a
+        # refused or failed retry leaves the target alone. A LOWER target, and any non-retry key
+        # with a different target, is still refused.
         raw_target = float(row["target"])
+        if not math.isfinite(raw_target):
+            return 0.0, (f"target mismatch on {sel_id}: key {key!r} carries a non-finite "
+                         f"target {raw_target!r}")
+        raise_to = None
         if sel.get("keys") and sel.get("row_target") is not None:
-            if abs(float(sel["row_target"]) - raw_target) > 0.005:
-                return 0.0, (f"target mismatch on {sel_id}: this selection was admitted with "
-                             f"target ${float(sel['row_target']):.2f} and key {key!r} says "
-                             f"${raw_target:.2f}; a later key cannot move the ceiling")
+            cur_target = float(sel["row_target"])
+            if abs(cur_target - raw_target) > 0.005:
+                if (is_retry(row) and math.isfinite(raw_target)
+                        and raw_target > cur_target + 0.005
+                        and cfg("NBA_MODEL_RETRY_RAISE_TARGET_ENABLED")):
+                    raise_to = raw_target
+                else:
+                    return 0.0, (f"target mismatch on {sel_id}: this selection was admitted "
+                                 f"with target ${cur_target:.2f} and key {key!r} says "
+                                 f"${raw_target:.2f}; a later key cannot move the ceiling"
+                                 + ("" if raw_target > cur_target + 0.005 else
+                                    " (only a retry may RAISE it, never lower it)"))
         elif not sel.get("keys"):
             sel["row_target"] = raw_target
             sel["target"] = target           # the clamped target (TEST MODE) the cap uses
-        ceiling = min(sel["target"], float(cfg("NBA_MODEL_MAX_SELECTION_STAKE")))
+        eff_target = float(sel["target"])
+        if raise_to is not None:
+            eff_target = max(eff_target, target)     # `target` is the TEST MODE clamped value
+        ceiling = min(eff_target, float(cfg("NBA_MODEL_MAX_SELECTION_STAKE")))
         inflight = float(sel.get("inflight") or 0)
         headroom = round(ceiling - float(sel.get("committed") or 0) - inflight, 2)
         if headroom <= 0:
@@ -1644,12 +1712,18 @@ def _claim(row: dict):
             # how many fills records this key already had at the claim, so a rebuild can tell
             # a NEWER record from an older pre-claim refusal or none
             "rev0": _next_revision(key) - 1,
+            # a target RAISE this retry asked for; applied at commit only if money lands
+            "raise_to": raise_to, "raise_eff": (eff_target if raise_to is not None else None),
             "row": {k: row.get(k) for k in ("evt", "pid", "player", "team", "opp", "market",
                                               "side", "line", "kind", "attempt", "target",
                                               "key")}}
-        # The price the signal FIRST fired at, kept for the life of the selection. A retry
-        # arrives re-posted at the model's latest quote; gating it against its own `price`
-        # would reset the "no more than 10% below the signal price" gate on every retry.
+        if raise_to is not None:
+            log.info("[nba_model] %s: retry %r RAISES the target from $%.2f to $%.2f "
+                     "(ceiling $%.2f), applied only if money lands", sel_id, key,
+                     float(sel.get("row_target") or 0), raise_to, ceiling)
+        # The price the signal FIRST fired at, kept for the life of the selection. A BASE
+        # message is gated against it (reference_price); a retry, re-posted at the model's
+        # latest still +EV quote, is gated against its own price since v6.109.
         prices = state.setdefault("first_prices", {})
         prices.setdefault(sel_id, float(row["price"]))
         sel.setdefault("price", float(prices[sel_id]))
@@ -1752,6 +1826,12 @@ def _commit_locked(row, sel_id, placed, ambiguous, manual, reserved, accounts, a
                          for a in (accounts or [])],
             "outcome": outcome, "requested": requested,
             "rev0": (res or {}).get("rev0"), "written": False}
+    if (res or {}).get("raise_to") and (float(placed or 0) + float(ambiguous or 0)) > 0:
+        # the retry that raised the target put money on: the new ceiling now stands
+        sel["row_target"] = max(float(sel.get("row_target") or 0), float(res["raise_to"]))
+        sel["target"] = max(float(sel.get("target") or 0),
+                            float(res.get("raise_eff") or res["raise_to"]))
+        log.info("[nba_model] %s: target raised to $%.2f", sel_id, float(sel["row_target"]))
     sel["committed"] = round(float(sel.get("committed") or 0)
                              + float(placed or 0) + float(ambiguous or 0), 2)
     sel["ambiguous"] = round(float(sel.get("ambiguous") or 0)
@@ -1818,12 +1898,27 @@ def selection_snapshot(sel_id: str) -> dict:
         return {}
 
 
+def is_retry(row: dict) -> bool:
+    """One reading of `kind` for every retry rule (the retry switch and the price reference)."""
+    return str((row or {}).get("kind") or "").strip().lower() == "retry"
+
+
 def reference_price(row: dict) -> float:
-    """The price to gate this message against: the price the selection's FIRST admitted
-    message was posted at, or this message's own `price` if it is higher or the selection is
-    new. See claim(): a retry re-posts the latest quote, and a signal whose edge was computed
-    at 2.00 must not be placed at full size at 1.75 just because the retry says 1.75."""
+    """The price to gate this message against.
+
+    v6.109 (Wilson 2026-10-22, "just trust the model"): a RETRY is gated against its own posted
+    price. The model re-checks the edge at its latest quote before it re-sends the unfilled
+    stake, so tipbot no longer compares the retry with the price the selection first fired at
+    (that blocked a still +EV retry at 1.90 after a 2.10 base). The absolute floor, the
+    live-vs-posted gate and the odds ceiling still apply to the retry's own price.
+
+    Any other message: the price the selection's FIRST admitted message was posted at, or this
+    message's own `price` if it is higher or the selection is new."""
     own = float(row.get("price") or 0)
+    if not math.isfinite(own):
+        own = 0.0                  # a nan/inf quote must never become the gate's reference
+    if is_retry(row) and own > 0:
+        return own
     first = float(row.get("first_price") or 0)        # set by claim() on this very row
     if first <= 0:
         try:

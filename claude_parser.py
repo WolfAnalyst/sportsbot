@@ -47,7 +47,7 @@ _MAX_TOKENS = 4000
 # web_search is a server-side tool that runs its own loop. COST CONTROL (v5.81):
 # `max_uses` caps the number of searches per call (search fees + each result is
 # billed as input on later turns), and the short pause_turn continuation cap keeps
-# a misbehaving search from spinning. Sonnet (CLAUDE_WEBSEARCH_MODEL) + these caps
+# a misbehaving search from spinning. CLAUDE_WEBSEARCH_MODEL (Haiku 5.5 since v6.99) + these caps
 # keep each resolve well under a dollar (the Opus+uncapped path cost ~$2/call).
 _WEBSEARCH_MAX_TURNS = 3
 # v5.91 review (#4): a TOTAL wall-clock budget for the pause-turn loop. timeout=20
@@ -58,6 +58,18 @@ _WEBSEARCH_MAX_TURNS = 3
 # AFL player resolver now runs in a PASS-2 worker thread (v5.91 concurrent tips).
 _WEBSEARCH_BUDGET_SEC = 45.0
 _WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 5}
+# v6.99 (Wilson 2026-10-21 "can we websearch on haiku instead?"): every October web-search
+# resolve on Sonnet 4.6 timed out (the 20s create() limit; a replay of three past Zak cases
+# still timed out at 90s), so the SA track fell to the blind guess. Haiku 5.5 answered the
+# same replays in 3.5-7.4s (Miss Trombari -> Balaklava, confident; the other two an honest
+# "not confident"). On Haiku the dynamic-filtering tool above hit "input errors" on 2 of 3
+# replays and searched 0-1 times; the basic tool searched cleanly every time, so Haiku
+# gets the basic version.
+_WEB_SEARCH_TOOL_BASIC = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+
+
+def _web_search_tool(model: str) -> dict:
+    return _WEB_SEARCH_TOOL_BASIC if "haiku" in (model or "").lower() else _WEB_SEARCH_TOOL
 
 _CLIENT = None
 
@@ -79,6 +91,28 @@ def _text_from(msg) -> str:
     return "".join(b.text for b in msg.content if getattr(b, "type", None) == "text").strip()
 
 
+def _log_reply(kind: str, model: str, resp, text: str = None) -> None:
+    """v6.101 (Wilson 2026-10-21, Haiku parse audit): one INFO line per Claude reply with
+    the token usage and the raw reply, so a parse can be checked against what the model
+    actually returned and the monthly cost can be counted instead of estimated (the audit
+    had neither). Never raises."""
+    try:
+        u = getattr(resp, "usage", None)
+        st = getattr(u, "server_tool_use", None) if u is not None else None
+        usage = (f"in={getattr(u, 'input_tokens', 0)} out={getattr(u, 'output_tokens', 0)} "
+                 f"cache_read={getattr(u, 'cache_read_input_tokens', 0) or 0} "
+                 f"cache_write={getattr(u, 'cache_creation_input_tokens', 0) or 0} "
+                 f"searches={getattr(st, 'web_search_requests', 0) or 0 if st is not None else 0}")
+        if text is None:
+            text = _text_from(resp)
+        body = (text or "").replace("\r", "").replace("\n", "\\n")
+        if len(body) > 2000:
+            body = body[:2000] + f"...(+{len(body) - 2000} chars)"
+        log.info(f"Claude reply ({model}, {kind}): {usage} stop={getattr(resp, 'stop_reason', '')} | {body}")
+    except Exception:
+        pass
+
+
 def _complete_text(system_prompt: str, user_content: str, model: str) -> str:
     """One Messages API call for a text tip. System prompt is cached."""
     resp = _client().messages.create(
@@ -92,7 +126,9 @@ def _complete_text(system_prompt: str, user_content: str, model: str) -> str:
         }],
         messages=[{"role": "user", "content": user_content}],
     )
-    return _text_from(resp)
+    _txt = _text_from(resp)
+    _log_reply("text", model, resp, _txt)
+    return _txt
 
 
 def _complete_vision(prompt: str, image_bytes: bytes, model: str,
@@ -115,9 +151,11 @@ def _complete_vision(prompt: str, image_bytes: bytes, model: str,
             ],
         }],
     )
+    _txt = _text_from(resp)
+    _log_reply("image", model, resp, _txt)
     if fail_on_truncation and getattr(resp, "stop_reason", None) == "max_tokens":
         raise ValueError("vision reply cut off at the token limit (stop_reason max_tokens)")
-    return _text_from(resp)
+    return _txt
 
 
 def parse_with_claude(text, tipster, sport="nba", unit_size=1.0, default_units=1.0, model=None):
@@ -438,9 +476,10 @@ def _websearch_complete(system_prompt: str, user_content: str, model: str) -> st
             max_tokens=_MAX_TOKENS,
             thinking={"type": "disabled"},
             system=system_prompt,
-            tools=[_WEB_SEARCH_TOOL],
+            tools=[_web_search_tool(model)],
             messages=messages,
         )
+        _log_reply("websearch", model, last)
         if last.stop_reason == "pause_turn":
             if time.monotonic() >= _deadline:
                 log.warning("websearch: wall-clock budget exhausted mid pause-turn "
@@ -457,7 +496,7 @@ def _websearch_complete(system_prompt: str, user_content: str, model: str) -> st
 
 def _websearch_json(system_prompt: str, user_content: str, model=None) -> dict:
     """web_search resolver that returns a parsed JSON object (or {} on failure).
-    Defaults to CLAUDE_WEBSEARCH_MODEL (Sonnet) — the cheaper model for the costly
+    Defaults to CLAUDE_WEBSEARCH_MODEL (Haiku 5.5 since v6.99), the cheap model for the costly
     web-search path; the Opus parse fallback is unaffected."""
     if not ANTHROPIC_API_KEY:
         return {}
@@ -550,12 +589,12 @@ def resolve_sa_track_today(race_num, runner: str, date_str: str, candidate_track
         log.info(f"Claude web-search resolved SA track for '{runner}' R{race_num} -> '{track}'")
         return track
 
-    # v5.9x (Wilson 2026-07-12): NON-web-search FALLBACK, fires ONLY on a web-search
+    # v5.9x (Wilson 2026-07-12): NON-web-search FALLBACK, built for a web-search
     # TRANSIENT failure (2026-07-11 'Silver Chaos': 2x APITimeout -> _websearch_json
     # returned {} -> track=None -> every /v3/price 400s -> dead-ended at manual).
-    # `not out` (empty dict) means the search timed out / errored; a NON-empty dict
-    # with confident=false is an INFORMED "unsure" -> we DON'T guess over it (07-12
-    # review #8), leaving "" -> manual. Rather than dead-end on a timeout, make ONE
+    # Until v6.99 it fired only on `not out` (empty dict) and did NOT guess over an
+    # informed confident=false (07-12 review #8); since v6.99 it also guesses over that
+    # (see the v6.99 note below). Rather than dead-end, make ONE
     # fast bounded completion (no web_search tool / pause-loop, so it can't freeze
     # the inline event loop) that picks the single most likely SA track from the
     # candidate set; only a candidate-list track is accepted (no hallucinated one).
@@ -567,7 +606,17 @@ def resolve_sa_track_today(race_num, runner: str, date_str: str, candidate_track
     # same-race name substring collision on the guessed track) is slightly more
     # exposed here than on the informed web-search path — a known low-probability
     # residual (07-12 review #8), acceptable vs the dead-end it replaces.
-    if not out and candidate_tracks and ANTHROPIC_API_KEY:
+    # v6.99 (Wilson 2026-10-21, web search on Haiku): ALSO guess over an informed
+    # "not confident". Sonnet 4.6 timed out on every October search, so in practice
+    # EVERY trackless Zak tip took the guess path, and the racing_placer STAGE 1B live
+    # re-probe then found the right meeting by runner name (21 tips recovered 26 Jul to
+    # 13 Oct, e.g. 13 Oct Magic Princess 'Gawler' -> 'Balaklava', placed). Haiku answers
+    # "not confident" instead of timing out (Magic Princess in the replay), which under
+    # the old `not out` rule would skip the guess AND STAGE 1B (it needs a track) and
+    # dead-end at manual: worse than today. Guessing keeps today's behaviour for the
+    # unsure case; the NAME gate + STAGE 1B stay the safety net (the 07-12 review #8
+    # residual is unchanged: the guess path is the one production has run all along).
+    if candidate_tracks and ANTHROPIC_API_KEY:
         try:
             fb_system = (
                 "You pick the SINGLE most likely South Australian THOROUGHBRED race "
@@ -591,6 +640,7 @@ def resolve_sa_track_today(race_num, runner: str, date_str: str, candidate_track
                 system=fb_system,
                 messages=[{"role": "user", "content": fb_user}],
             )
+            _log_reply("track-guess", model or CLAUDE_WEBSEARCH_MODEL, resp)
             raw = (_text_from(resp) or "").replace("```json", "").replace("```", "").strip()
             obj = groq_parser._parse_json_with_repair(raw)
             if isinstance(obj, dict) and isinstance(obj.get("track"), str):

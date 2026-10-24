@@ -99,6 +99,40 @@ def _parse_json_with_repair(content: str) -> Optional[dict]:
     except json.JSONDecodeError:
         pass
 
+    # v6.101 (Wilson 2026-10-21, Haiku parse audit): Haiku 5.5 sometimes writes a sentence
+    # BEFORE the JSON ("This image is a tweet/commentary graphic ... so the tips list is
+    # empty.\n\n{"tips": []}", 13 and 14 Oct), which failed every repair below and was
+    # logged as a parse crash. Start at the {"tips" object (else the first "{"): a complete
+    # object is returned as is (any text after it ignored), a cut-off one goes on to the
+    # repairs from there.
+    # Review (v6.101): tip replies only (web-search replies keep their own extraction, so
+    # a stray first {"track": ...} cannot win); a reply with MORE THAN ONE "tips" object
+    # (an example quoted, then the answer) is never guessed -> None (manual); and the
+    # object still goes through the same damage checks as the repairs below, so a tip
+    # that lost its side or a 1-leg SGM goes to manual as before.
+    _s = (content or "").strip()
+    _m = re.search(r'\{\s*"tips"', _s)
+    if _m:
+        if len(re.findall(r'"tips"\s*:', _s)) > 1:
+            log.error("JSON reply holds more than one \"tips\" object; not guessing which "
+                      "is the answer (manual)")
+            return None
+        _i = _m.start()
+        try:
+            _obj, _end = json.JSONDecoder().raw_decode(_s[_i:])
+            if isinstance(_obj, dict):
+                log.warning(f"JSON reply had text around it; parsed the tips object at "
+                            f"char {_i} (ignored {_i} chars before, "
+                            f"{len(_s[_i + _end:].strip())} after)")
+                _t = _obj.get("tips", [])
+                if isinstance(_t, list) and all(isinstance(x, dict) for x in _t):
+                    return _validate_sgm_legs_after_repair(_obj)
+                return None
+        except json.JSONDecodeError:
+            pass
+        if _i > 0:
+            content = _s[_i:]
+
     # Strip trailing junk
     trimmed = content.rstrip().rstrip(",")
 
@@ -266,6 +300,10 @@ Tips on DIFFERENT lines (each its own line/emoji) = SEPARATE tips, not SGM.
    - SGM (legs separated by "/"): ONE tip with is_sgm=true, ALL legs in raw_legs
      Example: "Matt Rowell 24+ Disposals/Darcy Parish 19+ Disposals/Suns -7.5 @ 1.80 Sportsbet"
      -> ONE tip with 3 legs, NOT 3 separate tips
+   - EXCEPTION, a game total: when the WHOLE bet is "<Team> / <Team> Over|Under N" (two
+     TEAM NAMES then ONE total line and nothing else, e.g. "1U - Brooklyn / Wiz Over 224.5")
+     it names ONE game. It is a SINGLE game total: is_sgm=false, market "total", the line
+     once. NOT an SGM. If the line has any other leg after it, it is a normal SGM.
    - SGM with AGS leg: "Jackson 17+/Hollands 15+/Treacy AGS @ 1.80 Sportsbet"
      -> 3 legs: Jackson 17+ disposals, Hollands 15+ disposals, Treacy 1+ goals
    - Same-player shorthand in SGM: "Sam Darcy 10+ Disposals/2+ Goals" means BOTH legs are Sam Darcy
@@ -564,6 +602,88 @@ def _slash_leg_dir(sel: str) -> str:
     drift (2026-06-25 review)."""
     s = (sel or "").strip().lower()
     return "under" if "under" in s else ("over" if "over" in s else s)
+
+
+# v6.99 (Wilson 2026-10-21, Haiku parse audit): an SGM whose legs repeat the same bet.
+# 2026-10-13 AusBets "1U - Brooklyn / Wiz Over 224.5 (SB: 1.87)": the "/" joins the two
+# TEAM NAMES of one game, Haiku read it as two legs and returned ONE SGM whose two legs
+# were both "total over 224.5". Sportsbet 400'd it on all 5 accounts and the $600 single
+# was missed (Haiku read the same shape as a single on 15 and 17 Oct). Two identical legs
+# are never a real SGM.
+_GAME_TOTAL_MARKETS = ("total", "total_points", "game_total", "totals")
+
+
+def _line_mentions(text: str, line) -> int:
+    """How many times the number `line` (224.5, or 224 for a whole line) appears as its
+    own number in the bet text (the Shook buffer prefix stripped)."""
+    try:
+        v = abs(float(line))
+    except (TypeError, ValueError):
+        return 0
+    t = (text or "")
+    if "CURRENT MESSAGE:" in t:
+        t = t.split("CURRENT MESSAGE:", 1)[-1]
+    # by VALUE, so "224.50" and "224.5" are the same number (review: a trailing zero
+    # dodged a text match and let the two-game shape collapse)
+    n = 0
+    for tok in re.findall(r"(?<![\d.])\d+(?:\.\d+)?(?!\d|\.\d)", t):
+        try:
+            if float(tok) == v:
+                n += 1
+        except ValueError:
+            pass
+    return n
+
+
+def _sgm_duplicate_legs(raw_legs, text: str = None) -> str:
+    """Classify an SGM's RAW leg dicts. Returns "" when every leg is a different bet.
+    "game_total" when ALL legs are the same game-total line with no player AND the
+    message carries that line ONCE (the "Team / Team Over N" shape): the tip is that
+    one total, a SINGLE. "duplicate" when any two legs are otherwise the same bet: a
+    parse error the caller sends to manual, never guessed into a single (a prop pair
+    that lost a player name would otherwise become a single at the SGM price).
+    The text check is the same-game proof (v6.99 review): "Lakers/Warriors Over 224.5 /
+    Celtics Over 224.5" or two team totals "over 110.5" each name the line TWICE, and
+    collapsing those would silently drop a leg -> they are "duplicate" (manual). No
+    text -> never "game_total". Keys off the raw dicts because the shared builder can
+    carry the stat in `market` and the side in `type`. The team only counts for
+    non-game-total markets."""
+    if not raw_legs or len(raw_legs) < 2:
+        return ""
+
+    def _key(rl):
+        mkt = (rl.get("market") or "").strip().lower()
+        line = rl.get("line")
+        try:
+            line = float(line) if line is not None and line != "" else None
+        except (TypeError, ValueError):
+            line = str(line).strip().lower()
+        player = (rl.get("player") or "").strip().lower()
+        stat = (rl.get("stat") or "").strip().lower()
+        team = (rl.get("team") or "").strip().lower()
+        if mkt in _GAME_TOTAL_MARKETS and not player:
+            # one name for a game total, and the stat/team labels do not change the bet
+            mkt, stat, team = "total", "", ""
+        return (mkt, player, stat,
+                _slash_leg_dir(rl.get("selection") or rl.get("type") or ""), line, team)
+
+    keys = [_key(rl) for rl in raw_legs]
+    if len(set(keys)) == len(keys):
+        return ""
+    # Never collapse across a Shook-style context buffer: the kept leg could come from an
+    # EARLIER message in the buffer (review: a single on the wrong game).
+    _buffered = "CURRENT MESSAGE:" in (text or "")
+    if (len(set(keys)) == 1 and keys[0][0] == "total" and not keys[0][1] and not _buffered
+            and keys[0][3] in ("over", "under") and isinstance(keys[0][4], float)
+            and _line_mentions(text, keys[0][4]) == 1):
+        return "game_total"
+    return "duplicate"
+
+
+def _leg_as_raw(lg) -> dict:
+    """A built ParsedLeg as the raw-leg dict _sgm_duplicate_legs reads."""
+    return {"market": lg.market or "", "player": lg.player or "", "stat": lg.stat or "",
+            "selection": lg.selection or "", "line": lg.line, "team": lg.team_full or ""}
 
 
 # ── v6.58: team legs checked against the message text ─────────────────────────
@@ -901,8 +1021,13 @@ def _merge_slash_line_into_sgm(tips: list, text: str) -> list:
     _merge_all_named = all((lg.player or "").strip() and (lg.stat or "").strip()
                            for lg in merged_legs)
     _merge_any_pyo = any(getattr(t, "is_pyo_sgm", False) for t in tips)
+    # v6.99 (review): only when the LINES differ (an alt-line pair), as the shared
+    # builder's demotion already requires. The SAME line twice is a duplicate, not an
+    # alt: it used to come out as a single with no odds floor and an identical alt line;
+    # it now falls to the duplicate check below (manual).
+    _merge_lines_differ = len({lg.line for lg in merged_legs}) > 1
     if (len(merged_legs) >= 2 and len(_merge_keys) == 1 and _merge_all_named
-            and not _merge_any_pyo):
+            and not _merge_any_pyo and _merge_lines_differ):
         base.legs = [merged_legs[0]]
         base.is_sgm = False
         base.is_pyo_sgm = False
@@ -918,6 +1043,31 @@ def _merge_slash_line_into_sgm(tips: list, text: str) -> list:
             f"primary line={base.legs[0].line}, alt lines={[a['line'] for a in base.alt_lines]}"
         )
         return [base]
+
+    # v6.99 (review): the split-tip route must not rebuild the identical-leg SGM the
+    # per-tip builders now refuse. "Brooklyn / Wiz Over 224.5" split into two identical
+    # single totals -> keep ONE of them (it is that single, with its own tipped odds);
+    # any other repeated leg -> one manual tip (placing the copies would double the bet).
+    if not _merge_any_pyo:
+        # the FULL text, so a Shook context buffer still blocks the collapse (the line
+        # count strips the buffer itself)
+        _mdup = _sgm_duplicate_legs([_leg_as_raw(lg) for lg in merged_legs], text)
+        if _mdup == "game_total":
+            keep = tips[0]
+            keep.legs = [keep.legs[0]]
+            keep.legs[0].market = "total"
+            keep.is_sgm = False
+            log.warning(f"'/'=SGM merge: {len(merged_legs)} identical game-total legs -> "
+                        f"the SINGLE game total it is (one tip kept, its own odds)")
+            return [keep]
+        if _mdup == "duplicate":
+            base.legs = merged_legs
+            base.is_sgm = True
+            base.alert_only = True
+            _r = "SGM has the same leg twice (parse error), place manually"
+            base.alert_reason = f"{base.alert_reason}; {_r}" if getattr(base, "alert_reason", "") else _r
+            log.warning(f"'/'=SGM merge: duplicate legs -> ONE manual tip")
+            return [base]
 
     base.legs = merged_legs
     base.is_sgm = True
@@ -1972,7 +2122,8 @@ TEXT_PROMPT_FOURTHANDEV_NFL = (
     "verbatim to `description` on that SAME leg's tip object, never drop it, "
     "never act on it yourself. "
     "MULTIS: a parlay / multi / SGM / same-game multi (e.g. 'Parlay:\\n- Buffalo Bills ML\\n"
-    "- NE Patriots ML\\n$1.79') is ONE bet. Return each of its legs as its own tip object "
+    "- NE Patriots ML\\n$1.79', or 'PARLAY\\n\\nBroncos ML, Titans ML, Jags ML $2.41' with "
+    "the legs comma-separated on one line) is ONE bet. Return each of its legs as its own tip object "
     "with `multi`=true and the same `multi_group` number (1 for the first multi in the "
     "message, 2 for the next), the multi's COMBINED price in `odds` and its units in `units` "
     "on every leg. A standalone single has `multi`=false and `multi_group`=null. "
@@ -2495,10 +2646,34 @@ def parse_with_groq(
                         f"alt lines={[a['line'] for a in demoted_alt_lines]}"
                     )
 
+            # v6.99: an SGM that repeats the same leg (twin of tip_parser's check).
+            _dup_reason = ""
+            _rl = td.get("raw_legs") or []
+            if is_sgm and not is_pyo_sgm and len(legs) >= 2 and len(_rl) == len(legs):
+                try:
+                    _dup = _sgm_duplicate_legs(_rl, text)
+                except Exception as _de:
+                    log.error(f"SGM duplicate-leg check failed ({type(_de).__name__}: {_de}) -> MANUAL")
+                    _dup = "duplicate"
+                if _dup == "game_total":
+                    legs = [legs[0]]
+                    is_sgm = False
+                    legs[0].market = "total"
+                    if not (legs[0].selection or "").strip():
+                        legs[0].selection = _slash_leg_dir(_rl[0].get("selection") or _rl[0].get("type") or "")
+                    log.warning(f"SGM with {len(_rl)} identical game-total legs -> the SINGLE "
+                                f"game total it is ('Team / Team Over N' names one game)")
+                elif _dup == "duplicate":
+                    _dup_reason = "SGM has the same leg twice (parse error), place manually"
+                    log.warning(f"SGM with duplicate legs -> MANUAL: {_rl}")
+
             # Handle threshold bets - auto-place with threshold market
             is_threshold = td.get("is_threshold", False)
             alert_only = td.get("alert_only", False)
             alert_reason = td.get("alert_reason", "")
+            if _dup_reason:
+                alert_only = True
+                alert_reason = f"{alert_reason}; {_dup_reason}" if alert_reason else _dup_reason
 
             # Shook unit transform: his "0.3u" is conservative sizing. We scale
             # by 3 then round to the nearest 0.25 unit to match our risk level.

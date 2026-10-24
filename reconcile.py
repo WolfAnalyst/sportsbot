@@ -263,12 +263,15 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
 
     deadline = time.time() + max_wait_sec
     api_ok_once = False
+    last_ok_ts = None   # v6.115: when the latest SUCCESSFUL read STARTED (its snapshot's age)
     while True:
+        t_req = time.time()
         resp = hb.get_pending_bets(account_id)
         if resp.get("success") is False:
             log.warning(f"reconcile: get_pending_bets failed: {resp.get('error')}")
         else:
             api_ok_once = True
+            last_ok_ts = t_req
             for b in resp.get("bets", []):
                 if pending_bet_matches(b, event=event, stake=stake, sport=sport,
                                        selection_text=selection_text, after_ts=after_ts,
@@ -283,12 +286,21 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
             break
         time.sleep(poll_interval_sec)
 
-    if api_ok_once:
+    # v6.115 (review F1): absence is PROVEN only by a successful read that STARTED in the window's
+    # last poll interval. One early good read followed by failures (a stalled HyperBot) proves
+    # nothing, and neither does a slow read that finished late but asked early: the bet may have
+    # appeared after that snapshot, and "not found" lets the caller re-place it.
+    if last_ok_ts is not None and last_ok_ts >= deadline - poll_interval_sec:
         log.info(
             f"reconcile: NOT FOUND after {max_wait_sec}s — bet did not land "
             f"(event='{event}' stake=${stake}); caller may spill"
         )
         return {"landed": False, "match": None, "reconcile_failed": False}
+    if api_ok_once:
+        log.warning("reconcile: pending_bets failed at the end of the window (the last good read "
+                    f"was {deadline - last_ok_ts:.0f}s before it) — reconcile_failed, absence "
+                    "not proven")
+        return {"landed": None, "match": None, "reconcile_failed": True}
     log.warning("reconcile: pending_bets unreachable all round — reconcile_failed")
     return {"landed": None, "match": None, "reconcile_failed": True}
 

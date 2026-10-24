@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import threading
 import unicodedata
 from pathlib import Path
 from difflib import SequenceMatcher
@@ -22,6 +23,7 @@ log = logging.getLogger(__name__)
 
 ROSTER_DIR = Path(__file__).parent
 NBA_ROSTER_FILE = ROSTER_DIR / "roster_nba.json"
+_LIVE_NBA_ROSTER_FILE = NBA_ROSTER_FILE  # what tests must never refresh
 NBL_ROSTER_FILE = ROSTER_DIR / "roster_nbl.json"
 AFL_ROSTER_FILE = ROSTER_DIR / "roster_afl.json"
 MLB_ROSTER_FILE = ROSTER_DIR / "roster_mlb.json"
@@ -59,6 +61,7 @@ _loaded = False
 # wouldn't match directly via SequenceMatcher. Keys are lowercased.
 NBA_NICKNAMES = {
     "steph": "Stephen Curry",
+    "moe wagner": "Moritz Wagner",
     "kat": "Karl-Anthony Towns",
     "ant": "Anthony Edwards",
     "giannis": "Giannis Antetokounmpo",
@@ -190,6 +193,8 @@ def _load_rosters():
                         if isinstance(team, dict):
                             collisions = {k.lower(): list(v) for k, v in team.items()}
                         continue
+                    if name.startswith("__"):
+                        continue  # other meta keys (NBA_SEASON_KEY), never a player
                     roster[name.lower()] = {"name": name, "team": team}
                 log.info(f"Loaded {len(roster)} players from {path.name}"
                          + (f" ({len(collisions)} same-name collisions)" if collisions else ""))
@@ -615,6 +620,71 @@ def _name_tokens_for_gate(name: str) -> list:
     return core or toks
 
 
+def _name_words(name: str) -> list:
+    """The name's words, lowercased, accent-folded, letters only (so 'P.J.' == 'pj' and
+    "De'Aaron" == 'deaaron'), without generational suffixes. Unlike _name_tokens_for_gate it
+    keeps 1-2 letter words: 'PJ Washington' is two words, not one."""
+    out = []
+    for w in (name or "").split():
+        w = re.sub(r"[^a-z]", "", _fold_accents(w.lower()))
+        # A suffix word is dropped only after the first word: 'JR Smith' is initials, not a suffix.
+        if w and (w not in _GEN_SUFFIXES or not out):
+            out.append(w)
+    return out
+
+
+# Genuine short<->formal first-name pairs that are NOT prefixes of each other (Ollie/Oliver,
+# Lachie/Lachlan, Mike/Michael, Bill/William). Each set is one equivalence group, lowercased. Only
+# real diminutives: NOT Harry/Harrison, Jay/Jayden or Jack/Jackson, which can be different players
+# (see main._AFL_FIRST_NAME_GROUPS, which this extends with the NFL/NBA/MLB forms).
+_FIRST_NAME_GROUPS = [
+    {"brad", "bradley"}, {"matt", "matthew", "matty"}, {"josh", "joshua"}, {"mitch", "mitchell"},
+    {"nick", "nicholas", "nic", "nicolas"}, {"will", "william", "bill", "billy"},
+    {"ben", "benjamin"}, {"dan", "daniel", "danny"}, {"alex", "alexander", "alexandre", "alec"},
+    {"zac", "zach", "zachary", "zak"}, {"tom", "thomas"}, {"charlie", "charles"},
+    {"nat", "nathan", "nate", "nathaniel"}, {"ollie", "oliver", "oli"}, {"sam", "samuel"},
+    {"gus", "angus"}, {"ed", "edward", "eddie"}, {"cam", "cameron"}, {"lachie", "lachlan"},
+    {"paddy", "patrick"}, {"jake", "jacob"}, {"joe", "joseph"}, {"mike", "michael"},
+    {"tony", "anthony"}, {"dave", "david"}, {"andy", "andrew"}, {"bob", "robert", "bobby", "rob"},
+    {"jordy", "jordan"}, {"jamie", "james"}, {"chris", "christopher"},
+    {"herb", "herbert"}, {"moe", "moritz"}, {"ty", "tyler"},
+    {"jimmy", "james", "jim", "jamie"}, {"steve", "steven", "stephen", "stevie"},
+    {"ken", "kenneth", "kenny"}, {"rick", "richard", "ricky", "rich", "dick"},
+    {"theo", "theodore", "teddy"}, {"tommy", "thomas", "tom"}, {"jon", "jonathan", "jonny", "jonathon", "jono"},
+    {"gerald", "jerry", "gerry"}, {"jeremiah", "jeremy"}, {"larry", "lawrence"},
+    {"don", "donald", "donnie"}, {"fred", "frederick", "freddie"}, {"jeff", "jeffrey", "geoff"},
+    {"len", "leonard", "lenny"}, {"drew", "andrew"}, {"dwayne", "dwyane"},
+    {"kate", "katherine", "kathryn"}, {"bam", "bartholomew"},
+]
+_FIRST_NAME_CANON: dict = {}
+for _g in _FIRST_NAME_GROUPS:
+    _c = sorted(_g)[0]
+    for _v in _g:
+        _FIRST_NAME_CANON.setdefault(_v, _c)
+
+
+def _first_names_correspond(query: str, matched: str) -> bool:
+    """v6.108: for an equal-surname pair, do the FIRST names correspond? True for a bare
+    surname query (nothing to compare). A multi-word query needs a multi-word candidate (a
+    surname-only alias entry cannot corroborate a first name) whose first word is the same, an
+    initial of it, a prefix short form (Cam/Cameron), or a close spelling."""
+    qw, mw = _name_words(query), _name_words(matched)
+    if len(qw) < 2:
+        return True
+    if len(mw) < 2:
+        return False
+    a, b = qw[0], mw[0]
+    if a == b:
+        return True
+    if len(a) == 1 or len(b) == 1:
+        return a[:1] == b[:1]
+    # No generic prefix rule: it passes Jay/Jayden and James/Jameson (different players) and, with
+    # the tie refusal gone, 'Ja Higgins' picked one of several Higgins. Short forms are in the groups.
+    if _FIRST_NAME_CANON.get(a, a) == _FIRST_NAME_CANON.get(b, b):
+        return True
+    return SequenceMatcher(None, a, b).ratio() >= 0.85
+
+
 def _passes_token_overlap_gate(query: str, matched: str) -> bool:
     """Reject fuzzy matches that share no >=3-char tokens with the query.
 
@@ -658,8 +728,19 @@ def _passes_token_overlap_gate(query: str, matched: str) -> bool:
     if not matched_tokens:
         return False
     q_sur, m_sur = orig_tokens[-1], matched_tokens[-1]
-    if q_sur == m_sur:
-        return True
+    # v6.108 (roster audit 2026-10-22): an EQUAL surname used to pass with no first-name check,
+    # so a player missing from the roster resolved to a same-surname team-mate or stranger
+    # (Jeff Green -> Jalen Green, Jalen Williams -> Jaylin Williams, Bryce Harper -> Dylan
+    # Harper). Leave-one-out over the live NBA roster: 122 of 519 players could be swapped
+    # that way; the ETR NBA fan-out is blind ($400/unit, no price check), so it is a
+    # wrong-player bet. A multi-word query now needs the candidate's first name to correspond
+    # (same name, an initial, a short form that is a prefix such as Cam/Cameron or
+    # Herb/Herbert, an accent or punctuation difference such as PJ/P.J., or a close
+    # spelling). A bare surname query is unchanged (_lone_token_drifts is the stricter rule
+    # there). Failing this routes to manual / no match, the safe direction. Nicknames
+    # (Bam, KAT, Moe Wagner) resolve in NBA_NICKNAMES before this gate.
+    if q_sur == m_sur or _fold_accents(q_sur) == _fold_accents(m_sur):
+        return _first_names_correspond(query, matched)
     # v6.07 AUDIT (2026-07-31): compare ACCENT-FOLDED too. Tipsters type ASCII, the roster
     # is scraped WITH diacritics, and the fold makes an identical surname compare equal
     # instead of scoring 0.714 ('vucevic' vs 'vučević') and being gated out. Real case:
@@ -697,7 +778,7 @@ def _passes_token_overlap_gate(query: str, matched: str) -> bool:
     # 0.714. That is a real production query (it appears in logs/tipbot.log) and v6.06
     # resolved it correctly, so a single-token candidate must NOT be an escape hatch.
     if SequenceMatcher(None, q_sur, m_sur).ratio() >= 0.85:
-        if len(orig_tokens) == 1:
+        if len(_name_words(query)) == 1:
             return True   # lone-token query: _lone_token_drifts is the stricter rule
         if (len(matched_tokens) > 1
                 and SequenceMatcher(None, orig_tokens[0], matched_tokens[0]).ratio() >= 0.85):
@@ -705,7 +786,7 @@ def _passes_token_overlap_gate(query: str, matched: str) -> bool:
     # A SINGLE-token query is a surname in this domain (Eddie posts bare surnames),
     # so also accept it matching ANY token of the match — but only when the query is
     # NOT the match's first name, which is exactly the hole above.
-    if len(orig_tokens) == 1 and q_sur in matched_tokens and q_sur != matched_tokens[0]:
+    if len(_name_words(query)) == 1 and q_sur in matched_tokens and q_sur != matched_tokens[0]:
         return True
     return False
 
@@ -1404,6 +1485,154 @@ def afl_fuzzy_surname_candidates(token: str, threshold: float = 0.85) -> list:
     return out
 
 
+def _nba_season_for(day=None) -> str:
+    """The NBA season string ("2026-27") for a date. v6.104 (2026-10-21): the season was
+    hardcoded "2025-26", so once the 2026-27 season started the 'current season' list
+    collapsed (Knicks 8, Celtics 6 players) and the 15:01 restart's refresh overwrote the
+    roster with whole teams missing. v6.105: new season from AUGUST, the boundary of the
+    NBA model's roster fetch (nba_props.ingest.schedule.season_of). The model applies it to
+    its operating day (Sydney clock less 22h), so on 1 August until 22:00 Sydney the two
+    disagree; no NBA game is played then."""
+    import datetime as _dtm
+    d = day or _dtm.date.today()
+    y = d.year if d.month >= 8 else d.year - 1
+    return f"{y}-{(y + 1) % 100:02d}"
+
+
+def _nba_roster_shrank(old: dict, new: dict) -> list:
+    """Teams whose full-name player count in `new` is under half of what `old` had
+    (teams with fewer than 10 old players are ignored). A non-empty answer means the
+    fetch was partial: the caller keeps the old roster."""
+    import collections as _col
+
+    def _counts(d):
+        return _col.Counter(t for n, t in d.items()
+                            if isinstance(t, str) and t and len(str(n).split()) >= 2)
+    o, n = _counts(old), _counts(new)
+    out = []
+    for t, c in o.items():
+        if c < 10:
+            continue
+        if t in n:
+            if n[t] * 2 < c:
+                out.append(f"{t} {n[t]}/{c}")
+        elif len(n) < len(o):
+            # the team vanished AND the league lost a team -> partial fetch. A team that
+            # is only missing under its old name while the team count holds is a RENAME
+            # ("LA Clippers" -> "Los Angeles Clippers"): accepted, or the guard would
+            # block every future refresh (review).
+            out.append(f"{t} 0/{c}")
+    return sorted(out)
+
+
+#: Meta key in roster_nba.json: the NBA season the saved list was fetched for. v6.105
+#: (2026-10-21): the file restored from git at 15:11 was the 2025-26 list from July, but its
+#: fresh mtime made the startup check call it "fresh", so no 2026-27 rookie (Caleb Wilson)
+#: resolved and the model's first live bet was refused. The startup check now refreshes a
+#: file whose stamp is not the current season (a file with no stamp included). Skipped as
+#: a player by _load_rosters (every "__" key is).
+NBA_SEASON_KEY = "__season__"
+
+
+def nba_roster_season(path=None) -> str:
+    """The season stamped in the saved NBA roster file, or "" (no stamp / unreadable)."""
+    try:
+        with open(path or NBA_ROSTER_FILE, encoding="utf-8") as f:
+            v = json.load(f).get(NBA_SEASON_KEY, "")
+        return v if isinstance(v, str) else ""
+    except Exception:
+        return ""
+
+
+def reload_nba_roster() -> int:
+    """Re-read roster_nba.json into the in-memory NBA roster (the other sports untouched).
+    Returns the number of entries now loaded. An unreadable or empty file keeps the
+    previous in-memory roster (same rule as _load_rosters)."""
+    global _nba_roster
+    _load_rosters()
+    try:
+        with open(NBA_ROSTER_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        new = {str(n).lower(): {"name": n, "team": t} for n, t in data.items()
+               if not str(n).startswith("__")}
+    except Exception as e:
+        log.error(f"NBA roster reload failed: {e} -- keeping {len(_nba_roster)} entries")
+        return len(_nba_roster)
+    if not new:
+        log.error(f"NBA roster reload read 0 players: keeping {len(_nba_roster)} entries")
+        return len(_nba_roster)
+    _nba_roster = new  # one assignment: a reader sees the old dict or the new one
+    log.info(f"Reloaded {len(new)} players from {NBA_ROSTER_FILE.name} "
+             f"(season {nba_roster_season() or '?'})")
+    return len(new)
+
+
+_nba_refresh_lock = threading.Lock()
+_nba_refresh_last_at = 0.0
+#: The outcome of the last attempt ("refreshed" / "kept"), so a throttled caller can say
+#: whether the roster really is fresh (a failed attempt also starts the throttle window).
+_nba_refresh_last_status = ""
+
+#: Seconds a caller waits for an in-flight refresh before giving up ("busy"), and the
+#: NBA.com request timeout. Each waiter holds a placement worker, so both are bounded.
+NBA_REFRESH_LOCK_WAIT_SEC = 25.0
+NBA_FETCH_TIMEOUT_SEC = 20
+
+#: The on-demand refresh (refresh_nba_roster_now) runs at most once per this many seconds,
+#: so a burst of bets on unknown players makes one NBA.com call, not one each.
+NBA_REFRESH_MIN_INTERVAL_SEC = 600
+
+
+def refresh_nba_roster_now(min_interval_sec=None) -> str:
+    """Fetch the current-season NBA roster, save it (update_roster_from_api's guards apply)
+    and load it into memory. Serialised (one fetch at a time, so two callers never write
+    the file together) and throttled to one attempt per NBA_REFRESH_MIN_INTERVAL_SEC
+    (pass 0 to force). BLOCKING (a network call): never call it on the event loop.
+
+    Returns "refreshed" (a new list is loaded), "kept" (the fetch failed or looked partial,
+    the saved roster stays), "throttled" (an attempt ran too recently; its outcome is in
+    last_nba_refresh_status()) or "busy" (another refresh was still running after
+    NBA_REFRESH_LOCK_WAIT_SEC)."""
+    global _nba_refresh_last_at, _nba_refresh_last_status
+    import sys as _sys
+    import time as _t
+    _testing = os.getenv("TIPBOT_TESTING", "").strip().lower() in ("1", "true", "yes")
+    if ((_testing or "pytest" in _sys.modules)
+            and Path(NBA_ROSTER_FILE).resolve() == _LIVE_NBA_ROSTER_FILE.resolve()):
+        # a test must never call NBA.com and rewrite the live roster (point
+        # NBA_ROSTER_FILE at a tmp file to exercise this)
+        log.warning("NBA roster refresh skipped under tests (live roster file)")
+        return "kept"
+    gap = NBA_REFRESH_MIN_INTERVAL_SEC if min_interval_sec is None else min_interval_sec
+    if not _nba_refresh_lock.acquire(timeout=NBA_REFRESH_LOCK_WAIT_SEC):
+        return "busy"
+    try:
+        now = _t.monotonic()
+        if _nba_refresh_last_at and now - _nba_refresh_last_at < gap:
+            return "throttled"
+        _nba_refresh_last_at = now
+        try:
+            saved = update_roster_from_api()
+        except Exception as e:
+            log.error(f"NBA roster refresh failed: {e}")
+            saved = {}
+        # Only a stamped list is a refresh: the team-less static fallback (NBA.com down and
+        # no saved file) must never replace a loaded roster or be reported as fresh (review).
+        if not (saved and saved.get(NBA_SEASON_KEY)):
+            _nba_refresh_last_status = "kept"
+            return "kept"
+        reload_nba_roster()
+        _nba_refresh_last_status = "refreshed"
+        return "refreshed"
+    finally:
+        _nba_refresh_lock.release()
+
+
+def last_nba_refresh_status() -> str:
+    """The outcome of the last refresh attempt in this process ("" when none ran)."""
+    return _nba_refresh_last_status
+
+
 def update_roster_from_api():
     """
     Fetch current NBA rosters from NBA.com via nba_api package.
@@ -1420,12 +1649,14 @@ def update_roster_from_api():
 
     log.info("Fetching NBA roster from stats.nba.com...")
     roster = {}
+    season = _nba_season_for()
 
     try:
         # Get all current season players with team info
         result = commonallplayers.CommonAllPlayers(
             is_only_current_season=1,
-            season="2025-26",
+            season=season,
+            timeout=NBA_FETCH_TIMEOUT_SEC,
         )
         df = result.get_data_frames()[0]
 
@@ -1447,6 +1678,8 @@ def update_roster_from_api():
                         roster[last] = full_team
 
         log.info(f"Got {len(df)} players from NBA.com")
+        if roster:
+            roster[NBA_SEASON_KEY] = season  # v6.105: the live list only, never the fallback
 
     except Exception as e:
         log.error(f"NBA roster update failed: {e}")
@@ -1456,6 +1689,20 @@ def update_roster_from_api():
         from nba_api.stats.static import players
         for p in players.get_active_players():
             roster[p["full_name"]] = ""
+
+    # v6.104: never overwrite a good roster with a partial fetch (whole teams missing).
+    if roster and NBA_ROSTER_FILE.exists():
+        try:
+            with open(NBA_ROSTER_FILE, encoding="utf-8") as f:
+                _old = json.load(f)
+            _short = _nba_roster_shrank(_old, roster)
+            if _short:
+                log.error(f"NBA roster fetch looks PARTIAL, keeping the saved roster "
+                          f"({len(_short)} team(s) under half their saved size or gone: "
+                          f"{_short[:6]}; if NBA.com changed its team list, refresh by hand)")
+                return {}
+        except Exception as e:
+            log.warning(f"NBA roster shrink check skipped: {e}")
 
     if roster:
         # v6.07: ATOMIC write (tmp+replace) so a concurrent _load_rosters can never

@@ -39,7 +39,8 @@ log = logging.getLogger("tipbot.session_priority")
 # MLB added 2026-06-01 (v5.0): only MLB SGMs auto-place (the Shook HRRBI 2+
 # -> 2-leg same-player SGM edge). MLB singles have NO priority list, so
 # for_sport("mlb", is_sgm=False) returns [] and they route to manual.
-ALLOWED_SPORTS = {"nba", "nbl", "afl", "mlb", "racing", "nfl"}
+# "mma" (v6.112): the Just Bleed MMA test path, Sportsbet 295510 + bet365 314653 only.
+ALLOWED_SPORTS = {"nba", "nbl", "afl", "mlb", "racing", "nfl", "mma"}
 
 # Markets that may appear in a per-sport liability block (excluding racing,
 # which is structured per-track). Any market not listed here is allowed
@@ -127,6 +128,11 @@ KNOWN_NFL_MARKETS = {
     "first_half_line", "total_points",   # v6.84
 }
 
+# MMA markets (v6.112): cap keys of the Just Bleed MMA test path (main._mma_cap_key). Each is the
+# LIABILITY (profit if won) allowed per bet on that account; a MISSING key means the bet is
+# REFUSED on that path (it fails closed), unlike the other sports where missing = unlimited.
+KNOWN_MMA_MARKETS = {"h2h", "method", "round", "method_round", "distance", "total_rounds"}
+
 # Racing bet types we expect under per-track caps. AGS covered separately
 # under sports above (player_goals).
 KNOWN_RACING_BET_TYPES = {"win", "place"}
@@ -164,6 +170,9 @@ class PriorityConfig:
     # nba-v3: an OPTIONAL dedicated list for the NBA props MODEL only (NBA_MODEL_SESSION_PRIORITY).
     # Empty -> the model uses nba_singles (shared with the human NBA tipsters).
     nba_model_singles: list[str] = field(default_factory=list)
+    # v6.112: the Just Bleed MMA test path (MMA_SESSION_PRIORITY, e.g. 295510,314653). Empty -> no
+    # account may take an MMA bet, every MMA tip is a manual alert.
+    mma_singles: list[str] = field(default_factory=list)
     # True when that env var was set but malformed: the model then has NO accounts (manual).
     nba_model_singles_bad: bool = False
 
@@ -205,6 +214,16 @@ class PriorityConfig:
             return self.racing
         if s == "nfl":
             return self.nfl_singles
+        if s == "mma":
+            # v6.112: only while the Just Bleed MMA path is switched on, so no other tipster's
+            # sport="mma" tip can be routed to the two MMA test accounts
+            try:
+                import config as _cfg_mma_gate
+                if not getattr(_cfg_mma_gate, "MMA_ENABLED", False):
+                    return []
+            except Exception:
+                return []
+            return self.mma_singles
         return []
 
 
@@ -288,6 +307,8 @@ def load_sessions_yaml(path: str | Path) -> dict[str, SessionMeta]:
                 known = KNOWN_MLB_MARKETS
             elif sport_key == "nfl":
                 known = KNOWN_NFL_MARKETS
+            elif sport_key == "mma":
+                known = KNOWN_MMA_MARKETS
             else:
                 known = None  # racing validated separately
 
@@ -481,6 +502,8 @@ def load_priority_from_env() -> PriorityConfig:
                                     line-within-2 match only)
       NBL_SESSION_PRIORITY        (v6.32 -- Bettors Edge NBL singles fan-out;
                                     empty -> falls back to NBA_SESSION_PRIORITY)
+      MMA_SESSION_PRIORITY        (v6.112 -- Just Bleed MMA test path; 295510,314653;
+                                    empty -> no account takes an MMA bet)
       NBA_MODEL_SESSION_PRIORITY  (nba-v3 -- the NBA props model ONLY; optional,
                                     empty -> falls back to NBA_SESSION_PRIORITY;
                                     malformed -> no accounts and a config error)
@@ -500,6 +523,7 @@ def load_priority_from_env() -> PriorityConfig:
         nfl_singles=_parse_priority_env("NFL_SESSION_PRIORITY"),
         nbl_singles=_parse_priority_env("NBL_SESSION_PRIORITY"),
         nba_model_singles=_parse_priority_env("NBA_MODEL_SESSION_PRIORITY"),
+        mma_singles=_parse_priority_env("MMA_SESSION_PRIORITY"),
     )
     _raw_model = os.getenv("NBA_MODEL_SESSION_PRIORITY", "").strip()
     if _raw_model:
@@ -586,11 +610,17 @@ def all_priority_session_ids() -> set[str]:
         _model_on = bool(getattr(_cfg_mod, "NBA_MODEL_ENABLED", False))
     except Exception:
         _model_on = False
+    try:
+        import config as _cfg_mma
+        _mma_on = bool(getattr(_cfg_mma, "MMA_ENABLED", False))
+    except Exception:
+        _mma_on = False
     return set(
         cfg.nba_singles + cfg.nba_sgm + cfg.afl_singles
         + cfg.afl_sgm + cfg.mlb_singles + cfg.mlb_sgm + cfg.racing
         + cfg.nfl_singles + cfg.nbl_singles
         + (cfg.nba_model_singles if _model_on else [])
+        + (cfg.mma_singles if _mma_on else [])
     )
 
 

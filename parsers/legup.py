@@ -302,6 +302,247 @@ def build_forward(subject: str, received_text: str, race_date, sections: dict,
     return "\n".join(out)
 
 
+# ── tips page side (v6.102) ─────────────────────────────────────────────
+# Since 19 Oct the email carries no tips, only a "SEE TODAY'S TIPS" button (an EmailOctopus
+# tracking link) to a public page per race day, https://thelegupaustralia.com/tips-21oct-<slug>,
+# with tabs to the next two days' pages. Tips are added to a page as they're ready ("We'll add
+# any new tips as soon as they're ready"), so gmail_watcher polls the pages. A Pro Tip card:
+#
+#   <div class="ptx"><small>Pro Tip</small><b>Geelong R2 #18 ROYAL RENDEZVOUS – WIN $4</b>
+#   <p class="meta"><strong>Bookie:</strong> TAB</p><p class="meta"><strong>Stake:</strong> 6 units</p>...
+#
+# It is rebuilt as the old Quick Take line, so main.py places it exactly as before.
+
+PAGE_HOST = "thelegupaustralia.com"
+_PAGE_PATH_RE = re.compile(r"^/tips-(\d{1,2})([a-z]{3})-[a-z0-9]+/?$", re.IGNORECASE)
+# "21 October" / "21 Oct" / "21st Oct": whole month words only (review: "3 Decent" read as 3 Dec)
+_PAGE_HEAD_DATE_RE = re.compile(
+    r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUNE?|"
+    r"JULY?|AUG(?:UST)?|SEPT?(?:EMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)\b", re.IGNORECASE)
+# the Pro Tips section title, with at most its date pill ("Pro Tips Wed 21 Oct"); "Pro Tips
+# Plus" or anything else is an unknown tips section (manual)
+_PRO_TITLE_RE = re.compile(r"^\s*PRO TIPS(?:\s+(?:[A-Z]{3,9}\s+)?\d{1,2}(?:st|nd|rd|th)?\s+[A-Z]{3,9})?\s*$",
+                           re.IGNORECASE)
+_PRO_LABEL_RE = re.compile(r"^\s*PRO TIPS?\s*$", re.IGNORECASE)
+
+
+def tips_page_url(url: str):
+    """The canonical https://thelegupaustralia.com/tips-<d><mon>-<slug> for a Leg Up tips page
+    URL (absolute, or a path from the page's own day tabs), else None. Nothing else is ever
+    fetched as a tips page."""
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit((url or "").strip())
+    except ValueError:
+        return None
+    host = (u.hostname or "").lower()
+    if u.scheme or host:
+        if u.scheme != "https" or host not in (PAGE_HOST, "www." + PAGE_HOST):
+            return None
+    m = _PAGE_PATH_RE.match(u.path or "")
+    if not m or m.group(2).upper() not in _MONTHS:
+        return None
+    return f"https://{PAGE_HOST}{u.path.rstrip('/').lower()}"
+
+
+def _nearest_date(day: int, mon: str, today: date):
+    """day + month as the date nearest `today` (a page is never more than days away)."""
+    best = None
+    for y in (today.year - 1, today.year, today.year + 1):
+        try:
+            d = date(y, _MONTHS[mon.upper()[:3]], int(day))
+        except (ValueError, KeyError):
+            continue
+        if best is None or abs((d - today).days) < abs((best - today).days):
+            best = d
+    return best
+
+
+def tips_page_date(url: str, today: date):
+    """The race day a tips page is for, from its address (tips-21oct-...), or None."""
+    canon = tips_page_url(url)
+    if not canon:
+        return None
+    m = _PAGE_PATH_RE.match(canon.split(PAGE_HOST, 1)[1])
+    return _nearest_date(int(m.group(1)), m.group(2), today)
+
+
+class _PageReader(HTMLParser):
+    """Sections (h2 title, cards) and day-tab links of a tips page. A card is a <div> inside a
+    <section>: its <small> label, its first <b> headline, its "<strong>Label:</strong> value"
+    meta lines and all its text."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.sections, self.tabs, self.hero = [], [], ""
+        self._sec = None
+        self._card = None
+        self._card_depth = 0
+        self._cap = None          # (kind, parts) while capturing h1 / h2 / small / b / strong / p
+        self._nav_tabs = 0
+        self._p_parts = None
+        self._p_label = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        cls = (a.get("class") or "").split()
+        if self._cap:
+            self._cap[1].append(" ")  # "21 October<br>Today's" must not read "OctoberToday's"
+        if tag == "nav" and "dtabs" in cls:
+            self._nav_tabs += 1
+        elif tag == "nav" and self._nav_tabs:
+            self._nav_tabs += 1
+        if tag == "a" and self._nav_tabs and a.get("href"):
+            self.tabs.append(a["href"])
+        if tag == "section":
+            self._sec = {"title": "", "cards": []}
+            self.sections.append(self._sec)
+            self._card = None
+        elif tag == "div" and self._card is not None:
+            self._card_depth += 1
+        elif tag == "div" and self._sec is not None:
+            self._card = {"cls": cls, "label": "", "head": "", "metas": [], "text": []}
+            self._sec["cards"].append(self._card)
+            self._card_depth = 1
+        if tag == "h1" and not self.hero:
+            self._cap = ("h1", [])
+        elif tag == "h2" and self._sec is not None and self._card is None:
+            self._cap = ("h2", [])
+        elif self._card is not None and tag == "small" and not self._card["label"]:
+            self._cap = ("small", [])
+        elif self._card is not None and tag == "b" and not self._card["head"] and self._p_parts is None:
+            self._cap = ("b", [])
+        elif self._card is not None and tag == "p":
+            self._p_parts, self._p_label = [], None
+        elif self._p_parts is not None and tag == "strong":
+            self._cap = ("strong", [])
+
+    def handle_endtag(self, tag):
+        if tag == "nav" and self._nav_tabs:
+            self._nav_tabs -= 1
+        if self._cap and tag == self._cap[0]:
+            kind, parts = self._cap
+            txt = " ".join("".join(parts).split())
+            self._cap = None
+            if kind == "h1":
+                self.hero = txt
+            elif kind == "h2" and self._sec is not None:
+                self._sec["title"] = txt
+            elif kind == "small":
+                self._card["label"] = txt
+            elif kind == "b":
+                self._card["head"] = txt
+            elif kind == "strong":
+                self._p_label = txt
+        if tag == "p" and self._p_parts is not None:
+            val = " ".join("".join(self._p_parts).split())
+            if self._p_label is not None and self._card is not None:
+                lab = self._p_label.rstrip(":").strip()
+                v = val[len(self._p_label):].strip() if val.startswith(self._p_label) else val
+                self._card["metas"].append((lab, v))
+            self._p_parts, self._p_label = None, None
+        if tag == "div" and self._card is not None:
+            self._card_depth -= 1
+            if self._card_depth <= 0:
+                self._card = None
+        if tag == "section":
+            self._sec, self._card = None, None
+
+    def handle_data(self, data):
+        if self._cap:
+            self._cap[1].append(data)
+        if self._p_parts is not None:
+            self._p_parts.append(data)
+        if self._card is not None:
+            self._card["text"].append(data)
+
+
+def _meta(card: dict, *names) -> str:
+    for lab, v in card["metas"]:
+        if lab.lower() in names:
+            return v
+    return ""
+
+
+def page_card_line(card: dict) -> str:
+    """A Pro Tip card as the Quick Take line parse_tip_line() reads:
+    "Geelong R2 #18 ROYAL RENDEZVOUS – WIN @ $4 (Bookie: TAB)(Stake: 6 units)".
+    A card that doesn't fit stays readable (main sends any line it can't parse to manual)."""
+    head = card.get("head") or ""
+    if not head:
+        return " ".join("".join(card.get("text") or []).split())
+    parts = re.split(rf"\s+{_DASH}\s+", head, maxsplit=1)
+    if len(parts) == 2:
+        rest = parts[1].strip()
+        price = _meta(card, "price", "odds")
+        if "@" not in rest:
+            if re.fullmatch(r"(?i)(WIN|PLACE)", rest) and price:
+                rest = f"{rest} {price}"
+            rest = re.sub(r"(?i)^(WIN|PLACE)\s+(?=\S)", lambda m: f"{m.group(1)} @ ", rest, count=1)
+        head = f"{parts[0].strip()} – {rest}"
+    bookie = _meta(card, "bookie")
+    stake = _meta(card, "stake", "stakes")
+    if stake and re.fullmatch(r"\d+(?:\.\d+)?|\.\d+", stake):
+        stake += " units"
+    return (head + (f" (Bookie: {bookie})" if bookie else "")
+            + (f"(Stake: {stake})" if stake else ""))
+
+
+_KNOWN_SECTION_RE = re.compile(r"^\s*(FUTURE TIPS|BLACK BOOK|POST RACE)", re.IGNORECASE)
+
+
+def _head_date_ok(text: str, d: date) -> bool:
+    """A page heading's "21 October" / pill's "21 Oct" agrees with d (no date in it: True)."""
+    found = list(_PAGE_HEAD_DATE_RE.finditer(text or ""))
+    return all(int(m.group(1)) == d.day and _MONTHS[m.group(2).upper()[:3]] == d.month for m in found)
+
+
+def parse_tips_page(html: str, url: str, today: date) -> dict:
+    """A tips page -> {"date": its race day (from the address), "pro": Pro Tip lines (Quick
+    Take format), "future": Future Tip lines, "unparsed": card lines from an unknown tips
+    section, "tabs": canonical addresses of the other day pages, "found": a Pro Tips section
+    exists (False = the layout changed), "date_problem": "" or why the page's own date
+    headings disagree with its address (then nothing on it may auto-place)}."""
+    rd = _PageReader()
+    try:
+        rd.feed(html or "")
+        rd.close()
+    except Exception:
+        pass
+    d = tips_page_date(url, today)
+    res = {"date": d, "pro": [], "future": [], "unparsed": [], "tabs": [], "found": False,
+           "date_problem": "" if d else f"no date in the page address {url!r}"}
+    for t in rd.tabs:
+        c = tips_page_url(t)
+        if c and c not in res["tabs"]:
+            res["tabs"].append(c)
+    if d and not _head_date_ok(rd.hero, d):
+        res["date_problem"] = f"the page heading {rd.hero!r} is not {d.isoformat()}"
+    for sec in rd.sections:
+        title = sec["title"]
+        cards = [c for c in sec["cards"] if "empty" not in c["cls"] and (c["head"] or "".join(c["text"]).strip())]
+        if _PRO_TITLE_RE.match(title):
+            res["found"] = True
+            if d and not _head_date_ok(title, d):
+                res["date_problem"] = res["date_problem"] or f"the Pro Tips heading {title!r} is not {d.isoformat()}"
+            for c in cards:
+                if _PRO_LABEL_RE.match(c.get("label") or ""):
+                    res["pro"].append(page_card_line(c))
+                else:
+                    # a card not labelled "Pro Tip" (a Black Book card moved here?): manual
+                    res["unparsed"].append(f"[{title}, card {c.get('label') or 'without a label'!r}] "
+                                           f"{page_card_line(c)}")
+        elif re.match(r"^\s*FUTURE TIPS\b", title, re.IGNORECASE):
+            for c in cards:
+                if c.get("label") and "(date:" in c["label"].lower():
+                    res["future"].append(c["label"])
+                res["future"].append(page_card_line(c))
+        elif not _KNOWN_SECTION_RE.match(title) and re.search(r"\bTIPS?\b", title, re.IGNORECASE):
+            # a new kind of tips section: shown to Wilson (manual), never placed
+            res["unparsed"] += [f"[{title}] {page_card_line(c)}" for c in cards]
+    return res
+
+
 # ── main side ───────────────────────────────────────────────────────────
 
 def parse_tip_line(line: str):

@@ -1,0 +1,44 @@
+{
+  "_comment": "AFL roster corrections + Sportsbet name matching. Applied at roster LOAD (roster.py _apply_afl_name_overrides) AND at GENERATION (generate_afl_roster.py), so the daily 04:30 Draftguru scrape can't undo them. Sections: (1) overrides = CONFIRMED roster->Sportsbet renames (roster key renamed + both spellings resolve to the Sportsbet name); use ONLY when the Sportsbet spelling is confirmed from a live 'Available: player=...' reject line. (2) aliases = candidate alternate Sportsbet spellings TRIED against the LIVE catalog at placement (main._afl_canonical_catalog_player) -- whichever spelling Sportsbet's board actually carries is used, in ONE lookup, NO extra POST / no double-stake retry. SAFE to list an unconfirmed variant here: an exact-normalised catalog match resolves to the intended player or nothing (never a different player), so listing BOTH spellings just lets the live board decide. First-name diminutives already covered by _AFL_FIRST_NAME_GROUPS in main.py (Matt/Matthew, Mitch/Mitchell, Ollie/Oliver, Nic/Nick, Lachie/Lachlan, Cam/Cameron, Dan/Daniel, Sam/Samuel, Josh/Joshua, Tom/Thomas, Charlie/Charles, Will/William, Ben/Benjamin, Zac/Zak/Zachary) do NOT need an alias -- these are the NON-diminutive spellings/suffixes. (3) team_overrides = force a player's club (fixes a same-name scrape collision, e.g. two Max Kings). (4) add = insert a missing player. (5) remove = drop a retired/delisted player the scrape still lists. Keys/values match what the roster/tip uses vs what Sportsbet lists.",
+  "overrides": {
+    "Brad Hill": "Bradley Hill"
+  },
+  "aliases": {
+    "Robert Hansen": ["Robert Hansen Jr", "Robert Hansen Jnr"],
+    "Maurice Rioli": ["Maurice Rioli Jnr", "Maurice Rioli Jr"],
+    "Malcolm Rosas": ["Malcolm Rosas Jnr", "Malcolm Rosas Jr"],
+    "Jordon Butts": ["Jordan Butts"],
+    "Jordon Sweet": ["Jordan Sweet"],
+    "James Jordon": ["James Jordan"],
+    "Marc Pittonet": ["Mark Pittonet"],
+    "Talor Byrne": ["Taylor Byrne"],
+    "Finnbar Maley": ["Finbar Maley"],
+    "Rhyan Mansell": ["Ryan Mansell"],
+    "Kaleb Smith": ["Caleb Smith"],
+    "Archie May": ["Archer May"],
+    "Mitch Owens": ["Mitchito Owens"],
+    "Wil Powell": ["Will Powell"],
+    "Wil Dawson": ["Will Dawson"],
+    "Conor McKenna": ["Connor McKenna"],
+    "Nik Cox": ["Nick Cox"],
+    "Elliot Himmelberg": ["Elliott Himmelberg"],
+    "Alix Tauru": ["Alex Tauru"],
+    "Tobie Travaglia": ["Toby Travaglia"],
+    "Aidan Schubert": ["Aiden Schubert"],
+    "Hugo Ralphsmith": ["Hugo Ralph-Smith", "Hugo Ralph Smith"],
+    "Hussien El Achkar": ["Hussien El-Achkar"],
+    "Saad El-Hawli": ["Saad El Hawli"],
+    "Bailey J. Williams": ["Bailey Williams"]
+  },
+  "team_overrides": {
+    "Max King": "St Kilda"
+  },
+  "add": {
+    "Bailey J. Williams": "West Coast Eagles"
+  },
+  "remove": [
+    "Steven May",
+    "Tom Campbell",
+    "Shane McAdam"
+  ]
+}

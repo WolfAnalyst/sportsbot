@@ -92,6 +92,51 @@ def check_and_mark(key: str, ttl_sec: float, label: str = "", path: Path | None 
         return None
 
 
+class Unavailable(RuntimeError):
+    """The registry could not tell new from seen (strict callers only)."""
+
+
+def check_and_mark_strict(key: str, ttl_sec: float, label: str = "", path: Path | None = None):
+    """check_and_mark for money paths that must FAIL CLOSED (MMA): the same answer (the previous
+    entry, or None after recording `key`), but when the registry cannot tell new from seen (the
+    file is unreadable, the write failed, any error, or the guard is switched off by
+    SEEN_BETS_ENABLED=false) it raises `Unavailable` instead of answering "new". Other tipsters
+    keep the permissive check_and_mark. Under the test suite an un-opted-in registry still answers
+    None, like check_and_mark."""
+    if not key:
+        raise Unavailable("empty key")
+    if not ENABLED:
+        raise Unavailable("SEEN_BETS_ENABLED is off")
+    if not _active():
+        return None
+    path = path or SEEN_PATH
+    try:
+        with _lock:
+            data = _load(path)
+            if data is None:
+                raise Unavailable(f"{path.name} could not be read")
+            now = time.time()
+            prev = data.get(key)
+            if prev and now - float(prev.get("ts", 0)) <= ttl_sec:
+                return dict(prev)
+            old = data.get(key)
+            data[key] = {"ts": now, "label": (label or "")[:160]}
+            try:
+                _save(path, data)
+            except Exception:
+                if old is None:
+                    data.pop(key, None)
+                else:
+                    data[key] = old
+                raise
+            return None
+    except Unavailable:
+        raise
+    except Exception as e:
+        log.error(f"seen_bets: check_and_mark_strict failed for {key!r} ({e})")
+        raise Unavailable(str(e)) from e
+
+
 def check(key: str, ttl_sec: float, path: Path | None = None):
     """The entry if `key` was seen within `ttl_sec`, else None. Does not register."""
     if not key or not _active():
@@ -122,6 +167,22 @@ def mark(key: str, label: str = "", path: Path | None = None) -> None:
             _save(path, data)
     except Exception as e:
         log.error(f"seen_bets: mark failed for {key!r} ({e})")
+
+
+def unmark(key: str, path: Path | None = None) -> None:
+    """Forget `key` (a refusal that was not final: the same tip re-posted later is read again)."""
+    if not key or not _active():
+        return
+    path = path or SEEN_PATH
+    try:
+        with _lock:
+            data = _load(path)
+            if data is None or key not in data:
+                return
+            del data[key]
+            _save(path, data)
+    except Exception as e:
+        log.error(f"seen_bets: unmark failed for {key!r} ({e})")
 
 
 def scan(prefix: str, ttl_sec: float, path: Path | None = None) -> list:

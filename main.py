@@ -13,6 +13,7 @@ import asyncio
 import copy
 import html as _html_mod
 import json
+import math
 import logging
 import os
 import re
@@ -37,6 +38,7 @@ from config import (
     AFL_DISPOSALS_REDISTRIBUTE, AFL_REDISTRIBUTE_MAX_PASSES,
     SGM_CONCURRENT_FANOUT,
     ETR_NBA_CONCURRENT_FANOUT, ETR_NBA_SESSION_IDS, ETR_NBA_FIXED_LADDER,
+    AUSBETS_NBA_CONCURRENT_FANOUT,
     ETR_NBA_TEST_MODE, ETR_NBA_UNIT_SIZE_TEST,
     RECONCILE_AMBIGUOUS, RECONCILE_SPILL,
     X_TIPSTER, X_FORCE_BOOKIE, X_MAX_ODDS_MULT, MAX_ODDS_MULT,
@@ -62,7 +64,8 @@ from config import (
     SPORTSBET_MAX_STAKE_REBET,
     HB_SEND_MAX_ODDS, HB_SEND_DIRECTION, HB_RETRY_WITHOUT_PLAYER, NFL_WORSE_LINE_STAKE_MULT,
     NFL_RUSH_ATT_FALLBACK_STAKE_MULT,
-    HB_RETRY_WITHOUT_STAT, SB_SLOW_538_REBET_MAX_SEC, NFL_ALT_RUNG_MAX_YDS, NFL_ALT_MAX_ODDS_MULT,
+    HB_RETRY_WITHOUT_STAT, SB_SLOW_538_REBET_MAX_SEC, SB_SLOW_538_RECONCILE_REBET,
+    NFL_ALT_RUNG_MAX_YDS, NFL_ALT_MAX_ODDS_MULT,
     SELF_BET_MAX_STAKE,
     EDDIE_CAPTION_FALLBACK_ENABLED,
     EDDIE_TEXT_PLACE_ENABLED,
@@ -151,6 +154,15 @@ try:
 except Exception as _e:   # v6.69 review: ZoneInfoNotFoundError (a KeyError) at import without tzdata
     logging.getLogger("tipbot").warning(f"nba-v3: nba_model_core not loaded ({_e!r})")
     nba_core = None
+try:
+    # v6.112 Just Bleed MMA (tipbot-only; the sports fork lacks both, and its channel filter
+    # drops the channel anyway). The path is OFF unless config.MMA_ENABLED.
+    from parsers import mma_bleed as mma_parser
+    import mma_sports
+except Exception as _e:
+    logging.getLogger("tipbot").warning(f"mma: modules not loaded ({_e!r})")
+    mma_parser = None
+    mma_sports = None
 from groq_parser import parse_with_groq, _preprocess_saiyan_emojis
 from hyperbot_client import HyperBotClient
 from resolver import resolve_afl_event, afl_games_in_play, afl_games_on_date, team_key
@@ -427,6 +439,7 @@ def _should_alert_mbl_violation(mbl_violations, unfilled_stake: float,
 # 53523 is not in NBA_SESSION_PRIORITY (since bet365 sports is broken).
 # Adding kev_nba and ausbets_nba here makes both flow through to the
 # sportsbet sessions in NBA_SESSION_PRIORITY.
+AUSBETS_NBA_TIPSTER = "ausbets_nba"
 TIPSTERS_IGNORE_SUGGESTED_BOOKIE: set[str] = {"kev_nba", "ausbets_nba", "saiyan_afl", "etr_nba"}
 
 # Tipsters whose tips MUST carry an explicit unit/stake to be placed. A tip with
@@ -449,6 +462,56 @@ UNITS_REQUIRED_TIPSTERS: set[str] = {"kev_nba", "ausbets_nba", "dello_afl", "edd
 # a 'u' word on the next line; after the 'u' only a word boundary or "nit(s)"
 # may follow, so "5 under" / "1 Utah" don't match.
 _UNIT_TOKEN_RE = re.compile(r"\b\d+(?:\.\d+)?[ \t]*u(?:nits?)?\b", re.IGNORECASE)
+
+# v6.97 (Wilson 2026-10-20: "get rid of the random manual alerts that aren't actually bets,
+# just info"): does a post that parsed to 0 tips still LOOK like a bet? Two tiers, from two Haiku
+# reviews of real 4th&EV posts and probes:
+#   STRONG (always a bet, even next to recap words): an @ price, an over/under with a DECIMAL
+#     line ("over 47.5"), a spread on a named team in either order ("-3.5 Bills", "Bills -3.5"),
+#     "to win", or units right after a team name ("Bills 2u").
+#   MEDIUM (a bet unless the post reads as a results recap): a $ amount, American odds (+120),
+#     ML / moneyline, anytime, units, an N+ stat (2+ TDs, 7+ assists, 2+ threes), a whole-number
+#     over/under.
+# A post with neither (chatter, "Futures update:", "Bets today will be between 3.45-4.30") or a
+# recap with only MEDIUM signals ("$20 profit yesterday", "+36 units this season") is logged
+# instead of sent to the MANUAL chat.
+_NOT_A_TEAM = (r"(?!(?:Today|Tonight|Tomorrow|Yesterday|Units?|Week|Season|Day|Game|Games|Bets?"
+               r"|Profit|Pts|Points|Rebounds|Assists|Record|Net|Up|Down)\b)")
+_BET_STRONG_RE = re.compile(
+    r"@\s?\$?\d+\.\d+|@\s?[+-]\d{3,4}\b"
+    r"|\b(?i:over|under|o|u)\s?\d+\.\d\b"
+    r"|(?<![\w.])[+-]\d{1,2}(?:\.5)?\s+" + _NOT_A_TEAM + r"[A-Z][a-z]{2,}"
+    r"|\b" + _NOT_A_TEAM + r"[A-Z][a-z]{2,}\s+[+-]\d{1,2}(?:\.5)?(?![\d.])"
+    r"|\b" + _NOT_A_TEAM + r"[A-Z][a-z]{2,}\s+\d+(?:\.\d+)?\s*u(?:nits?)?\b")
+_BET_MEDIUM_RE = re.compile(
+    r"\$\d+(?:\.\d{2})?\b|(?<![\w.])[+-]\d{3,4}\b|\b(?:ML|moneyline|money line|anytime)\b"
+    r"|\b\d+(?:\.\d+)?[ \t]*u(?:nits?)?\b"
+    r"|\b\d+\+\s*(?:td|rec|rush|pass|yds|yards|points|pts|reb|ast|assist|three|3pm|rebound)"
+    r"|\b(?:over|under|o|u)\s?\d+\b|\bto win\b", re.IGNORECASE)
+_RECAP_RE = re.compile(
+    r"(?i)^\s*[+-]\d+(?:\.\d+)?(?:ish)?\s+(?:on|today|for|this)\b"
+    r"|\bon the (?:day|game|week|season)\b|\bthis (?:week|season)\b|\bfor the (?:week|day|season)\b"
+    r"|(?<!to )(?<!potential )\bprofit\b|\bresults?\b|\brecord\b|\byesterday\b|\blast night\b"
+    r"|\bwent \d+-\d+\b"
+    r"|\bwe(?:'re| are) (?:up|down)\b|\bstill can.?t catch\b|\bnow sitting\b|\bto kick off\b"
+    r"|\bsettled\b|\bwe hit\b")
+
+
+def _looks_like_bet_post(text: str) -> bool:
+    t = text or ""
+    if _BET_STRONG_RE.search(t):
+        return True
+    return bool(_BET_MEDIUM_RE.search(t)) and not _RECAP_RE.search(t)
+
+
+def _cap_note(text: str, limit: int = 3000) -> str:
+    """Keep an info note under Telegram's 4096-character limit AFTER the notifier's HTML
+    escaping (& < > grow to 4-5 characters each)."""
+    import html as _html
+    t = text
+    while len(_html.escape(t, quote=False)) > limit and len(t) > 20:
+        t = t[: int(len(t) * 0.9)]
+    return t if t == text else t + "\n... (truncated)"
 
 # v5.52 BRACES (ausbets_nba only): explicit no-bet framing. AusBets posts
 # near-miss lines under a "these are NOT bets" header and Groq still parses
@@ -1583,6 +1646,23 @@ PRE_PLACEMENT_REJECT_PATTERNS = [
     "insufficient funds",
     "insufficient_funds",
     "no 'cp' placeability",
+    # v6.97 (Wilson 2026-10-20: "pls fix clean rejects"): HyperBot's own validation-stage
+    # outcome codes. HB refused BEFORE sending anything to the bookie, so the bet cannot have
+    # landed however long the answer took. 2026-10-17 an AusBets leg got "[line_not_offered]
+    # line=-7.5 ... Refusing to place a different line" in 6.9s, was treated as maybe-placed
+    # (debited $600, bookie blocklisted, ladder stopped) although reconcile found nothing.
+    # Codes where the BOOKIE answered (odds_moved, auth_rejected, bot_protection,
+    # placement_uncertain, unknown_error, schema_changed) are NOT listed: a slow one stays
+    # ambiguous. HB codes are listed WITH their brackets (HB errors start "[code] ...") so a code
+    # word inside some other error text does not match; the check is a substring test, and the
+    # two plain phrases are HB's own line_not_offered wording. odds_below_target: the agent aborts
+    # before any POST (v6.07 reconcile analysis). command_fields_missing: a request-validation
+    # reject (live bet365 tests 2026-10-19). auth_missing / account_disabled are NOT listed: no
+    # proof they are pre-send (Haiku review), so a slow one stays maybe-placed.
+    "[event_not_carried]", "[race_not_carried]", "[market_not_carried]", "[selection_not_carried]",
+    "[line_not_offered]", "no candidate carries it", "refusing to place a different line",
+    "[odds_below_target]",
+    "[command_fields_missing]",
     "cp=false",
 ]
 
@@ -2675,12 +2755,12 @@ def _drop_resent(tipster: str, channel_name: str, items: list, key_fn, label_fn,
         else:
             keep.append(it)
     if dropped:
+        # v6.97 (Wilson: no info-only MANUAL alerts): already sent, not placed again. Info, so
+        # it goes to the info chat, not the MANUAL chat (still visible if a resend is wrong).
         try:
-            notifier.notify_text_manual_alert(
-                channel_name,
-                f"{len(dropped)} bet(s) in this post were already sent earlier and were "
-                f"NOT placed again:\n" + "\n".join(dropped),
-                header="RESENT BETS, ignored")
+            notifier.notify_info(_cap_note(
+                f"RESENT BETS, ignored ({channel_name}): {len(dropped)} bet(s) in this post "
+                f"were already sent earlier and were NOT placed again:\n" + "\n".join(dropped)))
         except Exception as e:
             log.error(f"[{channel_name}] resent-bets note failed: {e}")
     return keep
@@ -2783,6 +2863,147 @@ def _make_alt_entry(leg) -> dict:
     }
 
 
+_SRC_SEGMENT_SPLIT_RE = re.compile(r"\n+|(?<![\d.])(?=\d+\.?\d*\s*[Uu]\s*-)")
+# prices and unit sizes carry digits that must not be mistaken for a prop line
+_SRC_NOISE_RE = re.compile(
+    r"\([^)]*\)|\$\s*\d+(?:\.\d+)?|@\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*units?\b"
+    r"|(?<![\d.])\d+(?:\.\d+)?\s*[Uu]\s*-", re.IGNORECASE)
+
+
+def _line_tokens(line) -> list:
+    """Spellings a tipster may use for a prop line: 35.5 -> '35.5' and '36+'."""
+    try:
+        v = float(line)
+        if not math.isfinite(v):
+            return []
+    except (TypeError, ValueError):
+        return []
+    toks = [re.escape(f"{v:g}")]
+    if v != int(v):
+        toks.append(re.escape(str(int(v) + 1)) + r"\s*\+")
+    # a whole-number token must not match the front of 5.5 or the end of 15.5
+    return [r"(?<![\d.])" + t + r"(?!\d|\.\d)" for t in toks]
+
+
+def _split_group_by_source_line(group: list) -> list:
+    """v6.96: split same-player tips into clusters that share ONE source line.
+
+    A real SGM is one line with its legs joined by "/" ("Tatum Over 35.5 PR /
+    Over 26.5 P"). Separate lines that each carry their own units and price
+    ("0.5U - Tatum Over 35.5 PR (SB: $1.9)" then "0.5U - Tatum Over 26.5 P (SB:
+    $1.9)") are independent singles. Wilson 2026-10-20: Tatum and Ausar Thompson
+    were promoted to 2.05 SGMs when posted as separate singles.
+
+    Only a source line containing "/" can make an SGM. Each tip is judged on its
+    own (order independent): its line number is looked for in the "/" lines and
+    in the other lines about this player. In a "/" line only -> that SGM. In an
+    other line only -> a single. In both, or in several "/" lines (ambiguous) -> a
+    single, logged. In neither (the model changed the line) or with no usable
+    line -> a single. A "/" counts only when 2+ parts around it hold a number.
+    Lines naming a different player with the same surname (Klay vs Ausar
+    Thompson) are ignored; nameless lines (a leg line under a name header) stay.
+    With no raw_message at all we cannot tell, so the old behaviour stands (one
+    cluster). Segments come from every distinct raw_message in the group, so the
+    regex fallback path (one raw_message per line) works too. Cluster membership
+    is order independent; clusters are returned in original tip order. Any
+    failure keeps every tip a single."""
+    try:
+        texts = []
+        for t in group:
+            if t.raw_message and t.raw_message not in texts:
+                texts.append(t.raw_message)
+        segments = [seg.strip() for txt in texts for seg in _SRC_SEGMENT_SPLIT_RE.split(txt)]
+        segments = [seg for seg in segments if seg]
+        if not segments:
+            return [group]
+
+        def _fold(x: str) -> str:
+            return _roster_fold_accents(x).replace("’", "'").lower()
+
+        player = _fold(group[0].legs[0].player or "")
+        words = [w for w in re.findall(r"[a-z0-9']+", player) if w not in _ROSTER_GEN_SUFFIXES]
+        cand = segments
+        if words:
+            first, last = words[0], words[-1]
+            sur_re = re.compile(r"(?:([a-z][a-z'.]*)\s+)?\b" + re.escape(last) + r"\b")
+
+            sport = (group[0].sport or "nba").lower()
+
+            _lead_name_re = re.compile(
+                r"^\s*(?:\d+(?:\.\d+)?\s*[Uu]\s*-\s*)?"
+                r"((?:[A-Z][\w'.\-]*\s+)*[A-Z][\w'.\-]*)\s+(?:Over|Under|O|U|\d)")
+
+            def _other_first_name(prev: str) -> bool:
+                if len(words) < 2:
+                    return False  # surname-only player: cannot tell first names apart
+                # a word before the surname makes it a DIFFERENT player only when
+                # "<word> <surname>" is a real roster player ("Klay Thompson")
+                try:
+                    return bool(exact_match_player(f"{prev} {last}", sport))
+                except Exception:
+                    return False
+
+            def _names_other_player(x: str) -> bool:
+                hits = list(sur_re.finditer(_fold(x)))
+                if not hits:
+                    # a line that opens with a DIFFERENT player's name
+                    # ("Jalen Brunson Over 26.5 P") is not evidence about this player
+                    lead = _lead_name_re.match(x)
+                    return (bool(lead) and lead.group(1).lower() not in ("over", "under", "o", "u")
+                            and last not in _fold(lead.group(1)))
+                for m in hits:
+                    prev = (m.group(1) or "").rstrip(".")
+                    if (not prev or prev == first or prev == last
+                            or prev in ("over", "under", "o", "u", "and")
+                            or (len(prev) == 1 and first.startswith(prev))
+                            or not _other_first_name(prev)):
+                        return False  # at least one mention is this player
+                return True
+
+            # drop only the lines that name a different player with this surname;
+            # keep this player's lines AND lines that name nobody (a "/" leg line
+            # under a name header)
+            cand = [x for x in segments if not _names_other_player(x)] or segments
+        cleaned = {id(x): _fold(_SRC_NOISE_RE.sub(" ", x)) for x in cand}
+
+        def _is_leg_slash(x: str) -> bool:
+            # a "/" only separates legs when two or more parts carry a number:
+            # "Over 25.5 P/R" and "Brooklyn/Boston -1.5" are not combos
+            return sum(1 for part in cleaned[id(x)].split("/") if re.search(r"\d", part)) >= 2
+
+        slash = [x for x in cand if "/" in x and _is_leg_slash(x)]
+        other = [x for x in cand if x not in slash]
+        if not slash:
+            return [[t] for t in group]
+
+        def _has(seg, toks):
+            return any(re.search(tok, cleaned[id(seg)]) for tok in toks)
+
+        clusters: dict = {}
+        order = []
+        for tip in group:
+            toks = _line_tokens(tip.legs[0].line)
+            in_slash = [x for x in slash if _has(x, toks)]
+            in_other = any(_has(x, toks) for x in other)
+            if in_slash and not in_other and len(in_slash) == 1:
+                key = id(in_slash[0])
+            elif in_slash and in_other:
+                log.warning(
+                    f"SGM auto-promote: line {tip.legs[0].line} of '{tip.legs[0].player}' "
+                    f"is on both a '/' line and a separate line; keeping it a single")
+                key = id(tip)
+            else:
+                key = id(tip)
+            if key not in clusters:
+                clusters[key] = []
+                order.append(key)
+            clusters[key].append(tip)
+        return [clusters[k] for k in order]
+    except Exception as e:  # never let a heuristic stop the whole message
+        log.warning(f"_split_group_by_source_line failed ({e}); keeping singles")
+        return [[t] for t in group]
+
+
 def _promote_misparsed_sgms(tips: list[ParsedTip]) -> list[ParsedTip]:
     """
     Detect and recover from Groq misparsing an SGM as multiple singles.
@@ -2831,7 +3052,11 @@ def _promote_misparsed_sgms(tips: list[ParsedTip]) -> list[ParsedTip]:
     sgm_promoted: set[int] = set()  # id() of tips absorbed into an SGM
     promoted_sgms: dict[int, ParsedTip] = {}  # id(primary tip) -> new SGM tip
 
-    for group in groups.values():
+    # v6.96: legs from separate source lines are separate singles, so promote
+    # only within a cluster of tips that share one line.
+    clusters = [c for g in groups.values() if len(g) >= 2
+                for c in _split_group_by_source_line(g)]
+    for group in clusters:
         if len(group) < 2:
             continue
         # v5.23 (Wilson 2026-06-06): require 2+ DISTINCT STATS to promote to an
@@ -2844,7 +3069,6 @@ def _promote_misparsed_sgms(tips: list[ParsedTip]) -> list[ParsedTip]:
         stats = {(t.legs[0].stat or "").lower() for t in group}
         if len(stats) < 2:
             continue
-
         primary = group[0]
         # Build new SGM tip on top of the primary's metadata. Copy legs
         # in batch order so the SGM legs match what the tipster wrote.
@@ -4263,7 +4487,7 @@ def _disposals_liveness_tick() -> None:
 # The latch is kept in memory AND in the state file (the file can be unwritable; see the
 # DisposalsModel note above), so one outage is one alert across polls and restarts.
 _NBA_LIVENESS_LOCK = threading.Lock()
-_NBA_LIVENESS_MEM = {"last_seen": None, "alerted_for": None}
+_NBA_LIVENESS_MEM = {"last_seen": None, "alerted_for": None, "last_hb": None}
 
 
 def _nba_liveness_path() -> str:
@@ -4276,7 +4500,14 @@ def _nba_liveness_load() -> dict:
     try:
         with open(_nba_liveness_path(), "r", encoding="utf-8") as f:
             d = json.load(f)
-        return d if isinstance(d, dict) else {}
+        if not isinstance(d, dict):
+            return {}
+        for k in ("last_seen", "alerted_for", "last_hb"):
+            v = d.get(k)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
+                                  or not math.isfinite(v)):
+                d[k] = None            # v6.111: a bad value must not stop the detector running
+        return d
     except Exception:
         return {}                      # no money state here: a lost file is a clean slate
 
@@ -4344,26 +4575,89 @@ def _nba_game_day_window(now_syd):
     return win_start, max(starts)
 
 
+def _nba_heartbeat_read(now_ts: float):
+    """(epoch or None, problem) for the model's heartbeat file (v6.111). The epoch is the OLDER of
+    last_beat_at and the file's mtime, so a file stale on either count is stale; one dated more
+    than 5 minutes in the future is bad, not alive. (None, "") when no file is configured; (None, reason) when it
+    is missing, unreadable or malformed."""
+    import config as _c
+    path = str(getattr(_c, "NBA_MODEL_HEARTBEAT_FILE", "") or "").strip()
+    if not path:
+        return None, ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        beat = datetime.fromisoformat(str(d["last_beat_at"]).strip().replace("Z", "+00:00"))
+        if beat.tzinfo is None:
+            beat = beat.replace(tzinfo=_dt_timezone.utc)
+        beat_ts = beat.timestamp()
+        mtime = os.path.getmtime(path)
+        mode = str(d.get("last_beat_mode") or "").strip().lower()
+    except FileNotFoundError:
+        return None, f"the heartbeat file {path} is missing"
+    except Exception as e:
+        return None, f"the heartbeat file {path} is unreadable ({type(e).__name__})"
+    if not (math.isfinite(beat_ts) and math.isfinite(mtime)):
+        return None, f"the heartbeat file {path} has a bad timestamp"
+    if mode != "live":
+        # a dry-run model beats into the same file but sends nothing: not a live feed
+        return None, (f"the heartbeat file {path} reports mode {mode or 'none'!r}, not 'live' "
+                      f"(a dry-run model places nothing)")
+    if beat_ts > now_ts + 300 or mtime > now_ts + 300:
+        # a clock-skewed file must not read as "alive for ever"
+        return None, f"the heartbeat file {path} is dated in the future"
+    return min(beat_ts, mtime, now_ts), ""
+
+
 def _nba_liveness_check(now=None) -> list:
     """(level, text) alerts. Silent outside game days, inside the quiet window, and after the
-    day's last tip-off."""
+    day's last tip-off. v6.111: a sign of life is a message from the model OR a fresh heartbeat
+    file; a "back" note is returned here when the file ends an alerted outage."""
     import config as _c
     if nba_core is None:
         return []
     now_syd = now if now is not None else datetime.now(nba_core.SYDNEY)
+    now_ts = now_syd.timestamp()
+    hb_ts, hb_problem = _nba_heartbeat_read(now_ts)
+    use_file = bool(str(getattr(_c, "NBA_MODEL_HEARTBEAT_FILE", "") or "").strip())
+    limit_h = (float(getattr(_c, "NBA_MODEL_HEARTBEAT_STALE_MIN", 90)) / 60.0 if use_file
+               else float(getattr(_c, "NBA_MODEL_SILENCE_HOURS", 2)))
+    back = []
+    with _NBA_LIVENESS_LOCK:
+        st = _nba_liveness_load()
+        alerted = st.get("alerted_for")
+        if alerted is None:
+            alerted = _NBA_LIVENESS_MEM.get("alerted_for")
+        seen = st.get("last_seen")
+        mem_seen = _NBA_LIVENESS_MEM.get("last_seen")
+        if isinstance(mem_seen, (int, float)) and (
+                not isinstance(seen, (int, float)) or mem_seen > seen):
+            seen = mem_seen
+        if hb_ts:
+            st["last_hb"] = max(float(st.get("last_hb") or 0.0), hb_ts)
+            _NBA_LIVENESS_MEM["last_hb"] = st["last_hb"]
+            _nba_liveness_save(st)
+        hb_known = max(float(st.get("last_hb") or 0.0),
+                       float(_NBA_LIVENESS_MEM.get("last_hb") or 0.0))
+        alive = max(seen if isinstance(seen, (int, float)) else 0.0, hb_known)
+        if (alerted is not None and alive > float(alerted) + 1.0
+                and (now_ts - alive) / 3600.0 < limit_h):
+            st["alerted_for"] = None
+            _NBA_LIVENESS_MEM["alerted_for"] = None
+            _nba_liveness_save(st)
+            back.append(("info", "NBA model is back: a heartbeat arrived after the silence alert."))
     if nba_core.in_quiet_window(now_syd):
-        return []
+        return back
     try:
         win = _nba_game_day_window(now_syd)
     except Exception as e:
         log.debug(f"[nba_model] liveness: schedule not readable ({e})")
-        return []
+        return back
     if not win:
-        return []
+        return back
     win_start, last_tip = win
-    now_ts = now_syd.timestamp()
     if now_ts > last_tip:
-        return []
+        return back
     with _NBA_LIVENESS_LOCK:
         st = _nba_liveness_load()
         last = st.get("last_seen")
@@ -4371,21 +4665,26 @@ def _nba_liveness_check(now=None) -> list:
         if isinstance(mem_last, (int, float)) and (
                 not isinstance(last, (int, float)) or mem_last > last):
             last = mem_last
-        ref = max(last if isinstance(last, (int, float)) else 0.0, win_start)
+        last = max(last if isinstance(last, (int, float)) else 0.0,
+                   float(st.get("last_hb") or 0.0), float(_NBA_LIVENESS_MEM.get("last_hb") or 0.0))
+        ref = max(last, win_start)
         quiet_h = (now_ts - ref) / 3600.0
-        if quiet_h < float(getattr(_c, "NBA_MODEL_SILENCE_HOURS", 2)):
-            return []
+        if quiet_h < limit_h:
+            return back
         if ref in (st.get("alerted_for"), _NBA_LIVENESS_MEM.get("alerted_for")):
-            return []
+            return back
         st["alerted_for"] = ref
         _NBA_LIVENESS_MEM["alerted_for"] = ref
         _nba_liveness_save(st)
-    seen = (datetime.fromtimestamp(last, nba_core.SYDNEY).strftime("%a %H:%M")
-            if isinstance(last, (int, float)) and last > 0 else "nothing yet today")
+    seen_txt = (datetime.fromtimestamp(last, nba_core.SYDNEY).strftime("%a %H:%M")
+                if last > 0 else "nothing yet today")
     tip = datetime.fromtimestamp(last_tip, nba_core.SYDNEY).strftime("%H:%M")
-    return [("critical",
-             f"NBA model feed SILENT for {quiet_h:.1f}h on a game day (last message: {seen}; "
-             f"last tip-off today {tip} Sydney). It should send a NOOP heartbeat every run. "
+    how = (f"Heartbeat: {hb_problem}." if hb_problem
+           else "It records a heartbeat every 45 minutes." if use_file
+           else "It should send a NOOP heartbeat every run.")
+    return back + [("critical",
+             f"NBA model looks DEAD: no sign of life for {quiet_h:.1f}h on a game day (last "
+             f"sign: {seen_txt}; last tip-off today {tip} Sydney). {how} "
              f"Check the NBA model's scheduled task and its Telegram bot.")]
 
 
@@ -4399,13 +4698,19 @@ def _nba_liveness_unlatch() -> None:
 
 
 def _nba_liveness_tick() -> None:
+    import config as _c
+    to_critical = bool(getattr(_c, "NBA_MODEL_LIVENESS_CRITICAL", True))
     for _level, text in _nba_liveness_check() or []:
         sent = False
         try:
-            sent = notifier.notify_info(text) is not False   # maintenance chat, like the AFL model's
+            if _level == "critical" and to_critical:
+                # v6.111: the model dying pages the CRITICAL chat (queued; Main's drainer sends)
+                sent = notifier.notify_critical(text) is not False
+            else:
+                sent = notifier.notify_info(text) is not False
         except Exception as e:
             log.error(f"[nba_model] liveness alert failed to send: {e}")
-        if not sent:
+        if not sent and _level == "critical":
             log.warning("[nba_model] liveness alert not sent: will retry on the next poll")
             _nba_liveness_unlatch()
 
@@ -4600,6 +4905,39 @@ def _is_mlb_hrrbi_sgm(tip: ParsedTip) -> bool:
         except (TypeError, ValueError):
             return False
     return len(players) == 1 and "" not in players and lines == {0.5, 1.5}
+
+
+def _gate_shook_sports(tips: list[ParsedTip]) -> list[ParsedTip]:
+    """v6.98 (Wilson 2026-10-21): Shook MLB is switched OFF (SHOOK_MLB_ENABLED,
+    default false: those tips are dropped with a log line, no alert) and Shook NFL
+    goes to MANUAL (SHOOK_NFL_MANUAL, default true). Shook's channel is registered
+    as sport "auto", so an NFL tip from him skipped the NFL-channel safeguards and
+    would have reached the generic singles path. Other Shook sports (NBA) pass
+    through untouched."""
+    import config as _c
+    mlb_on = bool(getattr(_c, "SHOOK_MLB_ENABLED", False))
+    nfl_manual = bool(getattr(_c, "SHOOK_NFL_MANUAL", True))
+    out = []
+    for tip in tips:
+        if tip.tipster == "shook":
+            sp = (tip.sport or "").lower()
+            if sp == "mlb" and not mlb_on:
+                log.info(f"Shook MLB is switched off (SHOOK_MLB_ENABLED=false): "
+                         f"ignoring {tip.raw_message[:100]!r}")
+                continue
+            if sp == "nfl" and nfl_manual:
+                log.info("Shook NFL -> manual (SHOOK_NFL_MANUAL): not auto-placing")
+                tip.alert_only = True
+                tip.alert_reason = "Shook NFL tip, routed to manual (not auto-placed)"
+            elif sp not in ("nba", "mlb", "nfl"):
+                # v6.97 (Haiku review): the sport comes from the parser ("auto" channel), so a
+                # missing or unknown label must fail CLOSED: manual, never auto-placed.
+                log.info(f"Shook tip with sport {sp!r} -> manual (sport not recognised)")
+                tip.alert_only = True
+                tip.alert_reason = (f"Shook tip, sport {sp or 'unknown'!r} not recognised: "
+                                    f"routed to manual (not auto-placed)")
+        out.append(tip)
+    return out
 
 
 def _mlb_hrrbi_to_sgm(tips: list[ParsedTip]) -> list[ParsedTip]:
@@ -5293,6 +5631,12 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
         # Gated by AFL_CONCURRENT_FANOUT; NBA/MLB keep _place_singles_v4.
         if AFL_CONCURRENT_FANOUT and (tip.sport or "").lower() == "afl":
             return _place_afl_fanout(tip)
+        # v6.114 AusBets NBA singles: equal split across the active Sportsbet accounts, all at
+        # once (Wilson 2026-10-23). Needs the AFL fan-out itself, so both flags must be on.
+        if (AUSBETS_NBA_CONCURRENT_FANOUT and AFL_CONCURRENT_FANOUT
+                and (tip.tipster or "").lower() == AUSBETS_NBA_TIPSTER
+                and (tip.sport or "").lower() == "nba"):
+            return _place_afl_fanout(tip)
         return _place_singles_v4(tip)
 
     # ── Legacy v3.10 path (USE_LEGACY_PLACEMENT=true) ───────────────
@@ -5375,6 +5719,7 @@ def _get_sessions_for_bookie(tip: ParsedTip) -> list[dict]:
         "nba": ["sportsbet", "tab"],
         "nbl": ["sportsbet", "tab"],
         "mlb": ["sportsbet"],
+        "mma": ["sportsbet", "bet365"],   # v6.112 Just Bleed MMA (own path; kept in step)
     }
     allowed = sport_filter.get(tip.sport)
     if allowed:
@@ -6700,6 +7045,7 @@ def _v4_get_active_sessions_unfiltered(tip: ParsedTip) -> list[dict]:
         "nba": ["sportsbet", "tab"],
         "nbl": ["sportsbet", "tab"],
         "mlb": ["sportsbet"],
+        "mma": ["sportsbet", "bet365"],   # v6.112 Just Bleed MMA (own path; kept in step)
     }
     allowed = sport_filter.get(tip.sport)
     if allowed:
@@ -8221,6 +8567,41 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                  f"({nba_core.test_bets_used()}/{nba_core.cfg('NBA_MODEL_TEST_MAX_BETS')} "
                  f"test bets used)")
 
+    # v6.106 (Wilson 2026-10-22: "spill over properly to finalise the stake ... the rest of that
+    # $100 will go into 1 other random sb account that accepted their allocated stake"): the NBA
+    # model (live mode only; test mode keeps its one test account) leaves out the accounts that
+    # already hit Sportsbet's max on this selection, and a RETRY goes whole to one random
+    # account (the spill below finishes it) instead of being split across every account.
+    _nba_live = bool(tip.tipster == NBA_MODEL_TIPSTER and nba_core is not None
+                     and not nba_core.cfg("NBA_MODEL_TEST_MODE"))
+    _nba_sel_key = str(getattr(tip, "_nba_sel_id", "") or "")
+    _nba_one_account = False
+    _nba_marks_removed = False
+    if _nba_live:
+        _nba_skip = set(_NBA_CAPPED_SIDS.get(_nba_sel_key) or ())
+        if _nba_skip:
+            _nba_kept = [s for s in sessions if str(s.get("session_id", "")) not in _nba_skip]
+            log.info(f"[nba_model] leaving out {sorted(_nba_skip)}: already at Sportsbet's max "
+                     f"on this selection")
+            if not _nba_kept:
+                # Review: Sportsbet's max is not permanent (it rises toward the game), so a
+                # selection where EVERY account hit it once must not become a dead end until
+                # the next restart: forget the marks and try every account again (a 538 costs
+                # one cheap POST per account and is re-recorded below).
+                log.info("[nba_model] every account had hit Sportsbet's max on this selection: "
+                         "trying them all again")
+                _NBA_CAPPED_SIDS.pop(_nba_sel_key, None)
+            else:
+                _nba_marks_removed = len(_nba_kept) < len(sessions)
+                sessions = _nba_kept
+        if (((getattr(tip, "_nba_row", None) or {}).get("kind") or "").lower() == "retry"
+                and len(sessions) > 1):
+            sessions = list(sessions)
+            _NBA_SPILL_RNG.shuffle(sessions)
+            _nba_one_account = True
+            log.info(f"[nba_model] retry -> one random account first "
+                     f"{[x.get('session_id') for x in sessions]} (the rest spills on)")
+
     # v6.80 (Wilson 2026-10-18: AFL game lines "random account and then spill over into another
     # random account, not EVERY account needs to bet it, as it would be so sus"): an AFL game
     # line (h2h / line / total, no player) goes WHOLE to one random account, up to its cap;
@@ -8238,7 +8619,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                  f"{[x.get('session_id') for x in sessions]} (whole stake to the first)")
 
     n_accounts = len(sessions)
-    per_account_target = (round(intended_stake, 2) if _afl_game_line
+    per_account_target = (round(intended_stake, 2) if (_afl_game_line or _nba_one_account)
                           else round(intended_stake / n_accounts, 2))
 
     # ── Direction-aware OVER liability cap (Task A, 2026-06-07) ─────────
@@ -8302,7 +8683,8 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
     # equal 1:1 share, so take the even path deliberately rather than by coincidence.
     # nba-v3: the NBA model is even-split for the same reason, and has no sessions.yaml
     # capacity weights to weight by (its ladder is the single config ladder).
-    _force_even_split = tip.tipster in (DISPOSALS_MODEL_TIPSTER, NBA_MODEL_TIPSTER)
+    _force_even_split = tip.tipster in (DISPOSALS_MODEL_TIPSTER, NBA_MODEL_TIPSTER,
+                                        AUSBETS_NBA_TIPSTER)  # v6.114: AusBets is even too
     fanout_targets, fanout_decay = (
         _afl_fanout_targets(sessions, sport, liability_market, intended_stake,
                             tip.tipster, tip.units)
@@ -8636,6 +9018,21 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             f"({cap_reason}, list_mode={is_list_mode}, sizing_odds={sizing_odds})"
         )
         jobs.append((sess, ladder, resolved))
+        if _nba_one_account:
+            # v6.106 (review): a retry starts on ONE account even when its liability cap holds
+            # less than the retry; the spill below passes the rest on, one account at a time
+            break
+
+    if (not jobs and _nba_live and _nba_marks_removed
+            and not getattr(tip, "_nba_resized", False)):
+        # Review: accounts left out for hitting Sportsbet's max were never sized, so the other
+        # accounts being liability-capped must not end the retry as 'capped' while a marked
+        # account is untried. Nothing has been sent or saved yet: forget the marks, size again.
+        tip._nba_resized = True
+        _NBA_CAPPED_SIDS.pop(_nba_sel_key, None)
+        log.info("[nba_model] nothing left to size after leaving out the accounts at "
+                 "Sportsbet's max: sizing again with every account")
+        return _place_afl_fanout(tip)
 
     if not jobs and _nba_sized_n and _nba_capped_n == _nba_sized_n:
         # every account is at its per-selection liability cap: not a failure, a distinct
@@ -8868,6 +9265,122 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
             if ambiguous_results:
                 break                     # may have landed: stop spilling
+
+    # v6.106 NBA model spill-over (Wilson 2026-10-22): an account that took LESS than its share
+    # (Sportsbet max 538, e.g. Tarken $45.50 of its $100) hands the rest to ONE random account
+    # that took its full share, then the next if that one also hits its max, all inside this
+    # placement. Each receiver is sized on the NBA config ladder with what it already carries
+    # on this selection (this placement's asks included, at the highest allowed fill), and its
+    # ask is saved with note_intent BEFORE it is sent. Never after a maybe-landed result, never
+    # above the unit. Accounts that hit the max are remembered for this selection, so a retry
+    # leaves them out. Whatever is still unfilled is left for the model's retry.
+    if _nba_live:
+        def _nba_short(r) -> bool:
+            """Placed less than its ask (a Sportsbet max-stake rebet), or refused for stake
+            size: Sportsbet's 538 / "stake too high" only (review: the broader stake-error
+            patterns also match price refusals, which must not mark an account as capped)."""
+            asked_r = float(getattr(r, "_requested_stake", 0) or 0)
+            if getattr(r, "success", False):
+                return asked_r > 0 and float(r.stake or 0) < asked_r - 0.01
+            _e = (getattr(r, "error", "") or "").lower()
+            return (not _is_ambiguous_result(r)) and (
+                re.search(r"(?<![\d.])538(?![\d.])", _e) is not None or "stake too high" in _e
+                or getattr(r, "max_stake", None) is not None)
+
+        _nba_hit = {str(r.session_id) for r in results if _nba_short(r)}
+        if _nba_hit and _nba_sel_key:
+            _NBA_CAPPED_SIDS.setdefault(_nba_sel_key, set()).update(_nba_hit)
+        tip._nba_spill_asks = []
+        # never after a maybe-landed result, nor after a "success" with no usable stake
+        # (that money may be on the book but is not counted in `placed`: review)
+        def _unusable(x) -> bool:
+            try:
+                st, od = float(x.stake or 0), float(x.odds)
+            except (TypeError, ValueError):
+                return True
+            return not (0 < st < float("inf") and 1.0 < od < float("inf"))
+        _nba_unsized = any(_unusable(x) for x in placed_results)
+        if unfilled >= AFL_FANOUT_MIN_STAKE and not ambiguous_results and not _nba_unsized:
+            try:
+                _sess_by_sid = {str(s.get("session_id", "")): s for s in sessions}
+                _full = [str(r.session_id) for r in placed_results
+                         if not _nba_short(r) and str(r.session_id) not in _nba_hit]
+                _NBA_SPILL_RNG.shuffle(_full)
+                _tried = {str(getattr(r, "session_id", "") or "") for r in results}
+                _fresh = [sid for sid in _sess_by_sid if sid not in _tried and sid not in _nba_hit]
+                _NBA_SPILL_RNG.shuffle(_fresh)
+                _nb_market = (getattr(tip, "_nba_row", None) or {}).get("market", "")
+                _mx = _nba_max_odds(tip)
+                _es3 = getattr(tip, "_nba_earliest_epoch", None)
+                for _sid in _full + _fresh:
+                    if unfilled < AFL_FANOUT_MIN_STAKE or ambiguous_results:
+                        break
+                    if _es3 is not None and nba_core.too_late(time.time(), _es3):
+                        log.warning(f"[nba_model] spill: inside the minimum lead before tip-off, "
+                                    f"${unfilled:.2f} left for the retry")
+                        break
+                    _sx = _sess_by_sid.get(_sid)
+                    _res = resolved_by_bookie.get(((_sx or {}).get("bookie", "") or "").lower())
+                    if _sx is None or _res is None or _session_stalled(_sid):
+                        continue
+                    try:
+                        _lo3 = float(_res.get("live_odds") or 0) or float(tipped_odds or 0)
+                    except (TypeError, ValueError):
+                        _lo3 = float(tipped_odds or 0)
+                    _mine = float((getattr(tip, "_nba_asks", None) or {}).get(_sid, 0.0)) + sum(
+                        st for s2, st in tip._nba_spill_asks if s2 == _sid)
+                    _used3 = float(_nba_used.get(_sid, 0.0)) + _mine * max(0.0, _mx - 1.0)
+                    if nba_core.is_capped(_nb_market, _lo3, _mx, _used3, min_stake=AFL_FANOUT_MIN_STAKE):
+                        continue
+                    _steps3 = nba_core.ladder_stake_steps(_nb_market, _lo3, unfilled, max_odds=_mx,
+                                                          used_liability=_used3)
+                    _lad3: list = []
+                    for _x in _steps3:
+                        _x = round(min(float(_x or 0), unfilled), 2)
+                        if _x >= AFL_FANOUT_MIN_STAKE and (not _lad3 or _lad3[-1] != _x):
+                            _lad3.append(_x)
+                    if not _lad3:
+                        continue
+                    _intent = (list((getattr(tip, "_nba_asks", None) or {}).items())
+                               + list(tip._nba_spill_asks) + [(_sid, _lad3[0])])
+                    if not nba_core.note_intent(getattr(tip, "_nba_row", None) or {}, _intent, _mx):
+                        log.error(f"[nba_model] spill: could not record the intent for {_sid}: "
+                                  f"not sending (${unfilled:.2f} left for the retry)")
+                        break
+                    tip._nba_spill_asks.append((_sid, _lad3[0]))
+                    log.info(f"[nba_model] spill: ${unfilled:.2f} unfilled -> {_sid} ladder {_lad3}")
+                    try:
+                        _r3 = _fanout_place_account(tip, _sx, _lad3, _res)
+                    except Exception as e:
+                        _r3 = BetResult(success=False, tip=tip, session_id=_sid,
+                                        bookie=_sx.get("bookie", "unknown"), stake=_lad3[0],
+                                        error=f"NBA spill exception: {e}", timestamp=datetime.now())
+                        _r3.is_ambiguous = True
+                    try:
+                        _r3._nba_spill_ask = _lad3[0]
+                        if not getattr(_r3, "_requested_stake", None):
+                            _r3._requested_stake = _lad3[0]
+                    except Exception:
+                        pass
+                    results.append(_r3)
+                    if _r3.success:
+                        placed_results.append(_r3)
+                    elif _is_ambiguous_result(_r3):
+                        ambiguous_results.append(_r3)
+                    else:
+                        failed_results.append(_r3)
+                    if _nba_short(_r3) and _nba_sel_key:
+                        _NBA_CAPPED_SIDS.setdefault(_nba_sel_key, set()).add(_sid)
+                    total_placed = round(sum(x.stake or 0 for x in placed_results), 2)
+                    ambiguous_total = round(sum(_at_risk_stake(x) for x in ambiguous_results), 2)
+                    unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
+            except Exception as _spill_e:
+                # the base bets are already on the book: never lose them to a spill error
+                log.error(f"[nba_model] spill aborted ({type(_spill_e).__name__}: {_spill_e}); "
+                          f"keeping what was placed")
+                total_placed = round(sum(x.stake or 0 for x in placed_results), 2)
+                ambiguous_total = round(sum(_at_risk_stake(x) for x in ambiguous_results), 2)
+                unfilled = round(max(0.0, intended_stake - total_placed - ambiguous_total), 2)
 
     # Displayed "intended" is the true unit, so the summary reads "placed $X of
     # $UNIT" + "Unfilled $Y" honestly (no longer lowered to what landed).
@@ -15413,6 +15926,12 @@ def _resolve_single_for_placement(
 
 
 _GAME_LINE_RNG = random.Random()   # v6.75 random account for game lines (tests patch it)
+# v6.106 NBA model spill-over: random receiver order (tests patch it), and the accounts that
+# have already hit Sportsbet's max (538) on a selection in this process, so a retry for that
+# selection leaves them out. In memory only: a restart forgets it (the retry then tries the
+# account once more and the 538 records it again).
+_NBA_SPILL_RNG = random.Random()
+_NBA_CAPPED_SIDS: dict = {}
 # v6.80: AFL leg markets that are GAME LINES for the random-account rule.
 _AFL_GAME_LINE_MARKETS = frozenset({"h2h", "line", "total", "total_points", "first_half_line",
                                     "first_half_h2h", "first_half_total", "handicap", "margin",
@@ -15670,12 +16189,70 @@ def _execute_bet_inner(
     # SB_SLOW_538_REBET_MAX_SEC; only slower than that is it treated as maybe-landed.
     _rebet_window = max(STAKE_REJECT_LATENCY_THRESHOLD_SEC, float(SB_SLOW_538_REBET_MAX_SEC or 0))
     if _mx_target is not None and _elapsed >= _rebet_window:
-        log.warning(
-            f"MAX-STAKE REBET SKIPPED: {bookie}:{sid} stake-too-high on ${stake:.2f} "
-            f"came back SLOW ({_elapsed:.1f}s >= {_rebet_window}s) "
-            f"— treating as maybe-landed (Erasmus guard), NOT rebetting"
-        )
-        _mx_target = None
+        # v6.116 (Wilson 2026-10-24: "yes rebet at the stated max"): before giving up on a slow
+        # 538, ask /api/pending_bets. On the account -> it landed (record it). PROVEN absent ->
+        # the one rebet at the max below, on this same account (never another account). Anything
+        # uncertain -> maybe landed, exactly as before (the Erasmus guard).
+        _slow_act, _slow_rec = "conservative", {}
+        _slow_unsure = (bool(resp.get("cid_unresolved"))
+                        or str(resp.get("outcome_code") or "").lower() in ("placement_uncertain",
+                                                                           "placement_unknown"))
+        if SB_SLOW_538_RECONCILE_REBET and not _slow_unsure:
+            try:
+                import reconcile as _rc
+                _slow_rec = _rc.decide_ambiguous(
+                    hb, session.get("account_id"),
+                    # the event exactly as POSTed (review: a verified/renamed fixture differs from
+                    # tip.event, and a landed bet under the posted name must not read as absent)
+                    event=event_for_hb, stake=stake,
+                    sport=tip.sport, selection=(selection or leg.selection or player or ""),
+                    submit_ts=_t_place_start, reconcile_enabled=RECONCILE_AMBIGUOUS,
+                    spill_enabled=False) or {}
+                _slow_act = _slow_rec.get("action") or "conservative"
+            except Exception as e:
+                log.error(f"slow-538 reconcile on {bookie}:{sid} raised ({e}): maybe landed")
+                _slow_act = "conservative"
+        if _slow_act == "placed":
+            _m = _slow_rec.get("match") or {}
+            try:
+                _act_stake = min(float(_slow_rec.get("actual_stake") or stake), float(stake))
+            except (TypeError, ValueError):
+                _act_stake = stake
+            log.warning(
+                f"SLOW 538 RECONCILED LANDED: {bookie}:{sid} ${_act_stake:.2f} is on the account "
+                f"(bet_id={_m.get('bookie_bet_id') or _m.get('id')}): recording it, no rebet")
+            _afl_log_event(
+                tip,
+                f"PLACED (reconciled slow 538) bookie={bookie} sid={sid} "
+                f"bet_id={_m.get('bookie_bet_id') or _m.get('id')} odds={_m.get('odds')} "
+                f"stake=${_act_stake:.2f}",
+            )
+            return BetResult(
+                success=True, tip=tip, session_id=sid, bookie=bookie,
+                bet_id=_m.get("bookie_bet_id") or _m.get("id"),
+                odds=_m.get("odds") or resp.get("odds") or target_odds,
+                stake=_act_stake, timestamp=datetime.now(),
+                placed_leg_summary=_format_tip_placement_summary(tip),
+                placed_market=market, placed_player=player, placed_stat=stat,
+                placed_line=line, placed_selection=selection,
+                elapsed_sec=_elapsed, correlation_id=resp.get("correlation_id"),
+            )
+        _nba_late = bool(getattr(tip, "tipster", "") == NBA_MODEL_TIPSTER and nba_core is not None
+                         and getattr(tip, "_nba_earliest_epoch", None) is not None
+                         and nba_core.too_late(time.time(), tip._nba_earliest_epoch))
+        if _slow_act == "not_placed" and not _nba_late:
+            log.warning(
+                f"SLOW 538 PROVEN NOT PLACED: {bookie}:{sid} ${stake:.2f} ({_elapsed:.1f}s) is not "
+                f"on the account: rebetting ONCE at the stated max")
+        else:
+            log.warning(
+                f"MAX-STAKE REBET SKIPPED: {bookie}:{sid} stake-too-high on ${stake:.2f} "
+                f"came back SLOW ({_elapsed:.1f}s >= {_rebet_window}s): "
+                f"treating as maybe-landed (Erasmus guard), NOT rebetting"
+                f" [reconcile: {_slow_act}{'; inside the NBA minimum lead' if _nba_late else ''}"
+                f"{': ' + str(_slow_rec.get('reason')) if _slow_rec.get('reason') else ''}]"
+            )
+            _mx_target = None
     if _mx_target is not None:
         log.info(
             f"MAX-STAKE REBET: {bookie}:{sid} stake-too-high on ${stake:.2f} "
@@ -15699,6 +16276,11 @@ def _execute_bet_inner(
             line=line,
             target_odds=target_odds,
             proposition_id=_resolved_prop_id,
+            # v6.116 (review): the same side and price ceiling as the original POST. The
+            # rebet can now come ~30 s later (after a reconcile), so it must not take a
+            # drifted price the first bet would have refused.
+            direction=_direction,
+            max_odds=_max_odds,
             period=_period,
         )
         _elapsed = _net_elapsed(_t_place_start)
@@ -16084,6 +16666,9 @@ async def _process_tip(text: str, tipster: str, sport: str,
     # LAST so it operates on the final tip list and produces a clean SGM with
     # no alt fallback (Wilson 2026-06-01: bet only the actual HRRBI play). Only
     # the 2+ HRRBI line is transformed; other MLB tips stay singles -> manual.
+    tips = _gate_shook_sports(tips)
+    if not tips:
+        return 0
     tips = _mlb_hrrbi_to_sgm(tips)
 
     # Force-bookie tipsters (EasyMoneyAFL = sportsbet): stamp suggested_bookie so
@@ -17076,12 +17661,12 @@ async def _route_image_racing_tips(raw_tips: list, tipster: str,
                 pass
 
     if _racing_resent:
+        # v6.97 (Wilson: no info-only MANUAL alerts): info chat, not the MANUAL chat.
         try:
-            notifier.notify_text_manual_alert(
-                channel_name,
-                f"{len(_racing_resent)} tip(s) in this post were already sent earlier and "
-                f"were NOT placed again:\n" + "\n".join(_racing_resent),
-                header="RESENT TIPS, ignored")
+            notifier.notify_info(_cap_note(
+                f"RESENT TIPS, ignored ({channel_name}): {len(_racing_resent)} tip(s) in this "
+                f"post were already sent earlier and were NOT placed again:\n"
+                + "\n".join(_racing_resent)))
         except Exception as e:
             log.error(f"[{channel_name}] resent-tips note failed: {e}")
 
@@ -18126,12 +18711,11 @@ async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
                 pass
 
     if _resent_img:
+        # v6.97 (Wilson: no info-only MANUAL alerts): info chat, not the MANUAL chat.
         try:
-            notifier.notify_text_manual_alert(
-                channel_name,
-                f"{len(_resent_img)} bet(s) in this image were already sent earlier and were "
-                f"NOT placed again:\n" + "\n".join(_resent_img),
-                header="RESENT BETS, ignored")
+            notifier.notify_info(_cap_note(
+                f"RESENT BETS, ignored ({channel_name}): {len(_resent_img)} bet(s) in this image "
+                f"were already sent earlier and were NOT placed again:\n" + "\n".join(_resent_img)))
         except Exception as e:
             log.error(f"[{channel_name}] resent-bets note failed: {e}")
 
@@ -20094,8 +20678,12 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
     })
 
     for r in placed_results:
+        # v6.101: the PLACED line too (a nearest-rung / tolerance placement used to log
+        # only the tipped line in bet_label, e.g. Kincaid tipped 49.5 placed 50.5)
+        _pl = getattr(r, "placed_line", None)
         log.warning(f"[{channel_name}] {_S} AUTO-PLACED: {bet_label} @ {r.odds} "
-                    f"${r.stake} on {r.bookie}:{r.session_id} (bet_id={r.bet_id})")
+                    f"${r.stake} on {r.bookie}:{r.session_id} (bet_id={r.bet_id})"
+                    + (f" placed_line={_pl}" if _pl is not None else ""))
     log.info(f"[{channel_name}] {_S} fan-out: placed ${total_placed:.2f} of "
              f"${display_intended:.2f} across {len(placed_results)}/{_n_accts} "
              f"account(s) ({len(failed_results)} failed, {len(ambiguous_results)} "
@@ -21817,6 +22405,30 @@ def _nbl_save_image(img: bytes, msg_id) -> str:
         return ""
 
 
+def _save_tip_image(img: bytes, tipster: str, msg_id) -> str:
+    """v6.101 (Wilson 2026-10-21, Haiku parse audit): audit copy of every image tip
+    (Zak / Trial racing, Eddie, 4th&EV) at logs/tip_images/<UTC>_<tipster>_<msg id>.<ext>,
+    like the NBL betslips, so a parse can be checked against the picture later (the audit
+    could not verify 26 racing parses or two 4th&EV posts). Returns the path or "".
+    NEVER raises (a full disk must not cost a bet)."""
+    try:
+        import tempfile
+        from groq_parser import _image_mime
+        ext = {"image/png": "png", "image/webp": "webp"}.get(_image_mime(img), "jpg")
+        d = Path(LOG_DIR) / "tip_images"
+        if os.getenv("TIPBOT_TESTING") and Path(LOG_DIR).resolve() == _NBL_IMG_REAL_LOG_DIR:
+            d = Path(tempfile.gettempdir()) / "tipbot_test_tip_images"
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(_dt_timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        safe = re.sub(r"[^A-Za-z0-9_-]", "", str(tipster or "tip"))[:40] or "tip"
+        p = d / f"{stamp}_{safe}_{msg_id}.{ext}"
+        p.write_bytes(img)
+        return str(p)
+    except Exception as e:
+        log.warning(f"tip image: audit copy not saved: {e}")
+        return ""
+
+
 def _nbl_image_parse(image_bytes: bytes):
     """Vision-parse one betslip screenshot (blocking; run in an executor). Claude only,
     with the same model the other image parses use (CLAUDE_FALLBACK_MODEL). RAISES on a
@@ -22796,6 +23408,43 @@ def _nfl_post_mentions_multi(text: str) -> bool:
     return bool(_NFL_MULTI_WORD_RE.search(text or ""))
 
 
+def _nfl_split_multis(raw_tips: list, text: str, channel_name: str = ""):
+    """v6.79 split of a 4th&EV post's parsed legs into ({group: [legs]} multis, [singles]).
+    Lifted out of the text processor in v6.99 so the whole backstop is testable; the
+    behaviour is unchanged. A multi leg is never placed as a single, whether the parser
+    set `multi` or not (Haiku 5.5 missed it on both parlays it saw, 11 and 18 Oct)."""
+    _multi_blocks = _nfl_multi_blocks(text)
+    _multis: dict = {}
+    _singles = []
+    for raw in raw_tips:
+        grp = _nfl_multi_group(raw, _multi_blocks)
+        if grp is not None:
+            _multis.setdefault(grp, []).append(raw)
+        else:
+            _singles.append(raw)
+    # A post that mentions a parlay / multi / SGM but where fewer than 2 legs could be tied to
+    # it is never guessed: every leg of the post goes to manual (a missed leg would otherwise
+    # be placed as a single at the multi's price).
+    _tied = sum(len(v) for v in _multis.values())
+    _stated = [int(x) for x in re.findall(r"\b(\d+)\s*[- ]?\s*legs?\b", text or "", re.I)]
+    if _nfl_post_mentions_multi(text) and (_tied < 2 or (_stated and _tied not in _stated)):
+        log.warning(f"[{channel_name}] 4th&EV NFL post mentions a multi but its legs could not "
+                    f"be identified ({_tied} tied, stated {_stated or 'none'}) -> the WHOLE "
+                    f"post to manual")
+        _multis = {"post": list(raw_tips)}
+        _singles = []
+    elif _nfl_post_mentions_multi(text):
+        # A TEAM leg (h2h / line / total ...) left untied in a post with a multi could be one
+        # of its legs: never placed as a single. Player-prop singles in the post still place.
+        _team_mts = ("h2h", "spread", "total", "team_total", "margin")
+        _loose = [r for r in _singles
+                  if (r.get("market_type") or "").strip().lower() in _team_mts]
+        if _loose:
+            _multis.setdefault(next(iter(_multis)), []).extend(_loose)
+            _singles = [r for r in _singles if r not in _loose]
+    return _multis, _singles
+
+
 def _nfl_multi_group(raw: dict, multi_blocks: list):
     """The multi this parsed leg belongs to, or None for a single. The parser's own flag
     counts; so does the leg's player (props) or team (team markets) appearing in a multi block,
@@ -22928,6 +23577,11 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
         # UNCONDITIONAL manual alert; dropping to a log-only line here
         # would silently regress that guarantee for a message someone
         # already decided was worth surfacing.
+        if not _looks_like_bet_post(text):
+            # v6.97: a recap / results / chatter post with no bet signal is info, not a bet.
+            log.info(f"[{channel_name}] 4th&EV NFL text parsed to 0 tips and has no bet "
+                     f"signal (recap/chatter) -> no manual alert: {text[:80]}")
+            return
         log.warning(f"[{channel_name}] 4th&EV NFL text classified actionable but parsed "
                     f"to 0 tips -> manual (review the classification): {text[:80]}")
         try:
@@ -22947,35 +23601,7 @@ async def _route_fourthandev_nfl_text(text: str, tipster: str, channel_name: str
     # kept them off the book. A multi leg is NEVER auto-placed: one grouped manual alert per
     # multi. Flagged by the parser (`multi`) AND, as a backstop, by the post's own
     # parlay/multi/SGM block naming the leg's team or player.
-    _multi_blocks = _nfl_multi_blocks(text)
-    _multis: dict = {}
-    _singles = []
-    for raw in raw_tips:
-        grp = _nfl_multi_group(raw, _multi_blocks)
-        if grp is not None:
-            _multis.setdefault(grp, []).append(raw)
-        else:
-            _singles.append(raw)
-    # A post that mentions a parlay / multi / SGM but where fewer than 2 legs could be tied to
-    # it is never guessed: every leg of the post goes to manual (a missed leg would otherwise
-    # be placed as a single at the multi's price).
-    _tied = sum(len(v) for v in _multis.values())
-    _stated = [int(x) for x in re.findall(r"\b(\d+)\s*[- ]?\s*legs?\b", text or "", re.I)]
-    if _nfl_post_mentions_multi(text) and (_tied < 2 or (_stated and _tied not in _stated)):
-        log.warning(f"[{channel_name}] 4th&EV NFL post mentions a multi but its legs could not "
-                    f"be identified ({_tied} tied, stated {_stated or 'none'}) -> the WHOLE "
-                    f"post to manual")
-        _multis = {"post": list(raw_tips)}
-        _singles = []
-    elif _nfl_post_mentions_multi(text):
-        # A TEAM leg (h2h / line / total ...) left untied in a post with a multi could be one
-        # of its legs: never placed as a single. Player-prop singles in the post still place.
-        _team_mts = ("h2h", "spread", "total", "team_total", "margin")
-        _loose = [r for r in _singles
-                  if (r.get("market_type") or "").strip().lower() in _team_mts]
-        if _loose:
-            _multis.setdefault(next(iter(_multis)), []).extend(_loose)
-            _singles = [r for r in _singles if r not in _loose]
+    _multis, _singles = _nfl_split_multis(raw_tips, text, channel_name)
     for grp, legs in _multis.items():
         try:
             descs = []
@@ -24169,13 +24795,53 @@ async def _place_one_nba_row(row: dict, msg_time, channel_name: str):
             return
 
         # 4. PLAYER IDENTITY. Roster-exact (no fuzzy) and on the team the message names.
+        #    v6.105: a player missing from the roster (rookie, new signing) or on another team
+        #    (trade) gets ONE throttled refresh from NBA.com and one more exact lookup, off the
+        #    event loop. Still a refusal if he does not resolve after it.
         player_roster, team_roster, why = nba_core.resolve_player(row["player"], row["team"])
+        refresh_status = ""
+        if why and any(m in why for m in nba_core._REFRESHABLE):
+            player_roster, team_roster, why, refresh_status = await _run_in_placement_executor(
+                nba_core.resolve_player_refreshing, row["player"], row["team"])
+            log.info(f"[{channel_name}] {key}: NBA roster refresh {refresh_status} -> "
+                     f"{'resolved ' + player_roster + ' / ' + team_roster if not why else 'still refused'}")
+            if nba_core.key_state(key) != nba_core.UNSEEN:
+                # a copy of this key claimed it while we waited (its record stands), or the
+                # ledger cannot be read now: write nothing, as the top gate does (review)
+                log.warning(f"[{channel_name}] {key}: claimed by another copy or ledger "
+                            f"unreadable after the roster refresh, dropped (no record)")
+                return
         if why:
             log.warning(f"[{channel_name}] {key}: {why}")
-            _fill_nothing("refused")
-            notifier.notify_critical(
-                f"⚠️ NBA model refused {row['player']} ({row['team']}): {why}\n\n"
-                f"{key}\nNothing placed.")
+            # v6.108 (roster audit): a miss where the refresh did NOT run to completion (throttled
+            # within 10 minutes of another attempt, failed or partial and kept, or busy) says
+            # nothing about whether NBA.com lists him. That is a retryable "none", not a final
+            # refusal, so the model's next offer gets a fresh lookup (a rookie NBA.com lists a
+            # few minutes after the last attempt was refused for good).
+            import roster as _roster_mod
+            _last = (_roster_mod.last_nba_refresh_status()
+                     if refresh_status == "throttled" else refresh_status)
+            # "throttled" counts as incomplete only when the attempt it stands for did not
+            # complete (review): after a completed refresh the miss is final.
+            _retryable_miss = refresh_status in ("kept", "busy") or (
+                refresh_status == "throttled" and _last != "refreshed")
+            _fill_nothing("none" if _retryable_miss else "refused")
+            _refresh_note = {
+                "refreshed": "The roster was refreshed from NBA.com and he is still not on it.",
+                "kept": "Refreshing the roster from NBA.com failed or looked partial; the saved roster was kept.",
+                "busy": "Another roster refresh from NBA.com was still running; the saved roster was used.",
+            }.get(_last, "")
+            if _refresh_note and refresh_status == "throttled":
+                _refresh_note = "(Last attempt, under 10 minutes ago.) " + _refresh_note
+            _alert = (f"⚠️ NBA model refused {row['player']} ({row['team']}): {why}\n\n"
+                      + (f"{_refresh_note}\n\n" if _refresh_note else "")
+                      + f"{key}\nNothing placed.")
+            if _retryable_miss and int(row.get("attempt") or 0) >= 1:
+                # the model retries this key up to 4 times; the first miss already paged
+                notifier.notify_info(_alert.replace("refused", "could not place", 1)
+                                     + "\n(A retry; the model may offer it again.)")
+            else:
+                notifier.notify_critical(_alert)
             return
 
         # 5. FIXTURE, pinned by both clubs and the exact tip-off. No opponent guessing.
@@ -24258,9 +24924,9 @@ async def _place_one_nba_row(row: dict, msg_time, channel_name: str):
         tip._nba_sel_id = sel_id
         tip._nba_start_epoch = start_utc.timestamp()
         tip._nba_earliest_epoch = earliest
-        # Gate against the price the selection was FIRST posted at, not a retry's re-posted
-        # quote (see nba_core.claim): drives the worse-than-posted gate, the 1.25x ceiling
-        # and the floor sent to HyperBot.
+        # A base is gated against the price the selection was FIRST posted at; a retry (v6.109)
+        # against its own re-posted quote (see nba_core.reference_price): drives the
+        # worse-than-posted gate, the 1.25x ceiling and the floor sent to HyperBot.
         tip.suggested_odds = nba_core.reference_price(row)
     except BaseException:
         # Nothing was sent anywhere: release the reservation (a leak would block the
@@ -24290,6 +24956,7 @@ async def _place_one_nba_row(row: dict, msg_time, channel_name: str):
     event_name = getattr(tip, "event", "") or ""
     tip._attempted_stake = 0.0          # the fan-out sets these once it actually sends
     tip._nba_asks = {}
+    tip._nba_spill_asks = []            # v6.106: [(session_id, top rung)] of the spill bets
 
     def _commit_blocking(p, a, m, conf, amb_acc, outcome_, requested_):
         """The ledger commit, which must NEVER stop the fills record from being written: a
@@ -24358,14 +25025,28 @@ async def _place_one_nba_row(row: dict, msg_time, channel_name: str):
     asks = dict(getattr(tip, "_nba_asks", {}) or {})
     if asks:
         unsent = set()
+        spill_sent = 0.0
         for r in results:
             sid = str(getattr(r, "session_id", "") or "")
-            if (not getattr(r, "success", False) and sid in asks
-                    and not _is_ambiguous_result(r)
-                    and _is_definitely_pre_placement(getattr(r, "error", "") or "")
+            _never_sent = (not getattr(r, "success", False) and not _is_ambiguous_result(r)
+                           and _is_definitely_pre_placement(getattr(r, "error", "") or ""))
+            _sp = getattr(r, "_nba_spill_ask", None)
+            if _sp is not None:
+                # v6.106: a spill bet's own ask (kept apart, so it is never mistaken for that
+                # account's base ask)
+                if not (_never_sent and abs(float(getattr(r, "_requested_stake", 0) or 0)
+                                            - float(_sp)) < 0.005):
+                    spill_sent += float(_sp)
+                continue
+            if (_never_sent and sid in asks
                     and abs(float(getattr(r, "_requested_stake", 0) or 0) - asks[sid]) < 0.005):
                 unsent.add(sid)
         attempted = round(sum(v for sid, v in asks.items() if sid not in unsent), 2)
+        if spill_sent:
+            # A spill re-asks a shortfall the base asks already hold, so base + spill can pass
+            # the message stake: capped there, so a fully placed stake reads unfilled 0 and a
+            # spill that came up short reads the real remainder (review F1).
+            attempted = round(min(float(requested), attempted + spill_sent), 2)
     else:
         attempted = float(getattr(tip, "_attempted_stake", 0.0) or 0.0)
     asked = 0.0 if capped else round(max(attempted, placed + ambiguous), 2)
@@ -24381,6 +25062,512 @@ async def _place_one_nba_row(row: dict, msg_time, channel_name: str):
     log.info(f"[{channel_name}] NBAModel {key}: outcome={outcome} "
              f"placed=${placed:.2f}/{requested:.2f} ambiguous=${ambiguous:.2f} "
              f"selection_committed=${(committed or 0.0):.2f}")
+
+
+# ── v6.112 Just Bleed MMA ($1-per-unit TEST bets, OFF unless MMA_ENABLED) ──────────────────────
+# One bet per tip on the ONE exact catalog row, at Sportsbet (MMA_SESSION_PRIORITY's Sportsbet
+# account) or bet365 (its bet365 account), whichever prices it higher: bet365 only when STRICTLY
+# better, a tie goes to Sportsbet, never both. The parser (parsers/mma_bleed.py) and every
+# market decision (mma_sports.py) are pure; this is the I/O. FAIL CLOSED: anything that is not
+# provably one exact market on a book, any missing guard input, any crash, is a manual alert.
+MMA_TIPSTER = "justbleed_mma"
+_MMA_CAP_KEY = {"ml": "h2h", "method": "method", "round": "round", "method_round": "method_round",
+                "distance": "distance", "total_rounds": "total_rounds"}
+_MMA_KIND_WORDS = {
+    "ml": "moneyline", "method": "method of victory", "round": "round betting",
+    "method_round": "method + round", "distance": "go the distance", "total_rounds": "total rounds",
+}
+_MMA_METHOD_WORDS = {"ko": "KO/TKO", "sub": "submission", "dec": "decision"}
+
+
+def _mma_now() -> float:
+    return time.time()
+
+
+def _mma_to_epoch(v):
+    """HyperBot's start_time_iso is an epoch float; tolerate an ISO string. None if unreadable."""
+    if v in (None, ""):
+        return None
+    try:
+        f = float(v)
+        return f if f > 0 else None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _mma_accounts() -> dict:
+    """{"sportsbet": session_id, "bet365": session_id} from MMA_SESSION_PRIORITY and
+    sessions.yaml: the FIRST listed session of each book. A session not in the list never takes
+    an MMA bet; an empty list means no account at all."""
+    out: dict = {}
+    for sid in session_priority.get_priority_for("mma"):
+        meta = session_priority.get_session_meta(str(sid))
+        book = (getattr(meta, "bookmaker", "") or "").lower()
+        if book in mma_sports.BOOKS and book not in out:
+            out[book] = str(sid)
+    return out
+
+
+def _mma_label(tip, fight, idx) -> str:
+    """What the bet is, in words, for the ledger and the alerts."""
+    who = fight.names()[idx] if idx in (0, 1) else ""
+    m = _MMA_METHOD_WORDS.get(tip.method, tip.method)
+    if tip.kind == "ml":
+        return who
+    if tip.kind == "method":
+        return f"{who} by {m}"
+    if tip.kind == "round":
+        return f"{who} wins in round {tip.round}"
+    if tip.kind == "method_round":
+        return f"{who} by {m} in round {tip.round}"
+    if tip.kind == "distance":
+        return f"{fight.label()} {'does not go' if tip.side == 'not' else 'goes'} the distance"
+    if tip.kind == "total_rounds":
+        return f"{fight.label()} {tip.side} rounds"
+    return tip.selection
+
+
+def _mma_read(tip, fight, idx, stake: float) -> str:
+    """One alert block: the line as posted, then what it was read as and the stake."""
+    head = tip.describe()
+    parts = [f"read: {_MMA_KIND_WORDS.get(tip.kind, 'not an auto-placed market')}"]
+    if fight is not None and tip.kind in _MMA_CAP_KEY:
+        parts.append(_mma_label(tip, fight, idx) + f" ({fight.label()})")
+    if tip.units is not None:
+        parts.append(f"{tip.units:g}u = ${stake:.2f}")
+    return head + "\n   " + " | ".join(parts)
+
+
+def _mma_cap_problem(sid: str, kind: str, stake: float, odds: float) -> str:
+    """"" when this account's sessions.yaml mma cap allows the bet, else why not. A cap that
+    is missing, zero or not a plain number REFUSES (the other sports read a missing cap as
+    unlimited; this path never does). The cap is LIABILITY: stake x (odds - 1)."""
+    key = _MMA_CAP_KEY[kind]
+    cap = session_priority.lookup_liability_cap(sid, "mma", key)
+    if cap is None:
+        return f"no mma.{key} cap for session {sid} in sessions.yaml (this path never treats a missing cap as unlimited)"
+    if isinstance(cap, (str, tuple)) or not isinstance(cap, (int, float)) or cap <= 0:
+        return f"session {sid} mma.{key} cap {cap!r} is not a positive number"
+    liability = round(stake * (odds - 1), 2)
+    if liability > cap:
+        return f"liability ${liability:.2f} (${stake:.2f} at {odds:g}) is over the ${cap:g} mma.{key} cap on session {sid}"
+    return ""
+
+
+def _mma_max_odds(sid: str, kind: str, stake: float, odds: float) -> float:
+    """The highest fill HyperBot may accept (sent as max_odds): 10% of slack above the checked
+    price so a tick UP between the catalog read and the fill is not refused, but never so high
+    that stake x (fill - 1) passes the sessions.yaml mma liability cap, and never below the
+    checked price (which already cleared the cap). Rounded DOWN to the cent."""
+    ceiling = odds * 1.10
+    cap = session_priority.lookup_liability_cap(sid, "mma", _MMA_CAP_KEY[kind])
+    if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0 and stake > 0:
+        ceiling = min(ceiling, 1.0 + cap / stake)
+    return max(odds, math.floor(ceiling * 100 + 1e-6) / 100)
+
+
+def _mma_catalog_blocking(book: str, sid: str, fight) -> dict:
+    """One book's catalog for one fight, proven to BE that fight. Sync (runs on the placement
+    pool). {"ok": True, "event", "markets", "start"} or {"ok": False, "why"}."""
+    whys = []
+    for cand in mma_sports.event_names(book, fight):
+        try:
+            pc = hb.price_check_sports(session_id=sid, sport="mma", event=cand)
+        except Exception as e:
+            whys.append(f"{cand!r}: {e}")
+            continue
+        if not isinstance(pc, dict) or pc.get("success") is False or not pc.get("markets"):
+            whys.append(f"{cand!r}: {str((pc or {}).get('error') or 'no markets')[:120]}")
+            continue
+        if not mma_sports.fight_in_catalog(pc["markets"], fight):
+            whys.append(f"{cand!r}: not provably {fight.label()} (no moneyline row names both fighters)")
+            continue
+        return {"ok": True, "event": cand, "markets": pc["markets"],
+                "start": _mma_to_epoch(pc.get("start_time_iso"))}
+    return {"ok": False, "why": "; ".join(whys) or "no event name tried"}
+
+
+def _mma_place_blocking(sid: str, event: str, pick, stake: float, target: float, max_odds=None):
+    t0 = time.time()
+    selection = pick.direction if (pick.market_class == "total_rounds" and pick.direction) else pick.selection
+    res = hb.place_single_sports_bet(
+        sid, "mma", event, market=mma_sports.hb_market(pick), selection=selection, stake=stake,
+        line=pick.line, target_odds=target, proposition_id=pick.proposition_id,
+        direction=pick.direction or None, max_odds=max_odds)
+    return res, time.time() - t0
+
+
+# What a bet365 / HyperBot answer proves was never submitted (b365_sports_test.PRE_PLACEMENT).
+_MMA_PRE_PLACEMENT = ("selection_not_carried", "market_not_carried", "command_fields_missing",
+                      "could not find event", "not carried", "requires a target_odds",
+                      "event_wrong_fixture", "daily placement cap reached")
+
+
+import hyperbot_client as _hyperbot_client_mod
+
+
+def _mma_clean_reject(res: dict, error: str) -> bool:
+    """True only when the answer PROVES nothing was submitted. Everything else that is not a
+    success is treated as maybe-placed (no retry, no other book)."""
+    if res.get("ambiguous") or res.get("cid_unresolved"):
+        return False
+    low = (error or "").lower()
+    return (_is_definitely_pre_placement(error) or any(p in low for p in _MMA_PRE_PLACEMENT)
+            or _hyperbot_client_mod._is_definite_4xx(low))
+
+
+def _mma_record_placed(tip, post_text, fight, idx, book, sid, event, pick, stake, res, elapsed, channel_name):
+    """Ledger + Telegram BET PLACED + audit for a landed bet. Never raises."""
+    try:
+        label = _mma_label(tip, fight, idx)
+        ptip = ParsedTip(
+            tipster=MMA_TIPSTER, sport="mma", is_sgm=False,
+            legs=[ParsedLeg(market="h2h" if pick.market_class == "ml" else pick.market_key,
+                            selection=label, line=pick.line or 0.0, raw_text=tip.selection)],
+            units=float(tip.units), unit_size=float(stake / tip.units) if tip.units else 0.0,
+            raw_message=post_text, event=event, suggested_bookie=",".join(tip.bookies),
+            suggested_odds=float(tip.price or 0.0))
+        try:
+            got_stake = float(res.get("stake")) if res.get("stake") else stake
+        except (TypeError, ValueError):
+            got_stake = stake
+        try:
+            got_odds = float(res.get("odds")) if res.get("odds") else pick.odds
+        except (TypeError, ValueError):
+            got_odds = pick.odds
+        result = BetResult(
+            success=True, tip=ptip, session_id=sid, bookie=book,
+            bet_id=str(res.get("bet_id") or res.get("client_bet_id") or ""), odds=got_odds,
+            stake=got_stake, timestamp=datetime.now(), placed_market=ptip.legs[0].market,
+            placed_selection=label, placed_line=pick.line if pick.line is not None else "",
+            correlation_id=res.get("client_bet_id"))
+        result.elapsed_sec = elapsed
+        notifier.notify_bet_placed(result)
+        _log_jsonl(_audit_log_path(), {
+            "type": "tip_outcome", "tipster": MMA_TIPSTER, "event": event,
+            "intended_stake": round(stake, 2), "placed_stake": round(got_stake, 2),
+            "unfilled_stake": round(stake - got_stake, 2),
+            "placements": [{"session_id": sid, "bookie": book, "stake": got_stake,
+                            "fill_odds": got_odds, "bet_id": result.bet_id}],
+            "failures": [], "mma": {"selection": tip.selection, "label": label, "market": pick.market_key,
+                                    "proposition_id": pick.proposition_id, "posted_price": tip.price}})
+    except Exception as e:
+        log.exception(f"[{channel_name}] MMA: bet LANDED but recording it failed: {e}")
+        try:
+            notifier.notify_critical(f"MMA bet landed on {book} {sid} but the ledger/alert step crashed: "
+                                     f"{tip.selection} ${stake:.2f}. Record it by hand. {e}")
+        except Exception:
+            pass
+
+
+def _mma_startup_notice() -> str:
+    """Log (and for a refused config, page) the MMA state at startup. Returns "on", "off" or
+    "refused". MMA_ENABLED=true with a bad MMA_* config leaves MMA OFF (config.py fails closed),
+    and that must be loud: the channel is NOT monitored."""
+    import config as _cmma
+    if _cmma.MMA_ENABLED_REQUESTED and not _cmma.MMA_ENABLED:
+        errs = "; ".join(_cmma.MMA_CONFIG_ERRORS) or "unknown config error"
+        log.error(f"[mma] MMA_ENABLED=true but the config is bad, so MMA is DISABLED and the Just Bleed "
+                  f"channel is NOT monitored: {errs}")
+        try:
+            notifier.notify_critical(
+                f"MMA is NOT monitored: MMA_ENABLED=true but the MMA config is bad ({errs}). Fix .env and "
+                f"restart; UFC tips from Just Bleed will not be read or placed until then.")
+        except Exception:
+            pass
+        return "refused"
+    if _cmma.MMA_ENABLED and mma_sports is not None:
+        log.warning(f"[mma] Just Bleed MMA is ENABLED: ${_cmma.MMA_UNIT_SIZE:g}/unit, max "
+                    f"{_cmma.MMA_MAX_UNITS:g}u, accounts {_mma_accounts() or 'NONE (set MMA_SESSION_PRIORITY)'}")
+        return "on"
+    log.info("[mma] MMA_ENABLED=false: the Just Bleed MMA channel is not monitored")
+    return "off"
+
+
+_MMA_INFLIGHT: set = set()      # seen_bets keys held by a tip that is still being processed
+
+
+async def _mma_handle_tip(tip, post, post_text, fights, catalogs, channel_name, ctx):
+    """_mma_handle_tip_inner, releasing the in-flight holds however it ends (a mark that
+    outlives the call is the seen_bets entry; the in-flight set only tells a concurrent post
+    apart from an old one)."""
+    held: list = []
+    try:
+        return await _mma_handle_tip_inner(tip, post, post_text, fights, catalogs, channel_name, ctx, held)
+    finally:
+        for k in held:
+            _MMA_INFLIGHT.discard(k)
+
+
+async def _mma_handle_tip_inner(tip, post, post_text, fights, catalogs, channel_name, ctx, held):
+    """One tip. Returns ("placed"|"ignored"|"alert", reason). Every path that is not "placed" or
+    a quiet "ignored" ends up in the post's one manual alert, with `reason`."""
+    import config as _c
+    unit = float(_c.MMA_UNIT_SIZE)
+    stake = mma_sports.stake_dollars(tip.units, unit) if tip.units is not None else 0.0
+    ttl = float(_c.MMA_SEEN_TTL_SEC)
+
+    # Marks made by THIS call. They stay only when the outcome is FINAL (a bet placed or maybe
+    # placed, a duplicate, an unreadable line); a refusal that depends on config, an outage or the
+    # card changing releases them, so a re-post after the fix is read again, not ignored.
+    marks: list = []
+
+    def refuse(reason):
+        for k in marks:
+            seen_bets.unmark(k)
+        return "alert", reason
+
+    # 1. RESEND GUARD (seen_bets, survives a restart): the same line of the same card again.
+    rkey = mma_sports.resend_key(post.card, tip)
+    try:
+        # STRICT: this path fails closed. If the registry cannot tell new from seen, nothing is placed.
+        prev = seen_bets.check_and_mark_strict(rkey, ttl, tip.selection)
+    except seen_bets.Unavailable as e:
+        log.error(f"[{channel_name}] MMA resend guard unavailable: {e}")
+        return refuse(f"the resend guard (seen_bets) is unavailable ({e}), so nothing was placed: "
+                      f"it cannot tell a new bet from a repeat")
+    if prev:
+        if rkey in _MMA_INFLIGHT:
+            log.warning(f"[{channel_name}] MMA post held by a concurrent post, ignored: {tip.selection}")
+            return "ignored", f"{tip.selection} (held by a concurrent post, still being processed)"
+        log.warning(f"[{channel_name}] MMA RESENT, ignored (first seen {seen_bets.age_text(prev)} ago): "
+                    f"{tip.selection}")
+        return "ignored", f"{tip.selection} (first seen {seen_bets.age_text(prev)} ago)"
+    marks.append(rkey)
+    _MMA_INFLIGHT.add(rkey)
+    held.append(rkey)
+    # 2. Not exactly readable -> alert (parser reason). A final reading: stays marked.
+    if not tip.readable:
+        return "alert", tip.reason or "not readable"
+    # 3. Typo guard.
+    if tip.units > float(_c.MMA_MAX_UNITS):
+        return refuse(f"OVER MAX UNITS: {tip.units:g}u is over the {float(_c.MMA_MAX_UNITS):g}u limit "
+                      f"(nothing placed, check the line)")
+    if stake <= 0:
+        return refuse(f"stake ${stake:.2f} is not a bettable amount")
+    # 4. The fight.
+    if not fights:
+        return refuse("the fight list (ESPN) is unavailable, so the fight cannot be pinned")
+    idx = None
+    if tip.kind in _MMA_CAP_KEY and tip.kind not in ("distance", "total_rounds"):
+        fight, idx, why = mma_sports.match_fighter(tip.fighter, fights)
+    else:
+        fight, why = mma_sports.fight_for_names(tip.fighters, fights)
+    if fight is None:
+        return refuse(why)
+    ctx["fight"], ctx["idx"] = fight, idx
+    # 5. Same fighter, same market, same fight (any wording, any units): once.
+    dkey = mma_sports.dup_key(fight, tip, idx)
+    try:
+        dprev = seen_bets.check_and_mark_strict(dkey, ttl, _mma_label(tip, fight, idx))
+    except seen_bets.Unavailable as e:
+        log.error(f"[{channel_name}] MMA duplicate guard unavailable: {e}")
+        return refuse(f"the duplicate guard (seen_bets) is unavailable ({e}), so nothing was placed: "
+                      f"it cannot tell a new bet from a repeat")
+    if dprev:
+        if dkey in _MMA_INFLIGHT:
+            return "alert", (f"held by a concurrent post: the same bet on {fight.label()} is being processed "
+                             f"by another post right now, not placed twice (check it landed once)")
+        return "alert", (f"DUPLICATE: the same bet on {fight.label()} was already seen "
+                         f"{seen_bets.age_text(dprev)} ago, not placed again")
+    marks.append(dkey)
+    _MMA_INFLIGHT.add(dkey)
+    held.append(dkey)
+    # 6. Accounts and the clock (ESPN's card time; the book's own start is added below).
+    accounts = _mma_accounts()
+    if not accounts:
+        return refuse("no MMA account: MMA_SESSION_PRIORITY is empty or lists no Sportsbet/bet365 session")
+    min_lead, tol = float(_c.MMA_MIN_LEAD_SEC), float(_c.MMA_START_TOLERANCE_SEC)
+    late = mma_sports.timing_problem(_mma_now(), fight.start, None, min_lead, tol)
+    if late:
+        return refuse(late)
+
+    # 7. Both books' catalogs (read-only), once per fight per post.
+    loop_calls = []
+    for book, sid in accounts.items():
+        if (book, fight.key) not in catalogs:
+            loop_calls.append((book, sid))
+    if loop_calls:
+        got = await asyncio.gather(*[
+            _run_in_placement_executor(_mma_catalog_blocking, b, s, fight) for b, s in loop_calls],
+            return_exceptions=True)
+        for (b, s), g in zip(loop_calls, got):
+            catalogs[(b, fight.key)] = (g if isinstance(g, dict)
+                                        else {"ok": False, "why": f"price check crashed: {g}"})
+    max_drop = float(_c.MMA_MAX_PRICE_DROP)
+
+    def build_pick(book, sid):
+        cat = catalogs[(book, fight.key)]
+        if not cat["ok"]:
+            return mma_sports.unavailable(book, f"{book} catalog unavailable: {cat['why']}")
+        bad = mma_sports.timing_problem(_mma_now(), fight.start, cat["start"], min_lead, tol)
+        if bad:
+            return mma_sports.unavailable(book, f"{book} {bad}")
+        pk = mma_sports.resolve(cat["markets"], fight, tip, idx, book=book)
+        if not pk.ok:
+            return pk
+        # The posted-price floor and the liability cap BEFORE the choice: a pick that cannot be
+        # placed is out of the comparison (so a placeable Sportsbet bet is not turned into an
+        # alert because the dearer bet365 pick fails), but its price is kept: bet365 may replace
+        # a blocked Sportsbet bet only when STRICTLY better (mma_sports.choose).
+        low = mma_sports.price_floor_problem(tip.price, pk.odds, max_drop, book)
+        if low:
+            return mma_sports.Pick(book=book, refused=low, status="too_low", odds=pk.odds)
+        capmsg = _mma_cap_problem(sid, tip.kind, stake, pk.odds)
+        if capmsg:
+            return mma_sports.Pick(book=book, refused=f"{book} {capmsg}", status="capped", odds=pk.odds)
+        return pk
+
+    picks = {book: build_pick(book, sid) for book, sid in accounts.items()}
+    if tip.price is None or not tip.price > 1.0:
+        log.info(f"[{channel_name}] MMA no usable posted price on {tip.selection!r}: price floor not checked")
+
+    # 8. Which book. bet365 may win on "Sportsbet has no such row" only if a SECOND Sportsbet read
+    # still shows no such row (a partial catalog on the first read must not hand the bet to bet365).
+    sbp, b3p = picks.get("sportsbet"), picks.get("bet365")
+    if sbp is not None and sbp.status == "absent" and b3p is not None and b3p.ok:
+        log.info(f"[{channel_name}] MMA Sportsbet shows no row for {tip.selection!r} while bet365 does: "
+                 f"re-reading the Sportsbet catalog once")
+        try:
+            again = await _run_in_placement_executor(_mma_catalog_blocking, "sportsbet", accounts["sportsbet"], fight)
+        except Exception as e:
+            again = {"ok": False, "why": f"price check crashed: {e}"}
+        catalogs[("sportsbet", fight.key)] = (again if isinstance(again, dict)
+                                              else {"ok": False, "why": f"price check crashed: {again}"})
+        try:
+            picks["sportsbet"] = build_pick("sportsbet", accounts["sportsbet"])
+        except Exception as e:
+            picks["sportsbet"] = mma_sports.unavailable("sportsbet", f"sportsbet re-read failed: {e}")
+    winner, why = mma_sports.choose(picks.get("sportsbet"), picks.get("bet365"))
+    if winner is None:
+        return refuse(why)
+    book = winner.book
+    sid = accounts[book]
+    cat = catalogs[(book, fight.key)]
+    log.info(f"[{channel_name}] MMA {tip.selection!r} -> {book} {sid}: {why}")
+    capmsg = _mma_cap_problem(sid, tip.kind, stake, winner.odds)
+    if capmsg:
+        return refuse(capmsg)
+    import bet365_sports as _b365
+    target = _b365.target_odds_floor(winner.odds)
+    if not target or target > winner.odds:
+        return refuse(f"no usable target_odds floor for price {winner.odds}")
+    # The posted-price floor must hold at the FILL, not only on the catalog price: HyperBot
+    # accepts anything at or above target_odds, so the target is never below posted x (1 - drop).
+    if tip.price is not None and tip.price > 1.0:
+        target = max(target, math.floor(tip.price * (1.0 - max_drop) * 100 + 1e-6) / 100)   # rounded DOWN
+    # The clock once more, just before the money moves.
+    late = mma_sports.timing_problem(_mma_now(), fight.start, cat["start"], min_lead, tol)
+    if late:
+        return refuse(late)
+
+    # 9. PLACE, once. No retry, no other book.
+    log.info(f"[{channel_name}] MMA PLACING {_mma_label(tip, fight, idx)} ${stake:.2f} @ {winner.odds:g} "
+             f"on {book} {sid} [{winner.market_key} prop={winner.proposition_id} event={cat['event']!r}]")
+    res, elapsed = await _run_in_placement_executor(
+        _mma_place_blocking, sid, cat["event"], winner, stake, target,
+        _mma_max_odds(sid, tip.kind, stake, winner.odds))
+    res = res if isinstance(res, dict) else {"success": False, "error": f"unreadable answer {res!r}"}
+    if res.get("success"):
+        _mma_record_placed(tip, post_text, fight, idx, book, sid, cat["event"], winner, stake, res,
+                           elapsed, channel_name)
+        return "placed", ""
+    err = str(res.get("error") or "")
+    _log_jsonl(_audit_log_path(), {
+        "type": "tip_outcome", "tipster": MMA_TIPSTER, "event": cat["event"],
+        "intended_stake": round(stake, 2), "placed_stake": 0.0, "unfilled_stake": round(stake, 2),
+        "placements": [], "failures": [{"session_id": sid, "bookie": book, "error": err}]})
+    if _mma_clean_reject(res, err):
+        return refuse(f"{book} rejected it before placing: {err[:200]}")      # nothing placed: a re-post may retry
+    try:
+        notifier.notify_critical(
+            f"MMA bet MAYBE PLACED on {book} {sid}: {_mma_label(tip, fight, idx)} ${stake:.2f} "
+            f"@ {winner.odds:g}. The answer was unclear ({elapsed:.1f}s): {err[:200]}. CHECK the account "
+            f"before placing by hand. tipbot will not retry or use the other book.")
+    except Exception:
+        pass
+    return "alert", f"{book} answer unclear ({err[:120]}): it MAY have placed, check the account"
+
+
+async def _process_mma_post(text: str, msg_time, channel_name: str):
+    """One Just Bleed MMA post. Crash-safe: any failure alerts the whole post for hand
+    placing. Not enabled -> nothing at all."""
+    import config as _c
+    if not _c.MMA_ENABLED:
+        log.info(f"[{channel_name}] MMA_ENABLED=false: post ignored: {(text or '')[:80]!r}")
+        return
+    try:
+        if mma_parser is None or mma_sports is None:
+            notifier.notify_text_manual_alert(channel_name, f"(MMA modules not loaded) place manually:\n{text}",
+                                              header="MMA, MANUAL")
+            return
+        post = mma_parser.parse_post(text)
+        if post.kind != "card" or not (post.tips or post.problems):
+            log.info(f"[{channel_name}] MMA {post.kind} post, nothing to bet: {(text or '')[:80]!r}")
+            return
+        fights = []
+        if post.tips:
+            fights = await _run_in_placement_executor(mma_sports.fetch_fights)
+        catalogs: dict = {}
+        unplaced = [("(could not read as a tip)", p) for p in post.problems]
+        placed = 0
+        ignored = []
+        for tip in post.tips:
+            ctx = {"fight": None, "idx": None}
+            try:
+                status, reason = await _mma_handle_tip(tip, post, text, fights, catalogs, channel_name, ctx)
+            except Exception as e:
+                log.exception(f"[{channel_name}] MMA tip crashed: {e}")
+                status, reason = "alert", f"CRASHED ({e}); it may or may not have placed: check the accounts"
+                try:
+                    notifier.notify_critical(f"MMA tip CRASHED: {tip.selection} ({e}). Check whether it placed "
+                                             f"before betting by hand.")
+                except Exception:
+                    pass
+            if status == "placed":
+                placed += 1
+            elif status == "ignored":
+                ignored.append(reason)
+            elif status == "alert":
+                unplaced.append((_mma_read(tip, ctx["fight"], ctx["idx"], mma_sports.stake_dollars(
+                    tip.units, float(_c.MMA_UNIT_SIZE)) if tip.units is not None else 0.0), reason))
+        log.info(f"[{channel_name}] MMA post: {len(post.tips)} tip(s), {placed} placed, "
+                 f"{len(unplaced)} not placed")
+        if ignored:
+            # A re-post is quiet in the manual chat but never silent: one INFO per post.
+            try:
+                notifier.notify_info(
+                    f"MMA re-post ignored ({channel_name}, {post.card or 'MMA card'}): {len(ignored)} line(s) "
+                    f"already seen, nothing placed again: " + "; ".join(ignored)[:900])
+            except Exception:
+                pass
+        if unplaced:
+            # ONE alert per post, split only when it would not fit (the alert helper truncates
+            # at 3000 chars, which would hide the tail of a long card).
+            title = f"{post.card or 'MMA card'}: {placed} placed, {len(unplaced)} NOT placed"
+            chunks, cur = [], ""
+            for head, why in unplaced:
+                blk = f"{head}\n   WHY NOT PLACED: {why}"
+                if cur and len(cur) + len(blk) + 2 > 2200:
+                    chunks.append(cur)
+                    cur = ""
+                cur = f"{cur}\n\n{blk}" if cur else blk
+            chunks.append(cur)
+            for i, chunk in enumerate(chunks, 1):
+                part = f" (part {i}/{len(chunks)})" if len(chunks) > 1 else ""
+                notifier.notify_text_manual_alert(channel_name, f"{title}{part}\n\n{chunk}", header="MMA, MANUAL")
+    except Exception as e:
+        log.exception(f"[{channel_name}] MMA post crashed: {e}")
+        try:
+            notifier.notify_text_manual_alert(
+                channel_name, f"(MMA post crashed: {e}). Some tips may have placed: check the accounts "
+                              f"before betting by hand.\n{text}", header="MMA, MANUAL")
+        except Exception:
+            pass
 
 
 async def _process_text_racing_tip(text: str, tipster: str, unit_size: float,
@@ -24970,25 +26157,92 @@ async def _leroy_place_race(parsed_race, date_str, channel_name):
 
 ROSTER_STALE_DAYS = 1
 
+# v6.107 (Wilson 2026-10-22): refresh the NBA roster once a day at 13:00 Sydney while Main runs,
+# not only at startup or on a model miss (a squad changes through the day: signings, waivers,
+# trades). Set NBA_ROSTER_DAILY_REFRESH_HOUR=-1 to switch it off.
+try:
+    NBA_ROSTER_DAILY_REFRESH_HOUR = int(os.getenv("NBA_ROSTER_DAILY_REFRESH_HOUR", "13"))
+except ValueError:
+    NBA_ROSTER_DAILY_REFRESH_HOUR = 13
+
+
+def _seconds_until_sydney_hour(hour: int, now_utc: "datetime | None" = None) -> float:
+    """Seconds from `now_utc` to the next HH:00 in Sydney local time. Computed in UTC, so a
+    daylight-saving change between now and then cannot shift it by an hour's drift."""
+    from zoneinfo import ZoneInfo
+    syd = ZoneInfo("Australia/Sydney")
+    now = (now_utc or datetime.now(_dt_timezone.utc)).astimezone(syd)
+    nxt = now.replace(hour=int(hour), minute=0, second=0, microsecond=0)
+    if nxt <= now:
+        nxt = (now + _timedelta(days=1)).replace(hour=int(hour), minute=0, second=0, microsecond=0)
+    return max(1.0, (nxt.astimezone(_dt_timezone.utc) - now.astimezone(_dt_timezone.utc)).total_seconds())
+
+
+async def _nba_roster_daily_loop():
+    """Once a day: re-pull the NBA list from NBA.com and load it without a restart. The blocking
+    fetch runs off the event loop; roster.refresh_nba_roster_now keeps the saved list when the
+    fetch is partial or fails. Silent on success; an INFO notice when it did not refresh."""
+    import roster as _roster
+    hour = NBA_ROSTER_DAILY_REFRESH_HOUR
+    if not (0 <= hour <= 23):
+        log.info("[roster] daily NBA roster refresh is OFF (NBA_ROSTER_DAILY_REFRESH_HOUR)")
+        return
+    log.info(f"[roster] daily NBA roster refresh armed for {hour:02d}:00 Sydney")
+    while True:
+        wait = _seconds_until_sydney_hour(hour)
+        while wait > 0:
+            # short sleeps, so a sleeping PC or a clock change re-aims at the right time
+            await asyncio.sleep(min(wait, 1800))
+            wait = _seconds_until_sydney_hour(hour) if wait > 1800 else 0
+        try:
+            status = await asyncio.get_running_loop().run_in_executor(
+                None, _roster.refresh_nba_roster_now, 0)
+        except Exception as e:
+            status = f"error: {e}"
+            log.error(f"[roster] daily NBA roster refresh failed: {e}")
+        log.info(f"[roster] daily NBA roster refresh: {status}")
+        if status != "refreshed":
+            try:
+                notifier.notify_info(f"NBA roster daily refresh did not refresh ({status}); "
+                                     f"the saved roster is kept")
+            except Exception:
+                pass
+        await asyncio.sleep(120)       # never fire twice in the same minute
+
 
 def _check_and_refresh_roster():
     """Check if roster_nba.json is older than ROSTER_STALE_DAYS, refresh in
     background thread if so. Non-blocking - bot continues startup."""
     try:
-        roster_path = Path("roster_nba.json")
+        import roster as _roster_mod
+        roster_path = Path(_roster_mod.NBA_ROSTER_FILE)  # v6.105: not cwd-relative (review)
         if not roster_path.exists():
             log.warning("roster_nba.json not found - skipping freshness check")
             return
         age_days = (time.time() - roster_path.stat().st_mtime) / 86400
-        if age_days > ROSTER_STALE_DAYS:
-            log.info(f"Roster is {age_days:.1f} days old (>{ROSTER_STALE_DAYS}), refreshing in background...")
+        # v6.105: a file stamped with another season (or none: a copy restored from git) is
+        # stale however new its mtime is; the 15:11 restore looked "fresh" for a day.
+        file_season, want_season = _roster_mod.nba_roster_season(), _roster_mod._nba_season_for()
+        if age_days > ROSTER_STALE_DAYS or file_season != want_season:
+            log.info(f"Roster is {age_days:.1f} days old, season {file_season or 'unstamped'} "
+                     f"(want {want_season}), refreshing in background...")
             import threading
-            from roster import update_roster_from_api
             def _refresh():
                 try:
-                    update_roster_from_api()
-                    notifier.notify_info("NBA roster auto-refreshed")
-                    log.info("Background roster refresh complete")
+                    # v6.105: through the serialised refresh, which also loads the new list
+                    # into memory (a lookup before it finished used to keep the old one).
+                    _st = _roster_mod.refresh_nba_roster_now(min_interval_sec=0)
+                    if _st == "refreshed":
+                        notifier.notify_info("NBA roster auto-refreshed")
+                        log.info("Background roster refresh complete")
+                    elif _st == "busy":
+                        log.info("Background roster refresh skipped: an on-demand refresh "
+                                 "was already running")
+                    else:
+                        # v6.104: a partial/failed fetch keeps the saved roster
+                        notifier.notify_info("NBA roster refresh skipped: the NBA.com fetch "
+                                             "looked partial or failed, the saved roster is kept")
+                        log.warning("Background roster refresh kept the saved roster")
                 except Exception as e:
                     log.error(f"Background roster refresh failed: {e}")
             threading.Thread(target=_refresh, daemon=True).start()
@@ -25985,6 +27239,14 @@ async def main():
                     _process_legup_post(text, channel_cfg, msg_time, channel_name))
             return
 
+        # v6.112 Just Bleed MMA: card posts, parsed by regex, $1/unit TEST bets (Sportsbet or
+        # bet365, whichever prices the exact market higher), everything inexact is a manual
+        # alert. The channel is only registered with MMA_ENABLED; this re-checks it.
+        if channel_cfg.get("parser") == "mma_bleed":
+            if text:
+                asyncio.create_task(_process_mma_post(text, msg_time, channel_name))
+            return
+
         # v6.08 DisposalsModel MACHINE FEED. The post IS the bet, as a fixed 18-field
         # `BET|v2|...` line. Handled here and RETURNED so it never reaches the LLM
         # text path below: for this strategy the line IS the trigger, and an LLM
@@ -26109,6 +27371,11 @@ async def main():
                     log.warning(f"[{channel_name}] download_media returned no bytes")
                     notifier.notify_image_alert(channel_name, "(image could not be downloaded)")
                     return
+                _saved_img = _save_tip_image(img_bytes, img_tipster, getattr(event, "id", 0))
+                # the caption too: it was never logged, so an image whose bet was in the
+                # caption left no trace when vision failed (10-19 18:30 4th&EV post)
+                _cap = (text or "").replace("\r", "").replace("\n", "\\n")[:500]
+                log.info(f"[{channel_name}] image saved: {_saved_img or '(not saved)'} | caption: {_cap}")
                 asyncio.create_task(
                     _process_image_tip(
                         img_bytes, img_tipster, img_sport, img_unit_size,
@@ -26489,6 +27756,9 @@ async def main():
             asyncio.create_task(_nba_liveness_loop())
     except Exception as _e71:
         log.error(f"[nba_model] liveness loop not started: {_e71}")
+    # v6.107: the NBA roster is also used by ETR and the NBA tipsters, so this runs whether or
+    # not the NBA model feed is on.
+    asyncio.create_task(_nba_roster_daily_loop())
     # v6.08p: re-ask Sportsbet for unfilled Saiyan stake as its to-win cap rises.
     if SAIYAN_TOPUP_ENABLED:
         asyncio.create_task(_saiyan_topup_loop())
@@ -26503,6 +27773,13 @@ async def main():
             _nba_startup_notice()
     except Exception as _e:
         log.warning(f"[nba_model] startup notice failed: {_e}")
+
+    # v6.112: one line saying whether the MMA test path is on and which accounts it may use;
+    # MMA asked for but refused (bad config) is a CRITICAL, never logged as enabled.
+    try:
+        _mma_startup_notice()
+    except Exception as _e:
+        log.warning(f"[mma] startup line failed: {_e}")
 
     # v6.07 (sweep #29): report priority sessions that were DEAD at startup. The
     # watchdog above can only see TRANSITIONS out of the already-active set, so a
