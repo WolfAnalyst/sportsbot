@@ -513,31 +513,6 @@ RULES:
 - For over/under line tips (Over 29.5 P), set: line = 29.5, selection = "over", is_threshold = false
 - Deobfuscate Kev's player names and return the REAL name
 - For Kev, resolve last-name-only to full name if you know it (e.g. "Jokic" -> "Nikola Jokic")
-- ETR NBA tips: player-prop tips with OBFUSCATED (leetspeak) names — DEOBFUSCATE to the
-  REAL full NBA player name using your NBA roster knowledge. Substitutions include
-  Kev's (! -> i, @ -> a, 0 -> o, 3 -> e, 1 -> l/i, $ or 5 -> s) PLUS context-sensitive
-  digit-for-letter where a digit stands in for a letter (e.g. "2" can be e OR o:
-  "Lu2e Ko2net" -> "Luke Kornet", "Dyl@n H@rp3r" -> "Dylan Harper"). Pick the real
-  active player the obfuscated text most plausibly spells. Also fix obvious OCR typos
-  ("Reounds" -> rebounds).
-  ETR format: "<Player> (<TEAM>) ABOVE|BELOW <line> <Stat phrase> <odds range> /
-  Projection: <Y> / Game N <AWAY> at <HOME>".
-    * ABOVE -> selection = "over"; BELOW -> selection = "under".
-    * team = the player's FULL team name from the (TEAM) code (e.g. SAS -> San Antonio
-      Spurs, NYK -> New York Knicks); sport = "nba"; market = "player_prop";
-      is_threshold = false (lines are .5 over/under, NOT N+ thresholds).
-    * Stat phrase -> stat: "Points" -> points, "Rebounds" -> rebounds, "Assists" ->
-      assists, "3-Pointers Made"/"Threes" -> threes, "Blocks" -> blocks, "Steals" ->
-      steals; COMPOUNDS: "Points + Rebounds + Assists" -> points_rebounds_assists,
-      "Points + Rebounds" -> points_rebounds, "Points + Assists" -> points_assists,
-      "Rebounds + Assists" -> rebounds_assists.
-    * CRITICAL: set odds = 0 for EVERY ETR tip. IGNORE the quoted odds range
-      ("-138 to -150") and the "Projection" — ETR places blind and the quoted price
-      must not arm the odds guards.
-  Example: "Lu2e Ko2net (SAS) ABOVE 1.5 Points -138 to -150 / Projection: 2.6 / Game 2
-  NYK at SAS" -> {player:"Luke Kornet", team:"San Antonio Spurs", stat:"points",
-  line:1.5, selection:"over", market:"player_prop", odds:0, sport:"nba",
-  is_threshold:false}.
 - SGMs (multiple legs in one bet) should have is_sgm = true, alert_only = false. Put legs in raw_legs.
 - For SGM same-player legs: if a leg has stat but no explicit player, USE THE PREVIOUS LEG'S PLAYER
   Example: "Sam Darcy 10+ Disposals/2+ Goals" -> leg 1 = Sam Darcy 10 Disp over, is_threshold=true, leg 2 = Sam Darcy 2 Goals over, is_threshold=true
@@ -930,6 +905,348 @@ def _check_team_legs_against_text(tips: list, text: str) -> list:
                         log.info(f"Total: game taken from the message: '{pair}'")
         except Exception as e:
             log.warning(f"Team-leg text check skipped for a tip: {e}")
+    return tips
+
+
+# v6.138 (Wilson 2026-10-28): a Shook over/under leg must have its side IN the message.
+# 2026-10-28 16:06 Shook followed "Jalen Johnson under 23.5 Points" with "30.5 PA lower
+# confidence alt. points good to -135": no side at all (it meant the under), Haiku
+# guessed OVER and $300.88 was placed on Jalen Johnson over 30.5 pts+asts. The context
+# buffer is not used to fill the side in (it could be an older, different bet): a side
+# the current message does not state, or contradicts, goes to manual.
+_SIDE_OVER_RE = re.compile(
+    r"\bover\b|\bmore\s+(?:than\s+)?\d|\bo\s?\d|\bM\s+\d|(?<![-+\d.])\d+(?:\.\d+)?\+(?!\d)", re.I)
+_OU_RE = re.compile(r"\bo\s*/\s*u\b", re.I)    # "o/u 23.5" names neither side
+_SIDE_UNDER_RE = re.compile(r"\bunder\b|\bless\s+(?:than\s+)?\d|\bu\s?\d|\bL\s+\d", re.I)
+# a leg's parsed selection, read as WHOLE words ("Oklahoma City Thunder" is not an under)
+_SEL_OVER_RE = re.compile(r"^\s*[om]\s*$|\b(?:overs?|more)\b", re.I)
+_SEL_UNDER_RE = re.compile(r"^\s*[ul]\s*$|\b(?:unders?|less)\b", re.I)
+
+
+def _shook_sel_side(sel) -> str:
+    """'over' / 'under'; '' = no side word (a team or yes/no pick); '?' = unreadable
+    (both sides, or not text)."""
+    if sel is None:
+        return ""
+    if not isinstance(sel, str):
+        return "?"
+    o, u = bool(_SEL_OVER_RE.search(sel)), bool(_SEL_UNDER_RE.search(sel))
+    if o and u:
+        return "?"
+    return "over" if o else ("under" if u else "")
+
+
+def _shook_leg_side(leg) -> str:
+    """A player or game-total leg with no readable side is unreadable ('?'), never
+    skipped. "yes" / "no" passes only on a market with no line (double double)."""
+    sel = getattr(leg, "selection", None)
+    side = _shook_sel_side(sel)
+    if side == "" and isinstance(sel, str) and sel.strip().lower() in ("yes", "no"):
+        try:
+            has_line = float(getattr(leg, "line", None) or 0) != 0
+        except (TypeError, ValueError):
+            has_line = True
+        return "?" if has_line else ""
+    if side == "" and ((getattr(leg, "player", "") or "").strip()
+                       or (getattr(leg, "market", "") or "").lower() in _GAME_TOTAL_MARKETS):
+        return "?"
+    return side
+
+
+# a number a side word can belong to: not a price ("-125", "+110"), not units ("0.25u"),
+# not part of a stat ("3PM", "1Q", "3s")
+_LINE_NUM_RE = re.compile(r"(?<![\d.+-])\d+(?:\.\d+)?(?!\d|\.\d|[A-Za-z])(?!\s*(?:u|units?)\b)", re.I)
+# a segment ends at a line break, '/', ',', ';' or a sentence end ("Jr. " is not one)
+_SEG_BREAK_RE = re.compile(r"[\n/,;]|(?<!\bJr)(?<!\bSr)(?<!\bSt)\.\s", re.I)
+_NAME_SUFFIXES = {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv", "v"}
+
+
+def _side_map(bet_text: str) -> list:
+    """Every line-like number in the message with the side word(s) that belong to it:
+    [{"v", "start", "end", "seg", "plus", "sides"}]. A side word belongs to exactly ONE
+    number: the one it is written into ("o23.5", "M 17.5", "25+", "more than 26.5"),
+    else, within its own segment, the nearest line number when all of them are on one
+    side of it and at most two words (no price) away ("under 23.5", "30.5 PA over";
+    not "30.5 PA good to -135 over the moon"). A word with line numbers on BOTH sides
+    in its segment ("23.5 Points over Holmgren 17.5") belongs to neither, and so does
+    a word with no number in its segment: fail closed, manual."""
+    breaks = [m.start() for m in _SEG_BREAK_RE.finditer(bet_text)]
+
+    def seg_of(pos):
+        return sum(1 for b in breaks if b < pos)
+
+    nums = [{"v": float(m.group(0)), "start": m.start(), "end": m.end(),
+             "seg": seg_of(m.start()), "plus": bet_text[m.end():m.end() + 1] == "+",
+             "sides": set()}
+            for m in _LINE_NUM_RE.finditer(bet_text)]
+    for side, rx in (("over", _SIDE_OVER_RE), ("under", _SIDE_UNDER_RE)):
+        for w in rx.finditer(bet_text):
+            inside = [n for n in nums if w.start() <= n["start"] < w.end()
+                      or n["start"] <= w.start() < n["end"]]
+            if inside:
+                inside[0]["sides"].add(side)
+                continue
+            seg = seg_of(w.start())
+            left = [n for n in nums if n["seg"] == seg and n["end"] <= w.start()]
+            right = [n for n in nums if n["seg"] == seg and n["start"] >= w.end()]
+            if left and right:
+                continue                    # sandwiched between two lines: neither
+            n = left[-1] if left else (right[0] if right else None)
+            if n is None:
+                continue
+            gap = (bet_text[n["end"]:w.start()] if left else bet_text[w.end():n["start"]])
+            # close to its line: at most two words between, no price ("-135 over the moon")
+            if not re.search(r"\d", gap) and len(gap.split()) <= 2:
+                n["sides"].add(side)
+    return nums
+
+
+def _segment_text(bet_text: str, seg: int) -> str:
+    return _SEG_BREAK_RE.split(bet_text)[seg] if bet_text else ""
+
+
+def _side_next_to_line(bet_text: str, line, player: str = "") -> set:
+    """The side word(s) that belong to the number `line` (see _side_map). A line not
+    written in the text is looked up as an "N+" written next to it (24.5 -> "25+"),
+    never as a bare 25. When the number is written more than once, the one in the
+    segment that names the player is the leg's own (the full name when it is anywhere
+    in the text, else the surname without Jr / III); if that does not pick exactly one
+    and the copies differ (one with a side, one without, or two sides), both sides are
+    returned: ambiguous, so manual.
+    Empty when the line is not in the text or has no side word of its own."""
+    try:
+        v = abs(float(line))
+    except (TypeError, ValueError):
+        return set()
+    nums = _side_map(bet_text)
+    if v not in [n["v"] for n in nums]:
+        v = v + 0.5
+        nums = [n for n in nums if n["v"] != v or n["plus"]]
+    mine = [n for n in nums if n["v"] == v]
+    if len(mine) > 1:
+        words = [w for w in (player or "").lower().split() if w not in _NAME_SUFFIXES]
+        full = " ".join(words) if len(words) > 1 else ""
+        if full and re.search(r"\b" + re.escape(full) + r"\b", bet_text, re.I):
+            probes = [full]                 # a namesake's surname must not decide
+        else:
+            probes = words[-1:]
+        for probe in probes:
+            hit = [n for n in mine if re.search(r"\b" + re.escape(probe) + r"\b",
+                                                _segment_text(bet_text, n["seg"]), re.I)]
+            if len(hit) == 1:
+                return set(hit[0]["sides"])
+            if hit and len({n["seg"] for n in hit}) == 1:
+                # one segment, the number twice: the copy nearest after the name is his
+                names = [m.end() for m in re.finditer(r"\b" + re.escape(probe) + r"\b",
+                                                      bet_text, re.I)]
+                gaps = sorted((n["start"] - e, i) for i, n in enumerate(hit)
+                              for e in names if e <= n["start"])
+                if gaps and (len(gaps) == 1 or gaps[0][0] < gaps[1][0]):
+                    return set(hit[gaps[0][1]]["sides"])
+        if any(n["sides"] != mine[0]["sides"] for n in mine):
+            return {"over", "under"}   # can't tell which is the leg's: ambiguous
+    return set(mine[0]["sides"]) if mine else set()
+
+
+def _shook_tip_alts(tip) -> list:
+    alt_line = getattr(tip, "alt_line", None)
+    return (([alt_line] if alt_line else [])
+            + list(getattr(tip, "alt_lines", None) or []))
+
+
+# v6.144: the stat words AusBets writes straight after a player line ("31.5 PR", "25.5 P",
+# "4+ A", "Over 18.5 Points"); any of these, case-insensitive, as a whole word
+_AUSBETS_STAT_RE = (r"(?:p|pts?|points?|r|rebs?|rebounds?|a|asts?|assists?|pr|pa|ra|pra|p\+r|"
+                    r"p\+a|r\+a|p\+r\+a|3s|3's|3pm|3pt|3-pts?|3pts|3p|threes?|blk|blocks?|stl|steals?|s\+b|"
+                    r"fgas?|fgm|tov|turnovers?|mins?|minutes|dd|td)")
+
+
+def _check_ausbets_stat_against_text(tips: list, text: str) -> list:
+    """AusBets only (Wilson 2026-10-29: "it should auto go to manual if no stat ... only bet
+    proper format for ausbets"): a player prop places only when the post names its stat right
+    after the leg's own number ("Over 11.5 PR", "4+ A"). "0.5U - AJ Dybantsa Over 11.5 (SB:
+    $1.86)" was read as rebounds on 28 Oct and nothing placed; he meant points. No stat word
+    after the number on any line -> manual with the reason. Team markets (handicaps, totals,
+    money lines) carry no player and are left alone. Any error -> every AusBets prop manual."""
+    if not text:
+        return tips
+    body = text.split("CURRENT MESSAGE:", 1)[-1]
+    live = [t for t in tips if str(getattr(t, "tipster", "")).startswith("ausbets")
+            and not t.alert_only]
+
+    def _manual(tip, why):
+        log.warning(f"AusBets stat check: {why} | {body.strip()[:120]!r}")
+        tip.alert_reason = f"{tip.alert_reason}; {why}" if tip.alert_reason else why
+        tip.alert_only = True
+
+    # the bets as written: each line's "/" segments, without the units ("0.5U -") or the price
+    # ("(SB: $1.86)"), whose numbers are not lines
+    segs = []
+    for ln in body.split("\n"):
+        ln = re.sub(r"\([^()]*\d[^()]*\)", " ", ln)
+        ln = re.sub(r"(?<![\w.])\d+(?:\.\d+)?\s*U\b", " ", ln, flags=re.IGNORECASE)
+        segs += [s for s in ln.split("/") if s.strip()]
+    for tip in live:
+        try:
+            for leg in tip.legs:
+                if not (leg.player or "").strip() or (leg.market and leg.market != "player_prop"):
+                    continue
+                line = float(leg.line)
+                stat_after = r"\s*" + _AUSBETS_STAT_RE + r"(?![a-z])"
+                # the number as written: the line itself ("Over 11.5", "4+" stored as 4), or for
+                # a .5 line with no such text, the threshold form ("3.5" written "4+")
+                forms = [(r"(?<![\d.])" + re.escape(f"{line:g}") + r"(?![\d.])", r"\+?")]
+                if line % 1 == 0.5:
+                    forms.append((r"(?<![\d.])" + re.escape(f"{line + 0.5:g}") + r"(?=\+)", r"\+"))
+                names = re.findall(r"[a-z]{3,}", leg.player.lower())
+                surname = names[-1] if names else ""
+                ok = False
+                for num, plus in forms:
+                    cand = [s for s in segs if re.search(num, s)]
+                    if not cand:
+                        continue
+                    # the leg's own segment: the one with its surname; else the one with any of
+                    # its names ("Kawhi"); else the only segment carrying the number (a carried-
+                    # forward "25+ P", the second leg of "Kawhi Under 32.5 P / Over 2.5 A").
+                    # "Bam Adebayo Over 11.5 PR" never vouches for "Dybantsa Over 11.5", nor
+                    # "Jalen Brunson ... 21.5 PR" for "Jalen Williams Over 21.5"; two unnamed
+                    # candidates is no answer (manual)
+                    own = [s for s in cand if surname and surname in s.lower()]
+                    if not own:
+                        own = [s for s in cand if any(n in s.lower() for n in names)]
+                        own = own if len(own) == 1 else []
+                    if not own and len(cand) == 1:
+                        own = cand
+                    ok = any(re.search(num + plus + stat_after, s, re.IGNORECASE) for s in own)
+                    break   # the first form found in the post decides
+                if not ok:
+                    _manual(tip, f"no stat after {leg.player} {line:g} in the post "
+                                 f"(read as {leg.stat or 'unknown'}): place manually if meant")
+                    break
+        except Exception as e:
+            _manual(tip, f"stat check failed ({e}): place manually")
+    return tips
+
+
+def _check_shook_side_against_text(tips: list, text: str) -> list:
+    """Shook only: every over/under leg's side must be stated in the CURRENT message
+    (the buffer prefix stripped), written next to the leg's own line ("under 23.5",
+    "M 17.5", "30.5 PA over", "25+"; see _side_map). Manual when: no side word belongs
+    to the line (a side elsewhere in the message is never borrowed); the other side, or
+    both, belong to it; a player / game-total leg's selection can't be read; or more
+    OVER (UNDER) bets in the message than "over" ("under") words that belong to lines.
+    Parser alt lines (alt_line / alt_lines, placed on spill; an alt with no selection
+    takes its main leg's side in main.py) keep the main bet's side as Shook's alts do
+    ("30.5 PA lower confidence alt" after an under is an under); an alt on the OTHER
+    side needs that side next to its own line, else all alts are dropped and the main
+    bets still go. Any error -> manual."""
+    if not text:
+        return tips
+    try:
+        return _check_shook_side_inner(tips, text)
+    except Exception as e:                  # never a silent drop: every Shook tip -> manual
+        for tip in tips:
+            if getattr(tip, "tipster", "") == "shook" and not tip.alert_only:
+                why = f"side check failed ({e}): place manually"
+                tip.alert_reason = f"{tip.alert_reason}; {why}" if tip.alert_reason else why
+                tip.alert_only = True
+        log.warning(f"Shook side check failed: {e}")
+        return tips
+
+
+def _check_shook_side_inner(tips: list, text: str) -> list:
+    bet_text = _OU_RE.sub(" ", text.split("CURRENT MESSAGE:", 1)[-1])
+    any_word =bool(_SIDE_OVER_RE.search(bet_text) or _SIDE_UNDER_RE.search(bet_text))
+    # only side words that belong to a line count ("under the radar" is not a side)
+    nums = _side_map(bet_text)
+    n_over = sum("over" in n["sides"] for n in nums)
+    n_under = sum("under" in n["sides"] for n in nums)
+
+    def _manual(tip, why):
+        log.warning(f"Shook side check: {why} | {bet_text.strip()[:120]!r}")
+        tip.alert_reason = f"{tip.alert_reason}; {why}" if tip.alert_reason else why
+        tip.alert_only = True
+
+    live = [t for t in tips if getattr(t, "tipster", "") == "shook" and not t.alert_only]
+    sided = {}   # id(tip) -> [(leg, side)]
+    for tip in live:
+        try:
+            pairs = [(leg, _shook_leg_side(leg)) for leg in tip.legs]
+            sided[id(tip)] = [(leg, s) for leg, s in pairs if s]
+            why = ""
+            for leg, side in sided[id(tip)]:
+                who = leg.player or leg.team_full or "the bet"
+                if side == "?":
+                    why = (f"could not read over or under from {leg.selection!r} for {who}: "
+                           f"place manually")
+                    break
+                near = _side_next_to_line(bet_text, leg.line, leg.player or "")
+                if near == {side}:
+                    continue
+                if near:
+                    why = (f"parsed {side.upper()} {leg.line} for {who} but the message has "
+                           f"{'/'.join(sorted(near)).upper()} next to {leg.line}: place manually")
+                elif any_word:
+                    why = (f"no over or under written next to {leg.line} for {who} (the parser "
+                           f"guessed {side.upper()}): place manually")
+                else:
+                    why = (f"the message does not say over or under for {who} (the parser "
+                           f"guessed {side.upper()}): place manually")
+                break
+            if why:
+                _manual(tip, why)
+        except Exception as e:
+            _manual(tip, f"side check failed ({e}): place manually")
+    live = [t for t in live if not t.alert_only]
+    # per side: no more OVER bets than "over" words, no more UNDER bets than "under" words
+    leg_sides = [s for t in live for _, s in sided.get(id(t), [])]
+    short = [s for s, n in (("over", n_over), ("under", n_under)) if leg_sides.count(s) > n]
+    if short:
+        for tip in live:
+            if sided.get(id(tip)):
+                _manual(tip, f"{leg_sides.count(short[0])} {short[0].upper()} bets in this "
+                             f"message but it says {short[0]} "
+                             f"{n_over if short[0] == 'over' else n_under} time(s): "
+                             f"place manually")
+        live = [t for t in live if not t.alert_only]
+    # alt lines: same side as the main bet, or the other side written next to the alt's line
+    keep = not short
+    try:
+        for tip in live if keep else []:
+            main_side = next((s for _, s in sided.get(id(tip), [])), "")
+            main_player = next((l.player or "" for l in tip.legs), "")
+            for a in _shook_tip_alts(tip):
+                if not isinstance(a, dict):
+                    keep = False
+                    break
+                if "selection" not in a:
+                    s = main_side          # main.py gives a selection-less alt the main side
+                else:
+                    s = _shook_sel_side(a.get("selection"))
+                    if s == "" and main_side:
+                        s = "?"            # an over/under bet's alt with no readable side
+                if s in ("over", "under"):
+                    near = _side_next_to_line(bet_text, a.get("line"), main_player)
+                    # the alt's own line decides when it carries a side; the other side
+                    # than the main bet must be written there
+                    bad = (near and near != {s}) or (s != main_side and near != {s})
+                else:
+                    bad = s == "?"
+                if bad:
+                    keep = False
+                    break
+            if not keep:
+                break
+    except Exception as e:
+        log.warning(f"Shook side check: alt check failed ({e}); dropping alt lines")
+        keep = False
+    if not keep:
+        for tip in live:
+            if _shook_tip_alts(tip):
+                log.warning(f"Shook side check: dropping alt line(s) whose side the message "
+                            f"does not state | {bet_text.strip()[:120]!r}")
+                tip.alt_line = None
+                tip.alt_lines = [] if getattr(tip, "alt_lines", None) is not None else None
     return tips
 
 
@@ -2750,6 +3067,8 @@ def parse_with_groq(
         # into separate tips is merged back into one SGM ticket.
         tips = _merge_slash_line_into_sgm(tips, text)
         tips = _check_team_legs_against_text(tips, text)   # v6.58
+        tips = _check_shook_side_against_text(tips, text)   # v6.138
+        tips = _check_ausbets_stat_against_text(tips, text)   # v6.144
 
         log.info(f"Groq parsed {len(tips)} tip(s) in {elapsed:.2f}s")
         return tips, elapsed

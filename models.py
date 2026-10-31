@@ -134,6 +134,12 @@ class BetResult:
     # are visible at a glance — same pattern as the racing tip alerts.
     # 2026-05-03 added: AFL/NBA alerts previously had no timing info.
     elapsed_sec: Optional[float] = None
+    # v6.154 (2026-10-29, Sportmarket wiring spec milestone 1b): the event string exactly as POSTed
+    # to the bridge / HyperBot (a verified or renamed fixture differs from tip.event). The
+    # fan-out's ambiguous reconcile and the deferred cid verify match pending_bets on THIS, since
+    # the bridge's pending_bets echoes the POSTed event. None on results built before the POST string
+    # existed (a resolver manual); the line_closed refusal carries it although nothing was sent.
+    placed_event: Optional[str] = None
 
     def summary(self) -> str:
         if self.success:

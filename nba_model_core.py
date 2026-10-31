@@ -777,7 +777,7 @@ def load_state() -> dict:
         try:
             fp = fills_path()
             if os.path.exists(fp):
-                with open(fp, "r", encoding="utf-8") as f:
+                with open(fp, "r", encoding="utf-8", errors="replace") as f:
                     for ln in f:
                         ln = ln.strip()
                         if not ln:
@@ -785,7 +785,12 @@ def load_state() -> dict:
                         try:
                             rec = json.loads(ln)
                         except Exception:
-                            continue        # a torn / non-JSON line is not evidence of money
+                            # a torn keyed line may be a money record cut mid-write: fail closed
+                            # (2026-11-01 review: a torn {"key": K, "placed": 500 ... line let K be
+                            # admitted and placed again once the ledger file was missing)
+                            if '"key"' not in ln:
+                                continue
+                            rec = {"key": "?", "placed": "torn"}
                         if not isinstance(rec, dict) or not rec.get("key"):
                             continue        # reconciliation-style records carry no key
                         try:
@@ -1260,6 +1265,8 @@ def note_price(row: dict) -> None:
     typically a retry re-posted at a lower quote, as the reference for the 10% price gate
     (signal fired at 2.10, retry at 1.76, live 1.71 would pass). Never overwrites; a corrupt
     ledger is left alone (the claim will refuse anyway)."""
+    if is_v4(row):
+        return          # nba-v4: a v4 row uses its own price, it never seeds the shared store
     try:
         price = float(row.get("price") or 0)
         if not math.isfinite(price) or price <= 1.0:
@@ -1277,40 +1284,67 @@ def note_price(row: dict) -> None:
         log.warning("[nba_model] could not note the first price: %s", e)
 
 
+def latest_fill(key: str):
+    """The LAST fills record for this key (a dict), or None when there is none or the file cannot be
+    read. The outer v4 backstop reads what a row handler call wrote."""
+    last = None
+    try:
+        with open(fills_path(), "r", encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if key not in ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and r.get("key") == key:
+                    last = r
+    except (OSError, ValueError):
+        return None
+    return last
+
+
 def _fills_for_key(key: str):
     """(any_record, answered): whether the fills file holds ANY record for this key, and whether
     it holds one that is not a plain refusal (money, a send, a manual route, a cap)."""
     any_rec = answered = False
     try:
-        with open(fills_path(), "r", encoding="utf-8") as f:
+        with open(fills_path(), "r", encoding="utf-8", errors="replace") as f:
             for ln in f:
                 try:
                     r = json.loads(ln)
                 except ValueError:
+                    if json.dumps(key, ensure_ascii=False) in ln:     # a torn line for this key: count it as answered
+                        any_rec = answered = True
                     continue
                 if not isinstance(r, dict) or r.get("key") != key:
                     continue
                 any_rec = True
                 if r.get("outcome") != "refused":
                     answered = True
-    except OSError:
+    except (OSError, ValueError):
         pass
     return any_rec, answered
 
 
 def _fills_money_for_key(key: str) -> bool:
     try:
-        with open(fills_path(), "r", encoding="utf-8") as f:
+        with open(fills_path(), "r", encoding="utf-8", errors="replace") as f:
             for ln in f:
                 try:
                     r = json.loads(ln)
                 except ValueError:
+                    if json.dumps(key, ensure_ascii=False) in ln:
+                        return True      # a torn line for THIS key may be its money record: fail closed
                     continue
                 if not isinstance(r, dict) or r.get("key") != key:
                     continue
-                if (float(r.get("placed") or 0) > 0 or float(r.get("ambiguous") or 0) > 0
-                        or r.get("outcome") in ("filled", "partial", "manual", "capped")):
-                    return True
+                try:
+                    if (float(r.get("placed") or 0) > 0 or float(r.get("ambiguous") or 0) > 0
+                            or r.get("outcome") in ("filled", "partial", "manual", "capped")):
+                        return True
+                except (ValueError, TypeError):
+                    return True          # this key's record has money fields that do not parse: fail closed
     except (OSError, ValueError, TypeError):
         pass
     return False
@@ -1358,7 +1392,7 @@ def _numbers_from_fills(row: dict) -> dict:
         evt = str(row.get("evt") or "").strip().casefold()
         pid = str(row.get("pid") or "").strip()
         line = float(row.get("line"))
-        with open(fills_path(), "r", encoding="utf-8") as f:
+        with open(fills_path(), "r", encoding="utf-8", errors="replace") as f:
             for ln in f:
                 try:
                     r = json.loads(ln)
@@ -1366,14 +1400,17 @@ def _numbers_from_fills(row: dict) -> dict:
                             or str(r.get("pid") or "") != pid
                             or abs(float(r.get("line")) - line) > 1e-6):
                         continue
-                    best["committed"] = max(best["committed"],
-                                            float(r.get("selection_committed") or 0))
-                    best["ambiguous"] = max(best["ambiguous"],
-                                            float(r.get("selection_ambiguous") or 0))
-                    best["placed"] = max(best["placed"], float(r.get("selection_placed") or 0))
-                    best["manual"] = best["manual"] or bool(r.get("manual"))
                 except (ValueError, TypeError, AttributeError):
                     continue
+                # each field on its own: one unparseable field must not hide the others
+                for out_k, in_k in (("committed", "selection_committed"),
+                                    ("ambiguous", "selection_ambiguous"),
+                                    ("placed", "selection_placed")):
+                    try:
+                        best[out_k] = max(best[out_k], float(r.get(in_k) or 0))
+                    except (ValueError, TypeError):
+                        pass
+                best["manual"] = best["manual"] or bool(r.get("manual"))
     except (OSError, ValueError, TypeError):
         pass
     return {k: (round(v, 2) if isinstance(v, float) else v) for k, v in best.items()}
@@ -1561,6 +1598,27 @@ def _new_selection(row: dict) -> dict:
             "manual": False, "player": row.get("player", "")}
 
 
+def _mark_v4(row: dict) -> None:
+    """Persist the selection's v4 mark for a v4 row whose claim was REFUSED (headroom, target, cap,
+    identity ...): ANY v4 record on a selection makes a later v3 offer for it a refusal. Best effort:
+    a failure here is logged, the refusal already stands."""
+    try:
+        sel_id = selection_id(row)
+        with _ledger_lock():
+            state = load_state()
+            if state.get("state_corrupt"):
+                return
+            sel = state["selections"].setdefault(sel_id, _new_selection(row))
+            if not sel.get("v4"):
+                sel["v4"] = True
+                if not save_state(state):
+                    log.critical("[nba_model] the v4 mark for %s could NOT be saved: a later v3 offer "
+                                 "for this selection will NOT be refused as v3-after-v4 (check by hand)",
+                                 sel_id)
+    except Exception as e:
+        log.warning("[nba_model] could not mark %s as v4: %s", row.get("key"), e)
+
+
 def claim(row: dict):
     """Admit or refuse this message (fails closed if the ledger lock cannot be taken, or if the
     selection is quarantined after a commit that could not be recorded)."""
@@ -1571,9 +1629,12 @@ def claim(row: dict):
             return 0.0, (f"selection {sel_id} is QUARANTINED ({why}): the ledger is behind the "
                          f"book on it, so no further offer is placed until an operator "
                          f"reconciles it by hand and clears the quarantine")
-        return _claim(row)
+        res = _claim(row)
     except LedgerLockError as e:
         return 0.0, f"could not lock the exposure ledger ({e}): refusing to place"
+    if res[0] <= 0 and is_v4(row):
+        _mark_v4(row)        # the row reached the claim: it is a v4 record on this selection
+    return res
 
 
 def _claim(row: dict):
@@ -1636,6 +1697,23 @@ def _claim(row: dict):
 
         if is_retry(row) and not cfg("NBA_MODEL_RETRY_ENABLED"):
             return 0.0, "kind=retry and NBA_MODEL_RETRY_ENABLED=false"
+
+        # nba-v4 (agreed with the model 2026-10-31): the model never sends v3 for a selection
+        # Pinnacle decided, so a v3 offer for a selection that already holds ANY v4 record is a
+        # feed fault (it would place Sportsbet-first, with no floors, on top of a bridge bet).
+        # Refused to manual: the caller writes the refused fill and pages. Ledgers written before
+        # v4 carry no mark and count as v3. A v4 offer after v3 money is left as it is (the model
+        # says it never happens); a warning is all it gets.
+        if is_v4(row):
+            if sel.get("keys") and not sel.get("v4"):
+                log.warning("[nba_model] %s: a v4 offer %r arrives after v3 offers %s on the same "
+                            "selection (committed $%.2f): the model says this never happens",
+                            sel_id, key, list(sel.get("keys") or []),
+                            float(sel.get("committed") or 0))
+        elif sel.get("v4"):
+            return 0.0, (f"selection {sel_id} already holds a BET|v4 (Sportmarket-decided) offer "
+                         f"and key {key!r} is v3: the model never sends v3 for a selection "
+                         f"Pinnacle decided. Refused, hand-place only if still wanted")
 
         # Per-fixture player cap (correlation bound). 0 disables it, which is the shipped
         # default: the NBA design has no per-game cap, so none is invented here. Counts
@@ -1703,6 +1781,8 @@ def _claim(row: dict):
         allowed = round(min(requested, headroom), 2)
         # Claim + reserve NOW, before placement. Released in commit().
         sel["keys"].append(key)
+        if is_v4(row):
+            sel["v4"] = True             # the v4 mark: persisted with the claim, survives restarts
         sel["inflight"] = round(inflight + allowed, 2)
         # Stamp the reservation with this process run: a reservation whose boot id is not ours
         # belongs to a process that died between the claim and the commit (recover_pending).
@@ -1716,7 +1796,7 @@ def _claim(row: dict):
             "raise_to": raise_to, "raise_eff": (eff_target if raise_to is not None else None),
             "row": {k: row.get(k) for k in ("evt", "pid", "player", "team", "opp", "market",
                                               "side", "line", "kind", "attempt", "target",
-                                              "key")}}
+                                              "key", "version")}}
         if raise_to is not None:
             log.info("[nba_model] %s: retry %r RAISES the target from $%.2f to $%.2f "
                      "(ceiling $%.2f), applied only if money lands", sel_id, key,
@@ -1724,12 +1804,16 @@ def _claim(row: dict):
         # The price the signal FIRST fired at, kept for the life of the selection. A BASE
         # message is gated against it (reference_price); a retry, re-posted at the model's
         # latest still +EV quote, is gated against its own price since v6.109.
-        prices = state.setdefault("first_prices", {})
-        prices.setdefault(sel_id, float(row["price"]))
-        sel.setdefault("price", float(prices[sel_id]))
-        # Handed back on the row itself so the caller need not re-read the ledger (a second,
-        # separate read that could fail would gate the message against its own price).
-        row["first_price"] = float(prices[sel_id])
+        # nba-v4: a v4 row uses ITS OWN price as the reference: it neither reads nor writes the
+        # shared first-price store (a Pinnacle quote must not become, or be gated against, the
+        # Sportsbet price a v3 row of the same selection first fired at).
+        if not is_v4(row):
+            prices = state.setdefault("first_prices", {})
+            prices.setdefault(sel_id, float(row["price"]))
+            sel.setdefault("price", float(prices[sel_id]))
+            # Handed back on the row itself so the caller need not re-read the ledger (a second,
+            # separate read that could fail would gate the message against its own price).
+            row["first_price"] = float(prices[sel_id])
         ident = state.setdefault("identity", {"pid_names": {}, "evt_players": {}})
         pid = str(row.get("pid") or "").strip()
         name = fold_name(row.get("player"))
@@ -1817,7 +1901,8 @@ def _commit_locked(row, sel_id, placed, ambiguous, manual, reserved, accounts, a
         # the key's outcome, kept so a missing fills row can be rebuilt after a crash
         state.setdefault("outcomes", {})[row.get("key")] = {
             "row": {k: row.get(k) for k in ("evt", "pid", "player", "team", "opp", "market",
-                                              "side", "line", "kind", "attempt", "target")},
+                                              "side", "line", "kind", "attempt", "target",
+                                              "version")},
             "placed": round(float(placed or 0), 2), "ambiguous": round(float(ambiguous or 0), 2),
             "manual": bool(manual),
             "stake": float((res or {}).get("stake") or reserved or 0), "event": event or "",
@@ -1898,6 +1983,12 @@ def selection_snapshot(sel_id: str) -> dict:
         return {}
 
 
+def is_v4(row: dict) -> bool:
+    """nba-v4: whether this row is a BET|v4 (the parser sets `version`; a v3 row, an old ledger row
+    and a salvaged row carry none or 'v3')."""
+    return str((row or {}).get("version") or "").strip().lower() == "v4"
+
+
 def is_retry(row: dict) -> bool:
     """One reading of `kind` for every retry rule (the retry switch and the price reference)."""
     return str((row or {}).get("kind") or "").strip().lower() == "retry"
@@ -1917,8 +2008,8 @@ def reference_price(row: dict) -> float:
     own = float(row.get("price") or 0)
     if not math.isfinite(own):
         own = 0.0                  # a nan/inf quote must never become the gate's reference
-    if is_retry(row) and own > 0:
-        return own
+    if (is_retry(row) or is_v4(row)) and own > 0:
+        return own                 # nba-v4: a v4 row's reference is its own (Pinnacle) price
     first = float(row.get("first_price") or 0)        # set by claim() on this very row
     if first <= 0:
         try:
@@ -2000,24 +2091,29 @@ def fill_flags(outcome: str, ambiguous: float, manual: bool, selection_committed
 def _fills_scan(key: str):
     """(records_for_key, any_record, answered) in ONE pass over the fills file."""
     n = 0
-    answered = False
+    answered = torn = False
     try:
-        with open(fills_path(), "r", encoding="utf-8") as f:
+        with open(fills_path(), "r", encoding="utf-8", errors="replace") as f:
             for ln in f:
                 if key not in ln:
                     continue                       # cheap pre-filter before the JSON parse
                 try:
                     r = json.loads(ln)
                 except ValueError:
+                    if json.dumps(key, ensure_ascii=False) in ln:     # a torn line for this key: answered,
+                        torn = True                                  # but NOT a readable revision
+                        answered = True
                     continue
                 if not isinstance(r, dict) or r.get("key") != key:
                     continue
                 n += 1
                 if r.get("outcome") != "refused":
                     answered = True
-    except OSError:
+    except (OSError, ValueError):
         pass
-    return n, n > 0, answered
+    # n counts READABLE records only: recover_pending compares it with the ledger's revision, and a
+    # torn line must not look like a newer record (it would skip the rebuild). 2026-11-01 review.
+    return n, (n > 0 or torn), answered
 
 
 def _next_revision(key: str) -> int:
@@ -2115,6 +2211,11 @@ def _write_fill_locked(row, requested, placed, ambiguous, manual, accounts, outc
     target = round(float(row.get("target") or 0), 2)
     is_manual = bool(manual) or bool(snap.get("manual"))
     retryable, final = fill_flags(outcome, ambiguous, is_manual, sel_committed, target, sel_amb)
+    if row.get("version") == "v4":
+        # v4 (a Pinnacle-decided bet, agreed with the model 2026-10-31): never retryable. A retry
+        # would come as v3, which has no floors and places Sportsbet-first; the model also never
+        # sends one, this is the second guard. The ledger keeps "version" so a rebuilt record agrees.
+        retryable = False
     req = round(float(requested or 0), 2)
     pl = round(float(placed or 0), 2)
     am = round(float(ambiguous or 0), 2)
@@ -2149,8 +2250,19 @@ def _write_fill_locked(row, requested, placed, ambiguous, manual, accounts, outc
     }
     path = fills_path()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # a crash mid-append can leave a torn last line with no newline; never glue this record onto
+    # it (the record would be unreadable and the key unanswered). 2026-11-01 review.
+    _lead = ""
+    try:
+        with open(path, "rb") as fb:
+            fb.seek(0, os.SEEK_END)
+            if fb.tell() > 0:
+                fb.seek(-1, os.SEEK_END)
+                _lead = "" if fb.read(1) == b"\n" else "\n"
+    except OSError:
+        _lead = ""
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False, allow_nan=False) + "\n")
+        f.write(_lead + json.dumps(rec, ensure_ascii=False, allow_nan=False) + "\n")
         f.flush()
         os.fsync(f.fileno())
     # answered: drop the ledger's outcome entry for this key in the SAME load/save

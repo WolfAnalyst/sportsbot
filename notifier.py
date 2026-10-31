@@ -18,7 +18,9 @@ from requests.exceptions import ReadTimeout  # v5.71: module-level so the
 import logging
 import os
 import json
+import hashlib
 import threading
+import uuid
 import sys
 from config import NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID, NOTIFY_SUCCESS_CHAT_ID
 
@@ -83,11 +85,132 @@ _nq_last_send_ts = 0.0
 # v6.18: how many sends are mid-POST. A record is popped only AFTER _send_now returns,
 # so an empty QUEUE FILE does not mean nothing is in flight; flush() waits on this too.
 _nq_inflight = 0
+_nq_idle_wake = threading.Event()
 
 
 _NQ_LOCK_ACQUIRE_SEC = float(os.getenv("NOTIFY_LOCK_ACQUIRE_SEC", "5"))
 _NQ_SEND_SUFFIX = ".send.lock"      # held across a transmission, drainers only
 _NQ_FILE_SUFFIX = ".lock"           # held across a file read/write, everyone
+# v6.159: records already SENT (or dropped) whose pop could not be saved. On Windows the pop's
+# os.replace is refused while any other handle has the queue open (an unlocked reader, a fail-
+# open lock, AV), and the record stayed at the head and went out AGAIN: 29 Oct 03:58-03:59 the
+# same "1 session(s) down" alert five times, each after "notify queue not saved". Every drainer
+# (any process) skips what is listed here; the process that sent it also keeps it in memory, in
+# case the list cannot be written. An APPEND still works while others read the queue.
+_NQ_SENT_SUFFIX = ".sent"
+_NQ_REPLACE_TRIES = 20              # os.replace refused: retry 20 x 50 ms before giving up
+_NQ_REPLACE_RETRY_SEC = 0.05
+# v6.170 (Wilson 2026-10-30 "retry the telegram as well"): 09:17-09:40 api.telegram.org read-timed
+# out on every send (20 s, nothing back) and six messages were dropped as delivery-uncertain, both
+# BET PLACED confirmations of the morning's NFL tips and the McMillan manual alert among them. A
+# read timeout now gets ONE resend after NOTIFY_RESEND_DELAY_SEC, its text marked so that when
+# the first copy did arrive (the 2026-06-16 Turang case) the second reads as the resend it is,
+# not as a second bet. A resend that times out again is dropped as before. Off:
+# NOTIFY_RESEND_ON_READ_TIMEOUT=0.
+_NQ_RESEND_UNCERTAIN = (os.getenv("NOTIFY_RESEND_ON_READ_TIMEOUT", "1").strip().lower()
+                        not in ("0", "false", "no", "off"))
+_NQ_RESEND_DELAYS_DEFAULT = (30.0, 120.0, 600.0, 1200.0)
+_NQ_RESEND_MAX_WAIT = 3600.0        # a not_before further out than this is read as this (clock skew)
+_NQ_TELEGRAM_MAX_CHARS = 4096
+
+
+def _parse_resend_delays(raw) -> tuple:
+    """NOTIFY_RESEND_DELAYS_SEC="30,120,600,1200": the wait before the 1st, 2nd, 3rd, 4th resend of a
+    read-timed-out message. Each attempt itself times out after 20 s, so the attempts fall at +0,
+    +50 s, +3 min 10 s, +13 min 30 s and +33 min 50 s: the re-check's arithmetic against the 30 Oct
+    outage (09:17-09:40, 23 min) is what added the 20-minute step; a three-step chain ended at 12.5
+    min and would still have lost that morning's messages. Garbage, empty, inf or nan -> the
+    default; each wait clamped to 1..3600 s; at most 5 resends. Never raises: a bad .env line must
+    not stop the bot at import."""
+    try:
+        vals = [float(x) for x in str(raw or "").replace(";", ",").split(",") if x.strip()]
+    except (TypeError, ValueError):
+        return _NQ_RESEND_DELAYS_DEFAULT
+    vals = [min(_NQ_RESEND_MAX_WAIT, max(1.0, v)) for v in vals if v == v and abs(v) != float("inf")]
+    return tuple(vals[:5]) or _NQ_RESEND_DELAYS_DEFAULT
+
+
+_NQ_RESEND_DELAYS = _parse_resend_delays(os.getenv("NOTIFY_RESEND_DELAYS_SEC", "30,120,600,1200"))
+_NQ_RESEND_MARK = "(resend: an earlier attempt timed out and may also have arrived)"
+
+
+def _nq_not_before(rec: dict, now: float) -> float:
+    """When this record may go (epoch), clamped to now + _NQ_RESEND_MAX_WAIT so a clock step or an
+    absurd value can never park the queue; 0 for a record with no wait or a garbled one."""
+    try:
+        nb = float((rec or {}).get("not_before") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if nb != nb:                      # nan
+        return 0.0
+    return min(nb, now + _NQ_RESEND_MAX_WAIT)
+
+
+def _nq_resends_of(rec: dict) -> int:
+    """How many marked resends this record has had, bounded to 0..len(delays); a garbled value
+    (text, Infinity, a negative) reads as 'all of them' (drop), never as an index error."""
+    try:
+        n = int((rec or {}).get("resends", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return len(_NQ_RESEND_DELAYS)
+    if n < 0:
+        return len(_NQ_RESEND_DELAYS)
+    return min(n, len(_NQ_RESEND_DELAYS))
+
+
+def _parse_keeper_sec(raw) -> float:
+    try:
+        v = float(str(raw or "").strip() or 60)
+    except (TypeError, ValueError):
+        return 60.0
+    if v != v or v <= 0 or v == float("inf"):
+        return 0.0 if v == 0 else 60.0
+    return max(5.0, min(3600.0, v))
+
+
+# v6.170 re-check: a drainer exits after ~5 min with an empty file and is restarted by the next
+# enqueue in ITS process, so a marked resend written to the shared queue by a one-shot script
+# (check_session_health, disk_guard, boot_alert) stayed on disk until tipbot Main next had
+# something to say. The keeper looks at the file once a minute and restarts the drainer when it
+# is not empty. NOTIFY_QUEUE_KEEPER_SEC=0 turns it off. Never under the test guard.
+_NQ_KEEPER_SEC = _parse_keeper_sec(os.getenv("NOTIFY_QUEUE_KEEPER_SEC", "60"))
+_nq_keeper_on = False
+_nq_keeper_gen = object()      # a reload makes a new one; a keeper from before the reload exits
+
+
+def _nq_keeper_tick() -> bool:
+    """One look: start the drainer when the queue file holds anything. True when it was asked to."""
+    try:
+        path = _NQ_PATH
+        if path and os.path.exists(path) and os.path.getsize(path) > 0:
+            _nq_start(keeper=False)
+            return True
+    except Exception as e:
+        log.debug(f"notify queue keeper: {e}")
+    return False
+
+
+def _nq_keeper(gen) -> None:
+    """Ticks until the module it was started from is gone. v6.170 isolation review: every test that
+    uses the notify-queue fixture reloads this module into the same globals, so a keeper from an
+    earlier test kept ticking and, 60 s into a combined run, restarted a drainer that drove the
+    rate-limit tests' stubbed transport. A keeper whose generation is stale, or whose process has
+    the test guard on, exits without acting. In production there is one keeper per process."""
+    global _nq_keeper_on
+    while True:
+        time.sleep(_NQ_KEEPER_SEC)
+        if gen is not _nq_keeper_gen or _blocked_by_test_guard():
+            if gen is _nq_keeper_gen:
+                _nq_keeper_on = False
+            return
+        _nq_keeper_tick()
+
+
+def _nq_due(items: list, now: float = None) -> list:
+    """The records that may be sent now (a resend waits out its not_before; the rest do not wait
+    behind it)."""
+    now = time.time() if now is None else now
+    return [it for it in items if _nq_not_before(it, now) <= now]
 
 
 class _nq_xlock:
@@ -232,14 +355,26 @@ def flush(timeout: float = 60.0) -> int:
     cooldown could eat on its own.
 
     Call this at the end of any short-lived process that sends notifications.
+
+    v6.170: returns as soon as nothing is DUE and nothing is in flight. A marked resend waiting
+    out its delay (30 s to 20 min) counts in the return value but is not waited for: it stays in
+    the shared queue file and the keeper thread of any long-lived importer (tipbot Main) sends it.
+    A non-zero return therefore means "left for later", not "stuck".
     """
     _nq_start()
     end = time.time() + max(0.0, timeout)
     while time.time() < end:
-        if not _nq_load() and _nq_inflight == 0:
-            return 0
+        _pend = _nq_pending()
+        if _nq_inflight == 0 and not _nq_due(_pend):
+            # v6.170: a resend waiting out its delay (30 s / 2 min / 10 min) is not worth
+            # holding a one-shot script for; it stays on disk and the next drainer of this
+            # shared queue (tipbot Main's, or this script's next run) sends it
+            if _pend:
+                log.info(f"notify flush: {len(_pend)} marked resend(s) waiting; left for the "
+                         f"next drainer")
+            return len(_pend)
         time.sleep(0.25)
-    left = len(_nq_load())
+    left = len(_nq_pending())
     if left or _nq_inflight:
         log.error(
             f"notify flush: {left} message(s) still queued after {timeout:.0f}s"
@@ -274,7 +409,8 @@ def _nq_enqueue(text: str, chat_id: str, parse_mode: str) -> bool:
         print(f"[NOTIFY] {text}")
         return False
     rec = {"text": text, "chat_id": str(chat_id), "parse_mode": parse_mode,
-           "queued_at": time.time(), "attempts": 0}
+           "queued_at": time.time(), "attempts": 0,
+           "id": uuid.uuid4().hex}      # v6.159: the same alert queued twice is two records
     try:
         with _nq_lock:
             os.makedirs(os.path.dirname(_NQ_PATH) or ".", exist_ok=True)
@@ -300,7 +436,12 @@ def _nq_thread_name(path: str) -> str:
         return "notify-queue:" + str(path)
 
 
-def _nq_start() -> None:
+def _nq_start(keeper: bool = True) -> None:
+    global _nq_keeper_on
+    if keeper and not _nq_keeper_on and _NQ_KEEPER_SEC > 0 and not _blocked_by_test_guard():
+        _nq_keeper_on = True
+        threading.Thread(target=_nq_keeper, args=(_nq_keeper_gen,), name="notify-queue-keeper",
+                         daemon=True).start()
     global _nq_thread
     with _nq_lock:
         if _nq_thread is not None and _nq_thread.is_alive():
@@ -335,7 +476,12 @@ def _nq_load() -> list:
                 if not line:
                     continue
                 try:
-                    out.append(json.loads(line))
+                    rec = json.loads(line)
+                    if not isinstance(rec, dict):
+                        # v6.159: valid JSON but not a record ("[]"): the pop keys every
+                        # record, so this would stall the queue and resend its head
+                        raise ValueError("not a record")
+                    out.append(rec)
                 except Exception:
                     # v6.18: SAY SO. This was a bare continue, unlike the outer
                     # handler below. Two os._exit watchdogs and a power-cut
@@ -351,15 +497,105 @@ def _nq_load() -> list:
         return []
 
 
-def _nq_save(items: list) -> None:
+def _nq_save(items: list) -> bool:
+    """True once the queue file holds exactly `items`. v6.159: a refused os.replace (another
+    handle open on the queue, Windows) is retried for ~1 s; False = the file is unchanged."""
     try:
         tmp = _NQ_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             for it in items:
                 f.write(json.dumps(it) + "\n")
-        os.replace(tmp, _NQ_PATH)
     except Exception as e:
         log.error(f"notify queue not saved: {e}")
+        return False
+    for attempt in range(_NQ_REPLACE_TRIES):
+        try:
+            os.replace(tmp, _NQ_PATH)
+            return True
+        except PermissionError as e:
+            err = e
+            if attempt + 1 < _NQ_REPLACE_TRIES:
+                time.sleep(_NQ_REPLACE_RETRY_SEC)
+        except Exception as e:
+            err = e
+            break
+    log.error(f"notify queue not saved: {err}")
+    return False
+
+
+def _nq_key(rec: dict) -> str:
+    """One queued record: its id (v6.159, set at enqueue); a record queued before that by its
+    enqueue time, chat and text (the text hashed, to keep .sent small)."""
+    if rec.get("id"):
+        return "id:" + str(rec["id"])
+    text = str(rec.get("text", ""))
+    return json.dumps([rec.get("queued_at"), str(rec.get("chat_id", "")),
+                       hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()])
+
+
+# Keys this process marked as sent: still skipped if the .sent file itself cannot be written
+# or read (review: a refused .sent append brought the resend loop back, once a second).
+_nq_sent_mem = set()
+_nq_sent_unreadable_logged = 0.0
+
+
+def _nq_sent_load():
+    """Keys of records already sent whose pop is not saved yet (see _NQ_SENT_SUFFIX), plus this
+    process's own. None = the .sent file exists but cannot be read: nothing may be sent then."""
+    try:
+        with open(_NQ_PATH + _NQ_SENT_SUFFIX, "r", encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()} | _nq_sent_mem
+    except FileNotFoundError:
+        return set(_nq_sent_mem)
+    except Exception as e:
+        global _nq_sent_unreadable_logged
+        if time.time() - _nq_sent_unreadable_logged > 60:     # the drainer retries every ~0.5 s
+            _nq_sent_unreadable_logged = time.time()
+            log.error(f"notify queue: sent list unreadable ({e}) - holding sends until it can be read")
+        return None
+
+
+def _nq_sent_mark(rec: dict) -> None:
+    """A record left the queue (sent or dropped) but its pop could not be saved: list it so no
+    drainer, in this process or another, sends it again."""
+    _nq_sent_mem.add(_nq_key(rec))
+    err = None
+    for attempt in range(_NQ_REPLACE_TRIES):          # the same ~1 s as a refused replace
+        try:
+            with open(_NQ_PATH + _NQ_SENT_SUFFIX, "a", encoding="utf-8") as f:
+                f.write(_nq_key(rec) + "\n")
+            log.error(f"notify queue: pop not saved, marked as sent so it is NOT resent: "
+                      f"{str(rec.get('text'))[:70]}")
+            return
+        except Exception as e:
+            err = e
+            if attempt + 1 < _NQ_REPLACE_TRIES:
+                time.sleep(_NQ_REPLACE_RETRY_SEC)
+    log.error(f"notify queue: pop not saved AND not listed in .sent ({err}) - this process "
+              f"will not resend it, another one might: {str(rec.get('text'))[:70]}")
+
+
+def _nq_sent_clear() -> None:
+    """Every listed record is out of the queue file: empty the list."""
+    _nq_sent_mem.clear()
+    try:
+        with open(_NQ_PATH + _NQ_SENT_SUFFIX, "w", encoding="utf-8"):
+            pass
+    except Exception as e:
+        log.error(f"notify queue: sent list not cleared ({e})")
+
+
+def _nq_unsent(items: list, sent) -> list:
+    """items minus those listed as sent; an unreadable list (None) still drops this process's."""
+    sent = _nq_sent_mem if sent is None else sent
+    return [it for it in items if _nq_key(it) not in sent] if sent else items
+
+
+def _nq_pending() -> list:
+    """What is still to send, read under the file lock: an unlocked read holds the queue open
+    while a drainer's pop replaces it, and on Windows that refuses the replace (v6.159)."""
+    with _nq_lock, _nq_xlock(_NQ_PATH):
+        return _nq_unsent(_nq_load(), _nq_sent_load())
 
 
 def _nq_drain() -> None:
@@ -368,7 +604,11 @@ def _nq_drain() -> None:
     idle = 0
     blocked = 0        # consecutive failures to take the transmission lock
     my_path = _NQ_PATH
+    nap = 0.0          # v6.159: a pause asked for INSIDE the send lock, taken after leaving it
     while True:
+        if nap:
+            time.sleep(nap)
+            nap = 0.0
         try:
             # v6.18: retire if the queue path has moved out from under us. `_nq_start`
             # keys the one-drainer-per-file guard on the path, so a drainer left bound to
@@ -380,14 +620,14 @@ def _nq_drain() -> None:
                          f"this drainer is retiring")
                 return
             with _nq_lock, _nq_xlock(_NQ_PATH):
-                items = _nq_load()
+                items = _nq_unsent(_nq_load(), _nq_sent_load())
             if not items:
                 idle += 1
                 # Exit after ~5 minutes idle; the next enqueue restarts us.
                 if idle > 150:
                     log.info("notify queue empty — drainer exiting until next message")
                     return
-                time.sleep(2)
+                _nq_idle_wake.wait(2)     # = sleep(2); set only by tests retiring a drainer
                 continue
             idle = 0
 
@@ -426,8 +666,21 @@ def _nq_drain() -> None:
                 # Re-read under the lock: the other drainer may have just sent this record
                 # and popped it while we were queueing for the lock.
                 with _nq_lock, _nq_xlock(_NQ_PATH):
+                    sent = _nq_sent_load()
                     items = _nq_load()
+                    if sent is None:
+                        # the list of sent records cannot be read: the head may be one of
+                        # them, so send nothing until it can (a late alert beats a double)
+                        items = []
+                    elif sent:
+                        # v6.159: what an earlier pop could not save is never sent again;
+                        # take it out of the file now, and empty the list once that is saved
+                        unsent = _nq_unsent(items, sent)
+                        if len(unsent) == len(items) or _nq_save(unsent):
+                            _nq_sent_clear()
+                        items = unsent
                 if not items:
+                    nap = 0.5          # not here: the send lock is held (another process waits)
                     continue
 
                 now = time.time()
@@ -440,7 +693,16 @@ def _nq_drain() -> None:
                 if len(items) > 1 and gap > 0:
                     time.sleep(gap)
 
-                rec = items[0]
+                # v6.170: the first record that is DUE. A resend waiting out its delay is skipped
+                # over, not waited behind (a 10-minute wait must not hold up the next alert); when
+                # nothing is due, nap until the soonest one is.
+                _now2 = time.time()
+                _due = _nq_due(items, _now2)
+                if not _due:
+                    _soon = min(_nq_not_before(it, _now2) for it in items)
+                    nap = min(5.0, max(0.1, _soon - _now2))
+                    continue
+                rec = _due[0]
                 waited = time.time() - float(rec.get("queued_at") or 0)
                 if waited > _NQ_STALE_SEC and rec.get("attempts", 0) % 20 == 0:
                     log.error(
@@ -479,36 +741,96 @@ def _nq_drain() -> None:
                 # The read-decide-write POP must be ONE atomic file operation, so every
                 # branch below stays inside this `with`.
                 with _nq_lock, _nq_xlock(_NQ_PATH):
-                    cur = _nq_load()
+                    sent = _nq_sent_load()
+                    cur = _nq_unsent(_nq_load(), sent)
                     # Only pop if the head is still the record we just sent: another
                     # process or an inline fallback could have rewritten the file
                     # underneath us.
-                    if cur and cur[0].get("queued_at") == rec.get("queued_at") \
-                            and cur[0].get("text") == rec.get("text"):
-                        head, rest = cur[0], cur[1:]
+                    # v6.170: the record may sit behind a waiting resend now, so it is found by
+                    # its key (and text, in case a resend copy of a pre-v6.159 record shares one)
+                    _kk = _nq_key(rec)
+                    _idx = next((i for i, it in enumerate(cur)
+                                 if _nq_key(it) == _kk and it.get("text") == rec.get("text")), None)
+                    if _idx is not None:
+                        head, rest = cur[_idx], cur[:_idx] + cur[_idx + 1:]
                     else:
                         head, rest = None, cur
 
+                    def _pop_sent():
+                        # v6.159: the record has left (sent, or dropped on purpose). Take it
+                        # out wherever it is; if that cannot be saved, list it in .sent so no
+                        # drainer sends it again. A saved pop also drops the listed ones.
+                        # One instance only: a record queued before v6.159 has no id, and
+                        # two of those can share a key.
+                        k = _nq_key(rec)
+                        left = list(cur)
+                        for i, it in enumerate(left):
+                            if _nq_key(it) == k:
+                                del left[i]
+                                break
+                        if _nq_save(left):
+                            if sent:           # every listed record is out of the file now
+                                _nq_sent_clear()
+                        else:
+                            _nq_sent_mark(rec)
+
                     if ok:
-                        _nq_save(rest if head is not None else cur)
+                        _pop_sent()
                     elif outcome == "throttled":
                         # Requeue at the FRONT: order matters for a bet log, and the
                         # message is fine, only the timing was wrong.
                         if head is not None:
                             head["attempts"] = int(head.get("attempts", 0)) + 1
                             _nq_save([head] + rest)
+                    elif outcome == "uncertain" and head is not None and _NQ_RESEND_UNCERTAIN \
+                            and _nq_resends_of(head) < len(_NQ_RESEND_DELAYS):
+                        # v6.170: a read timeout means the POST was transmitted and MAY have
+                        # been delivered; on 30 Oct it meant Telegram's API was down for 23
+                        # minutes and six messages were lost. A chain of marked resends
+                        # (30 s, 2 min, 10 min by default), the record kept in its place; the
+                        # mark tells a duplicate from a second bet.
+                        _n = _nq_resends_of(head)
+                        _again = dict(head)
+                        _again["resends"] = _n + 1
+                        _again["attempts"] = int(head.get("attempts", 0) or 0) + 1
+                        _again["not_before"] = time.time() + _NQ_RESEND_DELAYS[_n]
+                        _txt = str(head.get("text") or "")
+                        if _NQ_RESEND_MARK not in _txt:
+                            _room = _NQ_TELEGRAM_MAX_CHARS - len(_NQ_RESEND_MARK) - 1
+                            if len(_txt) > _room:
+                                _txt = _txt[:_room]
+                            _again["text"] = f"{_txt}\n{_NQ_RESEND_MARK}"
+                        _cur2 = list(cur)
+                        _cur2[_idx] = _again
+                        if _nq_save(_cur2):
+                            log.error(
+                                f"notify DELIVERY-UNCERTAIN (chat={rec.get('chat_id')}): resend "
+                                f"{_n + 1} of {len(_NQ_RESEND_DELAYS)} in "
+                                f"{_NQ_RESEND_DELAYS[_n]:.0f}s, marked as a resend: "
+                                f"{str(rec.get('text'))[:80]}")
+                        else:
+                            # the resend marker cannot be written (the 29 Oct refused replace):
+                            # an unmarked record at the head would go out again every cycle, so
+                            # it is dropped and listed as sent, exactly as before v6.170
+                            log.error(
+                                f"notify DELIVERY-UNCERTAIN (chat={rec.get('chat_id')}): the queue "
+                                f"cannot be saved, so NOT resent (dropped, listed as sent): "
+                                f"{str(rec.get('text'))[:80]}")
+                            _pop_sent()
                     elif outcome == "uncertain":
                         # A read timeout means the POST was TRANSMITTED and very likely
                         # delivered. Resending duplicates it (the 2026-06-16 Turang/Olson
                         # double-send). This is the ONE case we drop, and we say so loudly.
+                        # v6.170: reached when the resend chain is exhausted, or with the
+                        # resend switched off.
                         log.error(
                             f"notify DELIVERY-UNCERTAIN, dropping to avoid a duplicate "
                             f"(chat={rec.get('chat_id')}): {str(rec.get('text'))[:80]}")
-                        _nq_save(rest if head is not None else cur)
+                        _pop_sent()
                     else:
                         # Permanent (400 chat-not-found, bot blocked, malformed):
                         # requeueing would spin forever; _send_now logged NOTIFY LOST.
-                        _nq_save(rest if head is not None else cur)
+                        _pop_sent()
         except Exception as e:
             log.error(f"notify queue drainer error: {e}")
             time.sleep(5)
@@ -1243,6 +1565,13 @@ def notify_info(message: str) -> bool:
     return _send_maintenance(f"<b>INFO:</b> {_escape_html(message)}")
 
 
+def notify_tennis_placed(message: str) -> bool:
+    """v6.171: a Fergal tennis bet placed on Sportmarket (tiptitans_tennis). Bet Log chat, plain
+    text (first line bold)."""
+    head, _, rest = str(message or "").partition("\n")
+    return _send_success(f"<b>🎾 {_escape_html(head)}</b>" + (f"\n{_escape_html(rest)}" if rest else ""))
+
+
 def notify_betfair_bsp_placed(channel_name: str, event_str: str, placements: list) -> bool:
     """v5.93: Bet Log message for a Betfair BSP placement (Leroy). placements = list
     of {runner, market, size, units, bet_id} — each matched at the Starting Price."""
@@ -1504,6 +1833,11 @@ def notify_tip_placed_summary(
             if getattr(r, "_recovered_note", "")]
     if _rec:
         recovery_tag = "\n<b>⚙️ Recovered on re-bet:</b> " + _escape_html("; ".join(_rec))
+    # v6.128: a milestone twin bet (same line and odds, its own Sportsbet limit) is named as one
+    _twn = [getattr(r, "_twin_note", "") for r in (placed_results or [])
+            if getattr(r, "_twin_note", "") and getattr(r, "success", False)]
+    if _twn:
+        recovery_tag += "\n<b>Milestone twin:</b> " + _escape_html("; ".join(_twn))
 
     text = (
         f"<b>BET PLACED</b>{sgm_tag}{fallback_tag}\n"

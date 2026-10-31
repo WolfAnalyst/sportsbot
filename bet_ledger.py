@@ -328,9 +328,10 @@ def _now():
     return n.isoformat(timespec="seconds"), n.date().isoformat()
 
 
-def log_sports_bet(tip, result, account: str = "") -> None:
+def log_sports_bet(tip, result, account: str = "", *, titan: str = "", note: str = "") -> None:
     """Log a placed sports bet (singles / fan-out / SGM / MLB). tip is a
-    ParsedTip, result a BetResult."""
+    ParsedTip, result a BetResult. v6.171: `titan` and `note` for a Tip Titans sports tip
+    (Fergal tennis: titan FB, note "TT-<tip id> ..." so the Bet Record pairs it with the tip)."""
     try:
         placed_at, today = _now()
         legs = list(getattr(tip, "legs", None) or [])
@@ -374,7 +375,7 @@ def log_sports_bet(tip, result, account: str = "") -> None:
             # Uniform: the internal id. A sports tipster already IS one, but go through
             # the same helper both writers use so the column can never diverge again.
             "tipster": tipster_id_for(getattr(tip, "tipster", "")),
-            "titan": "",          # sports bets have no titan
+            "titan": titan or "",  # sports bets have no titan (Tip Titans tennis: FB)
 
             "sport": getattr(tip, "sport", "") or "",
             "event": getattr(tip, "event", "") or "",
@@ -392,7 +393,8 @@ def log_sports_bet(tip, result, account: str = "") -> None:
             "correlation_id": getattr(result, "correlation_id", "") or "",
             "units": _num(getattr(tip, "units", None)) if getattr(tip, "units", None) is not None else "",
             "unit_size": _num(getattr(tip, "unit_size", None)) if getattr(tip, "unit_size", None) is not None else "",
-            "note": getattr(result, "_recovered_note", "") or "",
+            "note": (note or getattr(result, "_recovered_note", "") or getattr(result, "_twin_note", "")
+                     or ""),
         })
     except Exception as e:
         log.error(f"bet_ledger.log_sports_bet failed: {e}")

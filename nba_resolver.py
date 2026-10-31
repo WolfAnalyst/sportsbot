@@ -63,7 +63,10 @@ NBA_TEAM_ALIASES = {
     # Pacific
     "warriors": "Golden State Warriors", "gsw": "Golden State Warriors", "golden state": "Golden State Warriors", "dubs": "Golden State Warriors", "gs": "Golden State Warriors",
     "clippers": "LA Clippers", "la clippers": "LA Clippers", "lac": "LA Clippers", "los angeles clippers": "LA Clippers",
-    "lakers": "Los Angeles Lakers", "la lakers": "Los Angeles Lakers", "lal": "Los Angeles Lakers", "la": "Los Angeles Lakers", "los angeles": "Los Angeles Lakers",
+    "lakers": "Los Angeles Lakers", "la lakers": "Los Angeles Lakers", "lal": "Los Angeles Lakers",
+    # v6.154 (2026-10-29): bare "la" and "los angeles" were Lakers. Two clubs play there, so a
+    # Clippers tip written that way was bet on the Lakers at any book. Both are now refused (see
+    # _AMBIGUOUS_NBA_TOKENS); "la lakers", "la clippers", "los angeles clippers", "lal", "lac" stay.
     "suns": "Phoenix Suns", "phoenix": "Phoenix Suns", "phx": "Phoenix Suns", "phn": "Phoenix Suns",
     "kings": "Sacramento Kings", "sacramento": "Sacramento Kings", "sac": "Sacramento Kings",
     # Southwest
@@ -321,11 +324,24 @@ def _fetch_schedule(sport: str, date: str) -> list[dict]:
 _schedule_fetch_failed: dict = {}  # {"nfl_2026-09-28": when the last fetch failed}
 
 
+# v6.154: tokens that name two NBA clubs. With no alias they would fall to the substring path
+# below ("los angeles" is inside "Los Angeles Lakers"; "la" inside "Atlanta" / "Dallas"), which
+# is the same wrong-team bet by another door, so they match nothing: the tip goes to manual.
+_AMBIGUOUS_NBA_TOKENS = frozenset({"la", "l.a.", "l.a", "los angeles", "los", "angeles"})   # review: the halves too
+
+
+def _ambiguous_team_token(query: str, aliases: dict) -> bool:
+    return aliases is NBA_TEAM_ALIASES and (query or "").strip().lower() in _AMBIGUOUS_NBA_TOKENS
+
+
 def _match_team(query: str, games: list[dict], aliases: dict = NBA_TEAM_ALIASES) -> Optional[dict]:
     """Find a game involving the queried team. `aliases` is the sport-specific
     abbreviation/nickname table (NBA by default; MLB callers pass
     MLB_TEAM_ALIASES so codes like 'OAK' resolve to 'Athletics')."""
     query_lower = query.strip().lower()
+    if _ambiguous_team_token(query_lower, aliases):
+        log.warning(f"Team token {query!r} names two NBA clubs (Lakers / Clippers): not resolving")
+        return None
 
     # Try alias lookup first
     full_name = aliases.get(query_lower, "")
@@ -430,6 +446,8 @@ def resolve_nba_event(
 
 def _team_is(query: str, espn_name: str, aliases: dict) -> bool:
     q = (query or "").strip().lower()
+    if _ambiguous_team_token(q, aliases):
+        return False
     full = aliases.get(q, "")
     name = espn_name.lower()
     if full:

@@ -40,7 +40,7 @@ log = logging.getLogger("tipbot.session_priority")
 # -> 2-leg same-player SGM edge). MLB singles have NO priority list, so
 # for_sport("mlb", is_sgm=False) returns [] and they route to manual.
 # "mma" (v6.112): the Just Bleed MMA test path, Sportsbet 295510 + bet365 314653 only.
-ALLOWED_SPORTS = {"nba", "nbl", "afl", "mlb", "racing", "nfl", "mma"}
+ALLOWED_SPORTS = {"nba", "nbl", "afl", "mlb", "racing", "nfl", "mma", "tennis"}   # v6.171: Fergal tennis
 
 # Markets that may appear in a per-sport liability block (excluding racing,
 # which is structured per-track). Any market not listed here is allowed
@@ -126,6 +126,8 @@ KNOWN_NFL_MARKETS = {
     "1st_quarter_passing_yards", "1st_quarter_rushing_receiving_yards",
     "team_total", "team_line", "margin", "handicap", "first_half_h2h", "first_half_total",
     "first_half_line", "total_points",   # v6.84
+    # v6.126: the anytime-TD cap keys (main._NFL_ATD_STATS), capped on the new accounts
+    "touchdowns", "anytime_touchdown", "anytime_td", "anytime_touchdowns",
 }
 
 # MMA markets (v6.112): cap keys of the Just Bleed MMA test path (main._mma_cap_key). Each is the
@@ -527,8 +529,12 @@ def load_priority_from_env() -> PriorityConfig:
     )
     _raw_model = os.getenv("NBA_MODEL_SESSION_PRIORITY", "").strip()
     if _raw_model:
+        # v6.154: the Sportmarket bridge's session id (not numeric) is a valid token; config.py's
+        # own check of the same variable accepts it too.
+        _sm_sid = os.getenv("SPORTMARKET_SESSION_ID", "sportmarket").strip() or "sportmarket"
         cfg.nba_model_singles_bad = (
-            not cfg.nba_model_singles or not all(t.isdigit() for t in cfg.nba_model_singles))
+            not cfg.nba_model_singles
+            or not all(t.isdigit() or t == _sm_sid for t in cfg.nba_model_singles))
     _priority_config = cfg
     return cfg
 
@@ -548,6 +554,16 @@ def get_session_meta(session_id: str) -> Optional[SessionMeta]:
     return _session_meta.get(str(session_id))
 
 
+def is_owned_session(session_id) -> bool:
+    """True if this HyperBot session is ours, i.e. has a sessions.yaml entry (a
+    commented-out block = switched off = not ours). Bypassed when
+    USE_LEGACY_PLACEMENT=true (yaml never loaded). main._is_owned_session and the
+    Tip Titans paths both call this, so other modules never `from main import` it."""
+    if os.getenv("USE_LEGACY_PLACEMENT", "false").lower() == "true":
+        return True
+    return get_session_meta(str(session_id)) is not None
+
+
 def session_label(session_id, fallback_bookie: str = "") -> str:
     """Human label for a session: "Denzel Sportsbet (s118458)".
 
@@ -564,17 +580,20 @@ def session_label(session_id, fallback_bookie: str = "") -> str:
     exception would replace a degraded message with no message at all.
     """
     sid = str(session_id) if session_id is not None else ""
+    # v6.154 (2026-10-29): a HyperBot id is a number, rendered "s118458". The Sportmarket bridge's
+    # session id ("sportmarket") is not, and "(ssportmarket)" read as a typo: render it bare.
+    _tag = f"s{sid}" if (sid.isdigit() or not sid) else sid
     try:
         meta = _session_meta.get(sid)
         if meta and meta.name:
             bookie = (getattr(meta, "bookmaker", "") or fallback_bookie or "").strip()
             if bookie:
-                return f"{meta.name} {bookie.capitalize()} (s{sid})"
-            return f"{meta.name} (s{sid})"
+                return f"{meta.name} {bookie.capitalize()} ({_tag})"
+            return f"{meta.name} ({_tag})"
     except Exception:
         pass
     bookie = (fallback_bookie or "").strip()
-    return f"{bookie} (s{sid})" if bookie else (f"s{sid}" if sid else "unknown session")
+    return f"{bookie} ({_tag})" if bookie else (_tag if sid else "unknown session")
 
 
 def get_priority_config() -> PriorityConfig:

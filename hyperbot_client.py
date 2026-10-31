@@ -30,6 +30,15 @@ from config import (
 
 log = logging.getLogger(__name__)
 
+
+def _sports_placement_paused() -> bool:
+    """v6.117: read fresh, so a test (or a later config reload) sees the current value."""
+    try:
+        import config as _cfg
+        return bool(getattr(_cfg, "SPORTS_PLACEMENT_PAUSED", False))
+    except Exception:
+        return True   # fail CLOSED (review): an unreadable flag must not let a bet through
+
 # ── v6.22 UN-POPPABLE TEST GUARD, mirrors notifier.py's v6.14/v6.18 one ──
 # Set True ONLY by a test that deliberately exercises the transport with
 # `requests` stubbed, so nothing can leave the machine. Everything else is
@@ -77,38 +86,143 @@ def _blocked_by_test_guard() -> bool:
 # (atomic reserve under a lock so the concurrent fan-out can't overshoot; persisted
 # so it survives a restart). Both 0 => disabled (fork default).
 _GOV_LOCK = threading.Lock()
-_GOV_STATE_PATH = os.getenv(
-    "PLACEMENT_GOVERNOR_STATE_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "placement_governor_count.json"),
-)
+
+
+def _main_logs_dir() -> str:
+    """The MAIN checkout's logs folder, also when this file is loaded from a worktree
+    (<repo>/.claude/worktrees/<name>/): the daily count and the test-bet record are one per
+    machine, not one per checkout (two worktrees must not get 20 a day each)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    i = here.replace("\\", "/").lower().find("/.claude/worktrees/")
+    return os.path.join(here[:i] if i >= 0 else here, "logs")
+
+
+_DEFAULT_GOV_STATE_PATH = os.path.join(_main_logs_dir(), "placement_governor_count.json")
+_GOV_STATE_PATH = os.getenv("PLACEMENT_GOVERNOR_STATE_PATH", _DEFAULT_GOV_STATE_PATH)
+_GOV_XLOCK_WAIT_SEC = 5.0
+
+
+def _gov_xlock():
+    """An OS lock on a lock file beside the counter, so two processes cannot both reserve the same
+    slot. The OS drops it when the holding process dies, so there is no stale lock to clean up and
+    nothing another process can delete. Returns the open file (held) or None when it could not be
+    taken in _GOV_XLOCK_WAIT_SEC: the caller then refuses (a cap that cannot be counted is not
+    allowed). Release with _gov_xunlock."""
+    lock = _GOV_STATE_PATH + ".lock"
+    try:
+        os.makedirs(os.path.dirname(lock) or ".", exist_ok=True)
+        f = open(lock, "a+b")
+    except OSError as e:
+        log.error(f"placement governor: could not open the counter lock {lock}: {e}")
+        return None
+    end = time.time() + _GOV_XLOCK_WAIT_SEC
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except OSError:
+            if time.time() >= end:
+                f.close()
+                return None
+            time.sleep(0.05)
+
+
+def _gov_xunlock(f) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except OSError as e:
+        log.error(f"placement governor: could not release the counter lock: {e}")
+    finally:
+        f.close()                       # closing drops the lock in any case
+
+
+class _GovCountError(Exception):
+    """The counter could not be read or written: the governed placement is refused."""
 
 
 def _gov_load() -> dict:
+    """The day's count. A missing file is a fresh count; any other read error raises
+    _GovCountError (a counter that cannot be read must not restart at 0)."""
     try:
         with open(_GOV_STATE_PATH, "r", encoding="utf-8") as f:
             d = json.load(f)
         return {"date": str(d.get("date", "")), "count": int(d.get("count", 0))}
-    except Exception:
+    except FileNotFoundError:
         return {"date": "", "count": 0}
+    except Exception as e:
+        raise _GovCountError(f"could not read {_GOV_STATE_PATH}: {e}") from e
 
 
 def _gov_save(state: dict) -> None:
+    """Persist the count; a failure raises _GovCountError (the slot cannot be counted)."""
+    tmp = f"{_GOV_STATE_PATH}.{os.getpid()}.tmp"
     try:
-        tmp = _GOV_STATE_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"date": state.get("date", ""), "count": int(state.get("count", 0))}, f)
+            f.flush()
+            os.fsync(f.fileno())          # a crash after the rename must not leave an empty file
         os.replace(tmp, _GOV_STATE_PATH)
     except Exception as e:
-        log.error(f"placement governor: could not persist count to {_GOV_STATE_PATH}: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise _GovCountError(f"could not save {_GOV_STATE_PATH}: {e}") from e
 
 
-def _placement_governor(amount):
+_DEFAULT_TEST_BETS_PATH = os.path.join(_main_logs_dir(), "claude_test_bets.jsonl")
+_TEST_BETS_PATH = os.getenv("CLAUDE_TEST_BETS_PATH", _DEFAULT_TEST_BETS_PATH)
+
+
+def _report_test_bet(n, cap, amount, ctx) -> None:
+    """Wilson 2026-10-31 ("20 a day and make sure its tracked and reported to me"): every governed
+    placement attempt is a Claude Code test bet (the live .env keeps the governor at 0/0, only a
+    command's inline env turns it on). One line in logs/claude_test_bets.jsonl and one Telegram
+    info message per attempt; the queue gets a short flush (the message is durable, a later
+    drainer sends it if this process exits first). The outcome is not known yet: the line records
+    the attempt. Under pytest the real file is never written. Never raises."""
+    if "pytest" in sys.modules and _TEST_BETS_PATH == _DEFAULT_TEST_BETS_PATH:
+        return
+    ctx = dict(ctx or {})
+    rec = {"ts": datetime.now().isoformat(timespec="seconds"), "n_today": n, "cap": cap,
+           "stake": amount, "pid": os.getpid(), **{k: v for k, v in ctx.items() if v is not None}}
+    try:
+        with open(_TEST_BETS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except Exception as e:
+        log.error(f"placement governor: could not record the test bet in {_TEST_BETS_PATH}: {e}")
+    what = " ".join(str(ctx.get(k)) for k in ("bookie", "event", "market", "selection")
+                    if ctx.get(k) not in (None, ""))
+    try:
+        import notifier
+        notifier.notify_info(f"🧪 Claude Code test bet {n}/{cap} today: ${amount:.2f} on "
+                             f"s{ctx.get('session_id', '?')} {what}".rstrip())
+        notifier.flush(timeout=3)
+    except Exception as e:
+        log.error(f"placement governor: could not report the test bet on Telegram: {e}")
+
+
+def _placement_governor(amount, ctx=None):
     """SAFE-MODE money guard for EVERY real placement (place_* only). Returns
     (allowed: bool, clamped_amount: float, reason: str). (1) Clamps the stake to
     GLOBAL_MAX_STAKE. (2) Atomically reserves one slot against
     GLOBAL_DAILY_PLACEMENT_CAP for the current calendar day; if the day's cap is
     already spent it returns allowed=False (the caller must NOT place). Both bounds
-    disabled when their config value is <= 0. Never raises."""
+    disabled when their config value is <= 0. A reserved slot is a Claude Code test bet and is
+    recorded and reported (_report_test_bet; `ctx` = the bet's session / bookie / event /
+    market / selection). Never raises."""
     # Fully INERT under TIPBOT_TESTING (the test harness sets it): tests must not be
     # stake-clamped, must not consume/refuse against the daily cap, and must never
     # touch the persisted PROD counter file. The governor applies in PRODUCTION only
@@ -126,24 +240,50 @@ def _placement_governor(amount):
         amt = float(GLOBAL_MAX_STAKE)
 
     if GLOBAL_DAILY_PLACEMENT_CAP and GLOBAL_DAILY_PLACEMENT_CAP > 0:
+        if "pytest" in sys.modules and _GOV_STATE_PATH == _DEFAULT_GOV_STATE_PATH:
+            return (True, amt, "")          # a test must never spend the real daily count
+        count_error = None
         with _GOV_LOCK:
-            today = datetime.now().strftime("%Y-%m-%d")
-            state = _gov_load()
-            if state.get("date") != today:
-                state = {"date": today, "count": 0}
-            if state["count"] >= GLOBAL_DAILY_PLACEMENT_CAP:
-                log.error(
-                    f"placement governor: DAILY PLACEMENT CAP reached "
-                    f"({state['count']}/{GLOBAL_DAILY_PLACEMENT_CAP} today) -> REFUSING this "
-                    f"placement. Raise GLOBAL_DAILY_PLACEMENT_CAP (explicit permission) to allow more."
-                )
-                return (False, amt,
-                        f"daily placement cap reached ({GLOBAL_DAILY_PLACEMENT_CAP}/day) - refused; "
-                        f"raise GLOBAL_DAILY_PLACEMENT_CAP for explicit permission")
-            state["count"] += 1
-            _gov_save(state)
-            log.info(f"placement governor: placement attempt {state['count']}/"
-                     f"{GLOBAL_DAILY_PLACEMENT_CAP} today (stake ${amt})")
+            xlock = _gov_xlock()
+            if xlock is None:
+                log.error("placement governor: the counter is locked by another process -> REFUSING")
+                return (False, amt, "daily placement cap: the counter could not be locked - refused")
+            try:
+                today = datetime.now().strftime("%Y-%m-%d")
+                state = _gov_load()
+                if state.get("date") != today:
+                    state = {"date": today, "count": 0}
+                if state["count"] >= GLOBAL_DAILY_PLACEMENT_CAP:
+                    log.error(
+                        f"placement governor: DAILY PLACEMENT CAP reached "
+                        f"({state['count']}/{GLOBAL_DAILY_PLACEMENT_CAP} today) -> REFUSING this "
+                        f"placement. Raise GLOBAL_DAILY_PLACEMENT_CAP (explicit permission) to allow more."
+                    )
+                    return (False, amt,
+                            f"daily placement cap reached ({GLOBAL_DAILY_PLACEMENT_CAP}/day) - refused; "
+                            f"raise GLOBAL_DAILY_PLACEMENT_CAP for explicit permission")
+                state["count"] += 1
+                _gov_save(state)
+                log.info(f"placement governor: placement attempt {state['count']}/"
+                         f"{GLOBAL_DAILY_PLACEMENT_CAP} today (stake ${amt})")
+                n = state["count"]
+            except _GovCountError as e:
+                log.error(f"placement governor: {e} -> REFUSING this placement")
+                count_error = e
+            finally:
+                _gov_xunlock(xlock)
+        if count_error is not None:
+            fix = (f"check or delete {_GOV_STATE_PATH} (deleting it restarts today's count at 0)")
+            try:
+                import notifier
+                notifier.notify_critical(f"Claude Code test bets are REFUSED: the daily counter "
+                                         f"failed ({count_error}). To fix: {fix}.")
+                notifier.flush(timeout=3)
+            except Exception as e:
+                log.error(f"placement governor: could not alert the counter failure: {e}")
+            return (False, amt, f"daily placement cap: the counter failed ({count_error}) - "
+                                f"refused; {fix}")
+        _report_test_bet(n, GLOBAL_DAILY_PLACEMENT_CAP, amt, ctx)     # outside the lock
     return (True, amt, "")
 
 # Retry config for transient upstream failures (5xx gateway errors, read timeout,
@@ -707,7 +847,14 @@ class HyperBotClient:
                 f"v3 placement AMBIGUOUS: cid={cid} TIMEOUT - bet status unknown, "
                 f"bookie={status.get('bookie')} session={status.get('session_id')}"
             )
+            # Sportmarket bridge c07eaa0: a timeout whose job SENT orders names them on the status entry
+            # (order_ids, orders [{order_id, filled_eur, confirmed}], unidentified_orders). Forwarded so a
+            # caller can match a pending record by its order id; absent keys prove nothing either way. Raw
+            # values, so a malformed one reaches the caller's fail-closed check (tiptitans_tennis._orders_final)
+            # instead of vanishing; the keys are set before "success" etc., so they cannot override them.
+            sent = {k: status[k] for k in ("order_ids", "orders", "unidentified_orders") if k in status}
             return {
+                **sent,
                 "success": False,
                 "error": f"cid timeout - bet status unknown (cid={cid})",
                 "ambiguous": True,
@@ -958,15 +1105,41 @@ class HyperBotClient:
             log.error(f"get_transactions failed for {session_id}: {e}")
             return []
 
-    def get_balance(self, session_id: str) -> dict:
+    def get_transactions_or_none(self, session_id: str, days_back: int = 14,
+                                 limit: int = 200):
+        """get_transactions, but a read that FAILED (no session id, an exception, an answer with
+        no transactions list) gives None, so a caller can tell "the history was read and the bet
+        is not in it" from "the history could not be read". A real empty history is []. Same
+        request as get_transactions; read-only / idempotent."""
+        if not session_id:
+            return None
+        try:
+            res = self._post_v3_async(
+                "/v3/transactions",
+                {"session_id": str(session_id), "days_back": days_back, "limit": limit},
+                initial_post_max_attempts=_RETRY_ATTEMPTS,
+            )
+            for s in (res or {}).get("statuses") or []:
+                result = s.get("result") or {}
+                if isinstance(result, dict) and isinstance(result.get("transactions"), list):
+                    return result["transactions"]
+            log.error(f"get_transactions_or_none: no transactions list for {session_id}")
+            return None
+        except Exception as e:
+            log.error(f"get_transactions failed for {session_id}: {e}")
+            return None
+
+    def get_balance(self, session_id: str, timeout: int = 30, max_attempts: int | None = None) -> dict:
         """v4.2: migrated to /v3/balance. Stays SYNC (per docs: 'Unlike
         other v3 endpoints, Get Balance is synchronous - it does not
         return 202 + correlation_id'). Drop-in URL swap, no shape change.
 
         /v2/balance had Deprecation + Sunset headers added 2026-05-16
         pointing at /v3/balance, sunset Sat 17 May. No tipbot callers in
-        practice but migrating wrapper for completeness."""
-        return self._post("/v3/balance", {"session_id": session_id})
+        practice but migrating wrapper for completeness. v6.173: `timeout` / `max_attempts` let
+        the trader balance watch keep a read short (default: the old 30 s with retries)."""
+        return self._post("/v3/balance", {"session_id": session_id}, timeout=timeout,
+                          max_attempts=max_attempts)
 
     def start_session(self, session_id: str) -> dict:
         """v4.1: routes through /v3/start_session. Endpoint may be sync
@@ -1026,6 +1199,48 @@ class HyperBotClient:
             return poll_result
         return self._unwrap_v3_price_sports(poll_result)
 
+    def get_events(self, sport: str, date: str = None, limit: int = 1000) -> dict | None:
+        """v6.194: GET /v3/events (sync, read-only, 60/min). Each event's "epk" plus its bound books.
+        `sport` takes a sport or a league ("nba" reads as the league). None on any failure."""
+        if _blocked_by_test_guard():
+            return None
+        params = {"sport": sport, "limit": limit}
+        if date:
+            params["date"] = date
+        try:
+            resp = requests.get(f"{self.base_url}/v3/events", headers=self.headers, params=params,
+                                timeout=8)      # a read that gates a bet: fail fast
+            if resp.status_code != 200:
+                log.warning(f"GET /v3/events {sport}: HTTP {resp.status_code}")
+                return None
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            log.warning(f"GET /v3/events {sport} failed: {e}")
+            return None
+
+    def get_markets(self, epk: str, bookie: str, market: str = None) -> dict | None:
+        """v6.194: GET /v3/markets (sync, read-only, 120/min): ONE bookie's whole card for ONE event,
+        every placeable row with its proposition_id (bet365 NBA combos, steals, blocks and every
+        player, which /v3/price's Bet Builder read does not carry). Odds are from HyperBot's last
+        scrape. None on any failure."""
+        if _blocked_by_test_guard():
+            return None
+        params = {"epk": epk, "bookie": bookie}
+        if market:
+            params["market"] = market
+        try:
+            resp = requests.get(f"{self.base_url}/v3/markets", headers=self.headers, params=params,
+                                timeout=8)      # a read that gates a bet: fail fast
+            if resp.status_code != 200:
+                log.warning(f"GET /v3/markets {epk} {bookie}: HTTP {resp.status_code}")
+                return None
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            log.warning(f"GET /v3/markets {epk} {bookie} failed: {e}")
+            return None
+
     def price_check_multi_session(self, session_ids: list[str], sport: str,
                                   event: str, player: str = None) -> dict:
         """Bulk multi-session sports price check.
@@ -1064,9 +1279,13 @@ class HyperBotClient:
         line: float = None, target_odds: float = None,
         proposition_id: str = None,
         direction: str = None, max_odds: float = None,
-        period: str = None,
+        period: str = None, event_id: str = None,
     ) -> dict:
         """Place a single sports bet (NBA, AFL, etc).
+
+        v6.174: `event_id` (Sportmarket bridge only) is the event_id of the bridge's own /v3/price
+        answer; with it the bridge refuses the bet if the event string now matches another game.
+        None (default) is omitted from the body, so every other caller is unchanged.
 
         v4.1: migrated to /v3/place_bet. Cid resolves in ~1s for clean
         placements; 5-minute cid timeout if the bookie session hangs.
@@ -1078,11 +1297,20 @@ class HyperBotClient:
         place_racing_bet docstring for the Erasmus regression that
         forced this. Same retry-unsafe class applies to sports.
         """
+        # v6.117: SPORTS_PLACEMENT_PAUSED backstop (the callers stop earlier; this one cannot be
+        # bypassed). A clean local refusal: nothing is sent, so it is never "maybe placed".
+        if _sports_placement_paused():
+            log.warning(f"[sports paused] refused locally, no request sent: session {session_id} "
+                        f"{sport} {event} ${stake}")
+            return {"success": False, "outcome_code": "sports_paused",
+                    "error": "[sports_paused] sports placement paused by Wilson "
+                             "(refused locally, no request sent)",
+                    "session_id": str(session_id)}
         # v6.57: fixture check first, so a refused bet never uses a daily-cap slot.
         _refused = self._event_guard_refusal(session_id, sport, event)
         if _refused:
             return _refused
-        _ok, stake, _gov = _placement_governor(stake)  # SAFE-MODE cap (place-only)
+        _ok, stake, _gov = _placement_governor(stake, dict(session_id=session_id, event=event, market=market, selection=selection))  # SAFE-MODE cap (place-only)
         if not _ok:
             return {"success": False, "error": _gov}
         payload = {
@@ -1135,6 +1363,8 @@ class HyperBotClient:
         # 'garrett_wilson_-_1st_qtr_alt_receiving_yds' is 'full_game') ... Available: ['1q']".
         if period and period != "full_game":
             payload["period"] = period
+        if event_id:
+            payload["event_id"] = event_id
         poll_result = self._post_v3_async("/v3/place_bet", payload)
         if poll_result.get("success") is False and "statuses" not in poll_result:
             return poll_result
@@ -1153,11 +1383,20 @@ class HyperBotClient:
         2026-05-03: max_attempts=1 to prevent retry-driven overstaking.
         See place_racing_bet docstring.
         """
+        # v6.117: SPORTS_PLACEMENT_PAUSED backstop (the callers stop earlier; this one cannot be
+        # bypassed). A clean local refusal: nothing is sent, so it is never "maybe placed".
+        if _sports_placement_paused():
+            log.warning(f"[sports paused] refused locally, no request sent: session {session_id} "
+                        f"{sport} {event} ${stake}")
+            return {"success": False, "outcome_code": "sports_paused",
+                    "error": "[sports_paused] sports placement paused by Wilson "
+                             "(refused locally, no request sent)",
+                    "session_id": str(session_id)}
         # v6.57: fixture check first, so a refused bet never uses a daily-cap slot.
         _refused = self._event_guard_refusal(session_id, sport, event)
         if _refused:
             return _refused
-        _ok, stake, _gov = _placement_governor(stake)  # SAFE-MODE cap (place-only)
+        _ok, stake, _gov = _placement_governor(stake, dict(session_id=session_id, event=event, market="sgm", selection=f"{len(legs or [])} legs"))  # SAFE-MODE cap (place-only)
         if not _ok:
             return {"success": False, "error": _gov}
         payload = {
@@ -1273,7 +1512,7 @@ class HyperBotClient:
         """
         if not date:
             date = datetime.now().strftime("%Y-%m-%d")
-        _ok, stake, _gov = _placement_governor(stake)  # SAFE-MODE cap (place-only)
+        _ok, stake, _gov = _placement_governor(stake, dict(session_id=session_id, event=f"{track} R{race_num}", market=market, selection=runner))  # SAFE-MODE cap (place-only)
         if not _ok:
             return {"success": False, "error": _gov}
         payload = {
@@ -1320,7 +1559,7 @@ class HyperBotClient:
         """
         if not date:
             date = datetime.now().strftime("%Y-%m-%d")
-        _ok, size, _gov = _placement_governor(size)  # SAFE-MODE cap (place-only)
+        _ok, size, _gov = _placement_governor(size, dict(session_id=session_id, bookie="betfair", event=f"{track} R{race_num}", market=f"{market} BSP {bet_direction}", selection=runner))  # SAFE-MODE cap (place-only)
         if not _ok:
             return {"success": False, "error": _gov}
         payload = {

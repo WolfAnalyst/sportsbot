@@ -34,6 +34,7 @@ ml-vs-line, and odds can drift between attempt and fill).
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 
@@ -66,12 +67,281 @@ def _norm(s):
     return "".join(c.lower() for c in (s or "") if c.isalnum())
 
 
+# v6.148 (2026-10-29, found by the limits poller review): HyperBot's /api/pending_bets reports
+# the SPORT FAMILY ("basketball", "american_football", "Racing", "soccer" on 29 Oct; the May
+# self-test sample said "NBA"), while callers pass tipbot's league ("nba", "nfl"). The exact
+# compare rejected every NBA / NFL landing, so a slow 538 that LANDED read as not placed and was
+# rebet at the max on the same account (a double stake). Both sides map to one family; only two
+# KNOWN, different families reject. An unknown label never rejects: a false "found" only
+# under-fills, a false "absent" double-stakes.
+_SPORT_FAMILY = {
+    "nba": "basketball", "nbl": "basketball", "wnba": "basketball", "ncaab": "basketball",
+    "basketball": "basketball",
+    "nfl": "americanfootball", "ncaaf": "americanfootball", "americanfootball": "americanfootball",
+    "afl": "aussierules", "aussierules": "aussierules", "australianrules": "aussierules",
+    "australianfootball": "aussierules",
+    "mlb": "baseball", "baseball": "baseball",
+    "nhl": "icehockey", "icehockey": "icehockey",
+    "soccer": "soccer", "epl": "soccer",      # not "football": AFL might be labelled that way
+    "racing": "racing", "horseracing": "racing", "thoroughbreds": "racing", "harness": "racing",
+    "greyhounds": "racing",
+    "tennis": "tennis", "mma": "mma", "ufc": "mma", "nrl": "rugbyleague", "rugbyleague": "rugbyleague",
+}
+
+
+def _sport_mismatch(pending_sport, sport) -> bool:
+    """True only when both sides are known sport families and they differ."""
+    a = _SPORT_FAMILY.get(_norm(str(pending_sport or "")))
+    b = _SPORT_FAMILY.get(_norm(str(sport or "")))
+    return bool(a and b and a != b)
+
+
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _line_mismatch(bet_text, line) -> bool:
+    """v6.148 review: with the sport gate fixed, another single on the same player (a rebounds
+    bet beside the points attempt) passed every gate. True only when the attempt has a line, the
+    pending bet text carries numbers, and none of them is within 1 of the line (30.5 in "30.5+
+    Points", 16.5 in "Over 16.5", a milestone's 6 in "6+ Rebounds" for line 5.5, a snapped rung).
+    No line, a non-finite line or no number in the text: no reject (a false reject would
+    double-stake)."""
+    if line is None or line == "":
+        return False
+    try:
+        ln = abs(float(line))
+    except (TypeError, ValueError):
+        return False
+    if ln != ln or ln in (float("inf"),):
+        return False
+    nums = []
+    for x in _NUM_RE.findall(str(bet_text or "")):
+        try:
+            nums.append(float(x))
+        except ValueError:
+            pass
+    if not nums:
+        return False
+    # within 1 of the posted line (review): a milestone's "N+" is line + 0.5, and HyperBot can snap a
+    # whole-number post to the next rung ("Line moved 23.0 -> 22.5"); a different stat's line
+    # (rebounds 5.5 beside points 30.5) is still rejected
+    return not any(abs(n - ln) <= 1.0 + 1e-6 for n in nums)
+
+
+_SCORE_RE = re.compile(r"(?<![\d.:\-])(\d)\s?-\s?(\d)(?![\d.\-:]|\s?[ap]m\b)")
+
+
+def _score_tokens(text) -> set:
+    """v6.180: set-score tokens ("2-0") in a bet text, as "N-M". Single digits joined by a dash
+    only (a colon is a label: "Set 1: 2-0" is the score 2-0, not 1-2), never inside a longer run
+    (a date 1-2-2026, a time 7-8pm), so a handicap (-5.5), a date or a line never reads as one."""
+    return {f"{a}-{b}" for a, b in _SCORE_RE.findall(str(text or "").replace("\u2212", "-").replace("\u2013", "-"))}
+
+
+def _score_mismatch(bet_text, selection_text) -> bool:
+    """v6.180 (Wilson via the bridge chat, 2026-10-31: "2-0 vs 2-1 can match the wrong pending bet"):
+    True when BOTH the attempt's selection text and the pending bet text carry exactly one set
+    score and they differ. Tennis set betting only in practice; no score on either side = no
+    reject (a false reject would double-stake)."""
+    a, b = _score_tokens(selection_text), _score_tokens(bet_text)
+    return len(a) == 1 and len(b) == 1 and a != b
+
+
+def _line_distance(bet_text, line):
+    """v6.180: how far the pending bet text's nearest number is from the attempt's line (None when
+    there is no line or no number). Used to RANK matches, never to reject: among several pending
+    bets that pass every gate (an 8.5 and a 9.5 on the same player, a -7.0 and a -7.5 on the same
+    team once whole rungs exist), the exact line is ours."""
+    if line is None or line == "":
+        return None
+    try:
+        ln = abs(float(line))
+    except (TypeError, ValueError):
+        return None
+    if ln != ln or ln == float("inf"):
+        return None
+    try:
+        signed_line = float(line)
+    except (TypeError, ValueError):
+        signed_line = None
+    best = None
+    text = str(bet_text or "").replace("\u2212", "-").replace("\u2013", "-")
+    for m in re.finditer(r"([+-]?)(\d+(?:\.\d+)?)", text):
+        try:
+            n = float(m.group(2))
+        except ValueError:
+            continue
+        # review: a signed text number ("+7.5" / "-7.5") is compared with its sign when the
+        # attempt's line is NEGATIVE (its sign is then certain), so the two sides of one spread on
+        # the same account do not tie; a positive attempt line may be an unsigned magnitude, and an
+        # unsigned text number has none, so those compare by magnitude
+        if (m.group(1) and signed_line is not None and signed_line < 0
+                and (m.start(1) == 0 or not text[m.start(1) - 1].isalnum())):
+            d = abs((n if m.group(1) == "+" else -n) - signed_line)
+        else:
+            d = abs(n - ln)
+        if best is None or d < best:
+            best = d
+    return best
+
+
+# words that follow a name in a pending bet text without being a name (the side, the market, the
+# racing market tag): a pending "Anna K. -5.5 games" must not read as the surname "games"
+_NOT_A_NAME = frozenset({
+    "over", "under", "win", "place", "line", "total", "totals", "points", "point", "rebounds",
+    "assists", "threes", "blocks", "steals", "games", "game", "sets", "set", "asian", "handicap",
+    "spread", "margin", "yards", "receiving", "rushing", "passing", "receptions", "touchdowns",
+    "touchdown", "disposals", "marks", "tackles", "goals", "kicks", "handballs", "clearances",
+    "hitouts", "first", "last", "anytime", "alternate", "pick", "own", "team", "match", "the",
+    "and", "with", "each", "way", "quinella", "exacta", "trifecta", "odds", "boost", "promo",
+    "multi", "same", "sgm", "leg", "legs", "h2h", "head", "moneyline", "winner", "draw", "tie",
+    "plus", "minus", "half", "quarter", "1st", "2nd", "3rd", "4th", "correct", "score", "scorer",
+    "betting", "bet", "double", "triple", "pts", "reb", "ast", "pra", "trb", "stl", "blk",
+})
+
+
+def _ordered_toks(s):
+    """_toks as a list in text order (duplicates kept), accents folded."""
+    return [t for t in "".join(c.lower() if c.isalnum() else " " for c in _fold(s)).split()
+            if len(t) >= 3]
+
+
+def _looks_like(a: str, b: str) -> bool:
+    """v6.180 (review): two surname spellings that are one name after folding (Schroder / Schroeder,
+    Doncic / Donchich): a close string ratio, or one a prefix of the other."""
+    if not a or not b:
+        return False
+    if a == b or a.startswith(b) or b.startswith(a):
+        return True
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.75
+
+
+def _same_first_name_other_player(bet_text, selection_text) -> bool:
+    """v6.180 (tipbot-f5's set_betting reviewers, 2026-10-31): "Anna Kalinina" shares one token with
+    the opponent's pending "Anna Blinkova (Anna Blinkova)" on the same match, so the one-shared-token
+    gate read the opponent's bet as ours. True only when: the selection has at least two name
+    tokens, the ONLY shared token is the selection's first word, and in the pending text that word
+    is followed by a name-like word (alphabetic, not a market word) that the selection does not
+    carry. A single-token selection, two or more shared tokens, a shortened pending name ("Anna K."),
+    a market word after the name, or a surname that is the tip's with another spelling (accents
+    folded, then a close string ratio) never reject (a false reject double-stakes)."""
+    sel = _ordered_toks(selection_text)
+    bet = _ordered_toks(bet_text)
+    if len(sel) < 2 or len(bet) < 2:
+        return False
+    # mutation lens (G1): market words shared by both sides ("under", "over", "win") are not names,
+    # so "Paul Reed Under" vs the foreign "Paul Walker 9.5 Rebounds (Paul Walker Under)" still has
+    # exactly one shared NAME, paul
+    shared = (set(sel) & set(bet)) - _NOT_A_NAME
+    if shared != {sel[0]} or sel[0] in _NOT_A_NAME:
+        return False
+    first = sel[0]
+    for i, t in enumerate(bet[:-1]):
+        if t != first:
+            continue
+        nxt = bet[i + 1]
+        if (nxt.isalpha() and nxt not in _NOT_A_NAME and nxt not in sel
+                and not any(_looks_like(nxt, x) for x in sel[1:])):
+            # review: a surname that merely SPELLS differently from the tip's (a transliteration
+            # the fold did not catch) is the same player, never a reject
+            return True
+    return False
+
+
+def _debit_floor(chosen: dict, cands: list, stake):
+    """v6.180 refutation round (M4): when several records passed the gates and the chosen one's stake
+    is below another candidate's, the caller's debit (`match["stake"]`) is raised to the largest
+    candidate stake, capped at the attempt: our own bet may be the larger record (HyperBot snapped
+    the line, a foreign exact-line bet was chosen), and a debit that is too SMALL leaves the
+    difference to be re-placed (a double stake), while one too large only under-reports. The
+    record's id / odds / text are the chosen record's; the copy carries `stake_floor_from`."""
+    if not chosen or len(cands) <= 1:
+        return chosen
+    try:
+        mx = max(float(c.get("stake") or 0) for c in cands)
+        cur = float(chosen.get("stake") or 0)
+        cap = float(stake) if stake is not None else mx
+    except (TypeError, ValueError):
+        return chosen
+    floor = min(mx, cap)
+    if floor <= cur + 0.005:
+        return chosen
+    out = dict(chosen)
+    out["stake"] = round(floor, 2)
+    out["stake_floor_from"] = cur
+    log.warning(f"reconcile: debit raised from ${cur:.2f} (the chosen record) to ${floor:.2f} (the "
+                f"largest of {len(cands)} matching records, capped at the attempt ${stake}): a smaller "
+                f"debit could leave our own stake to be re-placed")
+    return out
+
+
+def _best_match(cands: list, line, selection_text=None, stake=None):
+    """v6.180: the candidate nearest the attempt's line (exact first; no number last), then the one
+    at the attempt's exact stake, then the one sharing MORE selection tokens; ties keep the
+    pending_bets order. `cands` are records that already passed every gate, so the choice never
+    changes landed, only which record's stake / odds / id are recorded; a chosen stake that is not
+    the attempt's is logged as a WARNING (review: a snapped line beside a foreign exact-line bet)."""
+    if len(cands) <= 1:
+        return cands[0] if cands else None
+    sel_toks = _toks(selection_text) if selection_text else set()
+
+    def _stake_off(c) -> int:
+        try:
+            return 0 if stake is not None and abs(float(c.get("stake")) - float(stake)) <= 0.01 else 1
+        except (TypeError, ValueError):
+            return 1
+
+    ranked = sorted(enumerate(cands),
+                    key=lambda ic: (_line_distance(ic[1].get("bet"), line) is None,
+                                    _line_distance(ic[1].get("bet"), line) or 0.0,
+                                    _stake_off(ic[1]),
+                                    -len(sel_toks & _toks(ic[1].get("bet"))), ic[0]))
+    chosen = ranked[0][1]
+    others = [f"{str(c.get('bet'))[:40]} ${c.get('stake')}" for c in cands if c is not chosen]
+    stakes = set()
+    for c in cands:
+        try:
+            stakes.add(round(float(c.get("stake")), 2))
+        except (TypeError, ValueError):
+            pass
+    if _stake_off(chosen) or len(stakes) > 1:
+        # re-check: the records carry different stakes, so one of them may be OURS auto-capped
+        # beside a foreign bet at the attempt's stake; the ledger row needs a look either way
+        why = (f"its stake is NOT the attempt's ${stake}" if _stake_off(chosen)
+               else f"the matching records carry different stakes {sorted(stakes)}")
+        log.warning(f"reconcile: {len(cands)} pending bets matched every gate; chose "
+                    f"{str(chosen.get('bet'))[:60]!r} ${chosen.get('stake')} (nearest line {line}) over "
+                    f"{others}; {why}: check the ledger row")
+    else:
+        log.info(f"reconcile: {len(cands)} pending bets matched every gate; chose "
+                 f"{str(chosen.get('bet'))[:60]!r} (nearest line {line}, the attempt's stake) over {others}")
+    return chosen
+
+
+_FOLD_TABLE = str.maketrans({
+    # letters NFKD does not decompose (refutation round: "Đokić" vs the book's "Djokic", "Łukasz")
+    "\u0111": "dj", "\u0110": "Dj", "\u00f0": "d", "\u00d0": "D", "\u0142": "l", "\u0141": "L",
+    "\u00f8": "o", "\u00d8": "O", "\u0131": "i", "\u00fe": "th", "\u00de": "Th", "\u00e6": "ae",
+    "\u00c6": "Ae", "\u0153": "oe", "\u0152": "Oe", "\u00df": "ss",
+})
+
+
+def _fold(s) -> str:
+    """v6.180 (review): accents and other marks folded away, so the tip's "Jokić" and the book's
+    "Jokic" are one token (NFKD, combining marks dropped), and the letters NFKD leaves whole are
+    mapped by hand (đ -> dj, ł -> l, ø -> o, ı -> i, þ -> th, æ -> ae, œ -> oe, ß -> ss)."""
+    import unicodedata
+    out = unicodedata.normalize("NFKD", str(s or "").translate(_FOLD_TABLE))
+    return "".join(c for c in out if not unicodedata.combining(c))
+
+
 def _toks(s):
     """Significant (>=3 alnum char) lowercased tokens of s (split on non-alnum,
     exact-token equality). Shared by pending_bet_matches and the startup orphan
-    sweep for fuzzy selection comparison."""
+    sweep for fuzzy selection comparison. v6.180: accents folded first."""
     return {t for t in "".join(
-        c.lower() if c.isalnum() else " " for c in (s or "")
+        c.lower() if c.isalnum() else " " for c in _fold(s)
     ).split() if len(t) >= 3}
 
 
@@ -147,7 +417,8 @@ def _market_contradicts(pending, market) -> bool:
 
 def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=None,
                         after_ts, now_ts=None, dt_grace_sec=DEFAULT_DT_GRACE_SEC,
-                        stake_tol=DEFAULT_STAKE_TOL, market=None):
+                        stake_tol=DEFAULT_STAKE_TOL, market=None, line=None,
+                        selection_exact=True):
     """True if a /api/pending_bets record is the bet we just attempted.
 
     Gates (all must pass):
@@ -188,10 +459,30 @@ def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=Non
     if pstake <= 0 or pstake > stake + stake_tol:
         return False
 
-    if sport:
-        ps = _norm(pending.get("sport"))
-        if ps and _norm(sport) and ps != _norm(sport):
-            return False
+    if sport and _sport_mismatch(pending.get("sport"), sport):
+        return False
+
+    if _line_mismatch(pending.get("bet"), line):
+        log.info(f"reconcile: dt/event/stake matched but the pending bet "
+                 f"{str(pending.get('bet'))[:60]!r} is not on line {line}: rejecting (not our bet)")
+        return False
+
+    # v6.180 review: the two text rules below read the selection as THE posted selection (a player,
+    # a runner, a team, a set score). The deferred sports verify can only offer a tipster's raw
+    # message when the result carried no posted selection (SGM, MLB): fractional odds "3-1" or a
+    # "5-2 record" there would read as a score and reject our own bet, so it passes
+    # selection_exact=False and the rules stand aside (the one-shared-token gate still applies).
+    if selection_exact and _score_mismatch(pending.get("bet"), selection_text):
+        log.info(f"reconcile: dt/event/stake matched but the pending bet "
+                 f"{str(pending.get('bet'))[:60]!r} is another set score than "
+                 f"{str(selection_text)[:40]!r}: rejecting (not our bet)")
+        return False
+
+    if selection_exact and _same_first_name_other_player(pending.get("bet"), selection_text):
+        log.info(f"reconcile: dt/event/stake matched but the pending bet "
+                 f"{str(pending.get('bet'))[:60]!r} names another player with the same first name as "
+                 f"{str(selection_text)[:40]!r}: rejecting (not our bet)")
+        return False
 
     # v6.07 (sweep HIGH #6): HARD win/place gate. A racing PLACE attempt must never
     # confirm against the WIN bet on the same runner/account (or vice-versa) — every
@@ -246,7 +537,8 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
                       selection_text=None, after_ts,
                       max_wait_sec=DEFAULT_MAX_WAIT_SEC,
                       poll_interval_sec=DEFAULT_POLL_INTERVAL_SEC,
-                      market=None):
+                      market=None, exclude_bet_ids=(), line=None, selection_exact=True,
+                      line_gate=True):
     """Poll /api/pending_bets until a matching bet appears or max_wait elapses.
 
     Returns:
@@ -261,6 +553,7 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
         log.warning("reconcile: no account_id, cannot verify — treating as reconcile_failed")
         return {"landed": None, "match": None, "reconcile_failed": True}
 
+    _excl = {str(x) for x in (exclude_bet_ids or ()) if x}
     deadline = time.time() + max_wait_sec
     api_ok_once = False
     last_ok_ts = None   # v6.115: when the latest SUCCESSFUL read STARTED (its snapshot's age)
@@ -272,16 +565,31 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
         else:
             api_ok_once = True
             last_ok_ts = t_req
+            _matched = []
             for b in resp.get("bets", []):
+                # v6.128: a bet already known on this account (the same account's main-row bet
+                # seconds before its milestone twin) is never read as this one
+                if _excl and (str(b.get("id")) in _excl or str(b.get("bookie_bet_id")) in _excl):
+                    continue
+                # v6.180 refutation round: the deferred sports verify's "absent" ends in a "place it
+                # by hand" alert, so there the line only RANKS (line_gate=False); the slow-538
+                # path keeps the within-1 gate (its "absent" only debits)
                 if pending_bet_matches(b, event=event, stake=stake, sport=sport,
                                        selection_text=selection_text, after_ts=after_ts,
-                                       market=market):
-                    log.info(
-                        f"reconcile: LANDED — matched pending bet id={b.get('id')} "
-                        f"bookie_bet_id={b.get('bookie_bet_id')} stake=${b.get('stake')} "
-                        f"odds={b.get('odds')} event='{b.get('event')}'"
-                    )
-                    return {"landed": True, "match": b, "reconcile_failed": False}
+                                       market=market, line=(line if line_gate else None),
+                                       selection_exact=selection_exact):
+                    _matched.append(b)
+            if _matched:
+                # v6.180: several records can pass every gate (an 8.5 and a 9.5 on the same
+                # player within the line tolerance): the one on the exact line is ours
+                b = _best_match(_matched, line, selection_text, stake)
+                b = _debit_floor(b, _matched, stake)
+                log.info(
+                    f"reconcile: LANDED — matched pending bet id={b.get('id')} "
+                    f"bookie_bet_id={b.get('bookie_bet_id')} stake=${b.get('stake')} "
+                    f"odds={b.get('odds')} event='{b.get('event')}'"
+                )
+                return {"landed": True, "match": b, "reconcile_failed": False}
         if time.time() >= deadline:
             break
         time.sleep(poll_interval_sec)
@@ -306,7 +614,8 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
 
 
 def decide_ambiguous(hb, account_id, *, event, stake, sport, selection,
-                     submit_ts, reconcile_enabled, spill_enabled, market=None):
+                     submit_ts, reconcile_enabled, spill_enabled, market=None,
+                     exclude_bet_ids=(), line=None):
     """Shared SLOW-REJECTION reconciliation decision used by BOTH main.py sports
     placement and racing_placer.py (lives here, not main.py, to avoid a circular
     import). Encodes Wilson's 2026-05-31 decisions on top of verify_bet_landed.
@@ -343,7 +652,7 @@ def decide_ambiguous(hb, account_id, *, event, stake, sport, selection,
             selection_text=selection, after_ts=submit_ts,
             # v6.07 (sweep HIGH #6): racing win/place discriminator so a PLACE
             # attempt can't confirm against the WIN bet on the same runner.
-            market=market,
+            market=market, exclude_bet_ids=exclude_bet_ids, line=line,
         )
     except Exception as e:
         log.error(f"reconcile: verify_bet_landed raised: {e}")
@@ -375,6 +684,136 @@ def decide_ambiguous(hb, account_id, *, event, stake, sport, selection,
     # unfilled=$0 and the shortfall never reached manual.
     return {'action': 'not_placed',
             'reason': 'confirmed not-placed, spill off (Tier 1)'}
+
+
+# ── Late-landing check after a re-placement (v6.117) ────────────────────────
+# Wilson 2026-10-24 ("whatever is best ... please do"): every re-placement that follows a
+# PROVEN absence (a same-account rebet at Sportsbet's stated max, a spill to another account
+# or bookie) carries one residual risk: the original bet lands AFTER the ~30 s pending_bets
+# window. One deferred look at the ORIGINAL account turns that silent double into a CRITICAL
+# while there is still time to cash out. ALERT-ONLY: it never places, re-places or re-stakes,
+# so it cannot make anything worse.
+LATE_LANDING_CHECK_DELAY_SEC = float(os.getenv("LATE_LANDING_CHECK_DELAY_SEC", "180"))
+LATE_LANDING_CHECK_ENABLED = os.getenv(
+    "LATE_LANDING_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+
+
+def find_late_landing(pending_bets, *, event, stake, sport, selection, submit_ts,
+                      exclude_bet_ids=(), exclude_stakes=(), market=None, now_ts=None,
+                      never_bet_ids=(), line=None, selection_exact=True):
+    """The pending bet that is the ORIGINAL re-placed bet, or None. Pure, so it is testable.
+
+    Matches the usual gates (pending_bet_matches: an auto-capped, SMALLER landing of the original
+    still counts) and leaves out the re-placement itself: a same-account rebet is on the same
+    event and selection, so it is excluded by its bet id AND by its stake (review: the reply's
+    bet id may not be the pending record's id, and a rebet's stake is exact)."""
+    excl = {str(x) for x in (exclude_bet_ids or ()) if x}
+    # v6.128: another known bet on this account (a milestone twin's main bet) is simply never the
+    # original; it does not use up the re-placement's stake slot
+    never = {str(x) for x in (never_bet_ids or ()) if x}
+    excl_st = []
+    for x in exclude_stakes or ():
+        try:
+            excl_st.append(float(x))
+        except (TypeError, ValueError):
+            pass
+    # Each re-placement excludes ONE record (review: an original auto-capped to exactly the max
+    # must not hide behind its rebet). A record matched by bet id uses up its stake slot.
+    cands = []
+    for b in pending_bets or []:
+        try:
+            st = float(b.get("stake") or 0)
+        except (TypeError, ValueError):
+            continue
+        ids = {str(b.get("bookie_bet_id") or ""), str(b.get("id") or "")} - {""}
+        if ids & never:
+            continue
+        if ids & excl:
+            for i, x in enumerate(excl_st):
+                if abs(st - x) <= 0.01:
+                    del excl_st[i]
+                    break
+            continue
+        cands.append((b, st))
+    _matched = []
+    for b, st in cands:
+        hit_i = next((i for i, x in enumerate(excl_st) if abs(st - x) <= 0.01), None)
+        if hit_i is not None:
+            del excl_st[hit_i]
+            continue
+        if pending_bet_matches(b, event=event, stake=stake, sport=sport,
+                               selection_text=selection, after_ts=submit_ts,
+                               now_ts=now_ts, market=market, line=line,
+                               selection_exact=selection_exact):
+            _matched.append(b)
+    return _best_match(_matched, line, selection, stake)      # v6.180: the exact line first
+
+
+def schedule_late_landing_check(hb, account_id, *, event, stake, sport, selection, submit_ts,
+                                label, notify, exclude_bet_ids=(), exclude_stakes=(), market=None,
+                                never_bet_ids=(), line=None,
+                                delay_sec=None, retry_sec=30.0, selection_exact=True):
+    """Fire-and-forget: after `delay_sec`, look at the ORIGINAL account once more; if the
+    original bet is now there, call notify(message) (a CRITICAL). Never raises into the
+    caller and never places anything. Returns the thread (tests join it), or None."""
+    if not LATE_LANDING_CHECK_ENABLED or not account_id:
+        return None
+    delay = LATE_LANDING_CHECK_DELAY_SEC if delay_sec is None else float(delay_sec)
+    excl = tuple(str(x) for x in (exclude_bet_ids or ()) if x)
+
+    def _read():
+        # review: a 200 with a non-JSON or error body must count as unreadable, never as "absent"
+        try:
+            r = hb.get_pending_bets(account_id)
+        except Exception as e:
+            log.warning(f"late-landing check {label}: pending_bets raised ({e})")
+            return None
+        if (not isinstance(r, dict) or r.get("success") is False
+                or not isinstance(r.get("bets"), list)):
+            return None
+        return r
+
+    def _worker():
+        try:
+            time.sleep(max(0.0, delay))
+            resp = _read()
+            if resp is None:                       # one retry, then say it could not run (review)
+                time.sleep(max(0.0, float(retry_sec)))
+                resp = _read()
+            if resp is None:
+                msg = (f"Late-landing check could NOT run: {label}. pending_bets was unreadable "
+                       f"twice, so it is not known whether the original ${float(stake):.2f} bet "
+                       f"landed late beside its re-placement. Check the account by hand.")
+                log.error(f"late-landing check: {msg}")
+                notify(msg)
+                return
+            hit = find_late_landing(resp.get("bets") or [], event=event, stake=stake,
+                                    sport=sport, selection=selection, submit_ts=submit_ts,
+                                    exclude_bet_ids=excl, exclude_stakes=exclude_stakes,
+                                    market=market, never_bet_ids=never_bet_ids, line=line,
+                                    selection_exact=selection_exact)
+            if hit is None:
+                log.info(f"late-landing check {label}: the original ${float(stake):.2f} is "
+                         f"still absent after {int(delay)}s - no double")
+                return
+            msg = (f"POSSIBLE DOUBLE BET: {label}. The original ${float(stake):.2f} bet was "
+                   f"proven absent and the stake was placed again, but it has now APPEARED "
+                   f"on the account ({hit.get('bet')} @ {hit.get('odds')}, "
+                   f"${hit.get('stake')}, bet id {hit.get('bookie_bet_id') or hit.get('id')}). "
+                   f"Check the account and cash out one of them if the event has not started.")
+            log.error(f"late-landing check: {msg}")
+            notify(msg)
+        except Exception as e:  # never escape: alert-only
+            log.warning(f"late-landing check {label} failed: {e}")
+
+    try:
+        import threading
+        t = threading.Thread(target=_worker, name=f"late-landing-{label[:40]}", daemon=True)
+        t.start()
+        return t
+    except Exception as e:
+        log.warning(f"could not schedule the late-landing check {label}: {e}")
+        return None
 
 
 # ── Startup ORPHAN sweep (incident 2026-07-17, v6.03) ───────────────────────
@@ -670,7 +1109,9 @@ def collect_prop_exposure(hb, sessions, *, stat="disposals", sport="aussie_rules
                 continue
             if b.get("result") is not None:
                 continue  # settled; only unsettled money is exposure
-            if sport and str(b.get("sport") or "").lower() != sport:
+            # v6.148: by sport family; an unknown label is COUNTED (over-counted exposure only
+            # under-stakes; a skipped landing would over-stake)
+            if sport and _sport_mismatch(b.get("sport"), sport):
                 continue
             parsed = parse_player_prop_bet(b.get("bet"))
             if not parsed:

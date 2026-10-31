@@ -9,6 +9,8 @@ carries a single machine line:
     key=7c1f9a2b~1627824~5.5~T1-REB-U2~base~0
 
 18 pipe-separated fields: "BET", the schema version, then 16 `k=v` pairs in a FIXED order.
+(v4 adds `book=sportmarket|sb_floor=<odds or x>|sm_floor=<odds>` just before `key`, 21 fields, and
+is sent only when the deciding book is Sportmarket; see NBA_MODEL_CONTRACT_v3.md section 8.)
 The envelope is the AFL v2 contract (DISPOSALS_MODEL_CONTRACT_v2.md, parsers/disposals_model.py)
 unchanged. What differs in v3 (docs/PIPELINE-DESIGN.md section 3.4 of the model repo):
 
@@ -37,9 +39,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-# Only v3 is understood here. A v2 (AFL) line is refused on sight: it has no business on the
-# NBA path, and its `team` vocabulary is the 18 AFL clubs.
-SUPPORTED_VERSIONS = ("v3",)
+# Only v3 and v4 are understood here. A v2 (AFL) line is refused on sight: it has no business on
+# the NBA path, and its `team` vocabulary is the 18 AFL clubs.
+# v4 (the Sportmarket-first rule, 2026-10-31) is the v3 line plus three keys just before `key`:
+# `book` (exactly `sportmarket`), `sb_floor` (the lowest Sportsbet price that still clears the
+# model's EV, or the literal `x` = Sportsbet takes nothing) and `sm_floor` (the same for
+# Sportmarket). The model sends v3 for every bet decided at Sportsbet, v4 only when the deciding
+# book is Sportmarket. See NBA_MODEL_CONTRACT_v3.md section "v4".
+SUPPORTED_VERSIONS = ("v3", "v4")
 
 # Field order is FIXED and exact. Position-checked as well as key-checked.
 EXPECTED_KEYS = (
@@ -47,6 +54,14 @@ EXPECTED_KEYS = (
     "stake", "target", "proj", "gap", "kind", "start", "key",
 )
 N_FIELDS = 2 + len(EXPECTED_KEYS)  # "BET" + version + 16 pairs = 18
+# v4: the same 16 keys in the same order with book / sb_floor / sm_floor inserted just before key.
+EXPECTED_KEYS_V4 = EXPECTED_KEYS[:-1] + ("book", "sb_floor", "sm_floor", "key")
+N_FIELDS_V4 = 2 + len(EXPECTED_KEYS_V4)  # 21
+V4_BOOK = "sportmarket"
+# The lowest floor a v4 line may carry: the model never tips below NBA_MODEL_MIN_ODDS (1.70).
+# main.py passes the configured value to parse(); this is the module default.
+V4_MIN_FLOOR = 1.70
+V4_NO_BOOK = "x"            # sb_floor literal: Sportsbet must not take any of the stake
 
 # ---------------------------------------------------------------------------------------
 # THE TEAM VOCABULARY. The single place the 30 names are written down.
@@ -110,6 +125,9 @@ class ParseResult:
         return bool(self.rows or self.refusals)
 
 
+_TWO_DP_RE = re.compile(r"\d+(?:\.\d{1,2})?")      # v4 floors: odds at the cent
+
+
 def _coerce_float(raw: str):
     """Strict float coercion; None on anything that is not a plain decimal number.
 
@@ -158,8 +176,12 @@ def _check_key(key: str, pairs: dict, line: float, kind: str):
     return k_tag, attempt, None
 
 
-def _validate(pairs: dict, raw_line: str, markets, tags):
-    """Validate one already-split BET| line. Returns (row, None) or (None, reason)."""
+def _validate(pairs: dict, raw_line: str, markets, tags, version: str = "v3",
+              min_floor: float = V4_MIN_FLOOR):
+    """Validate one already-split BET| line. Returns (row, None) or (None, reason).
+
+    `version` is v3 or v4. A v4 line's extra keys (book, sb_floor, sm_floor) are checked after
+    the common checks, and a v4 retry is refused (a v4 key is always a base or add-on)."""
     # --- vocabulary -------------------------------------------------------------
     market = pairs["market"].strip().lower()
     if market not in markets:
@@ -231,6 +253,33 @@ def _validate(pairs: dict, raw_line: str, markets, tags):
     if not start:
         return None, "start is empty"
 
+    extra = {}
+    if version == "v4":
+        # a v4 line is one Sportmarket-decided base or add-on, key attempt 0; a retry is refused
+        if kind not in ("base", "addon") or attempt != 0:
+            return None, (f"a v4 line must be kind base or addon with key attempt 0, "
+                          f"got kind={kind!r} attempt={attempt}")
+        if pairs["book"] != V4_BOOK:
+            return None, f"book {pairs['book']!r} must be exactly {V4_BOOK!r}"
+        # a floor is odds at the cent: at most 2 decimals (a 1.855 would be rounded by somebody)
+        sm_floor = _coerce_float(pairs["sm_floor"])
+        if sm_floor is None or sm_floor < float(min_floor) - 1e-9:
+            return None, (f"sm_floor={pairs['sm_floor']!r} must be a plain decimal number "
+                          f">= {float(min_floor):.2f}")
+        if not _TWO_DP_RE.fullmatch(pairs["sm_floor"].strip()):
+            return None, f"sm_floor={pairs['sm_floor']!r} must have at most 2 decimals"
+        raw_sb = pairs["sb_floor"]
+        if raw_sb == V4_NO_BOOK:
+            sb_floor = None
+        else:
+            sb_floor = _coerce_float(raw_sb)
+            if sb_floor is None or sb_floor < float(min_floor) - 1e-9:
+                return None, (f"sb_floor={raw_sb!r} must be a plain decimal number "
+                              f">= {float(min_floor):.2f} or the literal {V4_NO_BOOK!r}")
+            if not _TWO_DP_RE.fullmatch(raw_sb.strip()):
+                return None, f"sb_floor={raw_sb!r} must have at most 2 decimals"
+        extra = {"book": V4_BOOK, "sb_floor": sb_floor, "sm_floor": sm_floor}
+
     return {
         "evt": evt,
         "pid": pid,
@@ -251,16 +300,28 @@ def _validate(pairs: dict, raw_line: str, markets, tags):
         "tag": tag,
         "attempt": attempt,
         "raw": raw_line,
+        "version": version,
+        **extra,
     }, None
 
 
-def _parse_line(raw_line: str, markets, tags):
-    """Split + shape-check one candidate BET| line. (row, None) or (None, reason)."""
+def _parse_line(raw_line: str, markets, tags, v4_enabled: bool = False,
+                min_floor: float = V4_MIN_FLOOR):
+    """Split + shape-check one candidate BET| line. (row, None) or (None, reason).
+
+    A v4 line is refused outright unless `v4_enabled` (the NBA_MODEL_V4_ENABLED kill switch;
+    fail closed, so the parser's own default is off)."""
     line = raw_line.strip()
     parts = line.split("|")
-    if len(parts) != N_FIELDS:
-        return None, (f"expected {N_FIELDS} pipe-separated fields, got {len(parts)} "
-                      f"(schema is BET|<version>|{'|'.join(k + '=' for k in EXPECTED_KEYS)})")
+    is_v4 = (len(parts) > 1 and parts[0].strip().upper() == "BET"
+             and parts[1].strip().lower() == "v4")
+    if is_v4 and not v4_enabled:
+        return None, "v4 disabled (NBA_MODEL_V4_ENABLED is false): refusing a BET|v4 line"
+    keys = EXPECTED_KEYS_V4 if is_v4 else EXPECTED_KEYS
+    n_fields = N_FIELDS_V4 if is_v4 else N_FIELDS
+    if len(parts) != n_fields:
+        return None, (f"expected {n_fields} pipe-separated fields, got {len(parts)} "
+                      f"(schema is BET|<version>|{'|'.join(k + '=' for k in keys)})")
     if parts[0].strip().upper() != "BET":
         return None, f"first field is {parts[0]!r}, expected 'BET'"
 
@@ -270,7 +331,7 @@ def _parse_line(raw_line: str, markets, tags):
                       f"(the NBA path understands {SUPPORTED_VERSIONS}); refusing")
 
     pairs = {}
-    for idx, (expected_key, chunk) in enumerate(zip(EXPECTED_KEYS, parts[2:])):
+    for idx, (expected_key, chunk) in enumerate(zip(keys, parts[2:])):
         if "=" not in chunk:
             return None, f"field {idx + 3} ({chunk!r}) is not k=v"
         k, _, v = chunk.partition("=")
@@ -281,7 +342,7 @@ def _parse_line(raw_line: str, markets, tags):
         if not v.strip() and k not in OPTIONAL_VALUE_KEYS:
             return None, f"{k} has an empty value"
         pairs[k] = v
-    return _validate(pairs, line, markets, tags)
+    return _validate(pairs, line, markets, tags, version=version, min_floor=min_floor)
 
 
 def salvage_row(raw_line: str, market=None):
@@ -320,13 +381,16 @@ def salvage_row(raw_line: str, market=None):
             "attempt": attempt, "tag": parts[3], "key": key}
 
 
-def parse(text: str, markets=None, tags=None):
+def parse(text: str, markets=None, tags=None, v4_enabled: bool = False,
+          min_floor: float = V4_MIN_FLOOR):
     """Parse a Telegram message from the NBA model feed.
 
     Returns None when the message contains no BET| line at all (chatter: drop silently, no
     alert). Otherwise returns a ParseResult whose `refusals` the caller MUST surface.
 
-    `markets` / `tags` are the config-driven allow-lists (None = the module defaults)."""
+    `markets` / `tags` are the config-driven allow-lists (None = the module defaults).
+    `v4_enabled` is the NBA_MODEL_V4_ENABLED kill switch (off = every BET|v4 line is refused);
+    `min_floor` is the lowest sb_floor / sm_floor a v4 line may carry (NBA_MODEL_MIN_ODDS)."""
     if not text or BET_PREFIX not in text:
         return None
     markets = tuple(m.strip().lower() for m in (markets or ALLOWED_MARKETS))
@@ -338,7 +402,8 @@ def parse(text: str, markets=None, tags=None):
         if BET_PREFIX not in raw_line:
             continue
         candidate = _HTML_TAG_RE.sub("", raw_line[raw_line.index(BET_PREFIX):]).strip()
-        row, reason = _parse_line(candidate, markets, tags)
+        row, reason = _parse_line(candidate, markets, tags, v4_enabled=v4_enabled,
+                                  min_floor=min_floor)
         if row is None:
             result.refusals.append((candidate.strip()[:400], reason))
             result.refusal_rows.append(salvage_row(candidate, markets[0]))

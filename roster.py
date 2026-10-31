@@ -62,7 +62,8 @@ _loaded = False
 NBA_NICKNAMES = {
     "steph": "Stephen Curry",
     "moe wagner": "Moritz Wagner",
-    "kat": "Karl-Anthony Towns",
+    "mo wagner": "Moritz Wagner",   # v6.146: 'mo' is also Mo Bamba's first name, so not a group
+    "kat":"Karl-Anthony Towns",
     "ant": "Anthony Edwards",
     "giannis": "Giannis Antetokounmpo",
     "greek freak": "Giannis Antetokounmpo",
@@ -598,8 +599,8 @@ def _lone_token_drifts(query_parts: list, matched_name: str) -> bool:
     'Slawson'->A.J. Lawson (before Jalen Slawson), 'Swanson'->Matt Svanson (before Dansby
     Swanson), 'Weissert'->Brandon Eisert, 'Greeves'->Ned Reeves, 'Eder'->Bryce Elder,
     'Collins'->Ryan Rollins, 'Gardener'->Myron Gardner. main.py's NBA Stage B REWRITES
-    tip.legs[0].player from these candidates and etr_nba places a BLIND $400/unit
-    fan-out with no price check, so a wrong leader is a wrong-player bet.
+    tip.legs[0].player from these candidates and a blind (no price check) fan-out could
+    place it, so a wrong leader is a wrong-player bet.
 
     Drift stays available for multi-token queries and via the explicit
     afl_fuzzy_surname_candidates path (Eddie vision typos)."""
@@ -641,14 +642,15 @@ _FIRST_NAME_GROUPS = [
     {"brad", "bradley"}, {"matt", "matthew", "matty"}, {"josh", "joshua"}, {"mitch", "mitchell"},
     {"nick", "nicholas", "nic", "nicolas"}, {"will", "william", "bill", "billy"},
     {"ben", "benjamin"}, {"dan", "daniel", "danny"}, {"alex", "alexander", "alexandre", "alec"},
-    {"zac", "zach", "zachary", "zak"}, {"tom", "thomas"}, {"charlie", "charles"},
+    {"zac", "zach", "zachary", "zak", "zack"}, {"tom", "thomas"}, {"charlie", "charles"},
     {"nat", "nathan", "nate", "nathaniel"}, {"ollie", "oliver", "oli"}, {"sam", "samuel"},
     {"gus", "angus"}, {"ed", "edward", "eddie"}, {"cam", "cameron"}, {"lachie", "lachlan"},
     {"paddy", "patrick"}, {"jake", "jacob"}, {"joe", "joseph"}, {"mike", "michael"},
     {"tony", "anthony"}, {"dave", "david"}, {"andy", "andrew"}, {"bob", "robert", "bobby", "rob"},
     {"jordy", "jordan"}, {"jamie", "james"}, {"chris", "christopher"},
     {"herb", "herbert"}, {"moe", "moritz"}, {"ty", "tyler"},
-    {"jimmy", "james", "jim", "jamie"}, {"steve", "steven", "stephen", "stevie"},
+    {"jimmy", "james", "jim", "jamie"}, {"steve", "steven", "stephen", "stevie", "steph"},
+    {"tim", "timothy", "timmy"}, {"ron", "ronald", "ronnie"},
     {"ken", "kenneth", "kenny"}, {"rick", "richard", "ricky", "rich", "dick"},
     {"theo", "theodore", "teddy"}, {"tommy", "thomas", "tom"}, {"jon", "jonathan", "jonny", "jonathon", "jono"},
     {"gerald", "jerry", "gerry"}, {"jeremiah", "jeremy"}, {"larry", "lawrence"},
@@ -683,6 +685,55 @@ def _first_names_correspond(query: str, matched: str) -> bool:
     if _FIRST_NAME_CANON.get(a, a) == _FIRST_NAME_CANON.get(b, b):
         return True
     return SequenceMatcher(None, a, b).ratio() >= 0.85
+
+
+def _unique_prefix_first_name(query: str, matched: str, roster_all: dict) -> "set | None":
+    """v6.170 (4th and +EV 2026-10-30 'Tet McMillan' over 72.5 receiving yards -> manual 'no team
+    resolved', the alert then lost in a Telegram outage; Wilson: "fix our fuzzy matching so it
+    parses correctly next time"). A multi-word query whose SURNAME equals the candidate's and whose
+    first word (3+ letters) is a PREFIX of the candidate's first name corresponds when, over the
+    WHOLE sport roster `roster_all` (never the scoped subset: the money review showed 'James
+    Williams' tagged Lions resolving to Jameson Williams while James Williams played for the other
+    club), (a) exactly ONE player with that surname has a first name starting with the prefix
+    ('tet' -> Tetairoa McMillan, not Jalen McMillan; 'jay' against Jayden and Jaylen Smith -> two ->
+    no match), (b) the prefix is not itself anybody's first name in that roster ('James', 'Jay',
+    'Dan' are real names, so a tip that says James Williams means a James, not Jameson: the v6.108
+    reason the generic prefix rule was dropped) and (c) the prefix truncates exactly ONE distinct
+    first name anywhere in the league ('tet' -> only Tetairoa; 'ant' -> Anthony, Antonio, Antoine ->
+    refused even when one Johnson carries it: the refutation round's leave-one-out probe showed every
+    wrong-player case it could build, 'Ant Johnson', 'Bra Smith', 'Jal Hunt', 'Wil Contreras', 'Bai
+    Williams', needs such a many-way prefix, where a twin missing from the roster hands the bet to
+    the other man). This is a rule for a short form that can only mean one name, not a general
+    truncation rule. Owners are counted by raw folded name, so 'Luis Garcia' and 'Luis Garcia Jr.'
+    are two owners. The hazard left is a short form whose ONLY expansion on the roster is not its
+    real owner because he is unrostered ('Tyre Smith' -> Tyreke Smith with Tyrese and Tyreek
+    absent). Returns the owner set ({one name}) when the rule applies, else None; the caller logs the
+    read at INFO so it is visible in tipbot.log."""
+    qw, mw = _name_words(query), _name_words(matched)
+    if len(qw) < 2 or len(mw) < 2:
+        return None
+    a, b = qw[0], mw[0]
+    if len(a) < 3 or len(b) <= len(a) or not b.startswith(a):
+        return None
+    sur = mw[-1]
+    if qw[-1] != sur:
+        return None
+    owners, firsts = set(), set()
+    for _k, _i in (roster_all or {}).items():
+        nm = (_i.get("name") if isinstance(_i, dict) else None) or _k
+        w = _name_words(nm)
+        if len(w) < 2:
+            continue
+        if w[0] == a:
+            return None               # the prefix is a first name in its own right
+        if w[0].startswith(a):
+            firsts.add(w[0])          # (c) every first name this prefix could stand for
+            if len(firsts) > 1:
+                return None
+            if w[-1] == sur:
+                # raw folded name, suffix kept: 'luis garcia' and 'luis garcia jr.' are two men
+                owners.add(" ".join(_fold_accents(str(nm).lower()).split()))
+    return owners if len(owners) == 1 else None
 
 
 def _passes_token_overlap_gate(query: str, matched: str) -> bool:
@@ -721,6 +772,15 @@ def _passes_token_overlap_gate(query: str, matched: str) -> bool:
     logs/tipbot.log, and NBA props run through this gate on a live $400/unit blind
     fan-out, so it is a real wrong-bet path, not a theoretical one.
     """
+    # v6.146: a query whose letters (accent-folded, spaces and punctuation dropped) equal those of
+    # a candidate of TWO OR MORE words is that name typed differently: 'Karl Anthony Towns' /
+    # Karl-Anthony Towns, 'Shai Gilgeous Alexander', 'De Aaron Fox', 'Fred Van Vleet'. The split
+    # words broke the first-name and surname comparisons below. A one-word candidate (a
+    # surname-only alias such as 'Jackson-Davis') is excluded: it would let 'Jackson Davis', who may
+    # be a different player missing from the roster, through (v6.108).
+    _mw = _name_words(matched)
+    if len(_mw) >= 2 and "".join(_name_words(query)) == "".join(_mw):
+        return True
     orig_tokens = _name_tokens_for_gate(query)
     if not orig_tokens:
         return True
@@ -732,7 +792,7 @@ def _passes_token_overlap_gate(query: str, matched: str) -> bool:
     # so a player missing from the roster resolved to a same-surname team-mate or stranger
     # (Jeff Green -> Jalen Green, Jalen Williams -> Jaylin Williams, Bryce Harper -> Dylan
     # Harper). Leave-one-out over the live NBA roster: 122 of 519 players could be swapped
-    # that way; the ETR NBA fan-out is blind ($400/unit, no price check), so it is a
+    # that way; a blind fan-out (no price check) would place it, so it is a
     # wrong-player bet. A multi-word query now needs the candidate's first name to correspond
     # (same name, an initial, a short form that is a prefix such as Cam/Cameron or
     # Herb/Herbert, an accent or punctuation difference such as PJ/P.J., or a close
@@ -1031,11 +1091,22 @@ def fuzzy_match_player(
         survivors = []
         for score, key, info in scored:
             if not _passes_token_overlap_gate(query_lower, info["name"]):
-                log.debug(
-                    f"fuzzy: discarding '{info['name']}' for '{query}' "
-                    f"(score={score:.3f}) - no surname correspondence"
-                )
-                continue
+                _own = _unique_prefix_first_name(query_lower, info["name"], roster)
+                if _own:
+                    # v6.170: 'Tet McMillan' -> Tetairoa McMillan (the only McMillan in the whole
+                    # roster whose first name starts with 'tet', and 'tet' is nobody's first name);
+                    # two owners, or a prefix that is a real first name, still refuse
+                    log.info(f"fuzzy: '{query}' kept as candidate '{info['name']}' "
+                             f"({info.get('team', '')}): its first word is the prefix of exactly "
+                             f"one {sport} first name on that surname league-wide "
+                             f"({sorted(_own)}) and is nobody's first name; scope "
+                             f"{len(roster_subset)} of {len(roster)} rows")
+                else:
+                    log.debug(
+                        f"fuzzy: discarding '{info['name']}' for '{query}' "
+                        f"(score={score:.3f}) - no surname correspondence"
+                    )
+                    continue
             # v6.07 (sweep #27, self-caught regression): for a LONE token the surname
             # must match EXACTLY - no drift. See _lone_token_drifts (shared with
             # fuzzy_match_all, which the v6.07 audit found had NEVER had this guard).
@@ -1277,8 +1348,8 @@ def fuzzy_match_all(
             # wrong-player drift class stayed fully live on this path -- and worse, the
             # drifted candidate often sorted FIRST ('Slawson' -> [A.J. Lawson, Jalen
             # Slawson], 'Swanson' -> [Matt Svanson, Dansby Swanson]). main.py's NBA
-            # Stage B rewrites tip.legs[0].player from this list and etr_nba places a
-            # BLIND $400/unit fan-out with no price check, so the leader IS the bet.
+            # Stage B rewrites tip.legs[0].player from this list and a blind
+            # (no price check) fan-out could place it, so the leader IS the bet.
             if _lone_token_drifts(query_parts, info["name"]):
                 log.debug(
                     f"fuzzy_match_all: discarding '{info['name']}' for lone token "
@@ -1374,6 +1445,52 @@ def mlb_fuzzy_player(query: str, threshold: float = 0.9) -> dict:
         return {}
     score, info = max(hits, key=lambda x: x[0])
     return {"name": info["name"], "team": info["team"], "score": round(score, 3)}
+
+
+def nfl_typo_player(query: str) -> dict:
+    """v6.123 GUARDED NFL resolver for a dropped-letter / hyphen variant of a FULL name, used
+    only when the normal match finds nobody. 2026-10-26 4th&EV 'Brevyn Span Ford' (roster 'Brevyn
+    Spann-Ford', Dallas Cowboys) went manual 'no team resolved'. A roster name is a hit only when
+    the query EQUALS it after folding (hyphens read as spaces, accents, case, spacing) or is it
+    with exactly ONE character dropped; a 2+ word query; EXACTLY ONE player hit, else {} (manual).
+    Deliberately no similarity score (review 2026-10-26): near-twin names one letter apart
+    (Caleb / Kaleb Johnson, Jayden / Jaylen Reed) and short names ('kee smith' -> Tykee Smith)
+    resolved to the WRONG player when one twin was missing from the roster. (v6.170's prefix
+    short form, `_unique_prefix_first_name` in fuzzy_match_player, is the one deliberate exception:
+    it admits a 3+ letter first word only when it truncates exactly ONE first name in the whole
+    league and exactly one player on that surname carries it, so a missing twin can only mislead
+    it when the short form has a single expansion on the roster.)
+    Returns {"name","team","score"} or {}."""
+    def _n(x: str) -> str:
+        return " ".join(_fold_accents((x or "").lower().replace("-", " ")).split())
+
+    def _one_dropped(short: str, full: str) -> bool:
+        if len(full) != len(short) + 1:
+            return False
+        k = 0
+        while k < len(short) and short[k] == full[k]:
+            k += 1
+        return short[k:] == full[k + 1:]
+    q = _n(query)
+    if not q or len(q.split()) < 2:
+        return {}
+    _load_rosters()
+    if not _nfl_roster:
+        return {}
+    hits = {}
+    for info in _nfl_roster.values():
+        nm = info.get("name") or ""
+        n = _n(nm)
+        if n == q or _one_dropped(q, n):
+            # surname-alias rows ('Spann-Ford') point at the same player: key on the full name
+            full = _upgrade_to_full_name({"name": nm, "team": info.get("team", ""),
+                                          "score": 1.0 if n == q else 0.95}, "nfl")
+            hits.setdefault(full["name"], full)
+    if len(hits) != 1:
+        if hits:
+            log.warning(f"NFL name '{query}' matches {sorted(hits)} -> manual (never guess a player)")
+        return {}
+    return next(iter(hits.values()))
 
 
 def _afl_token_norm(s: str) -> str:
