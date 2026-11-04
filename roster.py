@@ -49,6 +49,10 @@ _mlb_collisions: dict = {}
 # from day one (2026-09-10) rather than waiting for the MLB incident to repeat
 # on a new sport. Populated from roster_nfl.json's "__collisions__" block.
 _nfl_collisions: dict = {}
+# v6.207 (1 Nov Jefferson): {name_lower: {team: [positions]}} for the NFL collision
+# names only, from roster_nfl.json's "__collision_positions__" block, so a
+# position can settle which same-name player a stat prop belongs to.
+_nfl_collision_positions: dict = {}
 # AFL placement-time alias map {roster_name_lower: [alt_spelling, ...]} from
 # afl_name_overrides.json['aliases'] — alternate Sportsbet spellings tried against
 # the LIVE catalog by main._afl_canonical_catalog_player (see afl_name_aliases()).
@@ -159,20 +163,27 @@ MLB_KNOWN_COLLISIONS = {
     "Max Muncy": ["Athletics", "Los Angeles Dodgers"],
 }
 
-# NFL mirror of MLB_KNOWN_COLLISIONS, empty seed: a single weekly Sleeper
+# NFL mirror of MLB_KNOWN_COLLISIONS: a single weekly Sleeper
 # snapshot can under-report a collision (e.g. one of the two players is
 # mid-transaction and briefly has no `team`, so update_nfl_roster_from_api's
 # `if not (name and team): continue` skips it that week, leaving only one
 # team on record). Add a pair here ONLY once two genuinely different NFL
 # players sharing a full name are found (as MLB_KNOWN_COLLISIONS was seeded
 # after the Pete Alonso/Max Muncy incident) -- do not pre-guess entries.
-NFL_KNOWN_COLLISIONS: dict = {}
+# v6.207: seeded with the four pairs the 1 Nov Sleeper pull confirmed (roster_nfl.json
+# __collisions__), so a partial pull cannot erase them.
+NFL_KNOWN_COLLISIONS: dict = {
+    "Brandon Johnson": ["Pittsburgh Steelers", "Tampa Bay Buccaneers"],
+    "Marcus Harris": ["Kansas City Chiefs", "Tennessee Titans"],
+    "Justin Jefferson": ["Cleveland Browns", "Minnesota Vikings"],
+    "Byron Young": ["Los Angeles Rams", "Philadelphia Eagles"],
+}
 
 
 def _load_rosters():
     """Load roster JSON files into memory."""
     global _nba_roster, _nbl_roster, _afl_roster, _mlb_roster, _mlb_collisions
-    global _nfl_roster, _nfl_collisions, _loaded
+    global _nfl_roster, _nfl_collisions, _nfl_collision_positions, _loaded
     if _loaded:
         return
 
@@ -181,6 +192,7 @@ def _load_rosters():
                         (NFL_ROSTER_FILE, "_nfl")]:
         roster = {}
         collisions = {}
+        coll_positions = {}
         if path.exists():
             try:
                 with open(path, encoding="utf-8") as f:
@@ -193,6 +205,14 @@ def _load_rosters():
                     if name == "__collisions__":
                         if isinstance(team, dict):
                             collisions = {k.lower(): list(v) for k, v in team.items()}
+                        continue
+                    if name == "__collision_positions__":
+                        if isinstance(team, dict):
+                            for _pn, _pt in team.items():
+                                if isinstance(_pt, dict):
+                                    coll_positions[_pn.lower()] = {
+                                        str(_t): [str(_x).upper() for _x in (_ps or [])]
+                                        for _t, _ps in _pt.items()}
                         continue
                     if name.startswith("__"):
                         continue  # other meta keys (NBA_SEASON_KEY), never a player
@@ -230,6 +250,7 @@ def _load_rosters():
         else:
             _nfl_roster = roster
             _nfl_collisions = collisions
+            _nfl_collision_positions = coll_positions
 
     _apply_afl_name_overrides()
     _loaded = True
@@ -959,6 +980,20 @@ def is_nfl_name_collision(name: str) -> list:
         if _cn.strip().lower() == key:
             return list(_ct)
     return []
+
+
+def nfl_collision_positions(name: str):
+    """v6.207 (1 Nov Jefferson): for an NFL same-name collision, return
+    {team: {positions}} (Sleeper `position` plus `fantasy_positions`, upper-case),
+    or None when the name has no position data on file (stale roster_nfl.json
+    or a curated NFL_KNOWN_COLLISIONS entry) -- the caller must then stay manual."""
+    if not name:
+        return None
+    _load_rosters()
+    entry = _nfl_collision_positions.get(name.strip().lower())
+    if not entry:
+        return None
+    return {t: set(ps) for t, ps in entry.items()}
 
 
 def fuzzy_match_player(
@@ -2019,6 +2054,7 @@ def update_nfl_roster_from_api():
 
         surname_count: dict = {}
         fullname_teams: dict = {}  # fullName -> set of distinct teams (collision detector)
+        fullname_positions: dict = {}  # v6.207: fullName -> {team: set(positions)}
         unmapped_abbrs: set = set()  # team codes Sleeper returned that we don't know
         for p in (people or {}).values():
             if not isinstance(p, dict) or not p.get("active"):
@@ -2039,6 +2075,11 @@ def update_nfl_roster_from_api():
                     unmapped_abbrs.add(team_abbr)
                 continue
             fullname_teams.setdefault(name, set()).add(team)
+            _pos = {str(p.get("position") or "").upper()}
+            _pos |= {str(x).upper() for x in (p.get("fantasy_positions") or [])
+                     if isinstance(x, str)}
+            _pos.discard("")
+            fullname_positions.setdefault(name, {}).setdefault(team, set()).update(_pos)
             parts = name.split()
             if len(parts) >= 2:
                 key = _surnorm(parts[-1])
@@ -2069,6 +2110,12 @@ def update_nfl_roster_from_api():
                 roster[name] = next(iter(teams))
         if collisions:
             roster["__collisions__"] = collisions
+            # v6.207 (1 Nov Jefferson): positions per team for colliding names only,
+            # so a stat prop only one of them can produce is settled by position.
+            _cpos = {n: {t: sorted(ps) for t, ps in sorted(fullname_positions[n].items())}
+                     for n in sorted(collisions) if n in fullname_positions}
+            if _cpos:
+                roster["__collision_positions__"] = _cpos
             log.warning(
                 f"NFL same-name collisions dropped from name->team (disambiguate by "
                 f"slate, else manual): {collisions}"
@@ -2100,10 +2147,33 @@ def update_nfl_roster_from_api():
 
     if roster:
         _tmp = NFL_ROSTER_FILE.with_suffix(".json.tmp")
-        with open(_tmp, "w", encoding="utf-8") as f:
-            json.dump(roster, f, indent=2, ensure_ascii=False)
-        os.replace(_tmp, NFL_ROSTER_FILE)
-        log.info(f"Saved {len(roster)} entries to {NFL_ROSTER_FILE}")
+        try:
+            # v6.207: a partial Sleeper pull must not shrink the file the placers read: refuse
+            # to overwrite when the new pull has under 90% of the existing entries ("__" meta
+            # keys not counted on either side).
+            def _players(d):
+                return sum(1 for k in d if not str(k).startswith("__")) if isinstance(d, dict) else 0
+            _old_n = 0
+            try:
+                with open(NFL_ROSTER_FILE, encoding="utf-8") as f:
+                    _old_n = _players(json.load(f))
+            except (OSError, ValueError):
+                _old_n = 0
+            _new_n = _players(roster)
+            if _old_n and _new_n < 0.9 * _old_n:
+                log.error(f"NFL roster update REFUSED: the new pull has {_new_n} entries, "
+                          f"under 90% of the {_old_n} in {NFL_ROSTER_FILE}; keeping the old file")
+                return roster
+            with open(_tmp, "w", encoding="utf-8") as f:
+                json.dump(roster, f, indent=2, ensure_ascii=False)
+            os.replace(_tmp, NFL_ROSTER_FILE)
+            log.info(f"Saved {len(roster)} entries to {NFL_ROSTER_FILE}")
+        except OSError as e:
+            log.error(f"NFL roster update: could not write {NFL_ROSTER_FILE} ({e}); keeping the old file")
+            try:
+                os.remove(_tmp)
+            except OSError:
+                pass
 
     return roster
 

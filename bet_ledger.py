@@ -14,6 +14,7 @@ Design guarantees:
     wrote no machine-readable placement record).
 """
 import csv
+import io
 import math          # v6.19a: isfinite, so NaN units cannot masquerade as a value
 import os
 import re
@@ -23,23 +24,42 @@ from threading import Lock
 
 log = logging.getLogger("tipbot")
 
-def _default_ledger_path() -> str:
+def _under_test() -> bool:
+    """True under pytest ("pytest" in sys.modules, as notifier's guard) or with TIPBOT_TESTING set to ANY
+    non-empty value (as main.py reads it: a typo such as "ture" fails toward the temp file, never toward the
+    live ledger)."""
+    import sys
+    return "pytest" in sys.modules or bool(os.getenv("TIPBOT_TESTING"))
+
+
+def _ledger_read_path() -> str:
+    """The file a call-time READER should open. In a test run: the module's _LEDGER_PATH, the very file the
+    writers use (a reader that resolved BET_LEDGER_PATH on its own would read a different file than the one the
+    test wrote, review round 8 item 8). Otherwise: the call-time default (env override, then the production
+    path), as before."""
+    return _LEDGER_PATH if _under_test() else _default_ledger_path()
+
+
+def _default_ledger_path(honour_env: bool = True) -> str:
     """Resolve the ledger file path. v5.41 (2026-06-08): the unit suite was
     POLLUTING the production logs/bets_placed.csv with fixture rows (bet_id
     X1/X2) on every run — `notify_*` tests incidentally trigger a ledger write,
     and the path was hard-coded. Now: BET_LEDGER_PATH env override wins; else
-    TIPBOT_TESTING (set by the test harness) forces a temp file so a test can
-    NEVER touch the real ledger; else the production path."""
+    a test run (see _under_test) forces a temp file so a test can
+    NEVER touch the real ledger; else the production path.
+    v6.198: the path a MODULE starts with (_LEDGER_PATH below) ignores BET_LEDGER_PATH in a test run
+    (honour_env=False): a test process that inherits a live BET_LEDGER_PATH must not write to it. A test that
+    wants a path of its own sets bet_ledger._LEDGER_PATH."""
     env = os.getenv("BET_LEDGER_PATH")
-    if env:
+    if env and honour_env:
         return env
-    if os.getenv("TIPBOT_TESTING"):
+    if _under_test():
         import tempfile
         return os.path.join(tempfile.gettempdir(), "tipbot_test_bets_placed.csv")
     return os.path.join("logs", "bets_placed.csv")
 
 
-_LEDGER_PATH = _default_ledger_path()
+_LEDGER_PATH = _default_ledger_path(honour_env=not _under_test())
 COLUMNS = [
     "placed_at", "date", "tipster", "sport", "event", "market", "selection",
     "line", "side", "bookie", "account", "stake", "odds", "potential_return",
@@ -300,27 +320,35 @@ def _round2(v):
     return round(n, 2) if n is not None else ""
 
 
-def _write_row(row: dict) -> None:
-    """Append one row to bets_placed.csv (dedup on bet_id). Fully guarded."""
+def _write_row(row: dict) -> bool:
+    """Append one row to bets_placed.csv (dedup on bet_id). Fully guarded. True only when THIS call
+    wrote the row (False: no bet id, a bet id already logged, or the write failed). v6.233: the bet id
+    is marked as logged only AFTER the append succeeded (it used to be marked first, so a failed
+    append left the id marked and the row could never be written), and the row goes out in ONE write
+    so a failure cannot leave half a line behind for a retry to duplicate."""
     try:
         bet_id = str(row.get("bet_id") or "").strip()
         if not bet_id:
-            return  # a landed bet always has a bet_id; skip malformed/blank rows
+            return False  # a landed bet always has a bet_id; skip malformed/blank rows
         with _lock:
             _seed_logged_ids()  # v5.69 (i5): make dedup survive a restart
             if bet_id in _logged_bet_ids:
-                return
-            _logged_bet_ids.add(bet_id)
+                return False
             os.makedirs(os.path.dirname(_LEDGER_PATH) or ".", exist_ok=True)
             fresh = (not os.path.exists(_LEDGER_PATH)
                      or os.path.getsize(_LEDGER_PATH) == 0)
+            buf = io.StringIO(newline="")
+            w = csv.DictWriter(buf, fieldnames=COLUMNS, extrasaction="ignore")
+            if fresh:
+                w.writeheader()
+            w.writerow({k: row.get(k, "") for k in COLUMNS})
             with open(_LEDGER_PATH, "a", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
-                if fresh:
-                    w.writeheader()
-                w.writerow({k: row.get(k, "") for k in COLUMNS})
+                f.write(buf.getvalue())
+            _logged_bet_ids.add(bet_id)
+            return True
     except Exception as e:  # logging must never break placement
         log.error(f"bet_ledger: failed to write row (bet_id={row.get('bet_id')}): {e}")
+        return False
 
 
 def _now():
@@ -328,10 +356,12 @@ def _now():
     return n.isoformat(timespec="seconds"), n.date().isoformat()
 
 
-def log_sports_bet(tip, result, account: str = "", *, titan: str = "", note: str = "") -> None:
+def log_sports_bet(tip, result, account: str = "", *, titan: str = "", note: str = "") -> bool:
     """Log a placed sports bet (singles / fan-out / SGM / MLB). tip is a
     ParsedTip, result a BetResult. v6.171: `titan` and `note` for a Tip Titans sports tip
-    (Fergal tennis: titan FB, note "TT-<tip id> ..." so the Bet Record pairs it with the tip)."""
+    (Fergal tennis: titan FB, note "TT-<tip id> ..." so the Bet Record pairs it with the tip).
+    v6.233: returns True only when this call wrote the row (see _write_row); every caller before
+    ignored the return value."""
     try:
         placed_at, today = _now()
         legs = list(getattr(tip, "legs", None) or [])
@@ -369,7 +399,7 @@ def log_sports_bet(tip, result, account: str = "", *, titan: str = "", note: str
         )
         stake = _num(getattr(result, "stake", None))
         odds = _num(getattr(result, "odds", None))
-        _write_row({
+        return _write_row({
             "placed_at": placed_at,
             "date": today,
             # Uniform: the internal id. A sports tipster already IS one, but go through
@@ -393,14 +423,18 @@ def log_sports_bet(tip, result, account: str = "", *, titan: str = "", note: str
             "correlation_id": getattr(result, "correlation_id", "") or "",
             "units": _num(getattr(tip, "units", None)) if getattr(tip, "units", None) is not None else "",
             "unit_size": _num(getattr(tip, "unit_size", None)) if getattr(tip, "unit_size", None) is not None else "",
-            "note": (note or getattr(result, "_recovered_note", "") or getattr(result, "_twin_note", "")
-                     or ""),
+            "note": "; ".join(n for n in (
+                (note or getattr(result, "_recovered_note", "") or getattr(result, "_twin_note", "")
+                 or ""),
+                # v6.232: a Sportsbet fill far above the checked odds (the line may have moved) says so
+                getattr(result, "_reline_note", "") or "") if n),
         })
     except Exception as e:
         log.error(f"bet_ledger.log_sports_bet failed: {e}")
+        return False
 
 
-def log_racing_bet(parsed: dict, placement: dict, account: str = "") -> None:
+def log_racing_bet(parsed: dict, placement: dict, account: str = "") -> bool:
     """Log a placed racing bet (Tip Titans / Zak / Trial). parsed is the racing
     tip dict, placement is one {session_id,bookie,stake,odds,bet_id} entry."""
     try:
@@ -417,7 +451,7 @@ def log_racing_bet(parsed: dict, placement: dict, account: str = "") -> None:
         _rmethod = (placement.get("match_method") or "").strip()
         stake = _num(placement.get("stake"))
         odds = _num(placement.get("odds"))
-        _write_row({
+        return _write_row({
             "placed_at": placed_at,
             "date": parsed.get("date") or today,
             # Uniform: the internal id, the SAME convention the sports writer uses, so
@@ -451,6 +485,7 @@ def log_racing_bet(parsed: dict, placement: dict, account: str = "") -> None:
         })
     except Exception as e:
         log.error(f"bet_ledger.log_racing_bet failed: {e}")
+        return False
 
 
 # ── v6.19: "has this runner already been backed?" ────────────────────
@@ -572,7 +607,7 @@ def racing_runner_exposure(runner: str, market: str, within_hours: float = 24.0,
     if not want:
         return out
     try:
-        path = _default_ledger_path()          # call-time, per the _audit_log_path rule
+        path = _ledger_read_path()             # call-time, per the _audit_log_path rule
         if not os.path.exists(path):
             return out
         now = now or datetime.now()

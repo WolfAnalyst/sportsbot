@@ -521,7 +521,7 @@ def load_priority_from_env() -> PriorityConfig:
         afl_sgm=_parse_priority_env("AFL_SGM_SESSION_PRIORITY"),
         mlb_singles=_parse_priority_env("MLB_SESSION_PRIORITY"),
         mlb_sgm=_parse_priority_env("MLB_SGM_SESSION_PRIORITY"),
-        racing=_parse_priority_env("RACING_SESSION_PRIORITY"),
+        racing=_parse_priority_env("RACING_SESSION_PRIORITY", sport="racing"),
         nfl_singles=_parse_priority_env("NFL_SESSION_PRIORITY"),
         nbl_singles=_parse_priority_env("NBL_SESSION_PRIORITY"),
         nba_model_singles=_parse_priority_env("NBA_MODEL_SESSION_PRIORITY"),
@@ -532,19 +532,153 @@ def load_priority_from_env() -> PriorityConfig:
         # v6.154: the Sportmarket bridge's session id (not numeric) is a valid token; config.py's
         # own check of the same variable accepts it too.
         _sm_sid = os.getenv("SPORTMARKET_SESSION_ID", "sportmarket").strip() or "sportmarket"
+        # v6.225: a list left with only excluded accounts ([EXCLUDED_ONLY]) is a valid, empty list
+        # (no model account), not a malformed one
         cfg.nba_model_singles_bad = (
             not cfg.nba_model_singles
-            or not all(t.isdigit() or t == _sm_sid for t in cfg.nba_model_singles))
+            or not all(t.isdigit() or t == _sm_sid or t == EXCLUDED_ONLY
+                       for t in cfg.nba_model_singles))
     _priority_config = cfg
     return cfg
 
 
-def _parse_priority_env(var_name: str) -> list[str]:
-    """Parse a comma-separated env var into a list of cleaned session IDs."""
+EXCLUDED_ONLY = "__excluded_only__"     # v6.205: a placeholder that matches no session
+
+# v6.212 (Wilson 2 Nov): bookies that only ever take RACING bets (Dabble 339917). A session of one of these is
+# dropped from every non-racing priority list and from every non-racing filter_and_order_sessions call, so no
+# sports path can pick it even if its id is typed into a sports list or a sports list is empty ("no list = every
+# session"). The id check covers DABBLE_RACING_SESSION whatever bookie string HyperBot reports.
+RACING_ONLY_BOOKIES = frozenset({"dabble"})
+
+
+def is_racing_only(session_id, bookie: str = "") -> bool:
+    """True when this session may place RACING bets only (a RACING_ONLY_BOOKIES bookie, from the yaml, the
+    caller's own bookie string, or the configured Dabble session id). Never raises."""
+    try:
+        sid = str(session_id if session_id is not None else "").strip()
+        meta = _session_meta.get(sid)
+        for b in ((meta.bookmaker if meta else ""), bookie):
+            if str(b or "").strip().lower() in RACING_ONLY_BOOKIES:
+                return True
+        try:
+            import config as _cfg_ro
+            if sid and sid == str(getattr(_cfg_ro, "DABBLE_RACING_SESSION", "") or "").strip():
+                return True
+        except Exception:
+            pass
+    except Exception:
+        return False
+    return False
+
+
+def excluded_sessions() -> frozenset:
+    """v6.205 (Wilson 2026-11-01: "take out mario sb from all placement for now, sports and racing"):
+    session ids that are never placed on, whatever list names them. PLACEMENT_EXCLUDED_SESSIONS
+    (comma list); default Mario's Sportsbet 295510 live, nothing under TIPBOT_TESTING (tests use
+    295510 as an ordinary account). An explicitly empty value excludes nothing."""
+    raw = os.getenv("PLACEMENT_EXCLUDED_SESSIONS")
+    if raw is None:
+        raw = "" if os.getenv("TIPBOT_TESTING") else "295510"
+    return frozenset(x.strip() for x in str(raw).split(",") if x.strip())
+
+
+# v6.225 (Wilson 3 Nov 2026: every Sportsbet account but Tarken 295513 is a 1% account; "stop
+# sports on 1% accounts", "everything incl. model"): these sessions are never placed on for any
+# SPORT (every tipster, the NBA model, Fergal tennis, MLB singles, MMA); racing is untouched.
+# Neel, Talal, Sahil, Mario, Aaron, Tom, Matthew.
+SPORTS_EXCLUDED_DEFAULT = "295471,295475,295478,295510,319979,328827,319970"
+
+
+def sports_excluded_sessions() -> frozenset:
+    """v6.225: session ids never placed on for a non-racing sport, whatever list names them.
+    SPORTS_EXCLUDED_SESSIONS (comma list); default SPORTS_EXCLUDED_DEFAULT live, nothing under
+    TIPBOT_TESTING (tests use these ids as ordinary accounts). An explicitly empty value excludes
+    nothing."""
+    raw = os.getenv("SPORTS_EXCLUDED_SESSIONS")
+    if raw is None:
+        raw = "" if os.getenv("TIPBOT_TESTING") else SPORTS_EXCLUDED_DEFAULT
+    return frozenset(x.strip() for x in str(raw).split(",") if x.strip())
+
+
+# v6.236 (Wilson 4 Nov 2026: "take out Daniel b365 from racing"): bet365 refuses every racing bet on
+# Daniel 116964 (at its confirm step), so these sessions are never placed on for RACING; a sport
+# that lists them keeps them. Daniel.
+RACING_EXCLUDED_DEFAULT = "116964"
+
+
+def racing_excluded_sessions() -> frozenset:
+    """v6.236: session ids never placed on for racing, whatever list names them.
+    RACING_EXCLUDED_SESSIONS (comma list); default RACING_EXCLUDED_DEFAULT live, nothing under
+    TIPBOT_TESTING (tests use 116964 as an ordinary racing account). An explicitly empty value
+    excludes nothing."""
+    raw = os.getenv("RACING_EXCLUDED_SESSIONS")
+    if raw is None:
+        raw = "" if os.getenv("TIPBOT_TESTING") else RACING_EXCLUDED_DEFAULT
+    return frozenset(x.strip() for x in str(raw).split(",") if x.strip())
+
+
+def sports_sportsbet_allowed() -> frozenset | None:
+    """v6.225 (review: "Tarken only" must be an allowlist, so a new slot or an old account left in a
+    list cannot take sports bets): the Sportsbet sessions that may take a SPORTS bet.
+    SPORTS_SPORTSBET_ALLOWED (comma list); default Tarken 295513 live; None (no allowlist) under
+    TIPBOT_TESTING or when explicitly set to the word `any`."""
+    raw = os.getenv("SPORTS_SPORTSBET_ALLOWED")
+    if raw is None:
+        if os.getenv("TIPBOT_TESTING"):
+            return None
+        raw = "295513"
+    if str(raw).strip().lower() == "any":
+        return None
+    return frozenset(x.strip() for x in str(raw).split(",") if x.strip())
+
+
+# v6.225 (review): every Sportsbet session in sessions.yaml on 3 Nov 2026, used as well as the yaml
+# so the allowlist still holds when the yaml metadata is empty (a failed load, legacy mode)
+_KNOWN_SPORTSBET_SESSIONS = frozenset({
+    "65465", "53522", "68723", "118458", "295471", "295475", "295478", "295510", "295513",
+    "319970", "319979", "328827"})
+
+
+def _sportsbet_not_allowed() -> frozenset:
+    """v6.225: every Sportsbet session (sessions.yaml, plus the known list) outside
+    sports_sportsbet_allowed(). An allowlist set to "" allows no Sportsbet session at all."""
+    allowed = sports_sportsbet_allowed()
+    if allowed is None:
+        return frozenset()
+    from_yaml = {sid for sid, m in _session_meta.items()
+                 if str(getattr(m, "bookmaker", "") or "").strip().lower() == "sportsbet"}
+    return frozenset((from_yaml | _KNOWN_SPORTSBET_SESSIONS) - allowed)
+
+
+def excluded_for(sport) -> frozenset:
+    """v6.225: everything never placed on for `sport`: excluded_sessions() always, plus, for every
+    sport but racing (an unknown / empty sport counts as a sport: fail closed), the 1% list
+    sports_excluded_sessions() and every Sportsbet session outside the allowlist (Tarken).
+    v6.236: racing also drops racing_excluded_sessions() (Daniel bet365 116964); no sport does."""
+    if str(sport or "").strip().lower() == "racing":
+        return excluded_sessions() | racing_excluded_sessions()
+    return excluded_sessions() | sports_excluded_sessions() | _sportsbet_not_allowed()
+
+
+def _parse_priority_env(var_name: str, sport: str = "sports") -> list[str]:
+    """Parse a comma-separated env var into a list of cleaned session IDs (v6.205: minus
+    excluded_sessions(); v6.225: a non-racing list also minus sports_excluded_sessions())."""
     raw = os.getenv(var_name, "").strip()
     if not raw:
         return []
-    return [s.strip() for s in raw.split(",") if s.strip()]
+    # v6.205 / v6.225: the excluded accounts for this list's sport (racing: the all-placement list
+    # only); v6.212: a racing-only account (Dabble) never joins a non-racing list. One filter.
+    if var_name == "RACING_SESSION_PRIORITY":
+        sport = "racing"                     # the racing list is racing whoever parses it
+    _ex = excluded_for(sport)
+    _ro = str(sport or "").strip().lower() != "racing"
+    ids = [s.strip() for s in raw.split(",") if s.strip() and s.strip() not in _ex
+           and not (_ro and is_racing_only(s.strip()))]
+    if not ids and any(s.strip() for s in raw.split(",")):
+        # v6.205 review: a list that named ONLY excluded accounts stays a list (that matches no
+        # session), so it can never turn into "no list configured = every session"
+        return [EXCLUDED_ONLY]
+    return ids
 
 
 # ── Public lookups ──────────────────────────────────────────────────
@@ -640,7 +774,7 @@ def all_priority_session_ids() -> set[str]:
         + cfg.nfl_singles + cfg.nbl_singles
         + (cfg.nba_model_singles if _model_on else [])
         + (cfg.mma_singles if _mma_on else [])
-    )
+    ) - {EXCLUDED_ONLY}
 
 
 def is_placeable_session(session_id: str) -> bool:
@@ -695,6 +829,13 @@ def filter_and_order_sessions(
     If no priority list is configured for the sport, returns sessions
     unchanged (no regression — caller can fall back to legacy behaviour).
     """
+    # v6.205 / v6.225: the excluded accounts for this sport (racing: the all-placement list only);
+    # v6.212: a racing-only account (Dabble) is never a sports candidate. One filter, applied
+    # before the "no priority list = every session" fallback below.
+    _ex = excluded_for(sport)
+    _sports = str(sport or "").strip().lower() != "racing"
+    sessions = [s for s in sessions if str(s.get("session_id", "")) not in _ex
+                and not (_sports and is_racing_only(s.get("session_id", ""), s.get("bookie", "")))]
     if nba_model:
         priority = get_priority_for(sport, is_sgm, nba_model=True)
         if not priority:
@@ -702,11 +843,11 @@ def filter_and_order_sessions(
     else:
         priority = get_priority_for(sport, is_sgm)
     if not priority:
-        return sessions
+        return [s for s in sessions if str(s.get("session_id", "")) not in _ex]
 
     by_id = {str(s.get("session_id", "")): s for s in sessions}
     ordered = drop_fillup_when_others(
-        [by_id[pid] for pid in priority if pid in by_id], sport)
+        [by_id[pid] for pid in priority if pid in by_id and pid not in _ex], sport)
 
     listed = set(priority)
     dropped = [
@@ -1362,6 +1503,12 @@ def log_startup_summary() -> None:
     log.info(f"  MLB singles : {cfg.mlb_singles or '(empty -> manual)'}")
     log.info(f"  MLB SGM     : {cfg.mlb_sgm or '(empty)'}")
     log.info(f"  Racing      : {cfg.racing or '(empty)'}")
+    # v6.236: say which accounts racing leaves out (Daniel bet365 116964), so the shorter list is explained
+    try:
+        _rx = sorted(racing_excluded_sessions())
+        log.info(f"  Racing excluded (RACING_EXCLUDED_SESSIONS, racing only): {_rx or '(none)'}")
+    except Exception:
+        pass
     log.info(f"  NFL singles : {cfg.nfl_singles or '(empty)'}")
     log.info(f"  NBL singles : {cfg.nbl_singles or '(empty -> NBA singles list)'}")
 

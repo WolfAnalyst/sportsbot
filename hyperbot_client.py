@@ -472,7 +472,8 @@ class HyperBotClient:
 
     def _post_v3_async(self, path: str, payload: dict,
                        place_timeout: int = 15,
-                       initial_post_max_attempts: int = 1) -> dict:
+                       initial_post_max_attempts: int = 1,
+                       poll_deadline: float = None) -> dict:
         """Fire a v3 async endpoint, poll /api/bet_status until all cids
         resolve or budget elapses. Returns the final /api/bet_status
         response with `statuses[]`, or an error envelope from _post if
@@ -500,6 +501,10 @@ class HyperBotClient:
         ambiguous flag this function returns on a fast-failing POST. Do not
         add a retry loop around these place_* calls.
         """
+        if poll_deadline is not None:
+            # v6.231: a wall-clock deadline (epoch seconds) for the whole call: the POST waits no longer
+            # than what is left of it, then the status poll runs inside the rest
+            place_timeout = max(1.0, min(place_timeout, poll_deadline - time.time()))
         initial = self._post(
             path, payload, timeout=place_timeout,
             max_attempts=initial_post_max_attempts,
@@ -567,12 +572,23 @@ class HyperBotClient:
         effective_ceiling = min(budget_sec + _V3_POLL_GRACE_SEC, _V3_POLL_HARD_CEILING_SEC)
         while time.time() - start < effective_ceiling:
             interval = _V3_POLL_SCHEDULE[min(poll_count, len(_V3_POLL_SCHEDULE) - 1)]
+            read_timeout = 10
+            if poll_deadline is not None:
+                # every wait is cut to what is left of the deadline, the status read's timeout included,
+                # so the call returns (ambiguous, below) by the deadline, give or take the transport's own timeouts (a connect or a read can still overrun a timeout by a moment)
+                if poll_deadline - time.time() < 1.0:
+                    break
+                interval = min(interval, max(0.0, poll_deadline - time.time() - 1.0))
             time.sleep(interval)
             poll_count += 1
+            if poll_deadline is not None:
+                read_timeout = min(10, poll_deadline - time.time())
+                if read_timeout < 0.5:
+                    break
             last_poll = self._post(
                 "/api/bet_status",
                 {"correlation_ids": cids},
-                timeout=10,
+                timeout=read_timeout,
                 max_attempts=1,
             )
             statuses = last_poll.get("statuses") or []
@@ -1219,6 +1235,27 @@ class HyperBotClient:
             log.warning(f"GET /v3/events {sport} failed: {e}")
             return None
 
+    def get_races(self, date: str, country: str, race_type: str = None, limit: int = 1000) -> dict | None:
+        """v6.221: GET /v3/races (sync, read-only, 60/min): the races of one date and country, each
+        with its "pk" and the books HyperBot has bound to it so far. Callers cache it
+        (racing_pk.py); this method only reads. None on any failure."""
+        if _blocked_by_test_guard():
+            return None
+        params = {"date": date, "country": country, "limit": limit}
+        if race_type:
+            params["race_type"] = race_type
+        try:
+            resp = requests.get(f"{self.base_url}/v3/races", headers=self.headers, params=params,
+                                timeout=6)      # a read that gates a price check: fail fast
+            if resp.status_code != 200:
+                log.warning(f"GET /v3/races {date} {country}: HTTP {resp.status_code}")
+                return None
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            log.warning(f"GET /v3/races {date} {country} failed: {e}")
+            return None
+
     def get_markets(self, epk: str, bookie: str, market: str = None) -> dict | None:
         """v6.194: GET /v3/markets (sync, read-only, 120/min): ONE bookie's whole card for ONE event,
         every placeable row with its proposition_id (bet365 NBA combos, steals, blocks and every
@@ -1280,8 +1317,21 @@ class HyperBotClient:
         proposition_id: str = None,
         direction: str = None, max_odds: float = None,
         period: str = None, event_id: str = None,
+        epk: str = None, market_ref: str = None, poll_deadline: float = None,
     ) -> dict:
         """Place a single sports bet (NBA, AFL, etc).
+
+        v6.231: `poll_deadline` (optional, epoch seconds) is a wall-clock deadline for the whole call: the
+        POST and every status read wait no longer than what is left of it. tennis_books' Sportmarket
+        follow-up asks pass the end of the walk's time. Past it the answer is the usual AMBIGUOUS timeout
+        (the bet may have landed: never re-placed, reconciled). None (default) changes nothing.
+
+        v6.197: `epk` + `market_ref` (both from HyperBot's GET /v3/events + GET /v3/markets for THIS
+        bookie) is HyperBot's exact form: the event and the row are both named by id, with no name
+        matching. When both are given the body carries ONLY session_id, category, epk, market_ref,
+        stake, target_odds, max_odds (the docs: market_ref "replaces market + selection + player +
+        line + direction - send none of them"; epk replaces sport/competition/event). The fixture
+        guard and the placement governor still run on sport/event exactly as before.
 
         v6.174: `event_id` (Sportmarket bridge only) is the event_id of the bridge's own /v3/price
         answer; with it the bridge refuses the bet if the event string now matches another game.
@@ -1313,6 +1363,17 @@ class HyperBotClient:
         _ok, stake, _gov = _placement_governor(stake, dict(session_id=session_id, event=event, market=market, selection=selection))  # SAFE-MODE cap (place-only)
         if not _ok:
             return {"success": False, "error": _gov}
+        if epk and market_ref:
+            payload = {"session_id": session_id, "category": "sports", "epk": epk,
+                       "market_ref": market_ref, "stake": stake}
+            if target_odds:
+                payload["target_odds"] = target_odds
+            if max_odds:
+                payload["max_odds"] = max_odds
+            poll_result = self._post_v3_async("/v3/place_bet", payload)
+            if poll_result.get("success") is False and "statuses" not in poll_result:
+                return poll_result
+            return self._unwrap_single_status(poll_result)
         payload = {
             "session_id": session_id,
             "category": "sports",
@@ -1365,7 +1426,8 @@ class HyperBotClient:
             payload["period"] = period
         if event_id:
             payload["event_id"] = event_id
-        poll_result = self._post_v3_async("/v3/place_bet", payload)
+        poll_result = (self._post_v3_async("/v3/place_bet", payload, poll_deadline=poll_deadline)
+                       if poll_deadline is not None else self._post_v3_async("/v3/place_bet", payload))
         if poll_result.get("success") is False and "statuses" not in poll_result:
             return poll_result
         return self._unwrap_single_status(poll_result)
@@ -1426,10 +1488,16 @@ class HyperBotClient:
 
     def price_check_racing(
         self, session_id: str, track: str, race_num: int,
-        race_type: str = "(R)", date: str = None,
+        race_type: str = "(R)", date: str = None, pk: str = None, country: str = None,
     ) -> dict:
         """
         Get win/place odds for all runners in a race.
+
+        v6.221: `country` (e.g. "nz") rides on the track + race + date form so HyperBot cannot resolve
+        a New Zealand tip to a same-name Australian race; with a `pk` it is not sent (the pk has it).
+
+        v6.221: `pk` (the race's key from HyperBot's race list, pinned by the price shop) is sent
+        INSTEAD of track + race_num + race_type + date. This method never reads the race list.
 
         v4.2: migrated to /v3/price async (deprecation headers appeared
         2026-05-16 with sunset Sat 17 May). The v3 result body shape
@@ -1459,6 +1527,10 @@ class HyperBotClient:
             "race_type": race_type,
             "date": date,
         }
+        if pk:       # v6.221: the race by its key instead of track + race + date
+            payload = {"session_id": session_id, "category": "racing", "pk": str(pk)}
+        elif country:
+            payload["country"] = str(country)
         # Idempotent read, safe to retry on transient 5xx / timeout.
         poll_result = self._post_v3_async(
             "/v3/price", payload,
@@ -1488,9 +1560,15 @@ class HyperBotClient:
         runner: str, stake: float, market: str = "win",
         race_type: str = "(R)", date: str = None,
         target_odds: float = None, use_bonus_bet: bool = False, use_boost: bool = False,
-        bet_type: str = None,
+        bet_type: str = None, pk: str = None, country: str = None,
     ) -> dict:
         """Place a fixed-odds Win or Place bet on a single runner.
+
+        v6.221: `country` (e.g. "nz") rides on the track form (see price_check_racing); not sent with a pk.
+
+        v6.221: `pk` is the race key the price shop priced with (racing_placer pins it on the tip);
+        it is sent INSTEAD of track + race_num + race_type + date. This method never reads the
+        race list: with no pk it addresses the race exactly as before.
 
         v4.1: migrated to /v3/place_bet. Same async cid + poll pattern
         as place_single_sports_bet. Cid timeout maps to ambiguous
@@ -1526,6 +1604,12 @@ class HyperBotClient:
             "runner": runner,
             "date": date,
         }
+        if pk:       # v6.221: the race by its key instead of track + race + date
+            for _k in ("track", "race_num", "race_type", "date"):
+                payload.pop(_k, None)
+            payload["pk"] = str(pk)
+        elif country:
+            payload["country"] = str(country)
         if target_odds:
             payload["target_odds"] = target_odds
         if use_bonus_bet:

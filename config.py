@@ -78,7 +78,7 @@ _join_new_sb_accounts_to_lists()
 # always clear which build is running. The code fingerprint computed in
 # main.py (_code_fingerprint) complements this — it catches partial/stale
 # deploys even when this string wasn't bumped.
-TIPBOT_VERSION = "v6.196 (2026-11-01: NBA model BET|v4: a Pinnacle-decided Tier 1 REB Under goes to the Sportmarket bridge first at >= sm_floor, the remainder to Sportsbet only at >= its own sb_floor (x = not at all), no other spill; v4 fills never retryable; every v4 key short of its stake pages once and never invites a hand-place; a v3 offer after v4 at the same selection is refused; switch NBA_MODEL_V4_ENABLED, default off) + v6.195 (2026-10-31: bet365 NBA props priced from HyperBot's GET /v3/markets card: combos PRA / PR / PA / RA, steals, blocks and every player, full-game overs only; /v3/price as the fallback) + v6.194 (2026-10-31: TipBot-DiskGuard deletes the test suite's own logs in Temp over 200 MB once quiet for 10 min, and stale per-process trader in-flight test files after 72 h) + v6.193 (2026-10-31: bet365 NBA props: an over with no bet365 row at its rung takes the rung below at Sportsbet's price or better, or the rung above at Sportsbet / 0.8 or better; steals / blocks placed by name; Shook NBA single overs wired; NBA bet365 cap 1000 to win) + v6.192 (2026-10-31: Fergal tennis Sportsbet to-win caps per account, $400 match winner / $200 every other market, or the account's own lower max) + v6.191 (2026-10-31: Fergal tennis bets Sportsbet only on the five working accounts; the four banned ones are dropped even if the override names them) + v6.190 (2026-10-31: racing: a fast Sportsbet 756 'not permitted for your account' is a clean refusal for that account and the walk goes on to the next account; a slow one is still reconciled and, confirmed absent, spends that account only; one alert a day per account) + v6.187 (2026-10-31: bet365 racing: Wilson Bet365 338081 (wolfhound) joins racing just in front of Daniel 116964, racing caps copied from 116964) + v6.186 (2026-10-31: Fergal tennis: a Sportsbet 756 'not permitted for your account' is a clean refusal for that account, and the walk goes on to the next account) + v6.185 (2026-10-31: a multi-leg tip not marked as an SGM goes to manual for every tipster, and is keyed on all its legs for the resend guard; switch MULTI_LEG_NON_SGM_TO_MANUAL, default on) + v6.184 (2026-10-31: a timed-out Sportmarket partial fill is recorded by its order id once every order the bridge sent is closed; the client forwards the bridge's timeout order keys) + v6.183 (2026-10-31: the NBA milestone twin takes its side from the matcher, so a Sportsbet row whose text carries the line (Robinson / Murray-Boyles Over N) gets its twin, and every skipped twin is logged with the reason; racing: a not-found or not-carried on one Sportsbet account spends that account only, Sportsbet is dropped for the tip at the second)"
+TIPBOT_VERSION = "v6.237 (2026-11-04: a late-found Sportsbet bet is written at its real line with one alert, and the late check stops nothing; a look that finds a bet already in the ledger leaves the reservation alone; orphan sweep compares the period), then v6.244 (2026-11-04: NBA_MODEL_V5_ENABLED on, so tipbot accepts the model's BET|v5 lines), then v6.234 (2026-11-04: NBA model BET|v5 line: every Sportmarket leg places only at or above the line's sm_floor, x means no leg; switch NBA_MODEL_V5_ENABLED off until the model is told), then v6.238 (2026-11-04: Tarken known down lets bet365 and Sportmarket bet under the shortfall rules, a failed session read stays manual, a maybe stops the other book at every step; MMA can go to bet365 and Sportmarket, its Sportmarket leg off until the bridge is ready; a model line with no sm_floor gets no Sportmarket leg while Sportsbet is down), then v6.239 (2026-11-04: on the v4 singles path a closed partner line, or a fresh 538 on it where every POST was fast, goes on to the milestone on the same account; stake bound off the main price), then v6.236 (2026-11-04: racing deferred verify anchored on the send time and it says CHECK THE ACCOUNT on a miss; a short record is booked at its own stake; trader refusals remembered; Daniel bet365 116964 out of racing in code), then v6.240 (2026-11-04: Late Mail Leroy removed: channel, parser, Betfair BSP placement, settings; Betfair 99997 keeps launching through BETFAIR_AUTOSTART_SESSION; an unregistered chat is ignored and a positive channel id is an error at startup), then v6.241 (2026-11-04: an alert when a tipster edits a post; it never parses, places or changes a bet; sportsbot sync list completed), then v6.243 (2026-11-04: racing prices and places by HyperBot's race key, after 7 $1 tests; the coverage skip stays off, the race list leaves off books that are pricing), then v6.235 (2026-11-04: Dabble 339917 is priced and bet only on racing tips whose race day is today in the race's own state; an earlier, later or unreadable date drops it, an undated tip counts as today) + v6.233 (2026-11-04: the deferred sports verify matches pending_bets from the bet's SEND time instead of the schedule time, so a late-indexed bet is no longer read as absent; a Sportmarket bridge bet it finds late is claimed so another tip's exact-line reconcile excludes it; the look gates the line like the first look, a Sportmarket crash reports its real send time, a bet the look finds is written to the ledger with one info message, one validated stall clock; a bet the gated look misses but a line-free look finds is UNCERTAIN (one critical, nothing recorded or released), never absent; the late row carries the posted line / market / selection; bet_ledger marks an id only after a successful write) + v6.230 (2026-11-03: Leroy: a race header the parser cannot read (a bracketed state or country, a digit in the track) ends the current race and goes to a manual alert instead of folding its runners into the previous race) + v6.221 (2026-11-03: racing prices and places by the race's pk from HyperBot's race list, and skips a bookie the list does not carry on the race; switches RACING_PK_ENABLED / RACING_COVERAGE_SKIP_ENABLED, both off) + v6.220 (2026-11-03: racing price check logs 'runner on card, no price yet' apart from 'runner not found'; an unpriced runner on the card no longer starts the wrong-race search) + v6.219 (2026-11-03: racing same-price ties fill the bet365 accounts first, then the rest, each in racing priority order; a bet365 account that covers the tip alone takes it, else the v6.205 random pick over the others; an account refused at placement within RACING_REFUSER_LAST_SEC (6 h) goes last; switch RACING_TIE_B365_FIRST) + v6.224 review fixes (v6.222-v6.224) (2026-11-03: a digit in a team name (49ers, 76ers) is no longer read as a reconcile line (pre-existing, also on Sportsbet); deferred verify exact line + per-poll claims for bridge bets; kickoff check ignores stale ESPN, reads ms epochs; NBA model rebet re-checks its close; safe switch parsing) + v6.224 (2026-11-03: every Sportmarket bet (a v6.208 rung and the tipped line) carries the bridge board's own event_id from the /v3/price read that picked its line, so the bridge never bets a similarly named game; none when there was no read; never a HyperBot id; the bridge's [event_not_carried] = nothing sent) + v6.223 (2026-11-03: NFL / NBL / AusBets NBA sends to Sportmarket stop 90 s before the game's scheduled start (earliest of the bridge's board start, the catalog start, the ESPN schedule; unknown start = no change, logged once; switch SPORTMARKET_KICKOFF_CHECK_ENABLED), the rest goes to Sportsbet) + v6.222 (2026-11-03: a Sportmarket reconcile only accepts a bridge bet that is provably this attempt's: the bridge's own named order ids, else an exact line, never a bet another tip's attempt holds; the within-1 gate stays for Sportsbet) + v6.232 (2026-11-03: Sportsbet re-line guard: after every Sportsbet single fill with a bet id the real line is read from HyperBot's own bet receipt log; a receipt line different from the line sent is a confirmed move (true line on the ledger row, that tip's further Sportsbet sends stopped, one alert, end of tip says stopped), the same line changes nothing whatever the price did, an unreadable receipt with a fill over 5% above the odds checked alerts without stopping; Fergal tennis Sportsbet included; stops persist in logs/sb_reline_stops.json; the 538 learner skips a moved send) + v6.231 (2026-11-03: Fergal tennis asks Sportmarket again after a confirmed partial fill, each pass at the live price but never under 2% below the tipped odds (to 3 decimals: 1.911 for a 1.95 tip), at most 5 follow-up asks (0 = off), never after a maybe / not_placed / uncertain / pending_bets answer, a book with a strictly better price takes over and Sportmarket gets one more pass after the other books, the time is checked again before the POST, a walk cut off by a restart is alerted once; config FERGAL_TENNIS_SM_STEPDOWN_PCT / _PASSES) + v6.229 (2026-11-03: Shook NBA player-prop singles are recorded (logs/shook_deferred.json) and bet 60 min before tip-off at the current Sportsbet line, only if it has not moved more than 1 stat point against us (a move our way is bet; a tip inside the hour is checked at once; too far = logged only); switches SHOOK_DEFER_TO_1H_ENABLED, SHOOK_DEFER_MINUTES, SHOOK_DEFER_MAX_WORSE) + v6.227 (2026-11-03: BetRight's [odds_moved] dividend changed reply is a clean refusal at any speed on a racing trader account, the stake spills; every other bookie and wording keeps the speed rule) + v6.226 (2026-11-03: bet365 and Sportmarket take the stake FIRST at a price EQUAL to or better than Sportsbet's, ties go to them, Sportsbet gets the rest: the main better step, the v6.201 NBA first-half Sportmarket rule and the v6.208 better-line rung price rule; the better-mode fill floor is Sportsbet's own price, not a cent above; Fergal tennis unchanged) + v6.225 (2026-11-03: Sportsbet SPORTS placement goes to Tarken 295513 only: the seven 1% accounts (Neel, Talal, Sahil, Mario, Aaron, Tom, Matthew) are dropped from every non-racing list, the NBA model, Fergal tennis and MLB singles (SPORTS_EXCLUDED_SESSIONS); racing unchanged) + v6.212 (2026-11-02: Dabble 339917 is a racing-only bookie in the best-price walk: first and alone on a tie, the whole stake in one attempt, only the accepted stake HyperBot states counts and the rest goes on, an unclear reply is maybe-placed and never spilled; no sports path can pick it; switch DABBLE_RACING_ENABLED, default on) + v6.211 (2026-11-02: the Sportsbet stake estimate (sb_limits) gets a fixed per-account size from sessions.yaml sb_limit_pct (1 / 10 / 30 / ... / unlimited = 40%; Matthew and Tom now sized; a 538 only logs the implied size and notes it once a day when it is over 30% off), NFL player props on the 24h / 4h ladder, and full-game game lines for NBA / NBL / NFL (head to head, main handicap, game total, team total over); the estimate is only ever a ceiling, min(the ask, the estimate)) + v6.218 (2026-11-03: NBA model v4 shortfall under $1 does not page) + v6.228 (2026-11-03: NBL betting is off for every tipster and every book (NBL_BETTING_ENABLED, default off): a Bettors Edge post is dropped before parsing with a log line only, and every NBL send path refuses locally) + v6.217 (2026-11-03: every Sportsbet account is a 1% account except Tarken 295513 (10%): Aaron 319979 (was 10%), Tom 328827 and Matthew 319970 (were unlimited) are seeded at 1% in the stake estimate, and Matthew joins the SB_LIMITED_SESSIONS default (max-first)) + v6.216 (2026-11-02: NBA model bets go up to Sportsbet's own start (scheduled + 10 min, or its board start when earlier), no 90 s lead; Sportmarket at the scheduled tip-off) + v6.213 (2026-11-02: NBA model: Matthew 319970 bets only when the model bet ARRIVES within 2 h of tip-off (NBA_MODEL_LATE_ONLY_SESSIONS / NBA_MODEL_LATE_WINDOW_MIN, v3 and v4, a model re-send is a new arrival, an unknown tip drops him); Tom 328827 joins the limited group in the SB_LIMITED_SESSIONS default) + v6.210 (2026-11-02: NBA model post-538 close counts Sportsbet's cap steps to Sportsbet's own start, not the scheduled tip: reopens were 10 min early) + v6.214 (2026-11-02: the Bet Record auto-resulter settles cross-game moneyline multis: market multi, every leg '<Team> ML', each leg as a single head-to-head by its league's own path, any leg lost = Loss, all won = Win at the bet's odds, a tie / void / unknown leg = a human) + v6.209 (2026-11-01: racing trader accounts: when the pending_bets look finds ONE bet with a bet id and a stake SMALLER than the reserved one (TAB auto-capped it), it is booked as PLACED at the found stake and the rest is unfilled, not re-bet, not spilled, no hold) + v6.208 (2026-11-01: Sportmarket game lines (spread, game total, team total) try the bridge's better-number rungs of the same selection first, each priced strictly better than Sportsbet on the tipped line, best number first, at most 3; a partial or refused rung moves on, then the tipped line, then Sportsbet; switch SPORTMARKET_BETTER_LINE_ENABLED) + v6.207 (2026-11-01: Bettors Edge NBL captions ignore a trailing sign-off line (No more, That's it) and alert once when a caption disagrees with verified slip stakes; NFL same-name players settled by position when the tip names no team (not passing TD / interceptions), four known collisions seeded, a shrunk Sleeper pull never overwrites the roster; bet365 /v3/price reads retry once for callers that may wait, bet365-only legs wait out a pause once when the start is known, nothing is pulled or sent inside the last 2 minutes) + v6.206 (2026-11-01: NBA overs: the same-line Alt rung and plain main row are both bet on the same account (own limits), then the milestone; switch SB_ALT_MAIN_TWIN_ENABLED) + v6.205 (2026-11-01: racing same-price groups fill each tied account to its cap in priority order, fewer bets; Sportsbet Mario 295510 out of all placement) + v6.202 (2026-11-01: every NBA model fills record carries Sportsbet capacity: sb_liability_left, sb_price, sb_reopen_at, sb_zero_reason, sb_capacity_v, so the model re-sends a same-line top-up only when it can fill) + v6.204 (2026-11-01: bet365 NFL priced from HyperBot's /v3/markets card switched ON, like NBA / NBL) + v6.203 (2026-11-01: racing trader accounts: thoroughbred MBL in force all of race day from 00:00 local in every state (harness 10:00, WA all day, NT never); undated tips use the saturday: caps too; a slow 538 / odds changed / 756 is never freed, the look can only upgrade it to placed) + v6.201 (2026-11-01: NBA first-half spreads / totals (AusBets) go to the Sportmarket bridge only when its price on the same half line is strictly higher than the best HyperBot book's, the v6.172 better-step flow, no shortfall step; reconcile never matches a first-half bet to a full-game one or the reverse; switch SPORTMARKET_FIRST_HALF_ENABLED, default on) + v6.199 (2026-11-01: bet365 NBL (on) and NFL (switch off) priced from HyperBot's /v3/markets card; card bets placed by epk + market_ref; player names match with punctuation squashed) + v6.198 (2026-11-01: racing trader accounts 71265 / 78280 / 99999 / 99996 bet within the class MBL in parallel: MBL table by venue and state with its clock (thoroughbreds 09:00, VIC 07:00, harness 10:00, WA all day, NT never), judged at the bookie's own quote; async sends with reserved stake, referral = unconfirmed, never re-bet, one look, persisted follow, ledger-first durability and an in-flight file; fast 538 / odds changed / 756 = failure, slow = unconfirmed unless a 30 s window proves it absent; state-local race dates; faster price shop; switch RACING_TRADER_ASYNC) + v6.196 (2026-11-01: NBA model BET|v4: a Pinnacle-decided Tier 1 REB Under goes to the Sportmarket bridge first at >= sm_floor, the remainder to Sportsbet only at >= its own sb_floor (x = not at all), no other spill; v4 fills never retryable; every v4 key short of its stake pages once and never invites a hand-place; a v3 offer after v4 at the same selection is refused; switch NBA_MODEL_V4_ENABLED, default off) + v6.195 (2026-10-31: bet365 NBA props priced from HyperBot's GET /v3/markets card: combos PRA / PR / PA / RA, steals, blocks and every player, full-game overs only; /v3/price as the fallback) + v6.194 (2026-10-31: TipBot-DiskGuard deletes the test suite's own logs in Temp over 200 MB once quiet for 10 min, and stale per-process trader in-flight test files after 72 h) + v6.193 (2026-10-31: bet365 NBA props: an over with no bet365 row at its rung takes the rung below at Sportsbet's price or better, or the rung above at Sportsbet / 0.8 or better; steals / blocks placed by name; Shook NBA single overs wired; NBA bet365 cap 1000 to win) + v6.192 (2026-10-31: Fergal tennis Sportsbet to-win caps per account, $400 match winner / $200 every other market, or the account's own lower max) + v6.191 (2026-10-31: Fergal tennis bets Sportsbet only on the five working accounts; the four banned ones are dropped even if the override names them) + v6.190 (2026-10-31: racing: a fast Sportsbet 756 'not permitted for your account' is a clean refusal for that account and the walk goes on to the next account; a slow one is still reconciled and, confirmed absent, spends that account only; one alert a day per account) + v6.187 (2026-10-31: bet365 racing: Wilson Bet365 338081 (wolfhound) joins racing just in front of Daniel 116964, racing caps copied from 116964) + v6.186 (2026-10-31: Fergal tennis: a Sportsbet 756 'not permitted for your account' is a clean refusal for that account, and the walk goes on to the next account) + v6.185 (2026-10-31: a multi-leg tip not marked as an SGM goes to manual for every tipster, and is keyed on all its legs for the resend guard; switch MULTI_LEG_NON_SGM_TO_MANUAL, default on) + v6.184 (2026-10-31: a timed-out Sportmarket partial fill is recorded by its order id once every order the bridge sent is closed; the client forwards the bridge's timeout order keys) + v6.183 (2026-10-31: the NBA milestone twin takes its side from the matcher, so a Sportsbet row whose text carries the line (Robinson / Murray-Boyles Over N) gets its twin, and every skipped twin is logged with the reason; racing: a not-found or not-carried on one Sportsbet account spends that account only, Sportsbet is dropped for the tip at the second)"
 
 # ── Telegram ─────────────────────────────────────────────────────────
 _raw_api_id = os.getenv("TELEGRAM_API_ID", "0")
@@ -220,6 +220,17 @@ MLB_FLAT_STAKE = _env_float("MLB_FLAT_STAKE", "1")
 SHOOK_MLB_ENABLED = _env_bool("SHOOK_MLB_ENABLED", False)
 SHOOK_NFL_MANUAL = _env_bool("SHOOK_NFL_MANUAL", True)
 
+# v6.229 (Wilson 3 Nov 2026: "for shook, record his tips and only bet on them when 1 hour from tip if
+# the line has not moved by more than 1 stat point (instead of betting 10 hours before game starts
+# when he randomly posts early)"): a Shook NBA player-prop single is recorded (logs/shook_deferred.json)
+# and bet SHOOK_DEFER_MINUTES before tip-off at the CURRENT line, only if that line is no more than
+# SHOOK_DEFER_MAX_WORSE stat points worse for us than the tipped one (an over on a higher line, an
+# under on a lower one; a move our way always passes). A tip posted inside the window is checked at
+# once. A line that moved too far is only logged. Code default on; the test conftest pins it off.
+SHOOK_DEFER_TO_1H_ENABLED = _env_bool("SHOOK_DEFER_TO_1H_ENABLED", True)
+SHOOK_DEFER_MINUTES = _env_float("SHOOK_DEFER_MINUTES", "60")
+SHOOK_DEFER_MAX_WORSE = _env_float("SHOOK_DEFER_MAX_WORSE", "1.0")
+
 # v5.74: MLB HRRBI per-account STAKE ladder — fractions of the even-split target
 # ($400 / 4 accounts = $100 -> $100/$90/$85/$80...). The MLB HRRBI SGM fan-out uses
 # this fixed-% ladder (NOT the mlb.sgm liability brackets): each of the 4 SGM
@@ -330,12 +341,16 @@ SB_NEW_STAKE_STEP = float(os.getenv("SB_NEW_STAKE_STEP", "5"))
 # the accounts whose every stake is a SB_NEW_STAKE_STEP multiple (Matthew, Aaron, Tom)
 SB_STEP_SESSIONS = {s.strip() for s in os.getenv(
     "SB_STEP_SESSIONS", "319970,319979,328827").split(",") if s.strip()}
-# v6.142 (Wilson 2026-10-29): a Sportsbet account (not Matthew / Tom) is SENT its estimated max on the
-# row (whole $, sb_limits.py: the measured limits ladder x the account's size, learned from its 538s)
-# instead of over-asking for a 538 and rebetting at the max.
+# v6.142 (Wilson 2026-10-29): a Sportsbet account is SENT its estimated max on the row (whole $,
+# sb_limits.py: the measured limits ladder x the account's size) instead of over-asking for a 538 and
+# rebetting at the max. v6.211: the size is `sb_limit_pct` on the account's sessions.yaml block (1 / 10 /
+# 30 / ... / unlimited = 40%, fixed; an account with none keeps the learned / seeded size), Matthew and
+# Tom included, and the estimate is only ever a CEILING: min(the ask, the estimate), never a raise.
+# v6.217 (3 Nov): every Sportsbet account is 1% except Tarken 295513 (10%).
 SB_LIMIT_ESTIMATE_ENABLED = os.getenv("SB_LIMIT_ESTIMATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 # every sport, for every tipster on the Sportsbet fan-out (Wilson 2026-10-29: "hooked up to all tipsters
 # for all sports"); a sport / market only gets an estimate once sb_limits.BASE_10PCT holds its measured row
+# (v6.211: NBA / NBL / NFL player props and NBA / NBL / NFL full-game lines; AFL has no rows yet)
 SB_LIMIT_ESTIMATE_SPORTS = os.getenv("SB_LIMIT_ESTIMATE_SPORTS", "nba,nbl,nfl,afl")
 SB_NEW_SPREAD_MIN = float(os.getenv("SB_NEW_SPREAD_MIN", "0.10"))
 SB_NEW_SPREAD_MAX = float(os.getenv("SB_NEW_SPREAD_MAX", "0.20"))
@@ -346,19 +361,46 @@ SB_MILESTONE_TWIN_ENABLED = os.getenv("SB_MILESTONE_TWIN_ENABLED", "true").strip
 # v6.133 (Wilson 2026-10-28: "allow a 5 cent gap"): the twin row may be priced up to this far from
 # the main row (either way); it bets at its OWN price
 SB_MILESTONE_TWIN_MAX_ODDS_GAP = float(os.getenv("SB_MILESTONE_TWIN_MAX_ODDS_GAP", "0.05"))
+# v6.206 (Wilson 2026-11-01: the Alt and main rows "have separate limits ... bet both of them on the
+# same account"): an NBA over matched on the plain O/U row also takes the same-line Alt rung, and one
+# matched on an Alt rung the plain row, on the same account (within the gap above), before the
+# milestone. Off = the milestone twin only, as before.
+SB_ALT_MAIN_TWIN_ENABLED = os.getenv("SB_ALT_MAIN_TWIN_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 # v6.132 (Wilson 2026-10-28): Aaron (319979) is limited now (Sportsbet max $105 on the Luka row,
 # the 10% account 295513 $108.70): he bets with the limited group; Matthew + Tom keep the split.
+# v6.213 (Wilson 2 Nov 2026): Tom (328827) is limited now too, a 10% account like Aaron and Tarken:
+# he joins the limited group. Matthew (319970, the 40% account) stays out and keeps the split.
+# v6.217 (Wilson 3 Nov: "all sb are now 1% except tarken"): Matthew is cut to 1% too (2 Nov NBL:
+# "SB max $10.00" on every leg), so he joins the limited group: every Sportsbet account is limited.
 SB_LIMITED_SESSIONS = {s.strip() for s in os.getenv(
-    "SB_LIMITED_SESSIONS", "295471,295475,295478,295510,295513,319979").split(",") if s.strip()}
+    "SB_LIMITED_SESSIONS", "295471,295475,295478,295510,295513,319970,319979,328827").split(",")
+    if s.strip()}
 # v6.119 (Wilson: "rebet once, then close"): after a Sportsbet "stake too high" (538) on a sports
 # bet, the one rebet at the stated max still runs, then THAT account never tries THAT line again
 # for SB_LINE_CLOSED_TTL_SEC (persisted, survives a restart). Other accounts are unaffected.
 SB_CLOSE_LINE_AFTER_538 = os.getenv("SB_CLOSE_LINE_AFTER_538", "true").strip().lower() in ("1", "true", "yes")
 SB_LINE_CLOSED_TTL_SEC = float(os.getenv("SB_LINE_CLOSED_TTL_SEC", "86400"))
+# v6.232 (Wilson 3 Nov 2026): Sportsbet can re-line a prop on the SAME outcome id (Cunningham Over 22.5 ->
+# 23.5) while HyperBot's read of the event is 10 s or more behind, so it "matches" the old line and
+# sends; Sportsbet fills its live line and price, and the receipt carries no line. A Sportsbet fill whose
+# odds are checked against HyperBot's own bet receipt (sb_receipt.py): a receipt line that differs from the
+# line sent is a CONFIRMED move (the tip's fan-out stops, one alert, the true line goes on the ledger row);
+# only when the receipt cannot be read and the fill is MORE than SB_RELINE_ODDS_PCT above the odds checked
+# is there an alert (no stop). A stop is remembered until the event's start + 6 h (24 h when the start is not
+# known) in logs/sb_reline_stops.json, so a restart keeps it. Plain constants on purpose (no .env switch);
+# conftest pins them.
+SB_RELINE_GUARD = True
+SB_RELINE_ODDS_PCT = 0.05
+SB_RELINE_STOP_TTL_SEC = 86400.0          # a stop's life when the event's start is not known
+SB_RELINE_STOP_AFTER_START_SEC = 21600.0  # ... else until the event's start + this (6 h)
+# The re-line guard reads the REAL line of a Sportsbet fill from HyperBot's own receipt log (sb_receipt.py):
+# <root>\<account email>\<date>\*.log, polled up to SB_RECEIPT_WAIT_SEC. Plain constants (no .env).
+SB_RECEIPT_LOG_ROOT = r"C:\Users\Wilson\BET337\logs\sportsbet"
+SB_RECEIPT_WAIT_SEC = 6.0
 # v6.119 (Wilson: "flat 500 to win per account per single bet"): NFL singles were uncapped.
 NFL_MAX_TO_WIN_PER_BET = float(os.getenv("NFL_MAX_TO_WIN_PER_BET", "500"))
 # v6.120 (Wilson 2026-10-25): sports PLAYER PROPS on bet365 (the big-limit test account), ONLY when
-# bet365's price for the exact same bet is strictly better than Sportsbet's (bet365 takes the stake
+# bet365's price for the exact same bet is equal to or better than Sportsbet's (v6.226; bet365 takes the stake
 # first, up to its cap, the rest goes to the Sportsbet fan-out) or Sportsbet does not fill it (the
 # unfilled remainder, never maybe-placed stake, goes to bet365 up to its cap). Game lines, totals,
 # h2h, handicaps, SGMs and MMA never use this path. OFF unless B365_SPORTS_ENABLED=true.
@@ -391,6 +433,17 @@ B365_NBA_RUNG_ALTS = _env_bool("B365_NBA_RUNG_ALTS", True)
 # player, combos PRA / PR / PA / RA, steals, blocks) before the /v3/price Bet Builder catalog.
 # Off by default under TIPBOT_TESTING, so the suite never reads the live HyperBot API.
 B365_NBA_HB_MARKETS = _env_bool("B365_NBA_HB_MARKETS", not os.getenv("TIPBOT_TESTING"))
+# v6.197 (Wilson 2026-11-01): bet365 NBL from the same card (overs-only ladders like NBA), on.
+B365_NBL_HB_MARKETS = _env_bool("B365_NBL_HB_MARKETS", not os.getenv("TIPBOT_TESTING"))
+# v6.197 (Wilson 2026-11-01: "yes do nfl as well but tomorrow there will be a bunch of bets being
+# placed on nfl"): bet365 NFL from the card (named markets, main O/U unders + overs + alt ladder
+# rungs) instead of /v3/price's unlabelled groups. v6.204 (Wilson 2026-11-01: "i want nba and nfl
+# all on for b365"): on, like NBA / NBL (off under TIPBOT_TESTING).
+B365_NFL_HB_MARKETS = _env_bool("B365_NFL_HB_MARKETS", not os.getenv("TIPBOT_TESTING"))
+# v6.197 (Wilson 2026-11-01, "yeh we should do this"): a card row is placed by epk + market_ref
+# (HyperBot's exact form; $1 tests 1 Nov: Maxey 25+ points, DJ Moore 60+ receiving, Henry under
+# 18.5 rushing attempts), not by event name + proposition_id.
+B365_PLACE_BY_MARKET_REF = _env_bool("B365_PLACE_BY_MARKET_REF", not os.getenv("TIPBOT_TESTING"))
 B365_NBA_HARDER_RUNG_DROP = float(os.getenv("B365_NBA_HARDER_RUNG_DROP", "0.20"))
 B365_NBA_HARDER_RUNG_MAX_ODDS_MULT = float(os.getenv("B365_NBA_HARDER_RUNG_MAX_ODDS_MULT", "1.5"))
 B365_MAX_TO_WIN_NBL = float(os.getenv("B365_MAX_TO_WIN_NBL", "500"))
@@ -485,6 +538,14 @@ FOURTHANDEV_TEXT_PLACE_ENABLED = _env_bool("FOURTHANDEV_TEXT_PLACE_ENABLED", Tru
 # its first live use can be killed with a .env edit + restart. When off, every
 # post with a price in it is sent to Wilson as one manual alert instead.
 BETTORSEDGE_NBL_PLACE_ENABLED = _env_bool("BETTORSEDGE_NBL_PLACE_ENABLED", True)
+# v6.228 (Wilson 3 Nov 2026: "turn off nbl betting for all"; then "ignore completely"): every NBL
+# bet is off, on every book (Sportsbet, bet365, Sportmarket) and every route: a Bettors Edge post
+# is dropped before it is parsed (log line only, no alert), and every NBL send path refuses
+# locally. A new key, so the live .env (which sets BETTORSEDGE_NBL_PLACE_ENABLED=true) cannot turn
+# it back on by accident; NBL_BETTING_ENABLED=true in .env + a restart switches NBL back on.
+# Off by default everywhere (review: never open because of a stray TIPBOT_TESTING); the root
+# conftest turns it on for the suite so the NBL tests keep their meaning.
+NBL_BETTING_ENABLED = _env_bool("NBL_BETTING_ENABLED", False)
 
 # 2026-10-10 (Wilson): since 10 Oct The Bettors Edge posts Sportsbet betslip SCREENSHOTS
 # (no caption) followed by a units text ("1.5 and 0.5"). Image support in
@@ -892,6 +953,13 @@ NBA_MODEL_ENABLED = _nba_flag("NBA_MODEL_ENABLED", False, False)
 # takes nothing). OFF by default and while off EVERY BET|v4 line is refused to manual with a refused
 # fills record ("v4 disabled"). Only 1/true/yes switch it on (_env_bool): anything else reads as OFF.
 NBA_MODEL_V4_ENABLED = _env_bool("NBA_MODEL_V4_ENABLED", False)
+# v6.234 BET|v5 (Wilson 4 Nov 2026: a v3 line's Sportmarket legs, the better step and the shortfall,
+# never checked the model's 2% edge at Pinnacle): v5 is a Sportsbet-decided bet placed exactly as v3,
+# plus `sm_floor` (a price, or `x`). EVERY Sportmarket leg of a v5 line places only at a live price at
+# or above sm_floor, with the bridge's target_odds never under it; `x`, or a floor that cannot be read,
+# means no Sportmarket leg at all. OFF by default and while off EVERY BET|v5 line is refused to manual
+# with a refused fills record ("v5 disabled"), as v4 is. Only 1/true/yes switch it on (_env_bool).
+NBA_MODEL_V5_ENABLED = _env_bool("NBA_MODEL_V5_ENABLED", True)   # v6.244 on (Wilson 4 Nov); inert until the model sends v5
 # Channel + sender id live in .env (never hardcoded). OPEN (PIPELINE-DESIGN 9.5): whether NBA
 # signals share the AFL channel or get their own. Both work: a different channel registers its
 # own entry; the SAME channel and sender as DISPOSALS_MODEL_* is routed by schema version
@@ -922,6 +990,54 @@ SPORTMARKET_TIPSTERS = set(
 SPORTMARKET_SPORTS = set(
     s.strip().lower() for s in os.getenv("SPORTMARKET_SPORTS", "nba").split(",") if s.strip()
 ) or {"nba"}
+# v6.201 (Wilson 2026-11-01: "yes if higher odds"): an NBA FIRST-HALF spread or total (AusBets NBA)
+# goes to the bridge only when Sportmarket's price on the same line is equal to or higher (v6.226) than the best
+# HyperBot book's. Default ON; false restores the previous behaviour exactly (no first-half leg ever
+# touches the bridge). NBL is never routed (the bridge has no NBL first-half feed).
+SPORTMARKET_FIRST_HALF_ENABLED = os.getenv("SPORTMARKET_FIRST_HALF_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on")
+
+# v6.223 (Wilson 3 Nov, "do them all"): the kickoff check for NFL / NBL / AusBets NBA sends to Sportmarket,
+# the rule the NBA model has had since v6.216: no Sportmarket send from 90 s before the game's scheduled
+# start (the bridge's own board start, the catalog start tipbot already read, or the ESPN schedule it
+# already cached; the earliest known). The rest of the stake goes to Sportsbet as before. An unknown
+# start changes nothing (logged once). Default ON; false restores the previous behaviour exactly.
+# v6.224 review: only an exact off word switches it off; an unrecognised value keeps the check ON and warns once.
+_KICKOFF_RAW = os.getenv("SPORTMARKET_KICKOFF_CHECK_ENABLED", "true").strip().lower()
+if _KICKOFF_RAW in ("0", "false", "no", "off"):
+    SPORTMARKET_KICKOFF_CHECK_ENABLED = False
+else:
+    SPORTMARKET_KICKOFF_CHECK_ENABLED = True
+    if _KICKOFF_RAW not in ("1", "true", "yes", "on", ""):
+        import logging as _kick_logging
+        _kick_logging.getLogger("tipbot.config").warning(
+            "SPORTMARKET_KICKOFF_CHECK_ENABLED=%r is not a recognised value (use true/false): "
+            "keeping the kickoff check ON", _KICKOFF_RAW[:40])
+
+# v6.208 (Wilson 2026-11-01: "check lower lines for liquidity/higher odds from now on"): before the
+# tipped line, a full-game spread / game total / team total tries the bridge's rungs of the SAME
+# selection that are a better number for us (over: lower, under: higher, spread: more points) at a
+# price that still beats Sportsbet on the tipped line, best number first. Default ON; false restores
+# the tipped-line-only step exactly. MAX_TRIES bounds the extra bridge tries (each a betslip read).
+SPORTMARKET_BETTER_LINE_ENABLED = os.getenv("SPORTMARKET_BETTER_LINE_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on")
+try:
+    SPORTMARKET_BETTER_LINE_MAX_TRIES = max(0, int(os.getenv("SPORTMARKET_BETTER_LINE_MAX_TRIES", "3")))
+except ValueError:
+    SPORTMARKET_BETTER_LINE_MAX_TRIES = 3
+# v6.238 (Wilson 4 Nov 2026: Tarken down, "build it so bet365 and Sportmarket can still bet"): when the AFL /
+# NFL fan-out has no usable Sportsbet session, Sportmarket and bet365 take the tip alone under the shortfall
+# rules (no better step: no Sportsbet price), best price first, the rest to manual. False restores the manual exit.
+SPORTSBET_DOWN_EXTERNAL_ENABLED = _env_bool("SPORTSBET_DOWN_EXTERNAL_ENABLED", True)
+# v6.238 (Wilson 4 Nov 2026: MMA on bet365 and Sportmarket): the tipbot Sportmarket MMA moneyline leg. Default
+# OFF until the bridge can price and place MMA (today it answers [event_not_carried], nothing submitted).
+SPORTMARKET_MMA_ENABLED = _env_bool("SPORTMARKET_MMA_ENABLED", False)
+# the walk holds Sportsbet's turn: once this many seconds have passed no new rung starts (the tipped
+# line and Sportsbet then go on as before)
+try:
+    SPORTMARKET_BETTER_LINE_BUDGET_SEC = max(0.0, float(os.getenv("SPORTMARKET_BETTER_LINE_BUDGET_SEC", "90")))
+except ValueError:
+    SPORTMARKET_BETTER_LINE_BUDGET_SEC = 90.0
 
 # v6.171 (Wilson 2026-10-30): Fergal's Tip Titans tennis tips (titan FB) placed on Sportmarket
 # through the bridge (tiptitans_tennis.py). OFF until Wilson says go: while off his tips are dropped
@@ -953,6 +1069,29 @@ FERGAL_TENNIS_MAX_STAKE = _fergal_num("FERGAL_TENNIS_MAX_STAKE", 1200, 0, 1200)
 # price 1.5x the tipster's or more is a likely wrong match (the racing ceiling).
 FERGAL_TENNIS_ODDS_DROP_PCT = _fergal_num("FERGAL_TENNIS_ODDS_DROP_PCT", 0.10, 0, 0.5)
 FERGAL_TENNIS_CEILING_X = _fergal_num("FERGAL_TENNIS_CEILING_X", 1.5, 1.0, 5.0)
+# Sportmarket step-down (Wilson 2026-11-03, the Sonmez partial: a bridge fill of AUD 85.91 of 800 stopped at
+# [odds_below_target] and the rest went manual): after a CONFIRMED partial fill the walk asks Sportmarket
+# again for the remainder, each pass at the live price but never under this fraction below the TIPPED odds
+# (tipped x (1 - pct), rounded UP to 3 decimals: the bridge orders at 3), at most _PASSES follow-up passes.
+# The first pass keeps the FERGAL_TENNIS_ODDS_DROP_PCT logic. Both are read from the environment like the
+# neighbouring settings (defaults 0.02 and 5); FERGAL_TENNIS_SM_STEPDOWN_PASSES=0 switches the step-down off.
+def _fergal_count(name: str, default: int, lo: int, hi: int) -> int:
+    """A whole number in [lo, hi] (0 allowed when lo is 0); anything else (junk, NaN, fractions,
+    out of range) is the default."""
+    raw = os.getenv(name)
+    try:
+        v = float(raw if raw is not None else default)
+    except (TypeError, ValueError):
+        v = float("nan")
+    if not (lo <= v <= hi) or v != int(v):
+        if raw is not None:
+            print(f"[config] {name}={raw!r} is not a whole number in [{lo}, {hi}]; using {default}")
+        return int(default)
+    return int(v)
+
+
+FERGAL_TENNIS_SM_STEPDOWN_PCT = _fergal_num("FERGAL_TENNIS_SM_STEPDOWN_PCT", 0.02, 0, 0.5)
+FERGAL_TENNIS_SM_STEPDOWN_PASSES = _fergal_count("FERGAL_TENNIS_SM_STEPDOWN_PASSES", 5, 0, 20)
 
 # OPTIONAL dedicated account list for the NBA MODEL ONLY (comma-separated session ids, in
 # priority order, parsed exactly like NBA_SESSION_PRIORITY in session_priority.py). NBA_SESSION_PRIORITY
@@ -965,6 +1104,62 @@ if NBA_MODEL_SESSION_PRIORITY:
     if not _nba_sp_tokens or not all(t.isdigit() or t == SPORTMARKET_SESSION_ID for t in _nba_sp_tokens):
         _nba_err(f"NBA_MODEL_SESSION_PRIORITY={NBA_MODEL_SESSION_PRIORITY!r} is not a "
                  f"comma-separated list of session numbers; placing nothing until it is fixed")
+
+# v6.213 (Wilson 2 Nov 2026: "allow matthew to also bet nba model but only within the 2 hour from
+# tip window if the odds are still there"): these sessions are LATE-ONLY for the NBA model. A model
+# bet takes them only when the bet ARRIVED (the message being processed, so a model re-send is its
+# own arrival) within NBA_MODEL_LATE_WINDOW_MIN minutes of tip-off. A bet that arrived earlier never
+# uses them, however long it keeps retrying inside the fan-out; an unknown or non-finite tip time
+# drops them. Only the model's own fan-out is gated. The default holds Matthew 319970, so adding him
+# to NBA_MODEL_SESSION_PRIORITY is safe from the first second.
+# The ONLY way to switch the gate off is the exact word `off` (any case), logged loudly at startup.
+# A blank or separators-only value, a non-numeric token, a non-ASCII digit or an absurdly long number
+# keeps the default {319970} and logs a WARNING: a typo must never open the gate. It is deliberately
+# NOT a config error (NBA_MODEL_CONFIG_ERRORS would refuse all model placement): a bad value here is
+# already fail-closed for Matthew, so the other accounts keep betting. Tokens are ASCII digits kept as
+# str(int(t)), so "0319970" is 319970.
+import logging as _late_logging
+
+
+def _late_token(t: str):
+    """An ASCII-digit token without its leading zeros (the same form as nba_model_core.norm_sid),
+    at most 18 significant digits, else None (never raises)."""
+    if not (t.isascii() and t.isdigit()):
+        return None
+    n = t.lstrip("0") or "0"
+    return n if len(n) <= 18 else None
+
+
+_nba_late_raw = os.getenv("NBA_MODEL_LATE_ONLY_SESSIONS", "319970")
+_nba_late_tokens = [t.strip() for t in _nba_late_raw.split(",") if t.strip()]
+_nba_late_norm = [_late_token(t) for t in _nba_late_tokens]
+if _nba_late_raw.strip().lower() == "off":
+    NBA_MODEL_LATE_ONLY_SESSIONS = set()
+    _late_logging.getLogger("tipbot.config").warning(
+        "NBA_MODEL_LATE_ONLY_SESSIONS=off: the NBA model's late-only gate is OFF, every account in "
+        "NBA_MODEL_SESSION_PRIORITY bets whatever the time to tip-off")
+elif _nba_late_tokens and all(n is not None for n in _nba_late_norm):
+    NBA_MODEL_LATE_ONLY_SESSIONS = set(_nba_late_norm)
+else:
+    # blank / separators only / a bad token: the default group, never an empty gate
+    _late_logging.getLogger("tipbot.config").warning(
+        "NBA_MODEL_LATE_ONLY_SESSIONS=%r is not a comma-separated list of ASCII session numbers "
+        "(or the word off); using the default 319970", _nba_late_raw[:80])
+    NBA_MODEL_LATE_ONLY_SESSIONS = {"319970"}
+# minutes before tip-off, 0 to 720, fractions fine; anything else is the default 120 with a WARNING
+# (not a config error, for the same reason)
+try:
+    _nba_late_win_raw = os.getenv("NBA_MODEL_LATE_WINDOW_MIN", "120").strip()
+    if not _nba_late_win_raw.isascii():          # float() reads full-width / Arabic-Indic digits
+        raise ValueError("not ASCII")
+    NBA_MODEL_LATE_WINDOW_MIN = float(_nba_late_win_raw)
+    if not (0.0 <= NBA_MODEL_LATE_WINDOW_MIN <= 720.0):          # also False for nan
+        raise ValueError("outside 0 to 720")
+except ValueError:
+    _late_logging.getLogger("tipbot.config").warning(
+        "NBA_MODEL_LATE_WINDOW_MIN=%r is not a number from 0 to 720; using the default 120",
+        os.getenv("NBA_MODEL_LATE_WINDOW_MIN", "")[:40])
+    NBA_MODEL_LATE_WINDOW_MIN = 120.0
 
 # The market and tag allow-lists. Config-driven so another prop can be added later, but a
 # market added here is still REFUSED at placement until it has a liability ladder
@@ -1063,10 +1258,12 @@ NBA_MODEL_EVENT_START_TOLERANCE_SEC = _nba_in_range(
 # Refuse a message whose `start` (UTC tip-off) has passed, plus this much slack. Clamped to
 # clock-skew size: a larger value would place a bet after tip-off (in play).
 NBA_MODEL_START_SLACK_SEC = _nba_float("NBA_MODEL_START_SLACK_SEC", "0")
-# Minimum lead before tip-off: a message arriving closer than this is refused, for EVERY kind
-# including retries (a placement takes seconds to minutes across accounts, and the start gate
-# alone lets a bet start inside the last moments). Env configurable; never negative.
-NBA_MODEL_MIN_LEAD_SEC = _nba_float("NBA_MODEL_MIN_LEAD_SEC", "90")
+# Minimum lead before the bets' close: a message arriving closer than this is refused, for EVERY
+# kind including retries. v6.216 (Wilson 2026-11-02: "just allow any bets even if within 90
+# seconds as long as it is bettable"): the close is Sportsbet's own start (scheduled + 10 min,
+# nba_model_core.bet_close_epoch) and the default lead is 0 (was 90 s before the scheduled tip).
+# Env configurable; never negative.
+NBA_MODEL_MIN_LEAD_SEC = _nba_float("NBA_MODEL_MIN_LEAD_SEC", "0")
 # v6.73 (Wilson 2026-10-18: "the nba player prop model should only send tips within 12 hours of
 # tipoff"): a BET line (any kind) whose start is more than this far away is refused. NBA model
 # only. 0 = no limit.
@@ -1137,14 +1334,14 @@ NBA_MODEL_HEARTBEAT_FILE = os.getenv(
 NBA_MODEL_HEARTBEAT_STALE_MIN = _env_float("NBA_MODEL_HEARTBEAT_STALE_MIN", "90")
 NBA_MODEL_LIVENESS_CRITICAL = _env_bool("NBA_MODEL_LIVENESS_CRITICAL", True)
 
-# Leroy (Late Mail Leroy) — TEXT racing tipster (saddle#+units, Thoroughbreds AU,
-# same-day), placed via Betfair BSP (back) on LEROY_BETFAIR_SESSION. $LEROY_UNIT_SIZE
-# per unit, capped at LEROY_MAX_UNITS PER BET (win + place count separately), full
-# stake — NO splitting across accounts. LEROY_ENABLED is the kill-switch. v5.93.
-LEROY_UNIT_SIZE = _env_float("LEROY_UNIT_SIZE", "400")
-LEROY_MAX_UNITS = _env_float("LEROY_MAX_UNITS", "4")
-LEROY_BETFAIR_SESSION = os.getenv("LEROY_BETFAIR_SESSION", "99997")
-LEROY_ENABLED = _env_bool("LEROY_ENABLED", True)
+# v6.240 (Wilson 4 Nov: "there are no more Leroy tips, take out the Leroy placement logic and old
+# settings"): the Late Mail Leroy channel, parser and Betfair BSP placement are gone, and with them
+# LEROY_UNIT_SIZE / LEROY_MAX_UNITS / LEROY_BETFAIR_SESSION / LEROY_ENABLED. HyperBot used to launch
+# the Betfair session only because Leroy placed on it (hb_launch_sessions added LEROY_BETFAIR_SESSION
+# while LEROY_ENABLED). Wilson holds a Betfair balance there, so it keeps launching through this plain
+# setting: comma-separated ids, empty = launch none. No bet is placed through it. Drop it when the
+# balance no longer needs a live session.
+BETFAIR_AUTOSTART_SESSION = os.getenv("BETFAIR_AUTOSTART_SESSION", "99997")
 
 # The Leg Up Australia (v6.72, Wilson 2026-10-18): a racing tips EMAIL. gmail_watcher.py reads a
 # dedicated Gmail inbox (Wilson's own inbox forwards The Leg Up to it) and posts the Quick Take
@@ -1405,6 +1602,16 @@ LOOP_FREEZE_MAX_SILENCE_SEC = _env_int("LOOP_FREEZE_MAX_SILENCE_SEC", "900")
 # ~14x improvement on the 14.5h blackout, and the 900s loop-freeze check above
 # independently covers a wedged loop. Set 0 to disable (loop-freeze unaffected).
 WORK_STALL_MAX_SILENCE_SEC = _env_int("WORK_STALL_MAX_SILENCE_SEC", "3600")
+# v6.241 (Wilson 4 Nov 2026, 4th and EV edited a Murray 325+ post after it was parsed): one info alert
+# when a watched tipster post's TEXT (or image) really changes: tipster, old text, new text, how long
+# after posting. ALERT ONLY: nothing is parsed, placed, changed or cancelled (edit_alert.py). Ops settings,
+# not betting numbers: the original text of each post is kept in logs/edited_tip_posts.json for 7 days
+# (the MMA_SEEN_TTL_SEC resend memory), at most 2000 posts; a post edited with no stored original
+# alerts once only within 24 h of posting (the SB_RELINE_STOP_TTL_SEC / SB_LINE_CLOSED_TTL_SEC day).
+EDITED_TIP_ALERT_ENABLED = _env_bool("EDITED_TIP_ALERT_ENABLED", True)
+EDITED_TIP_STORE_MAX_AGE_SEC = 7 * 24 * 3600.0
+EDITED_TIP_STORE_MAX_POSTS = 2000
+EDITED_TIP_UNKNOWN_RECENT_SEC = 86400.0
 
 # ── HyperBot placement poll HARD CEILING (incident 2026-07-17, v6.03) ──
 # ROOT CAUSE of the 6.5h freeze: the v3 placement poll loop (_post_v3_async)
@@ -1518,6 +1725,22 @@ RACING_SA_TRACK_PROBE = os.getenv("RACING_SA_TRACK_PROBE", "true").strip().lower
 # shop). RACING_WRONG_RACE_MAX = highest race number searched.
 RACING_WRONG_RACE_SEARCH = os.getenv("RACING_WRONG_RACE_SEARCH", "true").strip().lower() in ("1", "true", "yes", "on")
 RACING_WRONG_RACE_MAX = int(os.getenv("RACING_WRONG_RACE_MAX", "12"))
+# v6.221 (the October measurement: 86 of 265 racing tips had a bookie fail its price check, about 550
+# "race not in catalog" reads and 102 timeouts, and bet365's 5-minute cooldown after a failure knocked it
+# out of the next tips). Both switches read HyperBot's race list (GET /v3/races, 60 calls a minute, cached
+# by racing_pk.py). v6.243 (Wilson 4 Nov: approve as long as tested with a couple of $1 bets): the pk switch is ON, 5 $1 bets by pk
+# landed on the right race and showed in pending_bets as fast as track-form bets. The coverage skip stays OFF: on 4 Nov the list
+# left bet365 off 12 sampled races and bet365 was pricing 7 of them. false = the old behaviour exactly.
+#   RACING_PK_ENABLED: price and place by the race's pk (from the list) instead of track + race + date,
+#     only when the list names the race unambiguously; unclear = today's form.
+#   RACING_COVERAGE_SKIP_ENABLED: skip a bookie the list does not carry on the race (an instant skip with
+#     a logged reason, no cooldown); HyperBot binds books progressively, so it is read from a snapshot no
+#     older than RACING_COVERAGE_TTL_SEC. A list that cannot be read = skip nobody.
+RACING_PK_ENABLED = _env_bool("RACING_PK_ENABLED", True)
+RACING_COVERAGE_SKIP_ENABLED = _env_bool("RACING_COVERAGE_SKIP_ENABLED", False)
+RACING_RACELIST_TTL_SEC = float(os.getenv("RACING_RACELIST_TTL_SEC", "120") or 120)
+RACING_COVERAGE_TTL_SEC = float(os.getenv("RACING_COVERAGE_TTL_SEC", "45") or 45)
+RACING_RACELIST_MAX_PER_MIN = int(os.getenv("RACING_RACELIST_MAX_PER_MIN", "36") or 36)   # limit is 60
 SA_THOROUGHBRED_TRACKS = [
     "Morphettville", "Morphettville Parks", "Gawler", "Murray Bridge",
     "Strathalbyn", "Port Augusta", "Mount Gambier", "Balaklava", "Oakbank",
@@ -1536,19 +1759,6 @@ IMAGE_TIP_PARSERS = {
 }
 
 TIPSTER_CHANNELS = {
-    # Late Mail Leroy — TEXT racing tips (saddle#+units) placed via Betfair BSP
-    # (back) on LEROY_BETFAIR_SESSION. A CHANNEL (no bot sender) -> no bot_id, so
-    # every post is treated as a tip + noise-filtered by parsers/leroy.py. NOT
-    # image_tips (text), NOT in any *_SESSION_PRIORITY — Leroy bypasses the
-    # fixed-odds racing pipeline entirely (see main._process_leroy_betfair_tip). v5.93.
-    -1003535060447: {
-        "name": "Late Mail Leroy",
-        "parser": "leroy",
-        "default_units": 1.0,
-        "unit_size": LEROY_UNIT_SIZE,
-        "sport": "racing",
-        "betfair_bsp": True,
-    },
     -1003201095340: {
         "name": "Saiyan AFL",
         "parser": "saiyan_afl",
@@ -2019,7 +2229,38 @@ RACING_DUP_RUNNER_GUARD = _env_bool("RACING_DUP_RUNNER_GUARD", True)
 # before. Kill-switch RACING_SAME_PRICE_FANOUT=false. Titans it applies to: comma list,
 # "*" = every racing tip (default "OC" = Cownie on Tip Titans).
 RACING_SAME_PRICE_FANOUT = _env_bool("RACING_SAME_PRICE_FANOUT", True)
+# v6.205 (Wilson 2026-11-01): a same-price group fills each tied account to its cap in priority order
+# (fewer, bigger legs) instead of an even split across every tied account. False = the v6.97 split
+# (and the default under TIPBOT_TESTING, so the v6.97 group tests keep their meaning).
+RACING_SAME_PRICE_FILL_CAPS = _env_bool("RACING_SAME_PRICE_FILL_CAPS", not os.getenv("TIPBOT_TESTING"))
+# v6.219 (Wilson 3 Nov: "yes fill b365 first if odds same"): within a same-price tie the bet365 accounts
+# fill first (racing priority order among them), then the rest; a bet365 account that can cover the
+# tip alone takes it. False = the v6.205 order exactly. The group order and the cover-alone pick only act
+# while RACING_SAME_PRICE_FILL_CAPS is on; the plain-walk bookie pick (bet365 before the other tied
+# bookies) and the bet365 session sort (a recent refuser last) use this switch whether it is on or not.
+RACING_TIE_B365_FIRST = _env_bool("RACING_TIE_B365_FIRST", True)
+# v6.219 review: with the switch on, an account whose placement failed with a session-level error
+# (bet365:116964's "[schema_changed] confirmbet ... no 'cp'") within this many seconds goes LAST in a
+# tie and is never the single cover-alone bet, so its refused share is not stranded when no tied
+# account sat out. Default 6 h. A landed bet on the account forgets it at once.
+def _clamp_refuser_window(v: float) -> float:
+    """inf / nan / negative -> the 6 h default (inf would make a refuser last forever); capped at 7 days.
+    0 stays 0 (nobody counts as a refuser)."""
+    if v != v or v in (float("inf"), float("-inf")) or v < 0:
+        return 21600.0
+    return min(v, 7 * 86400.0)
+
+
+RACING_REFUSER_LAST_SEC = _clamp_refuser_window(_env_float("RACING_REFUSER_LAST_SEC", "21600"))
 RACING_SAME_PRICE_FANOUT_TITANS = os.getenv("RACING_SAME_PRICE_FANOUT_TITANS", "OC")
+# v6.212 (Wilson 2 Nov): Dabble (HyperBot session 339917, "WW - Wilson Dabble") is a RACING-ONLY bookie, a
+# normal account in the best-price walk. Opt-in = the session being in RACING_SESSION_PRIORITY. On a tie for
+# the best price Dabble goes first and on its own (never one leg of a same-price group), takes the whole
+# remaining stake, and only what HyperBot says it ACCEPTED counts: the rest goes on to the other accounts.
+# DABBLE_RACING_ENABLED=false drops every Dabble session from racing placement (kill switch);
+# DABBLE_RACING_SESSION is the one Dabble session id allowed to place (any other Dabble session is dropped).
+DABBLE_RACING_ENABLED = _env_bool("DABBLE_RACING_ENABLED", True)
+DABBLE_RACING_SESSION = os.getenv("DABBLE_RACING_SESSION", "339917").strip() or "339917"
 # How far back to look. v6.19a: was 24h, which MISSED the 2026-09-05 re-sends because
 # both sat at 40.2 hours (Suit Of Wands and Common Interest, tipped 09-03 and re-sent
 # 09-05). Wilson: "should block all extra rebets on the same horse for the same units

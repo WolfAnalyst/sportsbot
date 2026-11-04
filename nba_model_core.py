@@ -56,13 +56,23 @@ LADDER_CONFIG_NAMES = {
 
 # The exact fields of one fills-file bet record (contract section 4; the same shape as
 # logs/disposals_model_fills.jsonl). The model joins on `key`.
-FILL_FIELDS = (
+LEGACY_FILL_FIELDS = (
     "key", "evt", "pid", "player", "team", "event", "market", "side", "line", "kind",
     "attempt", "revision", "target", "requested", "placed", "ambiguous", "unfilled",
     "selection_placed", "selection_ambiguous", "selection_committed", "accounts",
     "outcome", "retryable", "final", "manual", "processed_at",
 )
+# v6.202 (agreed with the model session nba-player-props-model-9d, 2026-11-01): Sportsbet capacity
+# after this record, so the model re-sends a same-line top-up only when it can fill. Appended to
+# every record; rows written before v6.202 carry LEGACY_FILL_FIELDS and still read fine.
+CAPACITY_FIELDS = ("sb_liability_left", "sb_price", "sb_reopen_at", "sb_zero_reason",
+                   "sb_capacity_v")
+FILL_FIELDS = LEGACY_FILL_FIELDS + CAPACITY_FIELDS
 FILL_OUTCOMES = ("filled", "partial", "none", "manual", "refused", "capped")
+SB_CAPACITY_VERSION = 1
+#: why Sportsbet was asked $0 on a key ("" = it was sent a positive stake)
+SB_ZERO_REASONS = ("", "capped", "closed", "no_row", "price_gate", "not_allowed",
+                   "filled_elsewhere", "other")
 
 _STATE_LOCK = threading.RLock()
 
@@ -369,6 +379,132 @@ def ladder_stake_steps(market: str, odds, intended: float, max_odds=None,
     return steps
 
 
+def unknown_capacity(reason: str = "other", price=None) -> dict:
+    """The capacity fields of a record written before (or without) Sportsbet sizing: nothing is
+    known about the accounts, so liability and reopen are null (the model reads null as unknown)."""
+    return {"sb_liability_left": None, "sb_price": _finite_price(price), "sb_reopen_at": None,
+            "sb_zero_reason": reason if reason in SB_ZERO_REASONS else "other",
+            "sb_capacity_v": SB_CAPACITY_VERSION}
+
+
+def unknown_capacity_after(sb_asked, filled: bool, price=None) -> dict:
+    """The unknown form for a record written AFTER sends (ledger unreadable, a failed commit, a
+    crash computing capacity): the reason still says whether Sportsbet was sent a stake."""
+    try:
+        asked = float(sb_asked or 0.0)
+    except (TypeError, ValueError):
+        asked = 0.0
+    return unknown_capacity("" if asked > 0.005 else "filled_elsewhere" if filled else "other",
+                            price)
+
+
+def _finite_price(p):
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return None
+    return p if math.isfinite(p) and p > 1.0 else None
+
+
+def _utc_iso(epoch) -> str:
+    """Whole seconds, rounded UP: a model acting at the written second never meets a line that is
+    still closed for a fraction of a second (review 2026-11-01)."""
+    return datetime.fromtimestamp(math.ceil(float(epoch)), timezone.utc).isoformat(timespec="seconds")
+
+
+def sb_capacity(market: str, sids, used, closed_until: dict, price, max_odds, sb_asked: float,
+                gate: str = "", filled: bool = False, min_stake: float = 1.0, now=None) -> dict:
+    """v6.202: the Sportsbet capacity fields of one fills record, computed AFTER the placement.
+
+    `sids` are the NBA-model Sportsbet accounts HyperBot had active for the tip; `used` is the
+    ledger's per-account liability on the selection after the commit (None = unreadable);
+    `closed_until` maps an account to the epoch its line opens again (a closed line after a 538, or
+    a 538 mark), absent when open; math.inf = closed with no known end (it adds no reopen time). Per account, in this order:
+      * at the ladder cap (no room, or the room cannot hold `min_stake` at the price): counts nothing,
+        and its close (if any) is ignored, since reopening it adds nothing;
+      * closed: counts nothing, its reopen time is a candidate for sb_reopen_at;
+      * open: its room (top rung - used) counts in sb_liability_left.
+    sb_zero_reason: "" when Sportsbet was sent a positive stake; else "filled_elsewhere" when the
+    stake was covered without Sportsbet; else the fan-out's `gate` (price_gate / not_allowed /
+    no_row); else "other" while an open account had room (timing, intent, crash), "closed" when
+    a closed account with room is all that is left, "capped" when every account is at the cap."""
+    now = time.time() if now is None else float(now)
+    sids = [str(s) for s in (sids or ())]
+    try:
+        asked = float(sb_asked or 0.0)
+    except (TypeError, ValueError):
+        asked = 0.0
+    if asked > 0.005:
+        reason = ""
+    elif filled:
+        reason = "filled_elsewhere"
+    elif gate in SB_ZERO_REASONS and gate:
+        reason = gate
+    else:
+        reason = None                     # decided by the accounts below
+    top = ladder_cap(market)
+    if used is None or top is None:
+        return unknown_capacity("other" if reason is None else reason, price)
+    left, reopen, n_closed, n_capped = 0.0, None, 0, 0
+    for sid in sids:
+        try:
+            u = max(0.0, float(used.get(sid, 0.0) or 0.0))
+        except (TypeError, ValueError, AttributeError):
+            return unknown_capacity("other" if reason is None else reason, price)
+        room = top - u
+        if room <= 0.005 or is_capped(market, price, max_odds, u, min_stake=min_stake):
+            n_capped += 1
+            continue
+        try:
+            cu = closed_until.get(sid) if closed_until else None
+            cu = float(cu) if cu is not None else None
+        except (TypeError, ValueError):
+            cu = None
+        if cu is not None and not math.isnan(cu) and cu > now:
+            n_closed += 1
+            if math.isfinite(cu):
+                reopen = cu if reopen is None else min(reopen, cu)
+            continue
+        left += room
+    if reason is None:
+        if left > 0.005:
+            reason = "other"
+        elif n_closed:
+            reason = "closed"
+        elif sids and n_capped == len(sids):
+            reason = "capped"
+        else:
+            reason = "other"
+    return {"sb_liability_left": round(left, 2), "sb_price": _finite_price(price),
+            "sb_reopen_at": _utc_iso(reopen) if reopen is not None else None,
+            "sb_zero_reason": reason, "sb_capacity_v": SB_CAPACITY_VERSION}
+
+
+def _clean_capacity(cap) -> dict:
+    """The capacity fields exactly as the record carries them: anything malformed becomes the
+    unknown form (a logging problem must never break the record)."""
+    if not isinstance(cap, dict):
+        return unknown_capacity()
+    out = unknown_capacity(cap.get("sb_zero_reason", "other"), cap.get("sb_price"))
+    lv = cap.get("sb_liability_left")
+    if isinstance(lv, (int, float)) and not isinstance(lv, bool):
+        try:
+            lv = float(lv)
+            if math.isfinite(lv) and lv >= 0:
+                out["sb_liability_left"] = round(lv, 2)
+        except (TypeError, ValueError):
+            pass
+    ra = cap.get("sb_reopen_at")
+    if isinstance(ra, str):
+        try:
+            when = datetime.fromisoformat(ra)
+            if when.tzinfo is not None and when.utcoffset().total_seconds() == 0:
+                out["sb_reopen_at"] = ra
+        except ValueError:
+            pass
+    return out
+
+
 def price_gate_refusal(live, posted, any_resolved: bool) -> str:
     """The two price gates, applied to the LIVE Sportsbet price of the exact line. "" = pass.
 
@@ -489,6 +625,107 @@ def earliest_start(*epochs):
     return min(vals) if vals else None
 
 
+def latest_start(*epochs):
+    """The LATEST of the given tip-off times (epoch seconds), ignoring missing / non-finite ones;
+    None if none is usable. The late-only account gate (v6.213) counts its window to THIS: where the
+    sources disagree the later tip is the safe one (the longer the lead, the later an account that
+    is only for the last hours may join)."""
+    vals = []
+    for e in epochs:
+        try:
+            v = float(e)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(v):
+            vals.append(v)
+    return max(vals) if vals else None
+
+
+def late_window_open(arrival_epoch, tip_epoch, window_min) -> bool:
+    """v6.213: True only when the bet ARRIVED (arrival_epoch) strictly before tip-off and no more
+    than `window_min` minutes ahead of it (the bound is inclusive). Anything missing, non-numeric
+    or non-finite is False: an account that is only for the last hours is never added on a guess."""
+    try:
+        a, t, w = float(arrival_epoch), float(tip_epoch), float(window_min)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(a) and math.isfinite(t) and math.isfinite(w)):
+        return False
+    lead = t - a
+    return 0.0 < lead <= w * 60.0
+
+
+def norm_sid(sid) -> str:
+    """A session id in its one comparable form: ASCII digits lose their leading zeros (so 319970,
+    "319970" and "0000319970" agree, at any length: no int(), so it never raises); anything else is
+    just stripped text."""
+    s = str(sid if sid is not None else "").strip()
+    return (s.lstrip("0") or "0") if (s and s.isascii() and s.isdigit()) else s
+
+
+def late_only_sessions() -> set:
+    """The session ids kept off the NBA model unless the late window is open (normalised, a set of
+    str). An unreadable config gives the default group, never an empty (open) gate."""
+    try:
+        raw = cfg("NBA_MODEL_LATE_ONLY_SESSIONS")
+        if isinstance(raw, str):
+            raw = raw.split(",")
+        return {norm_sid(s) for s in (raw or ()) if str(s).strip()}
+    except Exception:
+        return {"319970"}
+
+
+def late_reopen_epoch(tip_epoch, window_min):
+    """The epoch the late window opens (tip minus the window), or math.inf when either input is
+    missing or not finite (closed with no known end)."""
+    try:
+        t, w = float(tip_epoch), float(window_min)
+    except (TypeError, ValueError):
+        return math.inf
+    return t - w * 60.0 if (math.isfinite(t) and math.isfinite(w)) else math.inf
+
+
+def arrival_epoch(msg_time, now_ts):
+    """(epoch, source) for when a model message ARRIVED: Telegram's own message time (Telethon's
+    event.date, tz-aware UTC; a NAIVE datetime is server-local, as everywhere else in tipbot, which
+    datetime.timestamp() already assumes), clamped to no later than `now_ts`. A missing or unusable
+    message time falls back to `now_ts`."""
+    try:
+        ts = float(msg_time.timestamp())
+    except Exception:
+        ts = None
+    if ts is None or not math.isfinite(ts):
+        return float(now_ts), "now (the message time was missing or unusable)"
+    return min(ts, float(now_ts)), "message time"
+def bet_close_epoch(earliest_scheduled, sb_start=None):
+    """v6.216 (Wilson 2026-11-02: "just allow any bets even if within 90 seconds as long as it is
+    bettable"): when the model's bets stop (epoch seconds), or None if no start is known. That is
+    Sportsbet's own listed start (nothing verifies Sportsbet suspends the market there): the earliest
+    SCHEDULED tip-off (the message, ESPN) plus Sportsbet's NBA offset (sb_limits.
+    SB_START_OFFSET_MIN, 10 min), or Sportsbet's own board start (HyperBot's start_time_iso for
+    the Sportsbet session) when that is earlier. Never later than scheduled + the offset, so a
+    stale or wrong board start cannot open bets after the real tip."""
+    try:
+        sched = float(earliest_scheduled)
+    except (TypeError, ValueError):
+        sched = float("nan")
+    if not math.isfinite(sched):
+        return None
+    try:
+        import sb_limits
+        close = sched + 60.0 * float(sb_limits.SB_START_OFFSET_MIN.get("nba", 0.0))
+    except Exception as e:
+        log.warning(f"Sportsbet start offset unreadable ({e}); bets stop at the scheduled tip")
+        close = sched
+    try:
+        sb = float(sb_start)
+    except (TypeError, ValueError):
+        sb = float("nan")
+    if math.isfinite(sb) and sb > 0:
+        close = min(close, sb)
+    return close
+
+
 def fixture_start_checkable(pc_start) -> bool:
     """True when the price-check envelope carries a usable (finite, numeric) start time."""
     try:
@@ -595,12 +832,13 @@ def start_slack_sec() -> float:
 
 
 def min_lead_sec() -> float:
-    """Seconds before tip-off inside which no message is placed (never negative)."""
+    """Seconds before the bets' close (v6.216: Sportsbet's start, bet_close_epoch) inside which
+    no message is placed (never negative; v6.216 default 0)."""
     try:
         v = float(cfg("NBA_MODEL_MIN_LEAD_SEC"))
     except (TypeError, ValueError):
-        return 90.0
-    return v if math.isfinite(v) and v >= 0 else 90.0
+        return 0.0
+    return v if math.isfinite(v) and v >= 0 else 0.0
 
 
 def max_lead_sec() -> float:
@@ -700,8 +938,9 @@ def take_test_account(session_ids: list) -> "str | None":
 
 
 def too_late(now_ts: float, start_ts: float) -> bool:
-    """True when a message must be refused on timing: now is later than tip-off minus the
-    minimum lead, plus the (clamped) slack. Applies to every kind, retries included."""
+    """True when a message must be refused on timing: now is later than `start_ts` minus the
+    minimum lead, plus the (clamped) slack. Applies to every kind, retries included. v6.216: the
+    callers pass bet_close_epoch (Sportsbet's start), not the scheduled tip-off."""
     return now_ts > start_ts - min_lead_sec() + start_slack_sec()
 
 
@@ -1952,11 +2191,12 @@ def _commit_locked(row, sel_id, placed, ambiguous, manual, reserved, accounts, a
     return sel["committed"]
 
 
-def account_liability(sel_id: str) -> dict:
+def account_liability(sel_id: str, lock_timeout=None) -> dict:
     """{session_id: liability already carried on this selection, plus the asks of its open
     reservations at max_odds}. An unreadable or corrupt ledger raises: the caller must NOT size
-    a placement without knowing."""
-    with _ledger_lock():
+    a placement without knowing. `lock_timeout` (v6.202) overrides the lock budget for a caller
+    off the event loop."""
+    with _ledger_lock(lock_timeout):
         state = load_state()
     if state.get("state_corrupt"):
         raise LedgerLockError("the exposure ledger is corrupt")
@@ -2133,7 +2373,7 @@ def _attempt_of(row: dict) -> int:
 
 def write_fill(row: dict, *, requested: float, placed: float, ambiguous: float,
                manual: bool, accounts: list, outcome: str, event: str = "",
-               committed=None, add_selection=None, selection=None) -> None:
+               committed=None, add_selection=None, selection=None, capacity=None) -> None:
     """Append ONE record for this key to the fills file both producers read (contract section 4).
 
     One record per key per revision, never for a repeated key (the caller checks key_state).
@@ -2144,7 +2384,10 @@ def write_fill(row: dict, *, requested: float, placed: float, ambiguous: float,
     ledger read at all), else from the ledger, else from the fills file when the ledger cannot
     be read. The ledger lock is taken ONCE for the whole write (a failure to take it only means
     the numbers come from the fills file and the answered outcome is pruned later). Consumers
-    keep the highest `revision` per key. Guarded: a logging failure must never break placement."""
+    keep the highest `revision` per key. Guarded: a logging failure must never break placement.
+
+    `capacity` (v6.202) is the sb_* fields from `sb_capacity`; None (every path that never reached
+    Sportsbet sizing) writes the unknown form, sb_zero_reason "other"."""
     try:
         lock = None
         try:
@@ -2154,7 +2397,8 @@ def write_fill(row: dict, *, requested: float, placed: float, ambiguous: float,
             lock = None
         try:
             _write_fill_locked(row, requested, placed, ambiguous, manual, accounts, outcome,
-                               event, committed, add_selection, selection, lock is not None)
+                               event, committed, add_selection, selection, lock is not None,
+                               capacity)
         finally:
             if lock is not None:
                 lock.__exit__(None, None, None)
@@ -2163,7 +2407,7 @@ def write_fill(row: dict, *, requested: float, placed: float, ambiguous: float,
 
 
 def _write_fill_locked(row, requested, placed, ambiguous, manual, accounts, outcome, event,
-                       committed, add_selection, selection, have_lock):
+                       committed, add_selection, selection, have_lock, capacity=None):
     key = row.get("key", "")
     n_prev, _any, answered = _fills_scan(key)
     if outcome == "refused" and answered:
@@ -2248,6 +2492,9 @@ def _write_fill_locked(row, requested, placed, ambiguous, manual, accounts, outc
         "manual": is_manual,
         "processed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
+    rec.update(_clean_capacity(capacity))
+    if rec["sb_zero_reason"] == "" and req <= 0:
+        rec["sb_zero_reason"] = "other"     # nothing was asked on this key at all
     path = fills_path()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     # a crash mid-append can leave a torn last line with no newline; never glue this record onto
@@ -2287,9 +2534,13 @@ def validate_fill_record(rec: dict, *, writer: bool = True, check_key: bool = Tr
     out after a commit): placed <= selection_placed and ambiguous <= selection_ambiguous. tipbot
     must NEVER write such a record, so its own tests keep them hard.
 
+    v6.202: the sb_* capacity fields close the record (types, the reason vocabulary, sb_reopen_at an
+    ISO time with an offset, reason "" only with requested > 0). A reader (`writer=False`) also
+    accepts a record written before v6.202 (LEGACY_FILL_FIELDS, no sb_* fields).
+
     `check_key=False` skips the key checks for fixtures with synthetic keys."""
     bad = []
-    if tuple(rec) != FILL_FIELDS:
+    if tuple(rec) != FILL_FIELDS and (writer or tuple(rec) != LEGACY_FILL_FIELDS):
         bad.append(f"fields/order {tuple(rec)}")
         return bad
     if rec["outcome"] not in FILL_OUTCOMES:
@@ -2371,6 +2622,36 @@ def validate_fill_record(rec: dict, *, writer: bool = True, check_key: bool = Tr
         if abs(sum(a["stake"] for a in rec["accounts"] if isinstance(a, dict)
                    and isinstance(a.get("stake"), (int, float))) - rec["placed"]) > 0.011:
             bad.append("sum(accounts.stake) != placed")
+    if "sb_capacity_v" in rec:
+        bad.extend(_capacity_problems(rec))
+    return bad
+
+
+def _capacity_problems(rec: dict) -> list:
+    bad = []
+    v = rec["sb_capacity_v"]
+    if isinstance(v, bool) or v != SB_CAPACITY_VERSION:
+        bad.append(f"sb_capacity_v {v!r}")
+    for k in ("sb_liability_left", "sb_price"):
+        x = rec[k]
+        if x is not None and (isinstance(x, bool) or not isinstance(x, (int, float))
+                              or not math.isfinite(x) or x < 0):
+            bad.append(f"{k} is not null or a finite non-negative number")
+    if (isinstance(rec["sb_price"], (int, float)) and not isinstance(rec["sb_price"], bool)
+            and not rec["sb_price"] > 1.0):
+        bad.append("sb_price is not above 1")
+    ra = rec["sb_reopen_at"]
+    if ra is not None:
+        try:
+            when = datetime.fromisoformat(ra) if isinstance(ra, str) else None
+        except ValueError:
+            when = None
+        if when is None or when.tzinfo is None or when.utcoffset().total_seconds() != 0:
+            bad.append("sb_reopen_at is not null or an ISO UTC time (offset +00:00)")
+    if rec["sb_zero_reason"] not in SB_ZERO_REASONS:
+        bad.append(f"sb_zero_reason {rec['sb_zero_reason']!r}")
+    elif rec["sb_zero_reason"] == "" and not rec["requested"] > 0:
+        bad.append("sb_zero_reason '' (Sportsbet asked) with requested 0")
     return bad
 
 

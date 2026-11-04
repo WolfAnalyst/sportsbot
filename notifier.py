@@ -1572,31 +1572,6 @@ def notify_tennis_placed(message: str) -> bool:
     return _send_success(f"<b>🎾 {_escape_html(head)}</b>" + (f"\n{_escape_html(rest)}" if rest else ""))
 
 
-def notify_betfair_bsp_placed(channel_name: str, event_str: str, placements: list) -> bool:
-    """v5.93: Bet Log message for a Betfair BSP placement (Leroy). placements = list
-    of {runner, market, size, units, bet_id} — each matched at the Starting Price."""
-    lines = []
-    total = 0.0
-    for p in (placements or []):
-        total += float(p.get("size", 0) or 0)
-        lines.append(
-            f"  #{p.get('saddle', '?')} {p.get('runner', '?')} "
-            f"{str(p.get('market', 'win')).upper()} @BSP  "
-            f"${float(p.get('size', 0) or 0):.2f} ({float(p.get('units', 0) or 0):g}u)  "
-            f"[{p.get('bet_id') or 'no-id'}]"
-        )
-    body = "\n".join(lines) if lines else "  (none)"
-    text = (
-        f"<b>BET PLACED (Betfair BSP)</b>\n"
-        f"<b>Tipster:</b> {_escape_html(channel_name)}\n"
-        f"<b>Event:</b> {_escape_html(event_str)}\n"
-        f"<b>Total staked:</b> ${total:.2f} at the Starting Price\n"
-        f"<pre>{_escape_html(body)}</pre>\n"
-        f"Backs match at the SP when the race jumps."
-    )
-    return _send_success(text)
-
-
 def notify_critical(message: str) -> bool:
     """Infrastructure failure. Goes to critical chat."""
     return _send_critical(f"<b>🚨 CRITICAL:</b> {_escape_html(message)}")
@@ -1614,7 +1589,8 @@ def notify_image_alert(tipster: str, raw_message: str) -> bool:
     return _send_alert(text)
 
 
-def notify_text_manual_alert(tipster: str, raw_message: str, header: str = "MANUAL BET") -> bool:
+def notify_text_manual_alert(tipster: str, raw_message: str, header: str = "MANUAL BET",
+                             footer: str = "Not auto-placed. Check and place manually.") -> bool:
     """Generic manual-bet alert for a TEXT source with no auto-placement path
     (v6.21, A1 NFL onboarding). Mirrors notify_image_alert's shape but with a
     parameterised header instead of the hardcoded 'IMAGE TIP'/'Image bet
@@ -1629,7 +1605,11 @@ def notify_text_manual_alert(tipster: str, raw_message: str, header: str = "MANU
     3000 RAW chars first could still exceed Telegram's 4096 cap after
     escaping and get the whole alert silently dropped by _send_now. Escaping
     first and truncating the result guarantees the cap holds regardless of
-    character mix."""
+    character mix.
+
+    v6.207: `footer` is the closing sentence (default: the long-standing "Not auto-placed. Check and
+    place manually."); the bet365 "paused, bot retrying" note passes its own, because that sentence
+    would tell Wilson to place a bet the bot is about to place."""
     body = _escape_html(raw_message) if raw_message else "(no text)"
     # Budget: 4096 total, minus the header/tipster/labels/footer overhead
     # (a few hundred chars, generous margin) -- 3000 for the escaped body.
@@ -1640,7 +1620,7 @@ def notify_text_manual_alert(tipster: str, raw_message: str, header: str = "MANU
         f"<b>{_escape_html(header)}</b>\n"
         f"<b>Tipster:</b> {_escape_html(tipster)}\n"
         f"<b>Message:</b>\n<pre>{body}</pre>\n"
-        f"Not auto-placed. Check and place manually."
+        f"{_escape_html(footer)}"
     )
     return _send_alert(text)
 
@@ -1660,6 +1640,43 @@ def notify_image_no_tip(tipster: str, caption: str = "") -> bool:
         f"can see a tip in it."
     )
     return _send_alert(text)
+
+
+def _reline_stop_info(tip):
+    """v6.232: the Sportsbet re-line guard's stop on this tip (an info dict), else None. Reads the tip's own
+    attribute (the guard sets it when it stops the tip and whenever a refused send finds a stop in its
+    table), never `from main import ...`: when main runs as __main__ that would load a SECOND copy of
+    main with its own, empty state. Never raises."""
+    try:
+        return getattr(tip, "_sb_reline", None) or None
+    except Exception:
+        return None
+
+
+def _reline_stop_text(tip, intended_stake, placed_stake, unfilled, info) -> str:
+    """v6.232: the end-of-tip message for a fan-out the re-line guard stopped: it says STOPPED, not
+    'unfilled, place by hand' (the remainder was left unsent on purpose)."""
+    try:
+        legs = " / ".join(
+            " ".join(f"{(l.player or l.selection or '')} {l.selection if l.player else ''} "
+                     f"{l.line if l.line is not None else ''} {l.stat or ''}".split())
+            for l in (tip.legs or []))
+    except Exception:
+        legs = "(unable to render)"
+    info = info or {}
+    return (
+        f"<b>BET STOPPED: Sportsbet moved the line</b>\n"
+        f"<b>Tipster:</b> {_escape_html(tip.tipster)}\n"
+        f"<b>Event:</b> {_escape_html(tip.event or 'N/A')}\n"
+        f"<pre>{_escape_html(legs)}</pre>\n"
+        f"<b>Placed:</b> ${float(placed_stake or 0):.2f} of ${float(intended_stake or 0):.2f}\n"
+        f"<b>Not sent (stopped on purpose):</b> ${float(unfilled or 0):.2f}\n"
+        f"Sportsbet booked line {_escape_html(str(info.get('line') or '?'))} @ "
+        f"{_escape_html(str(info.get('price') or '?'))} (tipped {_escape_html(str(info.get('tip_line') or '?'))}; "
+        f"{_escape_html(str(info.get('account') or '?'))}, bet {_escape_html(str(info.get('bet_id') or '?'))}), "
+        f"so no more accounts, rebets or top-ups were sent. <b>Do not place the remainder by hand</b> until "
+        f"the Sportsbet bet slip has been checked."
+    )
 
 
 def notify_tip_placed_summary(
@@ -1766,6 +1783,8 @@ def notify_tip_placed_summary(
             detail_parts.append(f"market={placed_market}")
         if placed_stat and ref_stat and placed_stat != ref_stat:
             detail_parts.append(f"stat={placed_stat}")
+        if getattr(r, "_reline_note", ""):
+            detail_parts.append(str(r._reline_note))          # v6.232: LINE UNVERIFIED ...
         if detail_parts:
             base += f"  (placed {', '.join(detail_parts)})"
         base += _timing_suffix(sid_str, getattr(r, "elapsed_sec", None))
@@ -1801,7 +1820,11 @@ def notify_tip_placed_summary(
         )
 
     fill_tag = ""
-    if unfilled >= 1:
+    if unfilled >= 1 and _reline_stop_info(tip):
+        # v6.232: stopped on purpose by the re-line guard, not a shortfall to place by hand
+        fill_tag = (f"\n<b>Stopped:</b> ${unfilled:.2f} not sent, Sportsbet moved the "
+                    f"line (check the bet slip before placing any of it by hand)")
+    elif unfilled >= 1:
         fill_tag = f"\n<b>⚠️ Unfilled:</b> ${unfilled:.2f}"
 
     # v5.43: when the size was a no-units FALLBACK (the image had no readable unit
@@ -1837,7 +1860,8 @@ def notify_tip_placed_summary(
     _twn = [getattr(r, "_twin_note", "") for r in (placed_results or [])
             if getattr(r, "_twin_note", "") and getattr(r, "success", False)]
     if _twn:
-        recovery_tag += "\n<b>Milestone twin:</b> " + _escape_html("; ".join(_twn))
+        # v6.206: a same-line Alt rung / main row too, so the heading names neither kind
+        recovery_tag += "\n<b>Twin bets (own limits):</b> " + _escape_html("; ".join(_twn))
 
     text = (
         f"<b>BET PLACED</b>{sgm_tag}{fallback_tag}\n"
@@ -1866,6 +1890,9 @@ def notify_tip_placed_summary(
 
 def notify_tip_unfilled(tip, intended_stake, placed_stake, unfilled, failed_results) -> bool:
     """Alert when a tip couldn't be fully filled - manual placement needed for remainder."""
+    _rl = _reline_stop_info(tip)
+    if _rl:        # v6.232: stopped on purpose by the Sportsbet re-line guard
+        return _send_alert(_reline_stop_text(tip, intended_stake, placed_stake, unfilled, _rl))
     legs_lines = []
     for leg in tip.legs:
         if leg.market in ("h2h", "head_to_head", "margin"):
@@ -1900,6 +1927,7 @@ def notify_tip_unfilled_with_placements(
     session_timing=None,
     total_elapsed_sec=None,
     concurrent_bookies=False,
+    closed_only=False,
 ) -> bool:
     """
     Richer unfilled alert that also shows what was already placed (useful when
@@ -1914,7 +1942,14 @@ def notify_tip_unfilled_with_placements(
     _render_timing_block so the unfilled alert ALSO shows the reconciling
     end-to-end (parse / resolve / price-check / bookies / other) when the
     handler stamped tip._timing. Both optional — sequential callers omit them.
+
+    `closed_only` (v6.239 review 2): the caller left out its only failures because each was a
+    closed line ([line_closed] / [sb_estimate_skip], nothing sent) and something was placed, so
+    the last error says that instead of "no error captured". Every other alert is unchanged.
     """
+    _rl = _reline_stop_info(tip)
+    if _rl:        # v6.232: stopped on purpose by the Sportsbet re-line guard, not "place by hand"
+        return _send_alert(_reline_stop_text(tip, intended_stake, placed_stake, unfilled, _rl))
     raw_short = (tip.raw_message or "").strip()[:300]
 
     try:
@@ -1928,6 +1963,9 @@ def notify_tip_unfilled_with_placements(
         if getattr(r, "error", None):
             last_err = r.error
             break
+    else:
+        if closed_only:
+            last_err = "this account was skipped (its line is closed or over its stake estimate) and nothing was sent there"
     last_err_short = (last_err or "")[:250]
 
     # Index session_timing for per-line lookup (matches placed_summary pattern)
@@ -2047,7 +2085,7 @@ def notify_tip_unfilled_with_placements(
 _RACING_SOURCE_LABELS = {
     "ZAK": "ZAK RACING",
     "TRIAL": "TRIAL SNIPER",
-    "LEROY": "LATE MAIL LEROY",
+    "LEROY": "LATE MAIL LEROY",   # v6.240: Leroy is removed; kept so an old row's label still reads
 }
 
 

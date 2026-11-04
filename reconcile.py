@@ -96,16 +96,41 @@ def _sport_mismatch(pending_sport, sport) -> bool:
     return bool(a and b and a != b)
 
 
+# v6.224 review: the line reader is the ORIGINAL bare number reader, run on a copy of the text with only the
+# tokens that are never lines removed (each replaced by a space; "_" is a separator, never a word character):
+#   (i)  a number glued to a letter BEFORE it: "Bet365", "Q1", "A1", "h2h";
+#   (ii) a number followed by an ordinal, "ers" or a period word/letter: "1st", "49ers", "76ers", "1Q",
+#        "2H", "1Qtr", "2Half" (a (?<![\d.]) guard keeps "25.5th" from losing its 25.5).
+# The old reader took the "49" of "49ers" as a line, so a landed bet whose pending text was only the
+# selection ("San Francisco 49ers Over", no order state) failed the line gate and read as not placed.
+# Everything else reads exactly as before, a number followed by a unit word ("25.5pts", "30.5Pts"), ".5",
+# "-3.5", "25+", "25.5+", "(25.5)", "2-0": a whole-token rewrite dropped glued units and so rejected our own
+# bet ("Over 25.5pts (Game 2)"), and a \b-based removal missed "49ers_over", "1Q" and "Bet365".
+# Dropping a number only ever means "no number to compare" (the gate does not reject).
 _NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+_NOT_A_LINE_RE = re.compile(
+    r"[A-Za-z]\d+(?:\.\d+)?"
+    r"|(?<![\d.])\d+(?:st|nd|rd|th|ers|q(?:tr|uarter)?|h(?:alf)?)(?![A-Za-z])",
+    re.IGNORECASE)
 
 
-def _line_mismatch(bet_text, line) -> bool:
+def _line_numbers(bet_text) -> list:
+    """The numbers in a pending bet text that can be lines (see _NOT_A_LINE_RE), as strings."""
+    return _NUM_RE.findall(_NOT_A_LINE_RE.sub(" ", str(bet_text or "")))
+
+
+def _line_mismatch(bet_text, line, exact=False) -> bool:
     """v6.148 review: with the sport gate fixed, another single on the same player (a rebounds
     bet beside the points attempt) passed every gate. True only when the attempt has a line, the
     pending bet text carries numbers, and none of them is within 1 of the line (30.5 in "30.5+
     Points", 16.5 in "Over 16.5", a milestone's 6 in "6+ Rebounds" for line 5.5, a snapped rung).
     No line, a non-finite line or no number in the text: no reject (a false reject would
-    double-stake)."""
+    double-stake).
+
+    v6.222 `exact`: a Sportmarket bridge bet is placed on exactly the line the bridge was sent (it
+    refuses a line it does not offer), so there is no snapped-by-a-point case; one number in the
+    text must EQUAL the line (another tip's bet one point away is not this bet). The "no line / no
+    number in the text" cases still never reject."""
     if line is None or line == "":
         return False
     try:
@@ -115,7 +140,7 @@ def _line_mismatch(bet_text, line) -> bool:
     if ln != ln or ln in (float("inf"),):
         return False
     nums = []
-    for x in _NUM_RE.findall(str(bet_text or "")):
+    for x in _line_numbers(bet_text):
         try:
             nums.append(float(x))
         except ValueError:
@@ -125,6 +150,8 @@ def _line_mismatch(bet_text, line) -> bool:
     # within 1 of the posted line (review): a milestone's "N+" is line + 0.5, and HyperBot can snap a
     # whole-number post to the next rung ("Line moved 23.0 -> 22.5"); a different stat's line
     # (rebounds 5.5 beside points 30.5) is still rejected
+    if exact:
+        return not any(abs(n - ln) <= 1e-6 for n in nums)
     return not any(abs(n - ln) <= 1.0 + 1e-6 for n in nums)
 
 
@@ -145,6 +172,48 @@ def _score_mismatch(bet_text, selection_text) -> bool:
     reject (a false reject would double-stake)."""
     a, b = _score_tokens(selection_text), _score_tokens(bet_text)
     return len(a) == 1 and len(b) == 1 and a != b
+
+
+def _record_ask(pending) -> "float | None":
+    """The bridge record's `ask_aud` (the stake asked, before any partial fill), or None."""
+    try:
+        v = float((pending or {}).get("ask_aud"))
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and v > 0 and v != float("inf") else None
+
+
+_FIRST_HALF_SPELLINGS = ("first_half", "1h", "1st half", "1st_half", "first half", "h1")
+
+
+def _record_period(pending) -> "str | None":
+    """v6.201: 'first_half' / 'full_game' for a pending record that PROVES its period, else None.
+    The bridge's records carry `period` ('first_half' / 'full_game') and a first-half bet's text
+    starts '1st Half '; a text that starts '1st Half ' is first half whatever the field says. A
+    record with neither (HyperBot's) is unknown: never read as full game."""
+    txt = str((pending or {}).get("bet") or "").strip().lower()
+    if txt.startswith("1st half ") or txt.startswith("first half "):
+        return "first_half"
+    per = str((pending or {}).get("period") or "").strip().lower()
+    if per in _FIRST_HALF_SPELLINGS:
+        return "first_half"
+    if per == "full_game":
+        return "full_game"
+    return None
+
+
+def _period_mismatch(pending, period) -> bool:
+    """v6.201 (Wilson 2026-11-01, first-half betting on Sportmarket): a first-half bet and a
+    full-game bet on the same event, team and stake are two bets and must never confirm each other.
+    `period` is the ATTEMPT's period ('first_half' / 'full_game'); None / anything else = the caller
+    did not say, no gate (today's behaviour: a false reject here would re-place a bet that landed).
+    True only when the record PROVES the other period."""
+    p = str(period or "").strip().lower()
+    if p in _FIRST_HALF_SPELLINGS:
+        return _record_period(pending) == "full_game"
+    if p == "full_game":
+        return _record_period(pending) == "first_half"
+    return False
 
 
 def _line_distance(bet_text, line):
@@ -418,8 +487,13 @@ def _market_contradicts(pending, market) -> bool:
 def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=None,
                         after_ts, now_ts=None, dt_grace_sec=DEFAULT_DT_GRACE_SEC,
                         stake_tol=DEFAULT_STAKE_TOL, market=None, line=None,
-                        selection_exact=True):
+                        selection_exact=True, period=None, exact_line=False, own_ids=None):
     """True if a /api/pending_bets record is the bet we just attempted.
+
+    v6.222 (Sportmarket bridge bets only, set by the caller): `own_ids`, when given and non-empty,
+    is the set of order ids the bridge named for THIS attempt: only a record whose id or
+    bookie_bet_id is one of them can be ours (every other gate still applies on top).
+    `exact_line` makes the line gate exact instead of within 1 (see _line_mismatch).
 
     Gates (all must pass):
       - result is None (unsettled; pending_bets should only return these)
@@ -456,15 +530,32 @@ def pending_bet_matches(pending, *, event, stake, sport=None, selection_text=Non
         pstake = float(pending.get("stake"))
     except (TypeError, ValueError):
         return False
+    # (a bridge partial fill reads BELOW its ask, which this gate has always accepted; the few cents
+    # the bridge's EUR snap can read above are inside stake_tol)
     if pstake <= 0 or pstake > stake + stake_tol:
         return False
 
     if sport and _sport_mismatch(pending.get("sport"), sport):
         return False
 
-    if _line_mismatch(pending.get("bet"), line):
+    if _period_mismatch(pending, period):
         log.info(f"reconcile: dt/event/stake matched but the pending bet "
-                 f"{str(pending.get('bet'))[:60]!r} is not on line {line}: rejecting (not our bet)")
+                 f"{str(pending.get('bet'))[:60]!r} is the other period than the attempt "
+                 f"({period!r}): rejecting (not our bet)")
+        return False
+
+    if own_ids:
+        _pids = {str(pending.get("id") or ""), str(pending.get("bookie_bet_id") or "")} - {""}
+        if not (_pids & {str(x) for x in own_ids if x}):
+            log.info(f"reconcile: dt/event/stake matched but the pending bet "
+                     f"{str(pending.get('bet'))[:60]!r} (id {pending.get('id')}) is not one of this "
+                     f"attempt's own orders {sorted(str(x) for x in own_ids)}: rejecting (not our bet)")
+            return False
+
+    if _line_mismatch(pending.get("bet"), line, exact=exact_line):
+        log.info(f"reconcile: dt/event/stake matched but the pending bet "
+                 f"{str(pending.get('bet'))[:60]!r} is not on {'exactly ' if exact_line else ''}line "
+                 f"{line}: rejecting (not our bet)")
         return False
 
     # v6.180 review: the two text rules below read the selection as THE posted selection (a player,
@@ -538,7 +629,8 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
                       max_wait_sec=DEFAULT_MAX_WAIT_SEC,
                       poll_interval_sec=DEFAULT_POLL_INTERVAL_SEC,
                       market=None, exclude_bet_ids=(), line=None, selection_exact=True,
-                      line_gate=True):
+                      line_gate=True, period=None, exact_line=False, own_ids=None,
+                      exclude_fn=None):
     """Poll /api/pending_bets until a matching bet appears or max_wait elapses.
 
     Returns:
@@ -566,10 +658,18 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
             api_ok_once = True
             last_ok_ts = t_req
             _matched = []
+            _ex_now = _excl
+            if exclude_fn is not None:
+                # v6.224 review: ids that become known DURING a long poll (another tip's bet claimed after this
+                # check was scheduled) are left out on each read, not only the schedule-time snapshot
+                try:
+                    _ex_now = _excl | {str(x) for x in (exclude_fn() or ()) if x}
+                except Exception as e:
+                    log.warning(f"reconcile: exclude_fn failed ({e}); using the schedule-time exclusions")
             for b in resp.get("bets", []):
                 # v6.128: a bet already known on this account (the same account's main-row bet
                 # seconds before its milestone twin) is never read as this one
-                if _excl and (str(b.get("id")) in _excl or str(b.get("bookie_bet_id")) in _excl):
+                if _ex_now and (str(b.get("id")) in _ex_now or str(b.get("bookie_bet_id")) in _ex_now):
                     continue
                 # v6.180 refutation round: the deferred sports verify's "absent" ends in a "place it
                 # by hand" alert, so there the line only RANKS (line_gate=False); the slow-538
@@ -577,7 +677,10 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
                 if pending_bet_matches(b, event=event, stake=stake, sport=sport,
                                        selection_text=selection_text, after_ts=after_ts,
                                        market=market, line=(line if line_gate else None),
-                                       selection_exact=selection_exact):
+                                       selection_exact=selection_exact,
+                                       **({"period": period} if period else {}),
+                                       **({"exact_line": True} if exact_line else {}),
+                                       **({"own_ids": own_ids} if own_ids else {})):
                     _matched.append(b)
             if _matched:
                 # v6.180: several records can pass every gate (an 8.5 and a 9.5 on the same
@@ -615,7 +718,8 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
 
 def decide_ambiguous(hb, account_id, *, event, stake, sport, selection,
                      submit_ts, reconcile_enabled, spill_enabled, market=None,
-                     exclude_bet_ids=(), line=None):
+                     exclude_bet_ids=(), line=None, period=None, exact_line=False,
+                     own_ids=None):
     """Shared SLOW-REJECTION reconciliation decision used by BOTH main.py sports
     placement and racing_placer.py (lives here, not main.py, to avoid a circular
     import). Encodes Wilson's 2026-05-31 decisions on top of verify_bet_landed.
@@ -653,6 +757,9 @@ def decide_ambiguous(hb, account_id, *, event, stake, sport, selection,
             # v6.07 (sweep HIGH #6): racing win/place discriminator so a PLACE
             # attempt can't confirm against the WIN bet on the same runner.
             market=market, exclude_bet_ids=exclude_bet_ids, line=line,
+            **({"period": period} if period else {}),      # v6.201
+            **({"exact_line": True} if exact_line else {}),    # v6.222 (Sportmarket only)
+            **({"own_ids": own_ids} if own_ids else {}),
         )
     except Exception as e:
         log.error(f"reconcile: verify_bet_landed raised: {e}")
@@ -700,7 +807,7 @@ LATE_LANDING_CHECK_ENABLED = os.getenv(
 
 def find_late_landing(pending_bets, *, event, stake, sport, selection, submit_ts,
                       exclude_bet_ids=(), exclude_stakes=(), market=None, now_ts=None,
-                      never_bet_ids=(), line=None, selection_exact=True):
+                      never_bet_ids=(), line=None, selection_exact=True, period=None):
     """The pending bet that is the ORIGINAL re-placed bet, or None. Pure, so it is testable.
 
     Matches the usual gates (pending_bet_matches: an auto-capped, SMALLER landing of the original
@@ -744,7 +851,8 @@ def find_late_landing(pending_bets, *, event, stake, sport, selection, submit_ts
         if pending_bet_matches(b, event=event, stake=stake, sport=sport,
                                selection_text=selection, after_ts=submit_ts,
                                now_ts=now_ts, market=market, line=line,
-                               selection_exact=selection_exact):
+                               selection_exact=selection_exact,
+                               **({"period": period} if period else {})):
             _matched.append(b)
     return _best_match(_matched, line, selection, stake)      # v6.180: the exact line first
 
@@ -752,7 +860,7 @@ def find_late_landing(pending_bets, *, event, stake, sport, selection, submit_ts
 def schedule_late_landing_check(hb, account_id, *, event, stake, sport, selection, submit_ts,
                                 label, notify, exclude_bet_ids=(), exclude_stakes=(), market=None,
                                 never_bet_ids=(), line=None,
-                                delay_sec=None, retry_sec=30.0, selection_exact=True):
+                                delay_sec=None, retry_sec=30.0, selection_exact=True, period=None):
     """Fire-and-forget: after `delay_sec`, look at the ORIGINAL account once more; if the
     original bet is now there, call notify(message) (a CRITICAL). Never raises into the
     caller and never places anything. Returns the thread (tests join it), or None."""
@@ -791,7 +899,8 @@ def schedule_late_landing_check(hb, account_id, *, event, stake, sport, selectio
                                     sport=sport, selection=selection, submit_ts=submit_ts,
                                     exclude_bet_ids=excl, exclude_stakes=exclude_stakes,
                                     market=market, never_bet_ids=never_bet_ids, line=line,
-                                    selection_exact=selection_exact)
+                                    selection_exact=selection_exact,
+                                    **({"period": period} if period else {}))
             if hit is None:
                 log.info(f"late-landing check {label}: the original ${float(stake):.2f} is "
                          f"still absent after {int(delay)}s - no double")
@@ -833,7 +942,10 @@ def _ledger_row_matches(pending, ledger_rows, *, pdt, lookback_sec,
     an orphan). Mirrors pending_bet_matches' gates: event normalized-substring,
     stake within tol, selection-token overlap, and (best-effort) placed_at within
     the window of the pending dt. A row with an unparseable placed_at skips only the
-    time gate (still matched on event+stake+selection)."""
+    time gate (still matched on event+stake+selection).
+    v6.237: a row that carries a `period` (main reads it from the row's market) never
+    accounts for a record that proves the other period (_period_mismatch, the v6.201
+    guard): a first-half bet is not a full-game bet. No period on the row = as before."""
     pe = _norm(pending.get("event"))
     try:
         pstake = float(pending.get("stake"))
@@ -853,10 +965,17 @@ def _ledger_row_matches(pending, ledger_rows, *, pdt, lookback_sec,
             except (TypeError, ValueError):
                 rstake = None
             if rstake is not None and abs(pstake - rstake) > stake_tol:
-                continue
+                # v6.201: a bridge record's ask (a partial fill's stake reads below it) also counts,
+                # but only while the record's own stake is not above that ask
+                ask = _record_ask(pending)
+                if (ask is None or abs(ask - rstake) > stake_tol
+                        or (pstake is not None and pstake > ask + stake_tol)):
+                    continue
         rsel_toks = _toks(r.get("selection"))
         if pbet_toks and rsel_toks and not (pbet_toks & rsel_toks):
             continue
+        if r.get("period") and _period_mismatch(pending, r.get("period")):
+            continue      # v6.237: the other period's bet, not this one
         return True
     return False
 
