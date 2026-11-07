@@ -1876,6 +1876,23 @@ def claim(row: dict):
     return res
 
 
+# v6.251 review: the smallest allowed amount a claim admits, a fixed $1 (as v6.218's "under $1"), not
+# AFL_FANOUT_MIN_STAKE: a fill cents short of its rounded-up ask stays short, nothing is sent for cents.
+CLAIM_MIN_STAKE = 1.0
+
+
+def _round_up_reserve(allowed: float) -> float:
+    """v6.251 review: what a claim reserves as `inflight` for an allowed stake: the whole dollar above it while
+    SPORTMARKET_ROUND_UP_STAKE is on (the most Sportmarket can ask), else the stake itself."""
+    try:
+        if not bool(getattr(_config, "SPORTMARKET_ROUND_UP_STAKE", True)):
+            return allowed
+        cents = int(round(float(allowed) * 100))
+        return float(-(-cents // 100)) if cents > 0 else allowed
+    except (TypeError, ValueError):
+        return allowed
+
+
 def _claim(row: dict):
     """Admit or refuse this message, and return how much of it may be placed.
 
@@ -2018,15 +2035,29 @@ def _claim(row: dict):
                          + (f" + ${inflight:.2f} in flight" if inflight > 0 else "")
                          + f" of a ${ceiling:.2f} ceiling: nothing left to place")
         allowed = round(min(requested, headroom), 2)
+        # v6.251 review: an allowed amount under $1 is never placed (a Sportmarket fill cents short of a
+        # rounded-up ask stays short): a ceiling with only cents left is "nothing left to place" (benign, no
+        # page). retryable is NOT changed; a raise or moved-line retry whose own ask is $1 or more goes through.
+        _min_stake = CLAIM_MIN_STAKE
+        if allowed < _min_stake:
+            return 0.0, (f"selection {sel_id} has ${sel['committed']:.2f} committed of a "
+                         f"${ceiling:.2f} ceiling: only ${allowed:.2f} is left or asked, under the "
+                         f"${_min_stake:.2f} minimum stake: nothing left to place")
+        # v6.251 review: Sportmarket's ask goes up to the whole dollar (SPORTMARKET_ROUND_UP_STAKE), so the
+        # reservation is the whole dollar too. Reserved at the cents, three overlapping keys each rounded up
+        # after the headroom check and together passed the ceiling by up to $0.99 per key. Reserved at the
+        # rounded amount the next key sees the real headroom, so the selection passes its ceiling by under
+        # $1 in all (only the last key can). `allowed` (the stake returned) is unchanged.
+        reserve = _round_up_reserve(allowed)
         # Claim + reserve NOW, before placement. Released in commit().
         sel["keys"].append(key)
         if is_v4(row):
             sel["v4"] = True             # the v4 mark: persisted with the claim, survives restarts
-        sel["inflight"] = round(inflight + allowed, 2)
+        sel["inflight"] = round(inflight + reserve, 2)
         # Stamp the reservation with this process run: a reservation whose boot id is not ours
         # belongs to a process that died between the claim and the commit (recover_pending).
         sel.setdefault("reservations", {})[key] = {
-            "stake": allowed, "boot": BOOT_ID, "ts": time.time(), "accounts": [],
+            "stake": reserve, "boot": BOOT_ID, "ts": time.time(), "accounts": [],
             "max_odds": 0.0,
             # how many fills records this key already had at the claim, so a rebuild can tell
             # a NEWER record from an older pre-claim refusal or none

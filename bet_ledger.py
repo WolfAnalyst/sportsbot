@@ -22,6 +22,8 @@ import logging
 from datetime import datetime, timedelta   # v6.19: timedelta for the runner lookback
 from threading import Lock
 
+from horse_names import drop_nz_tag
+
 log = logging.getLogger("tipbot")
 
 def _under_test() -> bool:
@@ -532,7 +534,8 @@ def _norm_runner(selection: str, runner_match: str = "") -> str:
     # (the bookie's runner_match) are the same runner for the duplicate guard.
     import unicodedata
     s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    return re.sub(r"[^a-z0-9]", "", s.lower())
+    # v6.271: "Im Boo Nz" on a book's row and a tip's "Im Boo" are one horse, or a re-send bets it twice
+    return re.sub(r"[^a-z0-9]", "", drop_nz_tag(s).lower())
 
 
 def _norm_units(u):

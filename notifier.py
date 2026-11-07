@@ -842,6 +842,16 @@ NOTIFY_CRITICAL_CHAT_ID = os.getenv("NOTIFY_CRITICAL_CHAT_ID", "") or NOTIFY_CHA
 # NOTIFY_SUCCESS_CHAT_ID imported from config; fallback handled in _send_success
 
 
+# v6.266 review (Wilson 7 Nov 2026): main.py's tag on the local refusal of a main row under the no-price minimum. It is
+# a machine marker, never part of what Wilson reads.
+_NO_PRICE_MIN_TAG = "[no_price_minimum]"
+
+
+def _plain_error(err) -> str:
+    """v6.266 review: an error text without main.py's local-refusal tag, for any "Last error" line Wilson reads."""
+    return str(err or "").replace(_NO_PRICE_MIN_TAG, "").strip()
+
+
 def _escape_html(text: str) -> str:
     """Escape HTML special chars and strip Discord emoji tags."""
     text = re.sub(r"<:[A-Za-z0-9_]+:\d+>", "", text)
@@ -1433,7 +1443,7 @@ def notify_bet_failed(result) -> bool:
 
     # Error - keep more context than before. Available: [...] lists were
     # being truncated at 120 chars and losing the diagnostic info.
-    err = result.error or ""
+    err = _plain_error(result.error)
     err_truncated = err[:1500] if len(err) > 1500 else err
     if len(err) > 1500:
         err_truncated += " ...[truncated]"
@@ -1785,6 +1795,8 @@ def notify_tip_placed_summary(
             detail_parts.append(f"stat={placed_stat}")
         if getattr(r, "_reline_note", ""):
             detail_parts.append(str(r._reline_note))          # v6.232: LINE UNVERIFIED ...
+        if getattr(r, "_near_line_note", ""):
+            detail_parts.append(str(r._near_line_note))       # v6.250: filled on a nearby line, said plainly
         if detail_parts:
             base += f"  (placed {', '.join(detail_parts)})"
         base += _timing_suffix(sid_str, getattr(r, "elapsed_sec", None))
@@ -1905,7 +1917,10 @@ def notify_tip_unfilled(tip, intended_stake, placed_stake, unfilled, failed_resu
             )
     legs_str = "\n".join(legs_lines)
 
-    last_err = failed_results[-1].error if failed_results else "no error captured"
+    last_err = _plain_error(failed_results[-1].error) if failed_results else "no error captured"
+    _np_note = getattr(tip, "_no_price_min_note", "")
+    if last_err in ("", "no error captured") and isinstance(_np_note, str) and _np_note:
+        last_err = _np_note                      # v6.266 review: a bet365 / Sportmarket row under the minimum
     last_err_short = (last_err or "")[:200]
 
     title = "BET UNFILLED" if placed_stake > 0 else "BET FAILED"
@@ -1961,11 +1976,21 @@ def notify_tip_unfilled_with_placements(
     last_err = "no error captured"
     for r in reversed(failed_results or []):
         if getattr(r, "error", None):
-            last_err = r.error
+            last_err = _plain_error(r.error)          # v6.266 review: never main.py's tag in Wilson's text
             break
     else:
         if closed_only:
             last_err = "this account was skipped (its line is closed or over its stake estimate) and nothing was sent there"
+    # v6.266 review (Wilson 7 Nov 2026): a bet365 / Sportmarket row under the no-price minimum sends nothing and leaves no
+    # failed result, so main.py keeps its reason on the tip. With nothing else to say it is the last error; next to
+    # another error it comes first, so the 1.50 reason is never lost behind a stake error.
+    _np_note = getattr(tip, "_no_price_min_note", "")
+    _np_note = _np_note if isinstance(_np_note, str) else ""
+    if _np_note and _np_note not in last_err:
+        if last_err == "no error captured" or last_err.startswith("this account was skipped"):
+            last_err = _np_note
+        else:
+            last_err = f"{_np_note}; {last_err}"
     last_err_short = (last_err or "")[:250]
 
     # Index session_timing for per-line lookup (matches placed_summary pattern)
@@ -2002,9 +2027,11 @@ def notify_tip_unfilled_with_placements(
             stake = getattr(r, "stake", 0) or 0
             odds = getattr(r, "odds", 0) or 0
             boost_tag = " ⚡BOOST" if getattr(r, "used_boost", False) else ""
+            _nl = getattr(r, "_near_line_note", "")        # v6.250: filled on a nearby line, said plainly
             lines.append(
                 f"  {_session_label(sid, bookie)}{boost_tag}: "
                 f"${stake:.2f} @ {odds}{_timing_suffix(sid)}"
+                + (f" ({_nl})" if _nl else "")
             )
         placements_block = "\n".join(lines) if lines else "  (none)"
     else:

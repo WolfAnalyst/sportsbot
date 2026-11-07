@@ -1250,6 +1250,146 @@ def _check_shook_side_inner(tips: list, text: str) -> list:
     return tips
 
 
+# v6.249 (Wilson 6 Nov 2026: Shook's tipped price is the MEDIAN of the American prices he publishes, "-132 FD, -137
+# Builder, ..."; the model returns odds 0 for him, so every Shook tip used to be "no price"). Deterministic, from
+# the trigger message only. Unclear = no price.
+_SHOOK_BOOKS = (r"fanduel|fd|draftkings|dk|betmgm|mgm|hardrock|hr|builder|fliff|caesars|czrs|czr|px|ts|365|bet365|br"
+                r"|kalshi")
+_SHOOK_PAIR_RE = re.compile(r"(?<![\w.+-])([+-]\d{3,4})[ \t]+(" + _SHOOK_BOOKS + r")(?![A-Za-z0-9])", re.IGNORECASE)
+# between two pairs: whitespace, commas and line breaks, or a parenthetical "(some liq)" (captured: the tag of the
+# pair before it); never a slash, never other words
+_SHOOK_SEP_RE = re.compile(r"(?:[ \t]*\(([^()\n]*)\))?[ \t,\r\n]*")
+# v6.249 review: a price tagged "(non o/u)" / "(non ou)" is not a price for this over/under: it does not count
+_SHOOK_NON_OU_RE = re.compile(r"\bnon[\s-]*o\s*/?\s*u\b", re.IGNORECASE)
+# v6.249 review: a standalone number in the gap ("26 PR"): another stat's line, so the prices are not this bet's.
+# "3s" / "1st" / "Q1" are words, not numbers
+_SHOOK_BARE_NUMBER_RE = re.compile(r"(?<![\w.])\d+(?![\w.])")
+_SHOOK_LINENO_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)(\+?)")
+
+
+def american_to_decimal_odds(american):
+    """American odds (-114, +150) as AU decimal (1.8772, 2.5). None for anything unusable (|a| < 100 included);
+    never raises. main._american_to_decimal_odds is this function (v6.249: moved here so the parser can use it
+    without importing main)."""
+    try:
+        a = float(american)
+    except (TypeError, ValueError):
+        return None
+    if a != a or abs(a) < 100 or abs(a) == float("inf"):
+        return None
+    if a > 0:
+        return round(1 + a / 100, 4)
+    return round(1 + 100 / abs(a), 4)
+
+
+def shook_median_price(body: str, line) -> tuple:
+    """(median decimal price or None, [prices used], why) for the Shook main bet at `line` in the trigger message
+    `body`. The prices are the first contiguous run of "<American price> <book>" pairs (commas, spaces or a
+    parenthetical between them) that follows the main bet's own line; the run ends at the first non-pair, so
+    "good to -150", "+136 for same", a price with no book and anything after the run never count. A split post
+    (a slash between the markets or the prices) and a post whose main line cannot be tied to the run have no
+    price. The median of the decimals; an even count takes the mean of the middle two; rounded to 3 places."""
+    try:
+        line = float(line)
+    except (TypeError, ValueError):
+        return None, [], "unreadable line"
+    first = _SHOOK_PAIR_RE.search(body or "")
+    if not first:
+        return None, [], "no book-tagged price"
+    head = body[:first.start()]
+    # the main bet's own number: the last number before the run that is the leg's line ("25+" is the over 24.5)
+    own = None
+    for m in _SHOOK_LINENO_RE.finditer(head):
+        n, plus = float(m.group(1)), bool(m.group(2))
+        if abs(n - line) < 1e-9 or (plus and abs(n - 0.5 - line) < 1e-9):
+            own = m
+    if own is None:
+        return None, [], "the run does not follow this bet's line"
+    gap = head[own.end():]
+    if "/" in gap or re.search(r"\d\.\d|(?<![\w])\d+\+|[.!?](?:\s|$)", gap) or _SHOOK_BARE_NUMBER_RE.search(gap):
+        return None, [], "another number, a slash or a sentence break between the line and the prices"
+    pairs, pos, last_end = [], first.start(), first.start()
+    while True:
+        m = _SHOOK_PAIR_RE.match(body, pos)
+        if not m:
+            break
+        last_end = m.end()
+        sep = _SHOOK_SEP_RE.match(body, last_end)
+        if len(m.group(1)) > 4:
+            # v6.249 review: American prices are exactly three digits ("-1230 Fliff" is a typo or another number)
+            return None, pairs + [m.group(1)], "a four-digit price in the run (unclear)"
+        if sep is not None and sep.group(1) and _SHOOK_NON_OU_RE.search(sep.group(1)):
+            pass                       # tagged "(non o/u)": this price is for another market
+        else:
+            pairs.append(m.group(1))
+        pos = sep.end() if sep else last_end
+    # a slash straight after the last pair ("-114 Builder/-122 FD", "-120 Fliff/29.5 PA") is a split post
+    if re.match(r"[ \t]*(?:\([^()\n]*\))?[ \t]*/", body[last_end:]):
+        return None, pairs, "a slash after the prices (a split post)"
+    dec = [american_to_decimal_odds(p) for p in pairs]
+    if not dec or any(d is None for d in dec):
+        return None, pairs, "an unusable price in the run"
+    dec.sort()
+    k = len(dec)
+    med = dec[k // 2] if k % 2 else (dec[k // 2 - 1] + dec[k // 2]) / 2
+    return round(med, 3), pairs, ""
+
+
+def _apply_shook_median_price(tips: list, text: str) -> list:
+    """Shook NBA only (v6.249): give the single player-prop tip that matches the first priced run the MEDIAN of
+    his published prices as suggested_odds and _tipster_odds. Every other Shook NBA tip (an alt, a split post, a
+    post with no book-tagged price) has NO price: suggested_odds 0 and no _tipster_odds. v6.249 review: two or more
+    such tips on the SAME line in one post get no price at all (the run cannot be tied to one of them, and the
+    names are nicknames, so no guessing by name). The resend and deferred keys do not read the price. An error on
+    a tip gives THAT tip no price (suggested_odds 0, no _tipster_odds) and logs it."""
+    if not text:
+        return tips
+    body = text.split("CURRENT MESSAGE:", 1)[-1]
+
+    def _eligible(tip) -> bool:
+        return (getattr(tip, "tipster", "") == "shook" and (getattr(tip, "sport", "") or "").lower() == "nba"
+                and not tip.alert_only and not tip.is_sgm and len(tip.legs or []) == 1
+                and bool((tip.legs[0].player or "").strip()))
+
+    same_line: dict = {}
+    for tip in tips:
+        try:
+            if _eligible(tip):
+                same_line[round(float(tip.legs[0].line), 4)] = same_line.get(round(float(tip.legs[0].line), 4), 0) + 1
+        except Exception:
+            pass
+    for tip in tips:
+        try:
+            if not _eligible(tip):
+                continue
+            had = float(getattr(tip, "suggested_odds", 0) or 0)
+            if same_line.get(round(float(tip.legs[0].line), 4), 0) > 1:
+                med, prices, why = None, [], "two or more Shook tips on this line in one post"
+            else:
+                med, prices, why = shook_median_price(body, tip.legs[0].line)
+            if med is None:
+                if had > 1.0 or why.startswith("two or more"):
+                    log.info(f"Shook price: {tip.legs[0].player} {tip.legs[0].line}: no price from the post ({why})"
+                             + (f"; the model's {had} is ignored" if had > 1.0 else ""))
+                tip.suggested_odds = 0.0
+                if hasattr(tip, "_tipster_odds"):
+                    del tip._tipster_odds
+                continue
+            tip.suggested_odds = med
+            tip._tipster_odds = med
+            log.info(f"Shook price: {tip.legs[0].player} {tip.legs[0].line}: median {med} of "
+                     f"{len(prices)} price(s) {' '.join(prices)}")
+        except Exception as e:
+            log.warning(f"Shook price: failed for a tip ({type(e).__name__}: {e}): no price")
+            try:
+                tip.suggested_odds = 0.0
+                if hasattr(tip, "_tipster_odds"):
+                    del tip._tipster_odds
+            except Exception:
+                pass
+    return tips
+
+
 def _merge_slash_line_into_sgm(tips: list, text: str) -> list:
     """Deterministic "/" = SGM (Wilson 2026-05-31).
 
@@ -3068,6 +3208,7 @@ def parse_with_groq(
         tips = _merge_slash_line_into_sgm(tips, text)
         tips = _check_team_legs_against_text(tips, text)   # v6.58
         tips = _check_shook_side_against_text(tips, text)   # v6.138
+        tips = _apply_shook_median_price(tips, text)   # v6.249
         tips = _check_ausbets_stat_against_text(tips, text)   # v6.144
 
         log.info(f"Groq parsed {len(tips)} tip(s) in {elapsed:.2f}s")

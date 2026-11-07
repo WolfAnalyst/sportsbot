@@ -53,6 +53,17 @@ _PRICE_RE = re.compile(r"@\s*(\$?\s*\d+(?:\.\d+)?|[^\s(]+)")
 _STAKE_RE = re.compile(r"(?:Stakes?\s*:\s*|\(\s*)(\d+(?:\.\d+)?|\.\d+)\s*\)?\s*(?:units?|u)\b",
                        re.IGNORECASE)
 _BOOKIE_RE = re.compile(r"Bookie\s*:\s*([^)]+?)\s*\)", re.IGNORECASE)
+# v6.264 (Wilson 7 Nov 2026): the card's stake text "Stake: 7 units (4 locked in + 3 more at the
+# current price)". Only a clear "<L> locked (in) + <A> more (at the current price)" gives
+# locked_units (see parse_tip_line). Review fix: the forms "(4 locked + 3 more)", "4 locked in,
+# 3 more", "(4 units locked in + 3 more units at current price)" and a trailing full stop read the
+# same; any other stake text that says "locked" or "more" is not understood (no price, manual).
+_STK_N = r"\d+(?:\.\d+)?"
+_LOCKED_STAKE_RE = re.compile(
+    rf"(?<![\d.])({_STK_N})\s*(?:units?|u)?\s*locked(?:\s+in)?\s*(?:\+|,|&|\band\b)\s*"
+    rf"({_STK_N})\s*(?:units?|u)?\s*more(?:\s+units?)?(?:\s+at\s+(?:the\s+)?current\s+price)?"
+    rf"(?=\s*[)\].,;]|\s*$)", re.IGNORECASE)
+_LOCKED_WORD_RE = re.compile(r"\blocked\b|\bmore\b", re.IGNORECASE)
 _SCRATCHED_RE = re.compile(r"^\s*scratch", re.IGNORECASE)
 
 # Future Tips: a race header line "CAULFIELD CUP – Caulfield (Date: 17th October)", a
@@ -464,6 +475,120 @@ def _meta(card: dict, *names) -> str:
     return ""
 
 
+# v6.262 (Wilson 7 Nov 2026): since 5 Nov the card head is a bare "Rosehill R9 #11 SHOW BUSINESS
+# – WIN" and the price sits in meta sentences. Three strict readings, in this order. The page
+# parser stores a whole-<strong> sentence as a meta whose LABEL is the sentence, so both the
+# label and the value are searched.
+_NUM = r"\d+(?:\.\d+)?"
+_BK = r"[A-Za-z0-9][A-Za-z0-9 '&,.-]*?"
+_ADD_RE = re.compile(
+    rf"\bAdd\s+({_NUM})\s+more\s+units?\s+at\s+the\s+current\s+price\s*"
+    rf"\(\s*\$({_NUM})(?:\s+with\s+({_BK}))?\s*\)", re.IGNORECASE)
+_LOCKED_RE = re.compile(
+    rf"\bMembers\s+locked\s+in\s+{_NUM}\s+units?\s+at\s+\$({_NUM})"
+    rf"(?:\s+including\s+{_NUM}c\s+deductions)?"
+    rf"(?:\s+with\s+([A-Za-z0-9][A-Za-z0-9 '&,-]*?))?\s*\.(?=\s|$)", re.IGNORECASE)
+_RATED_RE = re.compile(
+    rf"\bvs\s+\$({_NUM})\s+Available\s+with\s+([A-Za-z0-9][A-Za-z0-9 '&-]*)", re.IGNORECASE)
+# v6.262 review fix: wording the reading does not fully understand is no price (manual), never
+# a fall-through to a different price. A "mention" is the wording alone, readable or not.
+_ADD_MENTION_RE = re.compile(r"\badd\b[^$]{0,40}?\bmore\b", re.IGNORECASE)
+_LOCKED_MENTION_RE = re.compile(r"\bMembers\s+locked\s+in\b", re.IGNORECASE)
+_LOCKED_ANY_RE = re.compile(r"\blocked\s+in\b", re.IGNORECASE)
+_LOCKED_UNITS_RE = re.compile(rf"\bMembers\s+locked\s+in\s+({_NUM})\s+units?\b", re.IGNORECASE)
+_TOTAL_RE = re.compile(rf"\bfor\s+({_NUM})\s+units?\s+in\s+total\b", re.IGNORECASE)
+_TOTAL_MENTION_RE = re.compile(r"\bin\s+total\b", re.IGNORECASE)
+_TOTE_RE = re.compile(r"TO\s*\+|\btote\b", re.IGNORECASE)
+_SCRATCH_RE = re.compile(r"scratch", re.IGNORECASE)
+_LEAD_NUM_RE = re.compile(rf"^\s*({_NUM})\b")
+
+
+def _meta_texts(card: dict) -> list:
+    return [" ".join(x for x in (lab, v) if x) for lab, v in card["metas"]]
+
+
+def _first_bookie(b: str) -> str:
+    return re.split(r"\s*(?:,|&|\band\b)\s*", (b or "").strip(), maxsplit=1)[0].strip()
+
+
+def _page_price(card: dict):
+    """(price text "$4.20", bookie) from a bare-head card's meta sentences, or None. First the
+    "Add N more units at the current price ($P with B)" play, then "Members locked in N units
+    at $P ... with B", then "Rated vs Market: ... vs $P Available with B"; a bookie list
+    ("TAB, Sportsbet", "TAB and Sportsbet") gives its first name. v6.262 review fix: a card the
+    reading does not fully understand has NO price (it goes to the manual alert), it never falls
+    through to another price: any scratch / TO+ / tote wording; an Add or Locked sentence that
+    cannot be read (an Add one never falls to Locked, a Locked one never to Rated); two
+    different prices; a price of 1 or less; and an Add play whose units do not agree with the
+    Stake ("for N units in total" = the stake, else locked + add = the stake)."""
+    texts = _meta_texts(card)
+    if any(_SCRATCH_RE.search(t) or _TOTE_RE.search(t) for t in texts):
+        return None
+    add_n = sum(len(_ADD_MENTION_RE.findall(t)) for t in texts)
+    lock_n = sum(len(_LOCKED_MENTION_RE.findall(t)) for t in texts)
+    if add_n:
+        found = [m for t in texts for m in _ADD_RE.finditer(t)]
+        if len(found) != add_n or add_n != 1:
+            return None
+        m = found[0]
+        price, bookie = m.group(2), _first_bookie(m.group(3))
+        if float(price) <= 1.0 or not _add_units_agree(card, texts, float(m.group(1))):
+            return None
+        return f"${price}", bookie
+    if lock_n:
+        found = [m for t in texts for m in _LOCKED_RE.finditer(t)]
+        if len(found) != lock_n or len({m.group(1) for m in found}) != 1:
+            return None
+        price = found[0].group(1)
+        if float(price) <= 1.0:
+            return None
+        return f"${price}", _first_bookie(found[0].group(2))
+    if any(_LOCKED_ANY_RE.search(t) for t in texts):
+        return None  # "locked in" wording that is not the members sentence: not understood
+    pool = [t for (lab, _), t in zip(card["metas"], texts) if lab.lower().startswith("rated vs market")]
+    found = [m for t in pool for m in _RATED_RE.finditer(t)]
+    if not found or len({m.group(1) for m in found}) != 1:
+        return None
+    price = found[0].group(1)
+    if float(price) <= 1.0:
+        return None
+    return f"${price}", _first_bookie(found[0].group(2))
+
+
+def _add_units_agree(card: dict, texts: list, add_units: float) -> bool:
+    """The Stake units must equal locked + add, and the Add sentence's own total when it has one.
+    v6.264 review fix: the locked-in units MUST be read (a total alone is not enough): the bet
+    is only the added units, so an Add price with no readable locked-in number is no price."""
+    sm = _LEAD_NUM_RE.match(_meta(card, "stake", "stakes"))
+    if not sm:
+        return False
+    stake = float(sm.group(1))
+    totals = [float(m.group(1)) for t in texts for m in _TOTAL_RE.finditer(t)]
+    if sum(len(_TOTAL_MENTION_RE.findall(t)) for t in texts) != len(totals) or len(totals) > 1:
+        return False
+    locked = {float(m.group(1)) for t in texts for m in _LOCKED_UNITS_RE.finditer(t)}
+    if len(locked) != 1:
+        return False
+    if totals and abs(totals[0] - stake) > 1e-9:
+        return False
+    return abs(next(iter(locked)) + add_units - stake) <= 1e-9
+
+
+def _page_add_locked(card: dict):
+    """(locked, added) units when the card's single Add sentence and its single Members locked
+    in sentence both read and add up to the Stake, else None."""
+    texts = _meta_texts(card)
+    found = [m for t in texts for m in _ADD_RE.finditer(t)]
+    if len(found) != 1:
+        return None
+    add = float(found[0].group(1))
+    locked = {float(m.group(1)) for t in texts for m in _LOCKED_UNITS_RE.finditer(t)}
+    if len(locked) != 1 or not _add_units_agree(card, texts, add):
+        return None
+    lk = next(iter(locked))
+    return (lk, add) if lk > 0 and add > 0 else None
+
+
 def page_card_line(card: dict) -> str:
     """A Pro Tip card as the Quick Take line parse_tip_line() reads:
     "Geelong R2 #18 ROYAL RENDEZVOUS – WIN @ $4 (Bookie: TAB)(Stake: 6 units)".
@@ -472,16 +597,31 @@ def page_card_line(card: dict) -> str:
     if not head:
         return " ".join("".join(card.get("text") or []).split())
     parts = re.split(rf"\s+{_DASH}\s+", head, maxsplit=1)
+    page_bookie = ""
+    add_lk = None
     if len(parts) == 2:
         rest = parts[1].strip()
         price = _meta(card, "price", "odds")
+        if (not price and not _meta(card, "bookie") and "@" not in rest
+                and re.fullmatch(r"(?i)(WIN|PLACE)", rest)):
+            pp = _page_price(card)  # v6.262: the price moved out of the head (5 Nov)
+            if pp:
+                price, page_bookie = pp
+        # v6.264 re-check: read for a priced head too, or a plain "7 units" bets all 7u at the head's price
+        add_lk = _page_add_locked(card)
         if "@" not in rest:
             if re.fullmatch(r"(?i)(WIN|PLACE)", rest) and price:
                 rest = f"{rest} {price}"
             rest = re.sub(r"(?i)^(WIN|PLACE)\s+(?=\S)", lambda m: f"{m.group(1)} @ ", rest, count=1)
         head = f"{parts[0].strip()} – {rest}"
-    bookie = _meta(card, "bookie")
+    bookie = _meta(card, "bookie") or page_bookie
     stake = _meta(card, "stake", "stakes")
+    if add_lk and re.fullmatch(r"(?:\d+(?:\.\d+)?|\.\d+)(?:\s*units?)?", stake or "", re.IGNORECASE):
+        # v6.264 review fix: the Add sentence gave the price and the locked-in and added units
+        # agree with a plain Stake, so write the stake in the card's own form and main sees
+        # locked_units (a plain "7 units" would have bet all 7u at the added price)
+        stake = (f"{add_lk[0] + add_lk[1]:g} units ({add_lk[0]:g} locked in + {add_lk[1]:g} more "
+                 f"at the current price)")
     if stake and re.fullmatch(r"\d+(?:\.\d+)?|\.\d+", stake):
         stake += " units"
     return (head + (f" (Bookie: {bookie})" if bookie else "")
@@ -550,7 +690,13 @@ def parse_tip_line(line: str):
 
     {"track", "race_num", "saddle", "runner", "market" (win|place|None),
      "odds" (float|None), "price_text" ("$4.40" / "TO+" / ...), "fixed_price" (bool),
-     "units" (float|None), "bookie", "scratched" (bool), "raw"}"""
+     "units" (float|None), "locked_units" (float|None), "locked_unreadable" (bool), "bookie",
+     "scratched" (bool), "raw"}
+
+    v6.264: locked_units is L only when the stake text clearly says "<L> locked (in) + <A> more
+    (at the current price)" exactly once and L + A equals the units read. Review fix: stake text
+    that mentions "locked" or "more" in any other way is NOT understood: locked_unreadable is set
+    and the tip has no price (manual), never a silent bet of the full units."""
     m = _TIP_RE.match(line or "")
     if not m:
         return None
@@ -561,7 +707,8 @@ def parse_tip_line(line: str):
         "saddle": int(m.group("saddle")) if m.group("saddle") else None,
         "runner": m.group("runner").strip(),
         "market": None, "odds": None, "price_text": "", "fixed_price": False,
-        "units": None, "bookie": "", "scratched": False, "raw": line.strip(),
+        "units": None, "locked_units": None, "locked_unreadable": False, "bookie": "",
+        "scratched": False, "raw": line.strip(),
     }
     if _SCRATCHED_RE.match(rest):
         tip["scratched"] = True
@@ -580,6 +727,17 @@ def parse_tip_line(line: str):
     sm = _STAKE_RE.search(rest)
     if sm:
         tip["units"] = float(sm.group(1))
+        tail = rest[sm.start():]
+        words = len(_LOCKED_WORD_RE.findall(tail))
+        if words:
+            lk = list(_LOCKED_STAKE_RE.finditer(tail))
+            if len(lk) == 1 and words == 2:
+                held, more = float(lk[0].group(1)), float(lk[0].group(2))
+                if held > 0 and more > 0 and abs(held + more - tip["units"]) <= 1e-9:
+                    tip["locked_units"] = held
+            if tip["locked_units"] is None:
+                tip["locked_unreadable"] = True
+                tip["odds"], tip["fixed_price"] = None, False
     bm = _BOOKIE_RE.search(rest)
     if bm:
         tip["bookie"] = bm.group(1).strip()

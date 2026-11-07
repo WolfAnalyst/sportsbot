@@ -702,9 +702,12 @@ def verify_bet_landed(hb, account_id, *, event, stake, sport=None,
     # nothing, and neither does a slow read that finished late but asked early: the bet may have
     # appeared after that snapshot, and "not found" lets the caller re-place it.
     if last_ok_ts is not None and last_ok_ts >= deadline - poll_interval_sec:
+        # v6.260 (Wilson 7 Nov 2026): "caller may spill" was logged every ~6 min while a trader referral was open,
+        # where no spill happens. This look is shared: the text now says only what it proved and what each caller does.
         log.info(
-            f"reconcile: NOT FOUND after {max_wait_sec}s — bet did not land "
-            f"(event='{event}' stake=${stake}); caller may spill"
+            f"reconcile: NOT FOUND after {max_wait_sec}s — no matching pending bet in this look "
+            f"(event='{event}' stake=${stake}); a trader-referral follow keeps looking and never spills, "
+            f"other callers decide to spill or alert"
         )
         return {"landed": False, "match": None, "reconcile_failed": False}
     if api_ok_once:

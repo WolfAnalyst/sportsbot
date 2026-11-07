@@ -108,6 +108,7 @@ from config import (
     DISPOSALS_MODEL_SEQ_RESET_TOLERANCE,
     DISPOSALS_MODEL_LIVENESS_CRITICAL,
 )
+import groq_parser   # v6.249: american_to_decimal_odds lives here
 from groq_parser import parse_tip_image, parse_a1_nfl_text, parse_fourthandev_nfl_text
 from groq_parser import parse_bettorsedge_nbl_text
 from models import ParsedTip, ParsedLeg, BetResult
@@ -169,6 +170,7 @@ from roster import is_nfl_name_collision
 from roster import exact_match_player
 import seen_bets
 import shook_defer   # v6.229: the Shook 1-hour deferral store and rules
+import player_names  # v6.267: the one rule for a first name a book shortens or spells another way
 import units_cap
 import trader_balance_watch   # v6.173: the balance signal on racing_placer's trader follows
 from roster import _GEN_SUFFIXES as _ROSTER_GEN_SUFFIXES, _fold_accents as _roster_fold_accents
@@ -592,6 +594,20 @@ def _is_no_bet_framing(raw: str) -> bool:
     ("nothin today", "no bets today", "none quite", "close to bets but no")."""
     return bool(_NO_BET_FRAMING_RE.search(raw or ""))
 
+
+def _add_alert_reason(tip, reason: str) -> None:
+    """v6.259 (Wilson 7 Nov 2026): a gate that sends a tip to manual ADDS its reason after any the parser
+    already set, instead of replacing it. 5 Nov 10:10 the AusBets parser said "previous tip should be Over 22.5
+    points_assists (not 23.5)" for CJ McCollum, the no-unit gate overwrote it, and the manual alert showed only
+    "no unit/stake specified": the correction never reached Wilson. A tip with no earlier reason reads as
+    before; a reason already in the text is not repeated. Text only: never touches alert_only or a stake."""
+    prev = (getattr(tip, "alert_reason", "") or "").strip()
+    if not prev:
+        tip.alert_reason = reason
+    elif reason not in prev:
+        tip.alert_reason = f"{prev}; {reason}"
+
+
 # ── Tipsters HARD-LOCKED to a single bookie ─────────────────────────
 # Opposite of the ignore-list: these tips are placed ONLY on the named bookie.
 # If that bookie has no active session, the tip routes to manual — it is NEVER
@@ -634,6 +650,11 @@ TIPSTERS_FORCE_ALSO_ALLOWED: dict[str, set] = {NBA_MODEL_TIPSTER: {"sportmarket"
 TIPSTERS_MAX_ODDS_MULT: dict[str, float] = {}
 if X_TIPSTER and X_MAX_ODDS_MULT and X_MAX_ODDS_MULT > 1.0:
     TIPSTERS_MAX_ODDS_MULT[X_TIPSTER] = X_MAX_ODDS_MULT
+# v6.249 review (Wilson 6 Nov: NO top limit for Shook, a priced tip's bets above 1.25x the median must place): a mult
+# <= 1.0 turns the ceiling off for the tipster everywhere it is read (_exceeds_odds_ceiling, _bookie_max_odds so no
+# max_odds is sent to HyperBot, _b365_ceiling and so Sportmarket's, _shook_better_line_pick). bet365 and Sportmarket then
+# size the to-win at 10% over the quoted price (_b365_price_ceiling), as for any tipster with no ceiling.
+TIPSTERS_MAX_ODDS_MULT["shook"] = 0.0
 
 
 def _afl_target_odds(sport, basis_odds, *, _round: bool = True):
@@ -1637,6 +1658,7 @@ PRE_PLACEMENT_REJECT_PATTERNS = [
     "line_closed",     # v6.119: the account already hit the max on this line, nothing sent
     "sb_estimate_skip",  # v6.211: the Sportsbet stake ceiling skipped the account (row full / estimate failed), nothing sent
     "reline_stop",       # v6.232: the tip's fan-out was stopped by the Sportsbet re-line guard, nothing sent
+    "[no_price_minimum]",  # v6.266 review: a main row under the no-price minimum was refused locally, nothing sent
     "no_runners",
     "no runners",
     "failed to get odds",
@@ -1883,6 +1905,18 @@ def _is_closed_or_skipped(error) -> bool:
     v6.239 review 2: corrected, [line_closed] is not only the pre-send check."""
     e = str(error or "")
     return "[line_closed]" in e or "[sb_estimate_skip]" in e
+
+
+# v6.266 review fix round (Wilson 7 Nov 2026): the send backstop's refusal of a MAIN row under the no-price minimum has its
+# own tag. It is NOT _is_closed_or_skipped: a closed main lets the same account's twin / partner try (an old rule), but a
+# main refused for its price must not, or a 1.45 twin goes out under a refused 1.42 main. Pre-placement, nothing sent.
+_NO_PRICE_MIN_TAG = "[no_price_minimum]"
+
+
+def _is_no_price_min_refusal(error) -> bool:
+    """v6.266 review: True for the local refusal of a main row under the no-price minimum (nothing sent, and no twin,
+    partner or chain row follows it on that account)."""
+    return _NO_PRICE_MIN_TAG in str(error or "")
 
 
 # v6.232 (Wilson 3 Nov 2026): the Sportsbet re-line guard. Sportsbet re-lines a prop on the SAME outcome id
@@ -5149,14 +5183,14 @@ def _gate_shook_sports(tips: list[ParsedTip]) -> list[ParsedTip]:
             if sp == "nfl" and nfl_manual:
                 log.info("Shook NFL -> manual (SHOOK_NFL_MANUAL): not auto-placing")
                 tip.alert_only = True
-                tip.alert_reason = "Shook NFL tip, routed to manual (not auto-placed)"
+                _add_alert_reason(tip, "Shook NFL tip, routed to manual (not auto-placed)")   # v6.259: keep the parser's reason
             elif sp not in ("nba", "mlb", "nfl"):
                 # v6.97 (Haiku review): the sport comes from the parser ("auto" channel), so a
                 # missing or unknown label must fail CLOSED: manual, never auto-placed.
                 log.info(f"Shook tip with sport {sp!r} -> manual (sport not recognised)")
                 tip.alert_only = True
-                tip.alert_reason = (f"Shook tip, sport {sp or 'unknown'!r} not recognised: "
-                                    f"routed to manual (not auto-placed)")
+                _add_alert_reason(tip, f"Shook tip, sport {sp or 'unknown'!r} not recognised: "
+                                       f"routed to manual (not auto-placed)")   # v6.259: keep the parser's reason
         out.append(tip)
     return out
 
@@ -5869,7 +5903,7 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
     if _sports_paused() and (tip.sport or "").lower() != "racing":
         log.warning(f"[sports paused] {tip.tipster} {tip.sport} tip NOT placed (manual alert)")
         tip.alert_only = True
-        tip.alert_reason = _SPORTS_PAUSED_REASON
+        _add_alert_reason(tip, _SPORTS_PAUSED_REASON)   # v6.259: keep earlier reasons
         notifier.notify_manual_alert(tip)
         return []
     # LIVE bets always alert
@@ -5994,6 +6028,8 @@ def place_tip(tip: ParsedTip) -> list[BetResult]:
             log.info("Handicap SGM -> routing to manual (AUTO_MANUAL_HANDICAP_SGM)")
             tip.alert_reason = "Handicap SGM — auto-routed to manual (not auto-placed)"
             notifier.notify_manual_alert(tip)
+            return []
+        if _no_price_sgm_to_manual(tip):
             return []
         # MLB HRRBI: per-account placement (SGM on SGM-capable accounts + the
         # 2+ single on single-only accounts, shared intended, leftover->manual).
@@ -6207,12 +6243,15 @@ def _bulk_price_check_player(
     if not session_ids:
         return None
 
+    # v6.267: the bridge's player filter takes exact spellings only (Alex Sarr finds nothing where Sportmarket has
+    # Alexandre Sarr), so a read that includes a bridge session carries no filter and tipbot matches the name itself
+    _filter = None if any(hb_router.is_bridge_session(sid) for sid in session_ids) else first_leg.player
     try:
         result = hb.price_check_multi_session(
             session_ids=session_ids,
             sport=tip.sport,
             event=tip.event,
-            player=first_leg.player,
+            player=_filter,
         )
     except Exception as e:
         log.warning(f"Bulk price check failed: {e}")
@@ -6247,14 +6286,16 @@ def _odds_by_bookie_from_bulk(
 
     odds_by_bookie: dict[str, float] = {}
     direction_lower = direction.lower()
-    player_lower = player.lower()
+    # v6.267: the row's player must be this player's name as a whole (accents, case, dots, apostrophes and spacing
+    # aside; a suffix on one side only still matches, a Jr never a Sr), not a name that merely contains it ("kevin love"
+    # was found inside "kevin loveland", "brian thomas" inside "brian thomasson")
 
     for sel in bulk_response.get("selections", []):
         sel_player = (sel.get("player") or "").lower()
         sel_line_raw = sel.get("line")
         sel_name = (sel.get("selection") or "").lower()
 
-        if player_lower not in sel_player:
+        if player_names.match([sel_player], player).kind != "exact":
             continue
         try:
             sel_line = float(sel_line_raw) if sel_line_raw is not None else None
@@ -6594,7 +6635,15 @@ def _try_auto_alt_lines(
     Stops at the first alt line that fills (partially or fully).
     """
     tipped_odds = tip.suggested_odds
+    if getattr(tip, "_shook_exact_line", False):
+        # v6.249 (Wilson 6 Nov: his tipped line after a better main line fell under the minimum, "dont bet the alt
+        # lines if no need to"): that row or no Tarken bet; the ±1 walk must not pick another line
+        log.info("Auto alt skipped: Shook's tipped line only (the better main line was under his minimum)")
+        return []
     candidates = _compute_alt_line_candidates(tip)
+    if getattr(tip, "_shook_orig_line", None) is not None:
+        # v6.247 Rule A: an auto +-1 line is built around the current line; none may pass Shook's original limit
+        candidates = [c for c in (candidates or []) if not _shook_orig_refusal(tip, c)]
     if not candidates:
         return []
     if not tipped_odds or tipped_odds <= 1.0:
@@ -7277,6 +7326,7 @@ def _place_with_spillover(tip: ParsedTip, sessions: list[dict]) -> list[BetResul
         # L25: save original leg values before the alt-chain loop mutates them.
         # After the loop exits the leg would otherwise hold the last alt's values.
         _orig_leg = copy.copy(alt_leg)
+        _alt_price_tok = _shook_alt_price_off(tip)       # v6.249: the main bet's price is not the alt's
 
         for alt_idx, alt in enumerate(alt_chain, 1):
             if remaining_for_alts <= STAKE_FLOOR:
@@ -7337,6 +7387,7 @@ def _place_with_spillover(tip: ParsedTip, sessions: list[dict]) -> list[BetResul
 
         # L25: restore original leg values after all alts have been tried.
         tip.legs[0].__dict__.update(_orig_leg.__dict__)
+        _shook_alt_price_back(tip, _alt_price_tok)       # v6.249
 
     # ── Automatic ±1 alt-line retry (player props only) ────────────
     # Skip when an ambiguous outcome occurred — the ±1 line is close to the
@@ -8128,6 +8179,9 @@ def _sm_kickoff_refusal(tip, resolved) -> str:
     than the NBA model's own (which has _nba_sched_close). Start unknown = no refusal (logged once per
     game); SPORTMARKET_KICKOFF_CHECK_ENABLED false = never."""
     import config as _c
+    _tip_why = _shook_tipoff_refusal(tip)
+    if _tip_why:
+        return _tip_why            # v6.247: a deferred Shook tip's own stored tip-off (the 90 s rule below stays)
     if not bool(getattr(_c, "SPORTMARKET_KICKOFF_CHECK_ENABLED", True)):
         return ""
     if getattr(tip, "tipster", "") == NBA_MODEL_TIPSTER or (tip.sport or "").lower() not in _SM_KICKOFF_SPORTS:
@@ -8201,6 +8255,8 @@ def _gap_skippable(tip, job, label: str = "") -> bool:
     v6.232: a Sportsbet job of a tip stopped by the re-line guard has nothing left to send either."""
     if _sb_reline_stopped(tip) and _sb_reline_is_sb(job):
         return True
+    if _no_price_refused_job(tip, job, label):
+        return True                  # v6.266 review: refused locally for the no-price minimum, nothing sent
     try:
         if not isinstance(job, (tuple, list)) or len(job) < 3:
             return False
@@ -8217,6 +8273,42 @@ def _gap_skippable(tip, job, label: str = "") -> bool:
     except Exception:
         return False
     return False
+
+
+def _no_price_row_refusal(tip, resolved):
+    """v6.266 review: (live_odds, minimum) when the send backstop would refuse this MAIN row for its price (a tip with no
+    price of its own, a row read under the no-price minimum), else None. A twin or milestone row (_twin_job) is never
+    refused (it keeps its own 5c rule), and a live price of 0 or none is no read: the target_odds sent still holds the
+    minimum, so that bet is safe to send. The one test the backstop and the stagger skip share. Never raises."""
+    try:
+        if not isinstance(resolved, dict) or resolved.get("_twin_job"):
+            return None
+        npm = _no_price_min_odds(tip)
+        if not npm:
+            return None
+        lv = float(resolved.get("live_odds") or 0)
+        if math.isfinite(lv) and 0 < lv < npm - 1e-9:
+            return (lv, npm)
+    except Exception:
+        return None
+    return None
+
+
+def _no_price_refused_job(tip, job, label: str = "") -> bool:
+    """v6.266 review (Wilson 7 Nov 2026 fix round): no stagger before an account whose main row the send refuses locally
+    for the no-price minimum: no request goes out, and the 20-30 s gap would only delay the accounts that can bet. Unlike
+    _gap_skippable's closed line, no twin follows this refusal, so it holds with a twin configured too."""
+    try:
+        if not isinstance(job, (tuple, list)) or len(job) < 3:
+            return False
+        if _no_price_row_refusal(tip, job[2]) is None:
+            return False
+        if label:
+            _sid = job[0].get("session_id", "") if isinstance(job[0], dict) else ""
+            log.info(f"{label}: no stagger before {_sid}, its row is under the no-price minimum (refused locally)")
+        return True
+    except Exception:
+        return False
 
 
 def _run_staggered(tip, jobs: list, run_one, label: str, make_error=None) -> list:
@@ -8378,6 +8470,12 @@ def _sb_twin_job(job, rest, main_r=None, resolved=None, main_ref=False):
         # review: a price that is missing or not a real price refuses the twin (never sized blind)
         if not (math.isfinite(_mo) and _mo > 1.0 and math.isfinite(_to) and _to > 1.0):
             return None
+        _smin = float(_r.get("_shook_min") or 0.0)
+        if _smin and not _to >= _smin - 1e-9:
+            # v6.249 review: a Shook twin under his minimum is never sent (the resolver dropped it; this holds the
+            # held and chained jobs to it as well)
+            log.info(f"Shook twin: {_twin_label(_tw)} @ {_to:g} under his {_smin:g} minimum: not sent")
+            return None
         if _to > _mo:
             rest = math.floor(float(rest) * (_mo - 1.0) / (_to - 1.0) * 100.0) / 100.0
     except (TypeError, ValueError, ZeroDivisionError, KeyError):
@@ -8388,7 +8486,8 @@ def _sb_twin_job(job, rest, main_r=None, resolved=None, main_ref=False):
     # row rides on the twin, and every bet already on this account is left out of its reconcile.
     _partner = _tw.get("kind") == "partner"
     _rt = dict(_r, market=_tw["market"], selection=_tw["selection"], line=_tw["line"],
-               proposition_id=_tw["proposition_id"], live_odds=_tw["odds"], target_odds=_tw["odds"],
+               proposition_id=_tw["proposition_id"], live_odds=_tw["odds"],
+               target_odds=max(float(_tw["odds"]), float(_r.get("_shook_min") or 0.0)),   # v6.249 review: never under his minimum
                send_target_odds=None,   # v6.152: the twin keeps asking for its own price
                twin=_tw.get("next"), stat=(_r.get("stat") if _partner else None),
                _is_twin=not _partner, _twin_job=True, _twin_kind=_twin_label(_tw),
@@ -8680,7 +8779,9 @@ def _sb_limit_row(tip, sid, resolved, cached_only=False):
     else:
         used = sb_limits.used_to_win(sid, tip.event, resolved.get("market"),
                                      resolved.get("player") or (tip.legs[0].player if tip.legs else ""),
-                                     resolved.get("line"), kind)
+                                     resolved.get("line"), kind,
+                                     # v6.267: the ledger keeps the tip's spelling of a player the catalog spells another way
+                                     also_names=((tip.legs[0].player,) if tip.legs and len(tip.legs) == 1 else ()))
     return kind, odds, mins, used, _tmk
 
 
@@ -8872,7 +8973,10 @@ def _run_max_first(tip, jobs: list, sid_of, resize, run_one, intended: float, la
             continue
         # v6.174 refutation round: with a milestone twin configured, a closed main row is followed
         # by the twin, a REAL send, so the gap stays; the skip is only for a row with nothing after it
-        if sent and _stagger_on() and not (twin is None and _gap_skippable(tip, job, label)):
+        # v6.266 review: a main row the send refuses for the no-price minimum costs no request and no twin follows it, so
+        # it has no gap even with a twin configured, and it does not make the next account wait (nothing was sent)
+        _np_local = _no_price_refused_job(tip, job, label)
+        if sent and _stagger_on() and not _np_local and not (twin is None and _gap_skippable(tip, job, label)):
             # v6.126 (Wilson: the limited accounts "with little to no delay, and then delay
             # betting/filling on these three new ones"): the long gap only before a new account;
             # v6.134 (Wilson 2026-10-28: "5-10 sec delay between the limited sb accounts too")
@@ -8888,7 +8992,8 @@ def _run_max_first(tip, jobs: list, sid_of, resize, run_one, intended: float, la
             time.sleep(gap)
         log.info(f"{label}: {'LIMITED' if _sb_limited(sid_of(job)) else 'new'} account "
                  f"{sid_of(job)} asked ${ask:.2f} of ${left:.2f} unfilled")
-        sent += 1
+        if not _np_local:
+            sent += 1
         try:
             r = run_one(sized)
         except Exception as e:
@@ -8978,6 +9083,10 @@ def _inside_start_window(tip, label: str) -> bool:
     start = _stagger_start_epoch(tip)
     if start is not None and time.time() >= start - _START_STOP_MARGIN_SEC:
         log.warning(f"{label}: not sent, it would go past the bets' close")
+        return True
+    if _shook_tipoff_refusal(tip):
+        # v6.247: a deferred Shook tip has no stagger start; its own stored tip-off is the stop
+        log.warning(f"{label}: not sent, {_shook_tipoff_refusal(tip)}")
         return True
     return False
 
@@ -10280,6 +10389,7 @@ def _fanout_place_account(tip, sess: dict, ladder: list, resolved: dict) -> BetR
                     and (_is_definitely_pre_placement(r.error or "") or _price_moved)
                     and "[line_closed]" not in (r.error or "")
                     and "[sb_estimate_skip]" not in (r.error or "")     # v6.211: deterministic local skip
+                    and not _is_no_price_min_refusal(r.error)           # v6.266 review: deterministic local refusal
                     and "422 client error" not in (r.error or "").lower()
                     and "event_wrong_fixture" not in (r.error or "")
                     # v6.154: the bridge's refusal is deterministic (it re-reads its own board);
@@ -10656,6 +10766,8 @@ def _place_dello_single(tip: ParsedTip) -> list[BetResult]:
     #    places on the AFL SGM priority (Daniel). Non-player-prop / non-standard-stat
     #    legs stay manual. A non-SGM multi stays manual. A single flows to step 2.
     if getattr(tip, "is_sgm", False):
+        if _no_price_sgm_to_manual(tip):
+            return []
         _sgm_legs = tip.legs or []
         _all_std_pp = len(_sgm_legs) >= 2 and all(
             (l.market or "").lower() == "player_prop"
@@ -11364,6 +11476,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                     f"${_max_total:.2f}"
                 )
                 intended_stake = round(_max_total, 2)
+                tip._sm_stake_capped = True       # v6.251: a cap shaped it, so Sportmarket's ask is not rounded up
 
     # v6.127 (Wilson 2026-10-27, the NFL rule of v6.124 for AusBets NBA): Sportsbet's catalog for
     # the game WAS read but has no usable row (no row for the player, or it refuses it on price) ->
@@ -11426,7 +11539,8 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
                              f"${_a_left:.2f} capped to ${_max_total:.2f}")
                     _a_left = round(_max_total, 2)
                     intended_stake = _a_left
-        for _name in _ext_order(_aq):
+                    tip._sm_stake_capped = True   # v6.251: as above, the cap wins over the rounding
+        for _name in _shortfall_order(_aq, tip, _sm_res, _a_cx, "AusBets NBA fan-out, Sportsbet no row"):
             if _a_left < AFL_FANOUT_MIN_STAKE:
                 break
             if _name == "sportmarket":
@@ -12409,7 +12523,7 @@ def _place_afl_fanout(tip: ParsedTip) -> list[BetResult]:
             _post_q["bet365"] = _ext_q.get("bet365")
         if _sm_can_post:
             _post_q["sportmarket"] = float(_sm_res.get("live_odds") or 0)
-        for _name in _ext_order(_post_q):
+        for _name in _shortfall_order(_post_q, tip, _sm_res, _b365_cx, "AusBets NBA fan-out"):
             if unfilled < AFL_FANOUT_MIN_STAKE:
                 break
             try:
@@ -12996,10 +13110,33 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
 
     # Pull sport-filtered active sessions, then apply v4 per-sport priority
     raw_sessions = _v4_get_active_sessions_unfiltered(tip)
-    if not raw_sessions:
-        log.warning("v4: no active sessions after sport filter")
+    # v6.247 (Wilson 5 Nov: "tarken, bet365 and sportmarket for nba"): a Shook NBA player-prop single takes the
+    # Sportmarket bridge session out BEFORE the Sportsbet-only priority filter below (which would drop it, it
+    # is in no NBA list). It is an external book like bet365, never one of the Sportsbet accounts in the loop.
+    # SHOOK_SPORTMARKET_ENABLED off, or any other tip: nothing here runs and the flow is exactly as before.
+    _shook_sm = _shook_sm_applies(tip, first_leg)
+    _sm_sess = None
+    _sb_down = False       # Tarken (every Sportsbet account in the NBA list) known down: the external books bet alone
+    _sb_down_st = "off"
+    if _shook_sm:
+        raw_sessions, _sm_sess = _sm_split_sessions(raw_sessions)
+        if not _sm_eligible(tip, first_leg, _sm_sess):
+            _sm_sess = None
+    if not raw_sessions and _shook_sm and (_sm_sess is not None or _shook_b365_possible(tip, first_leg)):
+        _sb_down_st = _sb_down_state(session_priority.get_priority_for(sport, is_sgm=False),
+                                       stalled_unknown=True)
+        if _sb_down_st == "down":
+            _sb_down = True
+            log.warning("v4 Shook: no active Sportsbet session (Tarken not active): "
+                        f"{_shook_down_books(tip, first_leg, _sm_sess)} may bet alone under the shortfall rules")
+    if not raw_sessions and not _sb_down:
+        _no_sess_err = "No active HyperBot sessions"
+        if _shook_sm and _sb_down_st in ("unknown", "up"):
+            _no_sess_err = ("The HyperBot session list could not be read, or the Sportsbet session is not "
+                            "answering (manual)")
+        log.warning(f"v4: no active sessions after sport filter ({_no_sess_err})")
         notifier.notify_bet_failed(BetResult(
-            success=False, tip=tip, error="No active HyperBot sessions",
+            success=False, tip=tip, error=_no_sess_err,
             timestamp=datetime.now(),
         ))
         return [BetResult(
@@ -13028,22 +13165,38 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
             timestamp=datetime.now(),
         )]
 
-    priority_sessions = session_priority.filter_and_order_sessions(
+    priority_sessions = ([] if _sb_down else session_priority.filter_and_order_sessions(
         raw_sessions, sport, is_sgm=False,
-    )
-    if not priority_sessions:
+    ))
+    if (not priority_sessions and not _sb_down and _shook_sm
+            and (_sm_sess is not None or _shook_b365_possible(tip, first_leg))):
+        # v6.247: sessions are up but none is in the NBA Sportsbet list: Tarken is down only when the session list
+        # was READ and shows none of the list active (v6.238's state); anything else is the old manual exit
+        _sb_down_st = _sb_down_state(configured_priority, stalled_unknown=True)
+        if _sb_down_st == "down":
+            _sb_down = True
+            log.warning("v4 Shook: no Sportsbet session in the NBA list is active (Tarken not active): "
+                        f"{_shook_down_books(tip, first_leg, _sm_sess)} may bet alone under the shortfall rules")
+    if not priority_sessions and not _sb_down:
         log.warning(
             f"v4: no priority sessions for {sport} singles — all candidates "
             f"unlisted. Routing to manual."
         )
+        _np_err = f"No priority sessions configured for {sport} singles"
+        _np_ret = "No priority sessions configured"
+        if _shook_sm and _sb_down_st in ("unknown", "up"):
+            # v6.247: the second state read found the list unreadable, or a Sportsbet session answering / stalled:
+            # not a config problem, and the same wording as the first read above
+            _np_err = _np_ret = ("The HyperBot session list could not be read, or the Sportsbet session is not "
+                                 "answering (manual)")
         notifier.notify_bet_failed(BetResult(
             success=False, tip=tip,
-            error=f"No priority sessions configured for {sport} singles",
+            error=_np_err,
             timestamp=datetime.now(),
         ))
         return [BetResult(
             success=False, tip=tip,
-            error="No priority sessions configured",
+            error=_np_ret,
             timestamp=datetime.now(),
         )]
 
@@ -13065,7 +13218,32 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                    and len(tip.legs or []) == 1 and first_leg is not None
                    and (first_leg.player or "").strip()
                    and ((first_leg.selection or "").strip().lower().split() or [""])[-1] == "over")
-    if _shook_b365:
+    _sm_res = None            # v6.247: Sportmarket's resolved row for a Shook NBA tip
+    _sm_pre: list = []
+    _ext_maybe = False        # v6.247: any external book answered "maybe placed": no other external book is asked
+
+    def _v4_book_ext(out, bookie, why) -> bool:
+        """v6.247: book one external book's BetResults (bet365 / Sportmarket) like the Sportsbet loop does:
+        a fill comes off remaining_stake, a maybe-placed answer is debited in full and recorded in
+        ambiguous_outcomes (alert, no alt / retry on it). True when any answer was maybe placed."""
+        nonlocal remaining_stake
+        maybe = False
+        _asked = float(remaining_stake or 0)       # the full amount asked in this step: the fail-closed debit
+        for _r in out or []:
+            results.append(_r)
+            if _r.success:
+                remaining_stake -= float(_r.stake or 0)
+            elif _is_ambiguous_result(_r):
+                # a maybe with no stake of its own is debited for the whole ask (never 0), as AusBets'
+                # _at_risk_stake falls back to the top rung
+                _amb = float(_r.stake or getattr(_r, "_requested_stake", 0) or _asked)
+                ambiguous_outcomes.append(_v4_maybe_outcome(bookie, _r.session_id, _amb, _r, why))
+                remaining_stake -= _amb
+                maybe = True
+        remaining_stake = round(max(0.0, remaining_stake), 2)
+        return maybe
+
+    if _shook_b365 and not _shook_sm:
         _b365_sb = None
         try:
             _bulk0 = _bulk_price_check_player(tip, priority_sessions)
@@ -13080,12 +13258,13 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
         if _b365_cx and _sb_on_line:
             _b365_pre = _b365_attempt(tip, _b365_cx, remaining_stake, mode="better",
                                       sb_price=_b365_sb, label="Shook NBA v4")
+            _ask0 = float(remaining_stake or 0)
             for _r in _b365_pre:
                 results.append(_r)
                 if _r.success:
                     remaining_stake -= float(_r.stake or 0)
                 elif _is_ambiguous_result(_r):
-                    _amb = float(_r.stake or getattr(_r, "_requested_stake", 0) or 0)
+                    _amb = float(_r.stake or getattr(_r, "_requested_stake", 0) or _ask0)
                     ambiguous_outcomes.append(_v4_maybe_outcome(
                         "bet365", _r.session_id, _amb, _r, "bet365 maybe placed"))
                     remaining_stake -= _amb
@@ -13106,6 +13285,102 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                 else:
                     log.info(f"v4 bet365 holds the bet; Sportsbet takes the ${remaining_stake:.2f} "
                              f"left (no tipster price: the usual Shook rules)")
+    elif _shook_sm and (_sm_sess is not None or _shook_b365):
+        # v6.247 (Wilson 5 Nov): Sportmarket and bet365 are each asked first when EQUAL or BETTER than Sportsbet
+        # (Tarken) on the same line (v6.226), best price first, each up to its cap; Tarken gets the rest; the
+        # unfilled remainder goes to them under the shortfall rules after it (below the loop). With Tarken known
+        # down there is no better step, only the shortfall. A maybe-placed answer stops the other external book.
+        _no_own_price = not _tip_has_own_price(tip)
+        _tl_cmp = _sm_tipped_line(tip, first_leg)
+        _sb_cmp_price = None
+        if not _sb_down and priority_sessions:
+            # Sportsbet's price on the tipped line, from the shared resolver the fan-outs use (Tarken's own row);
+            # a row on another line is no comparison (the better step needs the same line on both books)
+            try:
+                _tk_sess = next((x for x in priority_sessions
+                                 if "sportsbet" in str(x.get("bookie", "")).lower()), priority_sessions[0])
+                _tk_row, _tk_man = _resolve_single_for_placement(
+                    tip, _tk_sess, apply_ceiling=True, apply_floor=False, exact_only=_no_own_price)
+                if (_tk_row is not None and float(_tk_row.get("live_odds") or 0) > 1.0
+                        and _tl_cmp is not None and float(_tk_row.get("line")) == _tl_cmp):
+                    _sb_cmp_price = float(_tk_row["live_odds"])
+                else:
+                    log.info("v4 Shook: no Sportsbet price on the tipped line to compare the external books with")
+            except Exception as _e1:
+                log.info(f"v4 Shook: Sportsbet price for the comparison unavailable ({_e1})")
+            if _sb_cmp_price is None and _shook_b365:
+                try:
+                    _bulk0 = _bulk_price_check_player(tip, priority_sessions)
+                    if _bulk0:
+                        _sb_cmp_price = _odds_by_bookie_from_bulk(
+                            _bulk0, priority_sessions, player=first_leg.player, line=first_leg.line,
+                            direction=first_leg.selection or "").get("sportsbet")
+                except Exception as _e0:
+                    log.info(f"v4 bet365: Sportsbet price for the comparison unavailable ({_e0})")
+        _sb_on_line = bool(_sb_cmp_price) and not getattr(tip, "_is_threshold", False)
+        if _sm_sess is not None:
+            # v6.248: with no tipster price the bridge may answer a line one away when the tipped line has no row
+            # there (shook_near); such a row is marked "_shook_near" and is for the shortfall step only
+            _sm_res, _sm_why = _sm_resolve(tip, _sm_sess, _no_own_price,
+                                           shook_near=_shook_near_lines_ok(tip, first_leg))
+            if _sm_res is None:
+                log.info(f"v4 Shook: Sportmarket not used: {_sm_why}")
+            else:
+                _sm_near = bool(_sm_res.get("_shook_near"))
+                # the better step compares like lines only: a near row has no Sportsbet price to be compared with
+                _sm_res["sb_line"] = _tl_cmp if (_sb_on_line and not _sm_near) else None
+                _sm_res["game_line"] = None
+                if _sm_near:
+                    log.info(f"v4 Shook: Sportmarket has no row on the tipped line {_tl_cmp}; it quotes "
+                             f"{_sm_res.get('live_odds')} on line {_sm_res.get('line')} (shortfall step only)")
+                else:
+                    log.info(f"v4 Shook: Sportmarket quotes {_sm_res.get('live_odds')} on line "
+                             f"{_sm_res.get('line')} (Sportsbet {_sb_cmp_price})")
+        if _shook_b365:
+            _b365_cx = _shook_b365_ctx(tip, first_leg, _sb_on_line)
+        _ext_q: dict = {}
+        if _sb_on_line and not _sb_down:
+            if _b365_cx:
+                _ext_q["bet365"] = _ext_quote_b365(tip, _b365_cx)
+            if _sm_res is not None and not _sm_res.get("_shook_near"):     # v6.248: a near row is no better-step quote
+                _ext_q["sportmarket"] = float(_sm_res.get("live_odds") or 0)
+        for _name in _ext_order(_ext_q):
+            if remaining_stake < max(1.0, AFL_FANOUT_MIN_STAKE):
+                break
+            if _name == "bet365":
+                _o = _b365_attempt(tip, _b365_cx, remaining_stake, mode="better",
+                                   sb_price=_sb_cmp_price, label="Shook NBA v4")
+                _b365_pre = _o
+            else:
+                if _inside_start_window(tip, "Shook NBA v4 Sportmarket better step"):
+                    break
+                _o = _sm_better_step(tip, _sm_sess, _sm_res, remaining_stake,
+                                     sb_price=_sb_cmp_price, label="Shook NBA v4")
+                _sm_pre = _o
+            if _v4_book_ext(_o, "bet365" if _name == "bet365" else _sm_bookie(),
+                            f"{_name} maybe placed"):
+                _ext_maybe = True
+                log.warning(f"v4 Shook: {_name} answer unclear (maybe placed): no other external book is asked")
+                break
+        _held_by = [n for n, o in (("bet365", _b365_pre), ("Sportmarket", _sm_pre))
+                    if any(r.success or _is_ambiguous_result(r) for r in o)]
+        if _held_by:
+            try:
+                _own = float(tip.suggested_odds or 0)
+            except (TypeError, ValueError):
+                _own = 0.0
+            if _own > 1.0:
+                _ok, _why = _sb_after_b365_ok(tip, _sb_cmp_price, _tl_cmp, _tl_cmp)
+                if not _ok:
+                    _b365_skip_sb = True
+                    log.info(f"v4 {' and '.join(_held_by)} hold(s) the bet: Sportsbet not used ({_why}; "
+                             f"${remaining_stake:.2f} left goes to manual)")
+                else:
+                    log.info(f"v4 {' and '.join(_held_by)} hold(s) the bet; Sportsbet takes the "
+                             f"${remaining_stake:.2f} left")
+            else:
+                log.info(f"v4 {' and '.join(_held_by)} hold(s) the bet; Sportsbet takes the "
+                         f"${remaining_stake:.2f} left (no tipster price: the usual Shook rules)")
 
     # ── Outer loop: pick bookie, pick session, place, repeat ────────
     # Per-session set for line-move retry tracking. Using a set (keyed on sid)
@@ -13131,7 +13406,7 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
         if out["deferred"] is not None:
             _v4_deferred.append(out["deferred"])
 
-    while remaining_stake > 0 and not _b365_skip_sb:    # v6.188: unless bet365 holds and SB failed its gate
+    while remaining_stake > 0 and not _b365_skip_sb and not _sb_down:    # v6.188: unless bet365 holds and SB failed its gate; v6.247: or Tarken is down
         # Sessions still available (not used + bookie not blocklisted)
         unused = [
             s for s in priority_sessions
@@ -13211,9 +13486,13 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                     f"({chosen_bookie} session {chosen_session.get('session_id')})"
                 )
             else:
+                # v6.258 (Wilson 7 Nov 2026): this is a tip with no pre-read price, not a blind bet: the
+                # resolver reads the row's own price from the catalog at placement, and a no-price tip whose
+                # read gives nothing goes to manual there (NO_PRICE_NEEDS_CATALOG)
                 log.info(
-                    f"v4: price-check returned no data — placing blind on priority #1 unused "
-                    f"({chosen_bookie} session {chosen_session.get('session_id')})"
+                    f"v4: no pre-read price for this player prop, first unused session "
+                    f"({chosen_bookie} session {chosen_session.get('session_id')}); the catalog row's price "
+                    f"is read at placement"
                 )
 
         if not chosen_session:
@@ -13268,7 +13547,8 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                             _legd_j, _mkts_j,
                             full_game_only=((tip.sport or "").lower() in ("nba", "nbl")
                                             and _is_full_game_period(
-                                                getattr(first_leg, "period", ""))))
+                                                getattr(first_leg, "period", ""))),
+                            sport=tip.sport)
                     )
                     if _mj and _mj.get("odds") and float(_mj["odds"]) > 1.0:
                         live_odds = float(_mj["odds"])
@@ -13691,6 +13971,8 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                 # 30-retry churn on "giants +50.5hc" (2026-05-31).
                 and not getattr(tip, "_hc_catalog_consulted", False)
                 and sid not in _line_move_retried_sessions
+                # v6.249: Shook's tipped row after a better main line fell under his minimum: that line or nothing
+                and not getattr(tip, "_shook_exact_line", False)
             ):
                 original_line = tip.legs[0].line or 0
                 selection = tip.legs[0].selection or ""
@@ -13750,6 +14032,17 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
                 candidate_lines = (
                     moved_candidates + extracted_candidates + synthetic_candidates
                 )
+                if getattr(tip, "_shook_orig_line", None) is not None:
+                    # v6.247 Rule A: the candidates are built around the CURRENT line (already up to 1 worse than
+                    # Shook's original), so a retry must not drift past the original's limit
+                    _kept_c = []
+                    for _c_ln in candidate_lines:
+                        _why_c = _shook_orig_refusal(tip, _c_ln)
+                        if _why_c:
+                            log.info(f"v4 line-move retry: {_c_ln} skipped, {_why_c}")
+                        else:
+                            _kept_c.append(_c_ln)
+                    candidate_lines = _kept_c
 
                 if candidate_lines:
                     _line_move_retried_sessions.add(sid)
@@ -13948,27 +14241,94 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
     # v6.188 bet365 shortfall (Shook NBA OVERS): what Sportsbet left unfilled (placed and maybe
     # placed stake already out of remaining_stake) goes to bet365 up to its cap, unless bet365 already
     # holds (or refused at a stated max) a bet on this line, or Sportsbet was skipped by the gate.
-    if _b365_cx is None and (tip.tipster or "").lower() == "shook" and _b365_on(tip.tipster):
-        _b365_cx = _shook_b365_ctx(tip, first_leg, False)     # Sportsbet gave no comparable price
-    if (_b365_cx is not None and not _b365_skip_sb and _b365_post_allowed(_b365_pre)
-            and remaining_stake >= max(1.0, AFL_FANOUT_MIN_STAKE)
-            and not _inside_start_window(tip, "Shook NBA v4 bet365 shortfall")):
-        try:
-            _b365_post = _b365_attempt(tip, _b365_cx, remaining_stake, mode="shortfall",
-                                       label="Shook NBA v4")
-        except Exception as _b3e:                 # _b365_attempt never raises; belt and braces
-            log.error(f"v4 bet365 shortfall step crashed ({_b3e})")
-            _b365_post = []
-        for _r in _b365_post:
-            results.append(_r)
-            if _r.success:
-                remaining_stake -= float(_r.stake or 0)
-            elif _is_ambiguous_result(_r):
-                _amb = float(_r.stake or getattr(_r, "_requested_stake", 0) or 0)
-                ambiguous_outcomes.append(_v4_maybe_outcome(
-                    "bet365", _r.session_id, _amb, _r, "bet365 shortfall maybe placed"))
-                remaining_stake -= _amb
-        remaining_stake = round(max(0.0, remaining_stake), 2)
+    if _shook_sm:
+        # v6.247: the unfilled remainder goes to bet365 and Sportmarket under the existing shortfall rules (the
+        # tipped line or within 1, inside the shortfall price band; no tipster price = the exact line and the
+        # flat floor), best price first, each what the one before left. A book that already holds a bet on this
+        # line (placed, maybe placed, or a stake-size refusal) is not asked again; a maybe-placed answer from
+        # either stops the other; Sportsbet skipped by the after-gate leaves the rest to manual; with Tarken
+        # known down this is the whole bet. The rest goes to manual.
+        if _b365_cx is None and _shook_b365:
+            _b365_cx = _shook_b365_ctx(tip, first_leg, False)     # Sportsbet gave no comparable price
+        _post_q: dict = {}
+        if ((_sb_down or not _b365_skip_sb) and not _ext_maybe
+                and remaining_stake >= max(1.0, AFL_FANOUT_MIN_STAKE)):
+            if _b365_cx is not None and _b365_post_allowed(_b365_pre):
+                _post_q["bet365"] = _ext_quote_b365(tip, _b365_cx)
+            if _sm_res is not None and _sm_sess is not None and _sm_post_allowed(_sm_pre):
+                _post_q["sportmarket"] = float(_sm_res.get("live_odds") or 0)
+        for _name in _shortfall_order(_post_q, tip, _sm_res, _b365_cx, "Shook NBA v4"):
+            if remaining_stake < max(1.0, AFL_FANOUT_MIN_STAKE):
+                break
+            if _inside_start_window(tip, f"Shook NBA v4 {_name} shortfall"):
+                break
+            try:
+                if _name == "bet365":
+                    _o = _b365_attempt(tip, _b365_cx, remaining_stake, mode="shortfall", label="Shook NBA v4")
+                else:
+                    _o = _sm_attempt(tip, _sm_sess, _sm_res, remaining_stake, mode="shortfall",
+                                     label="Shook NBA v4")
+            except Exception as _b3e:                 # neither attempt raises; belt and braces
+                log.error(f"v4 {_name} shortfall step crashed ({_b3e})")
+                _o = []
+            if _v4_book_ext(_o, "bet365" if _name == "bet365" else _sm_bookie(),
+                            f"{_name} shortfall maybe placed"):
+                _ext_maybe = True
+                log.warning(f"v4 Shook: {_name} shortfall answer unclear (maybe placed): no other external "
+                            f"book is asked, the rest goes to manual")
+                break
+        if _sb_down:
+            # Tarken known down: nothing placed anywhere = manual with the v6.238 wording; a part fill carries the
+            # reason in the unfilled alert (the synthetic row is its "Last error")
+            _held_d = any(r.success or _is_ambiguous_result(r) for r in results)
+            _why_d = (f"Sportsbet not active (Tarken) and {_shook_down_books(tip, first_leg, _sm_sess)} "
+                      f"{'took only part of it' if _held_d else 'did not place it: nothing placed, manual'}")
+            if not _held_d:
+                log.warning(f"v4 Shook: {_why_d}")
+                notifier.notify_bet_failed(BetResult(success=False, tip=tip, error=_why_d,
+                                                     timestamp=datetime.now()))
+                # the early exit still leaves the same audit rows a failed tip gets below (the tip_outcome line
+                # and the tip_unfilled error-log row); the manual alert above is its alert
+                _log_jsonl(_audit_log_path(), {
+                    "type": "tip_outcome", "tipster": tip.tipster, "event": tip.event,
+                    "intended_stake": round(intended_stake, 2), "placed_stake": 0.0,
+                    "unfilled_stake": round(intended_stake, 2), "v4": True, "placements": [],
+                    "failures": [{"session_id": "", "bookie": _V4_NOT_SENT, "error": _why_d}],
+                })
+                _log_jsonl(ERROR_LOG, {
+                    "type": "tip_unfilled", "tipster": tip.tipster, "event": tip.event,
+                    "intended_stake": intended_stake, "placed_stake": 0.0,
+                    "unfilled_stake": round(intended_stake, 2), "last_error": _why_d,
+                    "message": tip.raw_message, "v4": True,
+                })
+                return [BetResult(success=False, tip=tip, error=_why_d, timestamp=datetime.now())]
+            if remaining_stake >= max(1.0, AFL_FANOUT_MIN_STAKE):
+                # a note for the unfilled alert's "Last error" and the audit, not a send: its bookie says so
+                results.append(BetResult(success=False, tip=tip, bookie=_V4_NOT_SENT, error=_why_d,
+                                         timestamp=datetime.now()))
+    else:
+        if _b365_cx is None and (tip.tipster or "").lower() == "shook" and _b365_on(tip.tipster):
+            _b365_cx = _shook_b365_ctx(tip, first_leg, False)     # Sportsbet gave no comparable price
+        if (_b365_cx is not None and not _b365_skip_sb and _b365_post_allowed(_b365_pre)
+                and remaining_stake >= max(1.0, AFL_FANOUT_MIN_STAKE)
+                and not _inside_start_window(tip, "Shook NBA v4 bet365 shortfall")):
+            try:
+                _b365_post = _b365_attempt(tip, _b365_cx, remaining_stake, mode="shortfall",
+                                           label="Shook NBA v4")
+            except Exception as _b3e:                 # _b365_attempt never raises; belt and braces
+                log.error(f"v4 bet365 shortfall step crashed ({_b3e})")
+                _b365_post = []
+            _ask0 = float(remaining_stake or 0)      # fail-closed debit when a maybe has no stake of its own
+            for _r in _b365_post:
+                results.append(_r)
+                if _r.success:
+                    remaining_stake -= float(_r.stake or 0)
+                elif _is_ambiguous_result(_r):
+                    _amb = float(_r.stake or getattr(_r, "_requested_stake", 0) or _ask0)
+                    ambiguous_outcomes.append(_v4_maybe_outcome(
+                        "bet365", _r.session_id, _amb, _r, "bet365 shortfall maybe placed"))
+                    remaining_stake -= _amb
+            remaining_stake = round(max(0.0, remaining_stake), 2)
 
     # ── Tipster-specified alt props (same as v3.10) ─────────────────
     total_placed_so_far = sum(r.stake or 0 for r in results if r.success)
@@ -14006,6 +14366,9 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
         # L25: save original leg values before the alt-chain loop mutates them.
         # After the loop exits the leg would otherwise hold the last alt's values.
         _orig_leg = copy.copy(alt_leg)
+        _alt_main_orig = ((tip._shook_orig_line, getattr(tip, "_shook_orig_side", ""))
+                          if getattr(tip, "_shook_orig_line", None) is not None else None)
+        _alt_price_tok = _shook_alt_price_off(tip)       # v6.249: the main bet's price is not the alt's
 
         _alt_stop = False
         for alt_idx, alt in enumerate(alt_chain, 1):
@@ -14020,6 +14383,20 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
             alt_leg.selection = alt.get("selection", alt_leg.selection)
             alt_leg.market = alt.get("market", alt_leg.market)
             tip._is_threshold = bool(alt.get("is_threshold", False))
+            if _alt_main_orig is not None:
+                # v6.247 Rule A for an alt: its own tipped line (_shook_filter_alts keeps it as orig_line when the
+                # board moved it) and its own side, not the main line's
+                try:
+                    _ao = alt.get("orig_line")
+                    if _ao is None:
+                        _ao = float(alt.get("line"))
+                        if tip._is_threshold and _ao.is_integer():
+                            _ao -= 0.5
+                    tip._shook_orig_line = float(_ao)
+                    tip._shook_orig_side = shook_defer.side_of(alt_leg.selection) or _alt_main_orig[1]
+                except (TypeError, ValueError):
+                    log.warning(f"v4 alt {alt_idx}: original line unreadable, skipped (Shook limit)")
+                    continue
 
             log.info(
                 f"v4 alt {alt_idx}/{len(alt_chain)}: stat={alt_leg.stat} "
@@ -14093,6 +14470,9 @@ def _place_singles_v4(tip: ParsedTip) -> list[BetResult]:
 
         # L25: restore original leg values after all alts have been tried.
         tip.legs[0].__dict__.update(_orig_leg.__dict__)
+        _shook_alt_price_back(tip, _alt_price_tok)       # v6.249
+        if _alt_main_orig is not None:
+            tip._shook_orig_line, tip._shook_orig_side = _alt_main_orig      # v6.247: the main line's limit again
 
     # ── Auto ±1 alt-line retry (only if nothing placed yet) ─────────
     # Guard: if any ambiguous outcome was detected during primary placement,
@@ -15072,8 +15452,68 @@ def _nfl_twin_row(markets: dict, main_key: str, player: str, line, direction: st
     return next(iter(uniq.values())) if len(uniq) == 1 else None
 
 
+def _catalog_spelling_ok(cat_name, player, sport="") -> bool:
+    """v6.267: the catalog's `cat_name` is this tip's player under the 1-hour check's rule (shook_defer.names_match) or
+    the shared first-name / alias rule (player_names, with the roster of the tip's `sport`): the POST then carries the
+    catalog's own spelling. No sport = no shortened first name (the alias table still counts)."""
+    if shook_defer.names_match(cat_name, player):
+        return True
+    return player_names.match([cat_name], player,
+                              roster=player_names.roster_keys(sport)).kind in ("alias", "first_name")
+
+
+def _catalog_names_all(markets) -> set:
+    """v6.267: every player name (lower case) any market of a price_check_sports catalog carries."""
+    out = set()
+    for mdata in (markets or {}).values():
+        sels = mdata.get("selections", []) if isinstance(mdata, dict) else (mdata if isinstance(mdata, list) else [])
+        for s in sels or []:
+            if isinstance(s, dict):
+                n = str(s.get("player") or "").strip().lower()
+                if n:
+                    out.add(n)
+    return out
+
+
+def _nba_catalog_player_l(markets: dict, market: str, player, sport: str = "", whole=None) -> str:
+    """v6.249: the lowercased spelling the catalog's `market` rows use for `player`, for _catalog_lookup /
+    _catalog_nearest (which compare lowercase names exactly). The tip's own spelling when a row carries it exactly
+    (the old rule, unchanged); else the ONE spelling that shook_defer.names_match (suffixes jr / sr / ii / iii / iv,
+    accents, punctuation and spacing dropped: the 1-hour check's rule; v6.249 review: a DIFFERENT suffix is no match,
+    "Hardaway Jr" never binds to "Hardaway Sr"). Two different catalog spellings that read the same are not told
+    apart: "" (no match), never a guess. "" also for an empty name. v6.267: when no catalog player of this market reads
+    as the tip's name, the shared rule (player_names) may take ONE other spelling (an alias, or a shortened first
+    name that needs the roster of `sport`), but never when the tipped name IS on the catalog (`whole`, default
+    `markets`) under another market: a player with his own rows is not borrowed from a namesake."""
+    own = str(player or "").strip().lower()
+    if not own:
+        return ""
+    mdata = (markets or {}).get(market)
+    sels = mdata.get("selections", []) if isinstance(mdata, dict) else (mdata if isinstance(mdata, list) else [])
+    names = {str(s.get("player") or "").lower() for s in sels or [] if isinstance(s, dict)}
+    names.discard("")
+    if own in names:
+        return own
+    if not shook_defer.name_key(player):
+        return own
+    hits = {n for n in names if shook_defer.names_match(n, player)}
+    if not hits and not any(shook_defer.names_match(n, player) for n in _catalog_names_all(whole or markets)):
+        # v6.267: the shared rule (player_names): the alias table, or ONE catalog player with the same surname and a
+        # shortened first name (Alex / Alexandre Sarr) for a rostered tip name; a Jr never binds to a Sr
+        _pm = player_names.match(names, player, roster=player_names.roster_keys(sport))
+        if _pm.kind in ("alias", "first_name"):
+            return _pm.name.lower()
+    if len(hits) == 1:
+        return next(iter(hits))
+    if len(hits) > 1:
+        log.warning(f"Catalog player {player!r} reads the same as {sorted(hits)} on {market}: not told apart, "
+                    f"no match")
+        return ""
+    return own
+
+
 def _match_nba_player_prop(leg_dict: dict, markets: dict, max_gap: float = 1.0,
-                           full_game_only: bool = False):
+                           full_game_only: bool = False, sport: str = ""):
     """Resolve an NBA/NBL player-prop leg against the live price_check_sports
     catalog: exact (player, direction, line) else the nearest carried line
     within max_gap. NBA O/U markets carry DIRECT lines (no AFL-style 'N+'
@@ -15101,11 +15541,25 @@ def _match_nba_player_prop(leg_dict: dict, markets: dict, max_gap: float = 1.0,
         return None
     # v6.128 review: a full-game NBA / NBL tip only sees full-game rows, O/U rows first
     view = _full_game_ou_first(markets, market) if full_game_only else markets
+    # v6.249 (Wilson 6 Nov, Jabari Smith Jr): the catalog's own spelling of the player under the same name rule the
+    # Shook 1-hour check uses (a suffix, accents and punctuation do not count); two catalog players that read the
+    # same are no match
+    player_l = _nba_catalog_player_l(view, market, leg_dict.get("player"), sport, whole=markets)
+    if not player_l:
+        return None
     hit = (_catalog_lookup(view, market, player_l, direction, tip_line)
            or _catalog_nearest(view, market, player_l, direction, tip_line, max_gap))
     # v6.183: the side this row was matched on. Its selection text can carry the line
     # ("Mitchell Robinson Over 13.5"), so the text alone does not say over / under.
     return dict(hit, direction=direction) if hit else None
+
+
+def _price_usable(p) -> bool:
+    """v6.258: a catalog price that is a real quote (a finite number over 1.0)."""
+    try:
+        return p is not None and math.isfinite(float(p)) and float(p) > 1.0
+    except (TypeError, ValueError):
+        return False
 
 
 def _tip_has_own_price(tip) -> bool:
@@ -15119,6 +15573,92 @@ def _tip_has_own_price(tip) -> bool:
         return so is not None and math.isfinite(float(so)) and float(so) > 1.0
     except (TypeError, ValueError):
         return False
+
+
+# v6.266 review: the sport values racing carries (an exact match on the lowercased value, spaces and hyphens as
+# underscores, never a substring): "racing" is what the racing tipsters and the placer use; the rest are the ledger's
+# spellings (horse_racing, greyhounds, harness) and the self-bet words that mean racing (horse, horses, gallops,
+# thoroughbred) plus the trots. Racing has its own price rules and is never held to the no-price minimum.
+_NO_PRICE_MIN_RACING = frozenset({
+    "racing", "horse_racing", "horse", "horses", "gallops", "thoroughbred", "thoroughbreds",
+    "greyhound", "greyhounds", "greyhound_racing", "harness", "harness_racing", "trot", "trots", "trotting", "pacing",
+})
+
+
+def _no_price_sgm_to_manual(tip) -> bool:
+    """v6.270 (Wilson 8 Nov 2026: "no price sgm go manual"): True when this same-game multi has no price of its own and
+    NO_PRICE_SGM_MANUAL is on; the alert has been sent and the caller returns with nothing placed. A failed check counts
+    as no price: the safe side is an alert, not an unpriced bet. A "/" line the parser had to re-merge has its price
+    cleared (_merge_slash_line_into_sgm), so it reads as no price here even if the post gave one."""
+    try:
+        import config as _c
+        if getattr(_c, "NO_PRICE_SGM_MANUAL", True) is False or _tip_has_own_price(tip):
+            return False
+    except Exception:
+        log.exception("no-price SGM check failed: treated as no price")
+    log.info(f"{tip.tipster}: SGM with no price read from the tip -> routing to manual (v6.270)")
+    _add_alert_reason(tip, "Same-game multi with no price read from the tip: place it yourself")
+    notifier.notify_manual_alert(tip)
+    return True
+
+
+def _no_price_min_odds(tip) -> float:
+    """v6.266 (Wilson 7 Nov 2026: "1.5 floor for default no price floor that gets sent to manual"): the lowest price a
+    sports bet may be struck at when the tipster gave NO price of his own (_tip_has_own_price false), NO_PRICE_MIN_ODDS
+    (1.50): a quote under it is not bet, and the target_odds sent is never under it. 1.50 itself passes and 1.49 cannot
+    fill (the target is the cent at or above the number, a fill must be at or above the target). This is only the
+    DEFAULT: Shook's 1.60 (strictly over), NFL's 1.6 and Eddie's 1.75 no-odds band stay as they are, whichever is
+    higher stands. 0.0 (nothing applies) for a tip with its own price, the NBA model (it carries its own prices and
+    floors), racing (the exact sport values in _NO_PRICE_MIN_RACING), or a setting at 1.0 or under. A setting that is
+    not a number cannot load (config.py raises at import, naming the setting); a non-finite one reads as the 1.50
+    default (fail closed). Never raises."""
+    try:
+        import config as _c
+        raw = getattr(_c, "NO_PRICE_MIN_ODDS", 1.50)
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            v = 1.50
+        if not math.isfinite(v):
+            v = 1.50
+        if v <= 1.0:
+            return 0.0
+        if getattr(tip, "tipster", "") == NBA_MODEL_TIPSTER:
+            return 0.0
+        sport = re.sub(r"[\s\-]+", "_", str(getattr(tip, "sport", "") or "").strip().lower())
+        if sport in _NO_PRICE_MIN_RACING:
+            return 0.0
+        if _tip_has_own_price(tip):
+            return 0.0
+        return v
+    except Exception:
+        return 0.0
+
+
+def _no_price_min_note(tip, price, npm) -> str:
+    """v6.266 review fix round (Wilson 7 Nov 2026): the plain reason a bet365 / Sportmarket row under the no-price minimum
+    was not used, to reach Wilson on every path. These refusals send nothing and return no BetResult, so nothing else
+    carries the reason: it is added to the tip's alert_reason (v6.259, the manual alert), kept on the tip for the unfilled
+    alerts (notifier shows it when no failed result says why), and logged with "-> manual" so _with_manual_reason hands it
+    to the NFL manual alert. Never raises. Returns the sentence."""
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        p = float("nan")
+    row = f"the row is ${p:.2f}" if math.isfinite(p) else "the row has no usable price"
+    text = f"no tipster price and {row}, under the {float(npm):.2f} no-price minimum: place manually"
+    try:
+        _add_alert_reason(tip, text)
+        tip._no_price_min_note = text
+    except Exception:
+        pass
+    log.info(f"{text} -> manual")
+    return text
+
+
+def _no_price_min_target(npm: float) -> float:
+    """v6.266: the target_odds that holds a bet to `npm`: the cent at or above it (1.50 -> 1.50, 1.505 -> 1.51)."""
+    return math.ceil(float(npm) * 100 - 1e-6) / 100
 
 
 def _is_full_game_period(period) -> bool:
@@ -19132,7 +19672,7 @@ def _format_tip_placement_summary(tip) -> str:
 def _resolve_single_for_placement(
     tip: ParsedTip, session: dict, *,
     apply_ceiling: bool = True, apply_floor: bool = True, exact_only: bool = False,
-    fh_hb_price: "float | None" = None,
+    fh_hb_price: "float | None" = None, shook_near: bool = False,
 ) -> "tuple[dict | None, BetResult | None]":
     """Resolve a single leg to the exact catalog {market, line, selection,
     proposition_id, target_odds} the bookie carries, for one session.
@@ -19209,6 +19749,7 @@ def _resolve_single_for_placement(
     # (the AusBets fan-out may then try bet365 alone); never set on a price-check outage.
     _sb_catalog_read = False
     _sb_row_found = False
+    _shook_near_used = False   # v6.248: the row is a near line (Shook, no tipster price, bridge shortfall)
 
     # ── Target odds (10% below the relevant price, floored at 1.01) ─
     # Prefer the per-bookie alt-line odds if this is an auto-alt attempt;
@@ -19274,7 +19815,13 @@ def _resolve_single_for_placement(
                         f"(NBA_MODEL_MIN_ODDS; the model itself refuses below this)")
                     target_odds = _nb_floor
     else:
-        log.info("Target odds: omitted (price-change retry, accepting current market)")
+        # v6.249 review: a Shook retry keeps his minimum (10% under his median, or the 1.61 no-price floor): the live read
+        # can be missing or the price can move after it, and a fill with no floor would go under it
+        target_odds = _shook_price_minimum(tip) or None
+        if target_odds:
+            log.info(f"Target odds: {target_odds} (price-change retry, Shook keeps his minimum)")
+        else:
+            log.info("Target odds: omitted (price-change retry, accepting current market)")
 
     # ── AFL player-prop singles: catalog-driven market/line resolution ──
     # Sportsbet keys "N+ disposals" as the OVER half-line (N-0.5) in the
@@ -19478,6 +20025,11 @@ def _resolve_single_for_placement(
     # meant team handicap never got auto-adjusted and the bookie was
     # blocklisted. AFL player props are handled by the catalog block above,
     # so this within-1.0 path is NBA/NBL (and team markets) only.
+    # v6.258 (Wilson 7 Nov 2026: "a sports player-prop tip with no tipster price must never be sent to the book
+    # when the catalog read gave nothing: it goes to manual"): _pp_gap_ok / _pp_exc only word the reason (read
+    # failed, empty or crashed); the check after the block stops a no-price tip with no usable row price.
+    _pp_gap_ok = True
+    _pp_exc = None
     if (market.startswith("player_") and player and (tip.sport or "").lower() != "afl"
             and tip.tipster != NBA_MODEL_TIPSTER):
         try:
@@ -19485,6 +20037,8 @@ def _resolve_single_for_placement(
                 session_id=sid, sport=tip.sport, event=tip.event,
                 markets_filter=["player_props"],
             )
+            if not (price_resp.get("success") and price_resp.get("markets")):
+                _pp_gap_ok = False          # v6.258: failed or empty
             if price_resp.get("success"):
                 markets_data = price_resp.get("markets", {})
                 _sb_catalog_read = bool(markets_data)
@@ -19504,12 +20058,48 @@ def _resolve_single_for_placement(
                 # v6.133 (Wilson 2026-10-28: "if no price then only place at the line, if line not
                 # offered then manual bet"): no tipster price = the exact tipped line or manual
                 _tip_line0 = line
-                _no_price = bool(exact_only) or not _tip_has_own_price(tip)
+                _no_price = (bool(exact_only) or not _tip_has_own_price(tip)
+                             or bool(getattr(tip, "_shook_exact_line", False)))     # v6.249: Shook's tipped row only
+                if player and not _nba_catalog_player_l(markets_data, market, player, tip.sport):
+                    # v6.249: two different catalog players read as this name (Jabari Smith Jr. / Jabari Smith):
+                    # no match, never a guess, and never a blind POST by text either
+                    log.warning(f"{tip.tipster} {player} {market} line {line}: the name matches two players on "
+                                f"{bookie}:{sid}: manual")
+                    _amb_r = BetResult(
+                        success=False, tip=tip, session_id=sid, bookie=bookie,
+                        error=(f"{player} matches two different players in the catalog (the same name once "
+                               f"suffixes and punctuation are dropped): place manually"),
+                        timestamp=datetime.now(),
+                        placed_market=market, placed_player=player, placed_stat=stat,
+                        placed_line=line, placed_selection=selection,
+                        placed_leg_summary=_format_tip_placement_summary(tip),
+                    )
+                    _amb_r._sb_catalog_read = _sb_catalog_read
+                    return (None, _amb_r)
                 _nm = _match_nba_player_prop(
                     {"market": market, "selection": selection,
                      "player": player, "line": line},
                     markets_data, max_gap=(0.0 if _no_price else 1.0), full_game_only=_fg_only,
+                    sport=tip.sport,
                 )
+                _near_why = ""
+                if not _nm and shook_near and _no_price and _shook_near_lines_ok(tip, leg):
+                    # v6.248 (Wilson 5 Nov: "allow one worse on b365 and sportmarket aswell"): the tipped line has
+                    # NO row here (a row that exists is never skipped for a near one), so the lines one either side
+                    # are walked, the better one for us first, each inside Shook's original-line limit and above
+                    # the 1.60 floor. Only the bridge's shortfall asks for this (shook_near); Tarken never does.
+                    try:
+                        _nm, _near_why = _shook_near_row(tip, leg, player, market, selection, line, markets_data,
+                                                         _fg_only)
+                    except Exception as _ne:
+                        # a crash in the walk is not "no price": say so, once, and take no near row
+                        log.warning(f"Shook near line: the walk for {player} {market} line {line} on "
+                                    f"{bookie}:{sid} crashed ({type(_ne).__name__}: {_ne}): no near row")
+                        _nm, _near_why = None, f"the near-line check failed ({type(_ne).__name__}: {_ne})"
+                    if _nm:
+                        _shook_near_used = True
+                        log.info(f"Shook near line: {player} {market} line {line} has no row on {bookie}:{sid}; "
+                                 f"line {_nm['line']} is offered @ {_nm.get('odds')}")
                 if _nm:
                     if _nm["line"] != line or _nm["selection"] != selection:
                         log.info(
@@ -19519,6 +20109,12 @@ def _resolve_single_for_placement(
                         )
                     line = _nm["line"]
                     selection = _nm["selection"]
+                    _cat_player = _nm.get("player")
+                    if (_cat_player and _cat_player != player
+                            and _catalog_spelling_ok(_cat_player, player, tip.sport)):
+                        # v6.249: the POST carries the catalog's own spelling of the player
+                        log.info(f"NBA catalog player: {player!r} -> {_cat_player!r} on {bookie}:{sid}")
+                        player = _cat_player
                     _resolved_live_odds = _nm.get("odds")  # ceiling-checked below
                     _sb_row_found = True
                     # v6.128: send the exact row (HyperBot picked it by text, and the milestone
@@ -19589,12 +20185,38 @@ def _resolve_single_for_placement(
                         # v6.128 review: never a 1st-quarter / half / first-minutes row
                         selections = (_full_game_ou_first(markets_data, market).get(market)
                                       or {}).get("selections", [])
+                    # v6.249 (the v6.248 review's finding, Wilson 6 Nov): a tip with a SIDE takes a row of that side
+                    # that carries a proposition id, never the other side's price at the same line (an under with
+                    # only an over row on its line used to take the over's price and POST). A bare-name
+                    # (threshold) selection has no side and is matched exactly as before. A tip that falls out
+                    # here takes the "not offered" route below.
+                    _sel_l0 = str(selection or "").strip().lower()
+                    _leg_side = ("under" if (_sel_l0.endswith(" under") or _sel_l0 == "under")
+                                 else "over" if (_sel_l0.endswith(" over") or _sel_l0 == "over") else "")
+                    if _leg_side:
+                        _before = len(selections)
+                        selections = [s for s in selections
+                                      if (str(s.get("direction") or "").strip().lower()
+                                          or shook_defer.side_of(s.get("selection"))) == _leg_side
+                                      and s.get("proposition_id") is not None]
+                        if len(selections) != _before:
+                            log.info(f"Price check: {player} {market} {_leg_side} {line}: {_before - len(selections)} "
+                                     f"row(s) of the other side or without an id left out of the legacy match "
+                                     f"on {bookie}:{sid}")
+                    # v6.249: the same player-name rule as the main match (two same-reading players = no match)
+                    _lg_name = _nba_catalog_player_l({market: {"selections": selections}}, market, player, tip.sport,
+                                                     whole=markets_data)
                     matching = [s for s in selections
-                                if s.get("player", "").lower() == player.lower()
+                                if _lg_name and (s.get("player") or "").lower() == _lg_name
                                 and (line is None or abs(float(s.get("line", 0)) - float(line)) < 0.01)]
                     if matching:
                         _resolved_live_odds = matching[0].get("odds")  # ceiling-checked below
                         _sb_row_found = True
+                        _lg_cat = matching[0].get("player")
+                        if _lg_cat and _lg_cat != player and _catalog_spelling_ok(_lg_cat, player, tip.sport):
+                            # v6.249 review: the POST carries the catalog's own spelling (as the main match does)
+                            log.info(f"NBA catalog player: {player!r} -> {_lg_cat!r} on {bookie}:{sid}")
+                            player = _lg_cat
                     if not matching and line is not None and _no_price and markets_data:
                         # v6.133: no tipster price and the tipped line is not on the board:
                         # manual, never a nearby line
@@ -19602,8 +20224,15 @@ def _resolve_single_for_placement(
                                  f"{bookie}:{sid} and the tipster gave no price: manual")
                         _np_r = BetResult(
                             success=False, tip=tip, session_id=sid, bookie=bookie,
-                            error=(f"line {line} not offered and the tipster gave no price "
-                                   f"(exact line only): place manually"),
+                            error=(f"line {line} not offered (Shook's tipped line only, the main line having "
+                                   f"moved to a price under his minimum): place manually"
+                                   if getattr(tip, "_shook_exact_line", False) else
+                                   f"line {line} not offered and the tipster gave no price "
+                                   f"(exact line only): place manually"
+                                   if not (shook_near and _shook_near_lines_ok(tip, leg)) else
+                                   # v6.248: the lines one away were looked at too
+                                   f"line {line} not offered and the tipster gave no price, and no line one "
+                                   f"away is usable ({_near_why or 'none inside the limits'}): place manually"),
                             timestamp=datetime.now(),
                             placed_market=market, placed_player=player, placed_stat=stat,
                             placed_line=line, placed_selection=selection,
@@ -19613,7 +20242,7 @@ def _resolve_single_for_placement(
                         return (None, _np_r)
                     if not matching and line is not None:
                         # Find closest line for this player
-                        player_sels = [s for s in selections if s.get("player", "").lower() == player.lower()]
+                        player_sels = [s for s in selections if _lg_name and (s.get("player") or "").lower() == _lg_name]
                         if player_sels:
                             closest = min(player_sels, key=lambda s: abs(float(s.get("line", 0)) - float(line)))
                             avail_line = float(closest.get("line", 0))
@@ -19624,8 +20253,42 @@ def _resolve_single_for_placement(
                                 log.info(f"Auto-adjusting line {line} -> {avail_line}")
                                 line = avail_line
                                 _resolved_live_odds = closest.get("odds")  # ceiling-checked below
+                                _lg_cat = closest.get("player")
+                                if _lg_cat and _lg_cat != player and _catalog_spelling_ok(_lg_cat, player, tip.sport):
+                                    log.info(f"NBA catalog player: {player!r} -> {_lg_cat!r} on {bookie}:{sid}")
+                                    player = _lg_cat
         except Exception as e:
+            _pp_gap_ok = False
+            _pp_exc = e
             log.debug(f"Price check skipped: {e}")
+
+        # v6.258 (fix round): a tip with no tipster price (NOT Shook's priced
+        # exact-line mark, a tip with a price keeps today's behaviour) is never POSTed without a usable price from
+        # its own catalog row: it has no tipster price to hold the fill to, and a row with no price (or no row)
+        # goes out at the full stake with no target or ceiling. Whatever the read did (failed, empty, crashed, or a
+        # good read with no row or a row without a price): no usable price = manual. A bridge session (Sportmarket)
+        # keeps its own rule (_sm_resolve wants a live price); a priced tip and the racing no-odds rule are untouched.
+        if (_cfgv("NO_PRICE_NEEDS_CATALOG", True)
+                and not _tip_has_own_price(tip)
+                and not hb_router.is_bridge_session(sid)
+                and not _price_usable(_resolved_live_odds)):
+            _why_pp = (f"the price read crashed ({type(_pp_exc).__name__}: {_pp_exc})" if _pp_exc is not None
+                       else "the price read failed or was empty" if not _pp_gap_ok
+                       else "the catalog gave no row with a price for the tipped selection")
+            log.warning(f"{tip.tipster} {player} {market} line {line} on {bookie}:{sid}: the tipster gave no price "
+                        f"and {_why_pp}: manual, nothing sent")
+            _npc_r = BetResult(
+                success=False, tip=tip, session_id=sid, bookie=bookie,
+                error=(f"no price to bet to: the tipster gave no price and {_why_pp} "
+                       f"(no catalog row or price): place manually"),
+                timestamp=datetime.now(),
+                placed_market=market, placed_player=player, placed_stat=stat,
+                placed_line=line, placed_selection=selection,
+                placed_leg_summary=_format_tip_placement_summary(tip),
+            )
+            # not a "read, no row" result: the catalog was not read, so the bet365 fallback gets no verdict
+            _npc_r._sb_catalog_read = False
+            return (None, _npc_r)
 
     elif market in ("h2h", "head_to_head", "moneyline", "ml") and str(bookie or "").lower() in ("sportsbet", _sm_bookie()):
         # v6.172 (game lines to Sportmarket): a MONEYLINE is matched to the catalog row of its team
@@ -20071,6 +20734,60 @@ def _resolve_single_for_placement(
             except Exception as e:
                 log.debug(f"Total catalog match skipped: {e}")
 
+    # ── v6.249 (Wilson 6 Nov): a Shook NBA bet with NO price of his own (an alt, a post with no book-tagged
+    # price) is bet on Sportsbet only ABOVE _NFL_MIN_LIVE_ODDS_NO_COMPARISON (1.60: exactly 1.60 is refused, the same
+    # boundary as _nfl_odds_guard_refuses for the near rows), and the target_odds sent can never fill under it.
+    # Mikal Bridges went on at 1.56 with no floor on 5 Nov. A priced tip keeps its own 10% floor instead.
+    if apply_floor and _shook_no_price_floor_applies(tip, bookie):
+        _bad160, _why160 = (_nfl_odds_guard_refuses(tip.tipster, None, _resolved_live_odds)
+                            if _resolved_live_odds else (False, ""))     # no price read: the target_odds below guards
+        if _bad160:
+            log.warning(f"Shook no-price floor: {leg.player} {selection} {line} @ {_resolved_live_odds} on "
+                        f"{bookie}:{sid}: {_why160}; NOT placing, routing to manual")
+            return (None, BetResult(
+                success=False, tip=tip, session_id=sid, bookie=bookie,
+                error=f"price floor: {_why160} (Shook, no price of his own)",
+                timestamp=datetime.now(),
+                placed_market=market, placed_player=player, placed_stat=stat,
+                placed_line=line, placed_selection=selection,
+                placed_leg_summary=_format_tip_placement_summary(tip),
+            ))
+        _send160 = round(float(_NFL_MIN_LIVE_ODDS_NO_COMPARISON) + 0.01, 2)
+        if not target_odds or float(target_odds) < _send160:
+            log.info(f"Target odds: {target_odds} -> {_send160} (Shook, no price of his own: a fill at or under "
+                     f"{_NFL_MIN_LIVE_ODDS_NO_COMPARISON} is not bet)")
+            target_odds = _send160
+
+    # ── v6.266 (Wilson 7 Nov 2026: "1.5 floor for default no price floor that gets sent to manual"): any other sports
+    # bet with NO tipster price is not bet under NO_PRICE_MIN_ODDS (1.50), and the target_odds sent can never fill
+    # under it. Shook's 1.60 and NFL's 1.6 above are higher and stand (the max of the two applies). A priced tip,
+    # racing and the NBA model get 0.0 here and are untouched. The refusal is the resolve-time one (the caller that
+    # compares prices passes apply_floor=False and never sends from here); _execute_bet_inner, the bet365 and the
+    # Sportmarket attempts hold the same minimum again at the send.
+    _npm = _no_price_min_odds(tip)
+    if _npm:
+        try:
+            _lv266 = float(_resolved_live_odds) if _resolved_live_odds is not None else None
+        except (TypeError, ValueError):
+            _lv266 = None
+        if apply_floor and _lv266 is not None and math.isfinite(_lv266) and _lv266 < _npm - 1e-9:
+            log.warning(f"{tip.tipster} {leg.player or leg.team_full} {selection} {line} @ {_lv266:g} on "
+                        f"{bookie}:{sid}: no tipster price and the row is under the {_npm:g} no-price minimum; "
+                        f"NOT placing, routing to manual")
+            return (None, BetResult(
+                success=False, tip=tip, session_id=sid, bookie=bookie,
+                error=(f"no tipster price and the row is ${_lv266:.2f}, under the {_npm:.2f} no-price minimum: "
+                       f"place manually"),
+                timestamp=datetime.now(),
+                placed_market=market, placed_player=player, placed_stat=stat,
+                placed_line=line, placed_selection=selection,
+                placed_leg_summary=_format_tip_placement_summary(tip),
+            ))
+        _t266 = _no_price_min_target(_npm)
+        if not target_odds or float(target_odds) < _t266 - 1e-9:
+            log.info(f"Target odds: {target_odds} -> {_t266} (no tipster price: a fill under {_npm:g} is not bet)")
+            target_odds = _t266
+
     # ── Max-odds CEILING sanity check (all sports tipsters) ─────────
     # If the live (catalog/price-check) odds for the resolved selection are far
     # above the tipped odds (default >1.25×), it's almost always a WRONG
@@ -20156,6 +20873,29 @@ def _resolve_single_for_placement(
             placed_leg_summary=_format_tip_placement_summary(tip),
         ))
 
+    # v6.249 review (Wilson 6 Nov): a twin or partner row is sent at ITS OWN quote as target_odds, so no price floor
+    # applied to it (median 1.84, minimum 1.66: main 1.67 passed, a twin at 1.62 went). For a Shook NBA tip a row under
+    # his minimum is dropped here, and the minimum rides on the resolved row so _sb_twin_job holds every twin job
+    # (the held ones too) to it. Other tipsters' twins are unchanged.
+    # v6.266 (Wilson 7 Nov 2026): the no-price minimum is the MAIN row's only. A twin or milestone row keeps its own rule
+    # (within 5c of the main row, SB_MILESTONE_TWIN_MAX_ODDS_GAP), so a second row at 1.45 is allowed under a 1.50 main.
+    _shook_min = _shook_price_minimum(tip) if _twin_row is not None else 0.0
+    if _shook_min:
+        _dropped: list = []
+
+        def _twin_at_min(t):
+            try:
+                _tp = float(t["odds"])
+                ok = math.isfinite(_tp) and _tp >= _shook_min - 1e-9
+            except (TypeError, ValueError, KeyError):
+                ok = False
+            if not ok:
+                _dropped.append(f"{_twin_label(t)} @ {t.get('odds')}")
+            return ok
+        _twin_row = _twin_chain_keep(_twin_row, _twin_at_min)
+        if _dropped:
+            log.info(f"Shook twin: {'; '.join(_dropped)} dropped: under his {_shook_min:g} minimum on {bookie}:{sid}")
+
     # ── Resolution complete — hand back the catalog-matched fields ──
     # `live_odds` is the catalog price captured during resolution (None for
     # markets with no catalog odds, e.g. team h2h). The AFL fan-out sizes
@@ -20170,6 +20910,7 @@ def _resolve_single_for_placement(
             "raw_market_name": _resolved_raw,
             # v6.128: the same-line, same-odds milestone row (own Sportsbet limit), or None
             "twin": _twin_row,
+            **({"_shook_min": _shook_min} if (_shook_min and _twin_row is not None) else {}),   # v6.249 review
             # v6.08x: the name form that VERIFIABLY resolved to the real fixture.
             # `_price_check_afl_verified` works out which rendering reaches the men's
             # board and logs "using it", but until now that answer died here and the POST
@@ -20180,6 +20921,8 @@ def _resolve_single_for_placement(
             "sb_no_row": bool(_sb_catalog_read and not _sb_row_found),
             # v6.201: only the bridge's first-half rows carry a period (sent as period="first_half")
             **({"period": _fh_period} if _fh_period else {}),
+            # v6.248: this row is a near line (one away from the tipped one): the Sportmarket shortfall only
+            **({"_shook_near": True} if _shook_near_used else {}),
         },
         None,
     )
@@ -20305,6 +21048,38 @@ _GAME_LINE_CAP_MARKETS = frozenset({"h2h", "line", "spread", "total", "total_poi
 _GUARD_TLS = threading.local()   # v6.70: per-thread "skip the v6.57 fixture guard" for model bets
 
 
+def _keep_tip_player_name(r, tip) -> None:
+    """v6.267 (Wilson 7 Nov 2026): the POST carries the BOOK's spelling of a player (bet365 / Sportmarket "Alexandre
+    Sarr", Sportsbet "Kenneth Gainwell"), but the ledger, the alerts, the Bet Record, the resend keys and the resulter
+    (which looks the name up in the box score) must keep the TIP's name ("Alex Sarr"). So a single-leg result whose
+    placed_player is another spelling of the tip's player (the shared rule in player_names: an alias or a shortened
+    first name; not the same name) gets the tip's name back, and the book's name inside placed_selection is replaced
+    by it. A same name spelled another way (accents, dots, a Jr on one side) keeps the book's spelling as before, a
+    selection that does not hold the book's name (a "To Record 25+" twin, a game line) stays as it is, and a Jr
+    against a Sr is never touched. Runs once per result, in the one wrapper every placement passes; it never raises."""
+    try:
+        if r is None or len(getattr(tip, "legs", None) or []) != 1 or getattr(tip, "is_sgm", False):
+            return
+        tp = str(tip.legs[0].player or "").strip()
+        pp = getattr(r, "placed_player", None)
+        if not tp or not isinstance(pp, str) or not pp.strip() or pp.strip() == tp:
+            return
+        if player_names.suffix_clash(pp, tp):
+            return
+        # only a spelling the shared rule accepts: any other name is a different player, and the ledger and alerts
+        # must show it, not hide a wrong-player bet under the tip's name
+        _roster = player_names.roster_keys(str(getattr(tip, "sport", "") or "").strip().lower())
+        if player_names.match([pp], tp, roster=_roster).kind not in ("alias", "first_name"):
+            return
+        sel = getattr(r, "placed_selection", None)
+        r.placed_player = tp
+        if isinstance(sel, str) and sel:
+            r.placed_selection = re.sub(rf"(?<![A-Za-z]){re.escape(pp.strip())}(?![A-Za-z])", lambda _m: tp, sel,
+                                        count=1, flags=re.I)
+    except Exception as e:
+        log.warning(f"player name: could not keep the tip's spelling on a result ({e})")
+
+
 def _execute_bet(
     tip: ParsedTip, session: dict, stake: float, presolved: dict | None = None,
 ) -> BetResult:
@@ -20322,7 +21097,8 @@ def _execute_bet(
         """The stake the Sportsbet ceiling SENT (None = no clamp) rides on the result, so the NBA
         model's capped mark never reads a clamp success as a Sportsbet 538; this run's own bet token
         rides on it too (round 3), so every later resolver of an ambiguous result (the reconcile, the
-        deferred verify) can settle or release it."""
+        deferred verify) can settle or release it. v6.267: the result also carries the TIP's player name."""
+        _keep_tip_player_name(r, tip)
         try:
             c = getattr(_GUARD_TLS, "sb_clamped_to", None)
             _GUARD_TLS.sb_clamped_to = None
@@ -20483,6 +21259,18 @@ def _execute_bet_inner(
     player = resolved["player"]
     stat = resolved["stat"]
     line = resolved["line"]
+    _shook_why = _shook_orig_refusal(tip, line)
+    if _shook_why:
+        # v6.247 Rule A (Wilson 5 Nov): Shook bets only a line the same as, better than, or at most
+        # SHOOK_DEFER_MAX_WORSE worse than his ORIGINAL one. The catalog's +-1 snap (and any retry) can land one
+        # further than the current line, so the line that would be POSTed is judged here, the last stop before
+        # any send. Nothing is sent ("line_closed" is a never-sent refusal).
+        log.warning(f"Shook original-line limit on {bookie}:{sid}: {_shook_why}; nothing sent")
+        return BetResult(success=False, tip=tip, session_id=sid, bookie=bookie,
+                         error=f"[line_closed] Shook original-line limit: {_shook_why}: refused locally, "
+                               f"no request sent",
+                         timestamp=datetime.now(), stake=stake, elapsed_sec=0.0,
+                         placed_leg_summary=_format_tip_placement_summary(tip))
     target_odds = resolved["target_odds"]
     # v6.152: an NFL/NBL fan-out sends HyperBot 90% of the tipped price as the floor
     # (resolved is only a dict here when the fan-out built it; other paths have no such key)
@@ -20530,6 +21318,37 @@ def _execute_bet_inner(
             if not (math.isfinite(_t5) and _t5 >= _v5f - 1e-9):
                 log.info(f"Target odds: {target_odds} -> {_v5f} (NBA v5: never under sm_floor)")
                 target_odds = _v5f
+    # v6.266 (Wilson 7 Nov 2026: 1.50 minimum for a tip with no tipster price): the backstop for every send through
+    # here (the Sportsbet fan-outs with a presolved row, a spill, a twin, a rebet, the price-change retry that sends
+    # no target, the bridge): a quote under the minimum is refused locally and the target_odds sent is never under
+    # it. The resolver already refused a row it read; a presolved row or one with no read reaches this check.
+    # A twin or milestone row (_twin_job) is exempt: its own rule is within 5c of the main row's price (Wilson 7 Nov).
+    # v6.266 review fix round: the refusal has its OWN tag, [no_price_minimum], not [line_closed]. A closed main row lets
+    # the account's twin / partner try (the old rule); a main refused for its price must not, or a twin at 1.45 went out
+    # under a refused 1.42 main. The tag is in the pre-placement list and out of _is_closed_or_skipped, so _run_max_first
+    # and the v4 chain build no twin, partner or chain row after it; the alert shows the sentence without the tag.
+    # A live price of 0 or none is NO READ, not a price under the minimum: it is not refused here (the resolver sends a
+    # live 0.0 to manual, a presolved row with no read reaches this check) and that is deliberate and safe, because the
+    # target_odds below is never under the minimum, so a fill under it cannot happen (HyperBot refuses under the target).
+    _npm = 0.0 if (isinstance(resolved, dict) and resolved.get("_twin_job")) else _no_price_min_odds(tip)
+    if _npm:
+        _np_ref = _no_price_row_refusal(tip, resolved)
+        if _np_ref is not None:
+            _lv266 = _np_ref[0]
+            log.warning(f"No-price minimum on {bookie}:{sid}: the row is {_lv266:g}, under {_npm:g}; nothing sent")
+            return BetResult(success=False, tip=tip, session_id=sid, bookie=bookie,
+                             error=(f"{_NO_PRICE_MIN_TAG} no tipster price and the row is ${_lv266:.2f}, under the "
+                                    f"{_npm:.2f} no-price minimum: place manually (refused locally, no request sent)"),
+                             timestamp=datetime.now(), stake=stake, elapsed_sec=0.0,
+                             placed_leg_summary=_format_tip_placement_summary(tip))
+        _t266 = _no_price_min_target(_npm)
+        try:
+            _cur266 = float(target_odds or 0)
+        except (TypeError, ValueError):
+            _cur266 = 0.0
+        if not (math.isfinite(_cur266) and _cur266 >= _t266 - 1e-9):
+            log.info(f"Target odds: {target_odds} -> {_t266} (no tipster price: never under {_npm:g})")
+            target_odds = _t266
     _resolved_prop_id = resolved["proposition_id"]
 
     # (v6.142 / v6.211: the Sportsbet stake ceiling is applied below, after the line-closed refusal)
@@ -20721,6 +21540,28 @@ def _execute_bet_inner(
     _direction = _dir if (HB_SEND_DIRECTION and _dir in ("over", "under")) else None
     _max_odds = _bookie_max_odds(tip.tipster, tip.suggested_odds, target_odds)
     _ev_kw = _sm_event_id_kw(sid, resolved)         # v6.224: the bridge board's event_id, bridge only
+    _tip_why = _shook_tipoff_refusal(tip)
+    if _tip_why:
+        # v6.247: a deferred Shook tip is never sent at or after its stored tip-off. This is the last stop before
+        # the POST (the pre-placement checks, the bet365 pause wait and a bridge step can all have run long
+        # since the deferred run's own check). Nothing is sent; the run's reservation is released as
+        # _guarded does for a failure before the POST; "[line_closed]" is the never-sent refusal and writes no
+        # closed-line mark.
+        log.warning(f"Shook tip-off stop on {bookie}:{sid}: {_tip_why}; nothing sent")
+        try:
+            _rr0 = getattr(_GUARD_TLS, "sb_run_res", None)
+            if _rr0:
+                import sb_limits as _sbl0
+                _sbl0.run_release(_rr0[0], _rr0[1])
+        except Exception as _e0:
+            log.warning(f"SB limits: release after the tip-off stop failed ({_e0})")
+        _GUARD_TLS.sb_run_res = None
+        _GUARD_TLS.sb_clamped_to = None
+        return BetResult(success=False, tip=tip, session_id=sid, bookie=bookie,
+                         error=f"[line_closed] Shook tip-off stop: {_tip_why}: refused locally, no request sent",
+                         timestamp=datetime.now(), stake=stake, elapsed_sec=0.0,
+                         placed_leg_summary=_format_tip_placement_summary(tip),
+                         placed_event=event_for_hb)
     _GUARD_TLS.sb_run_posted = True      # round 3: from here an exception may have left a bet on the book
     resp = hb.place_single_sports_bet(
         session_id=sid,
@@ -20753,7 +21594,8 @@ def _execute_bet_inner(
             and f"sel='{selection}'" in _err0
             and not resp.get("ambiguous")
             and _elapsed < STAKE_REJECT_LATENCY_THRESHOLD_SEC
-            and not _nba_past_close_now(tip, bookie)):       # v6.216: never past the close
+            and not _nba_past_close_now(tip, bookie)       # v6.216: never past the close
+            and not _shook_tipoff_refusal(tip)):           # v6.247: nor past a Shook tip's stored tip-off
         log.info(f"PLAYER-LESS RETRY: {bookie}:{sid} {selection!r} "
                  f"prop={_resolved_prop_id}: HB catalog row has player=None, retrying once without player")
         _afl_log_event(tip, f"PLAYERLESS-RETRY bookie={bookie} sid={sid} sel={selection!r}")
@@ -20794,7 +21636,8 @@ def _execute_bet_inner(
             and f"'{selection}'" in _avail
             and not resp.get("ambiguous")
             and _elapsed < STAKE_REJECT_LATENCY_THRESHOLD_SEC
-            and not _nba_past_close_now(tip, bookie)):       # v6.216: never past the close
+            and not _nba_past_close_now(tip, bookie)       # v6.216: never past the close
+            and not _shook_tipoff_refusal(tip)):           # v6.247: nor past a Shook tip's stored tip-off
         log.info(f"STAT-LESS RETRY: {bookie}:{sid} {selection!r} prop={_resolved_prop_id}: "
                  f"HB listed the selection but filtered it out on stat={stat!r}, retrying once without stat")
         _afl_log_event(tip, f"STATLESS-RETRY bookie={bookie} sid={sid} sel={selection!r}")
@@ -21007,6 +21850,10 @@ def _execute_bet_inner(
     if _mx_target is not None and _nba_past_close_now(tip, bookie):
         # v6.216 review: a fast 538 near the close must not rebet after it
         log.warning(f"MAX-STAKE REBET skipped: {bookie}:{sid} is past the NBA model bets' close")
+        _mx_target = None
+    if _mx_target is not None and _shook_tipoff_refusal(tip):
+        # v6.247: a fast 538 must not rebet at or after a deferred Shook tip's stored tip-off
+        log.warning(f"MAX-STAKE REBET skipped: {bookie}:{sid}: {_shook_tipoff_refusal(tip)}")
         _mx_target = None
     if _mx_target is not None and "sportsbet" in str(bookie or "").lower() and _sb_reline_stopped(tip):
         # v6.232: another account's fill tripped the re-line guard while this 538 was in flight: no
@@ -21466,6 +22313,72 @@ def _shook_should_process(text: str) -> bool:
     return True
 
 
+# v6.259 (Wilson 7 Nov 2026): Shook posts "Shook Play: 16.5 PR same unit alt..." (6 Nov 16:51, after the Jrue
+# Holiday over 12.5 Points post) and "10.5 points same unit alt..." (18:04, after Jaylen Wells over 1.5 3s) as
+# a SEPARATE message with no Over/Under or M/L token, so SHOOK_BET_RE never matched and the post fell out at
+# DEBUG with no alert. Wilson: a manual alert, not a bet. A message that fails the bet trigger, has a number
+# and the word alt / alternate, sends ONE alert with the full text and Shook's previous message (the player is
+# in that one). It never reaches a parser or a placement path. SHOOK_BET_RE is not widened: a post that DOES
+# match it (an "Over 10.5 ... alt") still goes to the parser as before.
+_SHOOK_ALT_RE = re.compile(r"\balt(?:ernate)?\b", re.IGNORECASE)
+_SHOOK_ALT_SEEN_TTL_SEC = 24 * 3600
+_SHOOK_ALT_NOID_TTL_SEC = 600       # no Telegram id to key on: the same words repeat for other players, so keep it short
+
+
+def _shook_alt_post(text: str) -> bool:
+    """True for a Shook message that fails the bet trigger, carries a number and the word alt / alternate, and
+    is not a recap or announcement (the preamble noise list). Pure: no state, no alert."""
+    try:
+        if not text or SHOOK_BET_RE.search(text):
+            return False
+        if not re.search(r"\d", text) or not _SHOOK_ALT_RE.search(text):
+            return False
+        low = text.lower()
+        return not any(n.lower() in low for n in SHOOK_NOISE_PREAMBLE)
+    except Exception:
+        return False
+
+
+def _shook_alt_alert(text: str, prev: str, msg_key: str = "") -> bool:
+    """Send the one manual alert for a Shook alt post (see _shook_alt_post). Resend guard (the new-tipster
+    rule): seen_bets keyed on the channel + Telegram message id (`msg_key`), so Telegram handing the same
+    message over again does not alert twice while the same words about another player (a new message) do.
+    The previous message cannot be part of the key: a redelivery sees a different one (the buffer already
+    holds the first copy). With no id the key is the text alone for a short window. Marked BEFORE the send
+    (atomic), released if the send fails so a redelivery can still alert. Never raises; nothing is parsed or
+    placed here."""
+    key = ""
+    try:
+        import hashlib
+        if msg_key:
+            key, ttl = "shook_alt|id|" + str(msg_key), _SHOOK_ALT_SEEN_TTL_SEC
+        else:
+            norm = re.sub(r"\s+", " ", text.strip().lower())
+            key, ttl = "shook_alt|txt|" + hashlib.sha1(norm.encode("utf-8", "replace")).hexdigest(), _SHOOK_ALT_NOID_TTL_SEC
+        first = seen_bets.check_and_mark(key, ttl, text[:80])
+        if first:
+            log.warning(f"Shook alt post RESENT, no second alert (first seen {seen_bets.age_text(first)} ago): "
+                        f"{text[:80]!r}")
+            return False
+        body = ("Shook posted an ALTERNATE line. The bot does not place alts: place it by hand if wanted.\n\n"
+                f"THIS MESSAGE:\n{text}\n\n"
+                f"HIS PREVIOUS MESSAGE (shown in case it names the player):\n{prev or '(none on file)'}")
+        ok = notifier.notify_text_manual_alert("shook", body, header="SHOOK ALT, MANUAL",
+                                               footer="An alt: not auto-placed. Place manually if wanted.")
+        if not ok:
+            seen_bets.unmark(key)
+            log.error(f"Shook alt alert was not delivered: {text[:80]!r}")
+        return bool(ok)
+    except Exception as e:
+        log.error(f"Shook alt alert failed ({type(e).__name__}: {e}): {text[:80]!r}")
+        try:
+            if key:
+                seen_bets.unmark(key)
+        except Exception:
+            pass
+        return False
+
+
 # ── v6.229: Shook NBA singles wait for the 1-hour check ──────────────
 # Wilson 3 Nov 2026: "for shook, record his tips and only bet on them when 1 hour from tip if the
 # line has not moved by more than 1 stat point (instead of betting 10 hours before game starts when
@@ -21509,6 +22422,272 @@ def _shook_defer_on() -> bool:
         return bool(getattr(_c, "SHOOK_DEFER_TO_1H_ENABLED", False))
     except Exception:
         return False
+
+
+# v6.247 (Wilson 5 Nov 2026: "for tomorrows nba ... we will utilise only tarken sb, uday b365 (if the milestones
+# is within 1 stat and is decent odds) and sportmarket for nba"; "shook is only betting 1 hour from tip if the lines
+# are the same or 1 worse or better"): a Shook NBA player-prop single gets the Sportmarket steps in
+# _place_singles_v4, every Shook bet on any book stays within SHOOK_DEFER_MAX_WORSE of his ORIGINAL line, and a
+# known-down Tarken no longer stops bet365 and Sportmarket from betting. All of it sits under
+# SHOOK_SPORTMARKET_ENABLED (the original-line limit applies whenever a deferred run set the attribute).
+
+def _shook_sm_applies(tip, leg) -> bool:
+    """SHOOK_SPORTMARKET_ENABLED and a Shook NBA single player-prop over / under (never an SGM, a live or
+    alert-only tip, or a game line) that went through the 1-hour check (tip._shook_orig_line is set). The
+    Sportmarket session itself is judged by _sm_eligible / _sm_on. v6.248: this is also the first condition of
+    _shook_near_lines_ok (a line one away on bet365 / Sportmarket when the tip has no tipster price)."""
+    try:
+        import config as _c
+        if not bool(getattr(_c, "SHOOK_SPORTMARKET_ENABLED", True)):
+            return False
+        if (tip.tipster or "").lower() != "shook" or (tip.sport or "").lower() != "nba":
+            return False
+        if tip.is_sgm or getattr(tip, "is_live", False) or getattr(tip, "alert_only", False):
+            return False
+        if len(tip.legs or []) != 1 or leg is None:
+            return False
+        if getattr(tip, "_shook_orig_line", None) is None:
+            # only a tip that went through the 1-hour check (the deferred run marked its ORIGINAL line) gets the
+            # new books and the Tarken-down route; a Shook single that fell past the deferral (an unmapped stat,
+            # deferral off) bets exactly as before v6.247
+            return False
+        return bool((leg.player or "").strip()) and bool(shook_defer.side_of(leg.selection))
+    except Exception:
+        return False
+
+
+def _shook_b365_possible(tip, leg) -> bool:
+    """bet365 may take this Shook tip at all: listed and on, and an over (Wilson: overs only)."""
+    try:
+        return (_b365_on(tip.tipster) and leg is not None
+                and ((leg.selection or "").strip().lower().split() or [""])[-1] == "over")
+    except Exception:
+        return False
+
+
+def _shook_down_books(tip, leg, sm_sess) -> str:
+    """The external books named in the log and the manual alert with Tarken down (v6.238's _sb_down_books)."""
+    out = []
+    if sm_sess is not None:
+        out.append("Sportmarket")
+    if _shook_b365_possible(tip, leg):
+        out.append("bet365")
+    return " and ".join(out) or "no external book"
+
+
+def _shook_orig_refusal(tip, line) -> str:
+    """v6.247 Rule A (Wilson 5 Nov: Shook only bets a line that is the same as, better than, or at most
+    SHOOK_DEFER_MAX_WORSE worse than his ORIGINAL tipped line). "" = this line may be bet, else why not. Only a
+    tip the deferred run marked (tip._shook_orig_line) is judged, so every other path is unchanged; a line that
+    cannot be read fails closed. An integer line on a threshold ('N+') tip is the over N - 0.5."""
+    orig = getattr(tip, "_shook_orig_line", None)
+    if orig is None:
+        return ""
+    side = getattr(tip, "_shook_orig_side", "") or shook_defer.side_of(
+        (tip.legs[0].selection if tip.legs else ""))
+    try:
+        ln = float(line)
+        if getattr(tip, "_is_threshold", False) and ln.is_integer():
+            ln -= 0.5
+    except (TypeError, ValueError):
+        return f"the line {line!r} cannot be read, so it cannot be held to Shook's original {orig:g}"
+    _mins, max_worse = _shook_defer_cfg()
+    ok, worse = shook_defer.line_verdict(side, orig, ln, max_worse)
+    if ok:
+        return ""
+    return (f"line {ln:g} is {worse:g} worse than Shook's original {float(orig):g} "
+            f"(limit {max_worse:g})")
+
+
+def _shook_alt_price_off(tip):
+    """v6.249: a Shook tipster alt (an over 9.5 "same units") has NO price of its own: only the main bet's median
+    is published. While the alt chain runs, the tip's price is taken off (suggested_odds 0 and no _tipster_odds, the
+    shape of a Shook tip with no price), so the alt gets the exact-line rule, the 1.60 minimum and no ceiling from
+    the main bet's price. Returns the token for _shook_alt_price_back (None = nothing was changed). Never raises."""
+    try:
+        if (tip.tipster or "").lower() != "shook" or (tip.sport or "").lower() != "nba":
+            return None          # v6.249 review: Shook NBA only, the tips _apply_shook_median_price prices
+        tok = (getattr(tip, "suggested_odds", 0.0), "_tipster_odds" in vars(tip), getattr(tip, "_tipster_odds", None))
+        if not (_tip_has_own_price(tip)):
+            return None
+        tip.suggested_odds = 0.0
+        if tok[1]:
+            del tip._tipster_odds
+        log.info(f"Shook alt: the main bet's price {tok[0]} is not the alt's: the alt has no price")
+        return tok
+    except Exception:
+        return None
+
+
+def _shook_alt_price_back(tip, tok) -> None:
+    """v6.249: put the main bet's price back after the alt chain (see _shook_alt_price_off)."""
+    if tok is None:
+        return
+    tip.suggested_odds = tok[0]
+    if tok[1]:
+        tip._tipster_odds = tok[2]
+
+
+def _shook_no_price_floor_applies(tip, bookie) -> bool:
+    """v6.249: the 1.60 minimum for a Shook NBA player-prop bet whose tipster price is missing (his alts, a post with
+    no book-tagged price), on a Sportsbet session. Not the Sportmarket bridge (its own checks in _sm_attempt_inner use
+    the same boundary) and not a priced tip (its 10% floor). Never raises."""
+    try:
+        if (tip.tipster or "").lower() != "shook" or (tip.sport or "").lower() != "nba":
+            return False
+        if str(bookie or "").lower() == _sm_bookie() or _tip_has_own_price(tip):
+            return False
+        leg = tip.legs[0] if tip.legs else None
+        return bool(leg is not None and (leg.player or "").strip() and not tip.is_sgm and len(tip.legs) == 1)
+    except Exception:
+        return False
+
+
+def _shook_price_minimum(tip) -> float:
+    """v6.249 review: the lowest price a Shook NBA single player-prop bet may be struck at on Sportsbet: 10% under his
+    median (_afl_target_odds, the figure placement sends as target_odds) when he gave a price, else the no-price floor
+    one cent over _NFL_MIN_LIVE_ODDS_NO_COMPARISON (1.61). 0.0 for every other tip (no minimum here). Never raises."""
+    try:
+        if (tip.tipster or "").lower() != "shook" or (tip.sport or "").lower() != "nba":
+            return 0.0
+        leg = tip.legs[0] if tip.legs else None
+        if not (leg is not None and (leg.player or "").strip() and not tip.is_sgm and len(tip.legs) == 1):
+            return 0.0
+        if _tip_has_own_price(tip):
+            return float(_afl_target_odds("nba", tip.suggested_odds) or 0.0)
+        return round(float(_NFL_MIN_LIVE_ODDS_NO_COMPARISON) + 0.01, 2)
+    except Exception:
+        return 0.0
+
+
+def _shook_near_lines_ok(tip, leg) -> bool:
+    """v6.248 (Wilson 5 Nov 2026: "allow one worse on b365 and sportmarket aswell"): a deferred Shook NBA single
+    player prop whose tipster gave NO price may take a line one away on bet365 and Sportmarket in the SHORTFALL
+    step, when the current line has no row on that book. Only that: _shook_sm_applies (deferred, switch on, a
+    single player prop), no tipster price of his own, and not a threshold ('N+') tip. A threshold tip stays
+    exact only while its line has not moved: once the board moves the deferred run clears tip._is_threshold
+    (leg.line = the board's line), and it is then a plain line under the same limits as any other. Tarken,
+    the better step, a priced tip and every other tipster are never touched. Never raises."""
+    try:
+        return bool(_shook_sm_applies(tip, leg) and not _tip_has_own_price(tip)
+                    and not getattr(tip, "_is_threshold", False))
+    except Exception:
+        return False
+
+
+def _shook_near_lines(tip, leg, tl) -> list:
+    """v6.248: the candidate lines for a near-line Shook bet, in the order to try them: the current tip line
+    `tl` +/- 1 (only when B365_SHORTFALL_MAX_LINE_DIFF allows a whole point), the side that is better for us
+    first (an over: the lower line; an under: the higher), then the worse side. The candidates are the CURRENT
+    line +/- 1, not the tipped one: after the board has moved better for us a bet can sit 2 from the tipped
+    line (a better line has no limit), and it is never more than SHOOK_DEFER_MAX_WORSE worse than the ORIGINAL
+    line (_shook_orig_refusal), so when the board has already moved 1 worse the 2-worse candidate is dropped
+    and only the other side is left. No wider search. The price floor (over 1.60: exactly 1.60 is refused) is
+    the caller's, per row. [] when the helper does not apply."""
+    try:
+        if not _shook_near_lines_ok(tip, leg):
+            return []
+        centre = float(tl)
+        if not math.isfinite(centre):
+            return []
+        maxd = float(_cfgv("B365_SHORTFALL_MAX_LINE_DIFF", 1.0) or 0)
+        steps = (-1.0, 1.0) if shook_defer.side_of(leg.selection) == "over" else (1.0, -1.0)
+        out = []
+        for d in steps:
+            if abs(d) > maxd + 1e-9:
+                continue
+            ln = centre + d
+            if ln <= 0 or _shook_orig_refusal(tip, ln):
+                continue
+            out.append(ln)
+        return out
+    except Exception:
+        return []
+
+
+def _shook_near_row(tip, leg, player, market, selection, line, markets_data, full_game_only):
+    """v6.248: the Sportmarket row of a near-line Shook bet: walk _shook_near_lines and, per line, ask the
+    catalog matcher for that line EXACTLY (max_gap 0, so _match_nba_player_prop's own nearest-row tie-break is
+    never used). The first row that is priced above the no-comparison floor (_nfl_odds_guard_refuses with no
+    tipster price) wins; a row under the floor falls through to the next candidate. Returns (row or None, why)."""
+    why = []
+    for ln in _shook_near_lines(tip, leg, line):
+        row = _match_nba_player_prop({"market": market, "selection": selection, "player": player, "line": ln},
+                                     markets_data, max_gap=0.0, full_game_only=full_game_only, sport=tip.sport)
+        if not row:
+            why.append(f"{ln:g}: no row")
+            continue
+        bad, w = _nfl_odds_guard_refuses(tip.tipster, None, row.get("odds"))
+        if bad:
+            why.append(f"{ln:g}: {w}")
+            continue
+        return row, ""
+    return None, "; ".join(why)
+
+
+_V4_NOT_SENT = "(not sent)"     # v6.247: the bookie label of a synthetic reason row that was never a send
+
+
+def _shook_sm_state_line() -> str:
+    """v6.247: the one startup line saying whether Shook NBA can reach Sportmarket. On / off words only: no .env
+    value and no bridge URL. Never raises."""
+    try:
+        _sw = bool(_cfgv("SHOOK_SPORTMARKET_ENABLED", True))
+        _sm_ok = bool(_sm_on("shook", "nba"))
+        _df = bool(_shook_defer_on())
+        return (f"Shook NBA to Sportmarket: switch {'ON' if _sw else 'OFF'}, "
+                f"shook/nba on the Sportmarket list and bridge {'ON' if _sm_ok else 'OFF'}, "
+                f"1-hour deferral {'ON' if _df else 'OFF'}: "
+                + ("Shook NBA can reach Sportmarket" if (_sw and _sm_ok and _df)
+                   else "Shook NBA can NOT reach Sportmarket"))
+    except Exception as e:
+        return f"Shook NBA to Sportmarket: state unreadable ({type(e).__name__}): can NOT be assumed"
+
+
+def _shook_tipoff_refusal(tip) -> str:
+    """v6.247: "" to go on, else why a send of a deferred Shook tip is refused: the tip-off the deferred run stored
+    (tip._shook_tipoff_ts) has come (`now >= tipoff`, the deferred run's own test, lead 0). Any other tip carries no
+    such attribute: "". An unreadable stored time fails closed. Checked immediately before each send."""
+    ts = getattr(tip, "_shook_tipoff_ts", None)
+    if ts is None:
+        return ""
+    try:
+        t = float(ts)
+        if not math.isfinite(t):
+            raise ValueError("not finite")
+    except (TypeError, ValueError):
+        return "the stored tip-off cannot be read, so nothing is sent"
+    if time.time() >= t:
+        return f"the game's tip-off ({datetime.fromtimestamp(t):%d %b %H:%M:%S}) has come"
+    return ""
+
+
+def _shook_down_route(tip) -> tuple:
+    """(go, why) for the deferred run: Tarken (the whole NBA Sportsbet list) is KNOWN down (v6.238's
+    _sb_down_state read the session list and found none active) and an external book may still bet this Shook
+    tip (the Sportmarket session, or bet365 for an over). Only "down" goes; "off", "unknown" and "up" keep the
+    old retry. Under SHOOK_SPORTMARKET_ENABLED. Never raises."""
+    try:
+        leg = tip.legs[0] if tip.legs else None
+        if not _shook_sm_applies(tip, leg):
+            return False, "not a Shook NBA player-prop single (or SHOOK_SPORTMARKET_ENABLED is off)"
+        prio = session_priority.get_priority_for("nba", is_sgm=False)
+        if not prio:
+            return False, "no NBA priority list"
+        st = _sb_down_state(prio, stalled_unknown=True)    # a stalled Tarken is not known down
+        if st != "down":
+            return False, f"Sportsbet state {st}"
+        sm = None
+        try:
+            _r, sm = _sm_split_sessions(_v4_get_active_sessions_unfiltered(tip))
+        except Exception as e:
+            log.info(f"Shook: Sportmarket session lookup failed ({e})")
+        if _sm_eligible(tip, leg, sm) or _shook_b365_possible(tip, leg):
+            return True, "down"
+        return False, "no external book can bet it"
+    except Exception as e:
+        log.warning(f"Shook: Tarken-down check failed ({e}): not treated as down")
+        return False, f"check failed ({e})"
 
 
 def _shook_defer_cfg() -> tuple:
@@ -21652,17 +22831,22 @@ async def _shook_defer_intercept(tip, dupe_fp: str, msg_time, channel_name: str)
     return True
 
 
-def _shook_rows_line(markets: dict, player: str, stat: str, side: str, tipped: float) -> tuple:
+def _shook_rows_line(markets: dict, player: str, stat: str, side: str, tipped: float,
+                     main_only: bool = False) -> tuple:
     """(current line, note) for player / stat / side from a Sportsbet price_check_sports `markets`
-    (full-game plain over/under rows; an 'N+' row only for overs), or (None, why)."""
+    (full-game plain over/under rows; an 'N+' row only for overs), or (None, why).
+    v6.249 `main_only`: the player's MAIN two-way rows only ("<Player> - Points"): the Alt ladder ("<Player> - Alt
+    Points", overs only, a plain row of the same key at every rung) and the N+ rows are left out, so the answer is
+    the line Sportsbet itself lists, not the tipped rung that the ladder always carries."""
     market = _NBA_STAT_TO_MARKET.get((stat or "").strip().lower())
     if not market or side not in ("over", "under"):
         return None, f"no board market for {stat!r}/{side!r}"
     rows = (_full_game_ou_first(markets or {}, market).get(market) or {}).get("selections") or []
-    want = shook_defer.norm_name(player)
     ou, th = [], []
     for r in rows:
-        if shook_defer.norm_name(r.get("player")) != want:
+        if not shook_defer.names_match(r.get("player"), player):
+            continue
+        if main_only and re.search(r"\balt\b", str(r.get("raw_market_name") or ""), re.IGNORECASE):
             continue
         sdir = str(r.get("direction") or "").strip().lower()
         if not sdir:
@@ -21679,7 +22863,7 @@ def _shook_rows_line(markets: dict, player: str, stat: str, side: str, tipped: f
         n = _nbl_threshold_of(r)
         if n is None:
             ou.append(ln)
-        elif side == "over":
+        elif side == "over" and not main_only:
             th.append(n - 0.5)
     return shook_defer.pick_board_line(ou, th, tipped, side)
 
@@ -21751,7 +22935,7 @@ def _shook_filter_alts(tip, markets: dict, max_worse: float, label: str) -> None
                 log.info(f"Shook: {label} alt {stat} {alt.get('line')} dropped: the 'N+' rung moved")
                 return None
             log.info(f"Shook: {label} alt {stat}: line {tipped:g} -> {cur:g}, betting the current line")
-            alt = dict(alt, line=cur)
+            alt = dict(alt, line=cur, orig_line=tipped)    # v6.247: the alt's own tipped line (the limit's reference)
         return alt
 
     if getattr(tip, "alt_lines", None):
@@ -21759,6 +22943,63 @@ def _shook_filter_alts(tip, markets: dict, max_worse: float, label: str) -> None
         tip.alt_lines = kept or None
     if getattr(tip, "alt_line", None):
         tip.alt_line = judge(tip.alt_line) if isinstance(tip.alt_line, dict) else None
+
+
+def _shook_better_line_pick(tip, markets: dict, tipped: float, cur: float, side: str) -> tuple:
+    """v6.249 (Wilson 6 Nov: "try bet main line"; if the better main line is under the minimum, "we would bet o24.5
+    milestone or alt instead of 22.5, dont bet the alt lines if no need to, keep 1.65 min"): the board moved our way
+    (cur is a better line than `tipped`) on a PRICED tip. ("main", note) = the current main row is at or above the
+    minimum (_afl_target_odds: 10% under his median, the same figure placement sends as target_odds): bet the main
+    line as before. ("tipped", note) = it is under the minimum and Sportsbet carries a row at his TIPPED line (an alt
+    or milestone row; the full-game O/U rows are searched before the N+ rows) at or above the minimum and inside the
+    odds ceiling: bet that line, exactly. ("none", why) = neither: no Tarken bet (the caller keeps the tipped line
+    and the exact flag, so Tarken's resolver refuses it and the stake goes on to the external books and the alert).
+    A row the matcher cannot read counts as absent. Never raises."""
+    try:
+        leg = tip.legs[0]
+        market = _NBA_STAT_TO_MARKET.get((leg.stat or "").strip().lower())
+        floor = _afl_target_odds("nba", tip.suggested_odds)
+        if not market or not floor:
+            return "none", f"no board market or no price floor for {leg.stat!r}"
+
+        # the main row's price: the first full-game row (the O/U rows before the N+ rows) of this player, side and
+        # line on the board. No priced row there = unknown: "main", the price floor at placement judges it
+        m_p = None
+        for r in (_full_game_ou_first(markets, market).get(market) or {}).get("selections") or []:
+            try:
+                if not shook_defer.names_match(r.get("player"), leg.player):
+                    continue
+                if re.search(r"\balt\b", str(r.get("raw_market_name") or ""), re.IGNORECASE):
+                    continue                    # the Alt ladder is not the main row
+                if (str(r.get("direction") or "").strip().lower() or shook_defer.side_of(r.get("selection"))) != side:
+                    continue
+                if abs(float(r.get("line")) - cur) > 1e-9:
+                    continue
+                p = float(r.get("odds"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if math.isfinite(p) and p > 1.0:
+                m_p = p
+                break
+        if m_p is None:
+            return "main", f"main line {cur:g} has no price on the board; the floor at placement judges it"
+        if m_p >= floor - 1e-9:
+            return "main", f"main line {cur:g} @ {m_p:g} is at or above {floor:g}"
+        # his tipped line: an EXACT row (a pid-addressed alt or milestone row; no snap), at or above the minimum
+        t_row = _match_nba_player_prop({"market": market, "selection": side, "player": leg.player, "line": tipped},
+                                       markets, max_gap=0.0, full_game_only=True, sport=tip.sport)
+        try:
+            t_p = float(t_row.get("odds")) if t_row else 0.0
+        except (TypeError, ValueError):
+            t_p = 0.0
+        if (t_row and math.isfinite(t_p) and t_p >= floor - 1e-9
+                and not _exceeds_odds_ceiling(tip.tipster, tip.suggested_odds, t_p)):
+            return "tipped", (f"main line {cur:g} @ {m_p:g} is under {floor:g}; his line {tipped:g} has a row "
+                              f"'{t_row.get('selection')}' @ {t_p:g}")
+        return "none", (f"main line {cur:g} @ {m_p:g} is under {floor:g}, and his line {tipped:g} has "
+                        f"{('a row @ ' + format(t_p, 'g') + ' (under the minimum or over the ceiling)') if t_row else 'no row'}")
+    except Exception as e:
+        return "none", f"the better-line check failed ({type(e).__name__}: {e})"
 
 
 def _shook_defer_alert(tip, reason: str) -> None:
@@ -21781,7 +23022,7 @@ def _shook_defer_finish(key: str, outcome: str) -> bool:
         return True
     except Exception as e:
         log.error(f"Shook: entry {key[:80]!r} not marked done ({outcome}): {e}")
-        after = ("it stays marked placing and is never sent again" if outcome == "placed"
+        after = ("it stays marked placing and is never sent again" if outcome in ("placed", "down_nothing_placed")
                  else "it stays pending and is checked again")
         shook_defer._alert(f"Shook deferred store cannot be written ({e}): an entry could not be "
                            f"marked {outcome}; {after}", rate_limited=True, key="finish")
@@ -21855,6 +23096,10 @@ def _shook_defer_run_inner(key: str) -> None:
         label = _shook_tip_label(tip)
         if not math.isfinite(tipoff):
             raise ValueError("tipoff_ts not finite")
+        # read here, not below: a stored leg that cannot be read ends as malformed, it cannot skip the runs count
+        leg = tip.legs[0]
+        tipped = shook_defer.tipped_line(leg, bool(getattr(tip, "_is_threshold", False)))
+        tipped_side = shook_defer.side_of(leg.selection)
     except Exception as e:
         try:
             shook_defer.remove(key)
@@ -21872,13 +23117,35 @@ def _shook_defer_run_inner(key: str) -> None:
     if now >= tipoff:
         _shook_defer_missed(key, tip, label, ent)
         return
-    if runs > _SHOOK_DEFER_MAX_RUNS:
-        log.warning(f"Shook: {label} not bet: the line could not be read after "
-                    f"{_SHOOK_DEFER_MAX_RUNS} checks")
-        if _shook_defer_finish(key, "unreadable"):
-            _shook_defer_alert(tip, "Shook 1-hour rule: the current line could not be read, so the "
-                                    "bet was NOT placed: place manually if wanted")
-        return
+    # v6.247: the stored tip-off, kept on the tip: _execute_bet_inner and _b365_attempt_inner (and the Sportmarket
+    # kickoff check) refuse a send at or after it, the same `now >= tipoff` test as above (lead 0). The Sportsbet
+    # start (+10 min) and _stagger_start_epoch (None for Shook) are not used for it.
+    tip._shook_tipoff_ts = tipoff
+    # v6.247 Rule A: Shook's ORIGINAL tipped line, carried on the tip BEFORE the current line replaces it. Every
+    # bet on every book (the Sportsbet retries and snaps, bet365's rungs and shortfall, Sportmarket's shortfall)
+    # is held to it in _shook_orig_refusal, not to the line the board shows now. Set before the Tarken-down read
+    # too: _shook_sm_applies (the new books, the down route) needs it.
+    _mins, max_worse = _shook_defer_cfg()
+    tip._shook_orig_line = tipped
+    tip._shook_orig_side = tipped_side
+    capped = runs > _SHOOK_DEFER_MAX_RUNS
+    _tk_down = False
+    _tk_why = ""
+    if capped:
+        # v6.247: the runs cap ends an unreadable / crashing entry, but a Tarken outage first seen after the cap
+        # must still reach the external books: the route gets ONE attempt (a read of the session list; only a
+        # Tarken truly known down goes). Everything else about the cap stays.
+        tip.event = ent.get("event") or tip.event
+        tip._presolved_event = tip.event
+        _tk_down, _tk_why = _shook_down_route(tip)
+        if not _tk_down:
+            log.warning(f"Shook: {label} not bet: the bet could not be checked after "
+                        f"{_SHOOK_DEFER_MAX_RUNS} checks ({_tk_why})")
+            if _shook_defer_finish(key, "unreadable"):
+                _shook_defer_alert(tip, "Shook 1-hour rule: the bet could not be checked (the current line or "
+                                        "the Sportsbet session list could not be read), so the bet was NOT "
+                                        "placed: place manually if wanted")
+            return
     # counted and re-timed BEFORE the work: a crash below repeats this check a minute later, and
     # only the runs cap ends a loop of failures
     if not _shook_defer_update(key, runs=runs, due_ts=now + _SHOOK_DEFER_CRASH_RETRY_SEC):
@@ -21887,29 +23154,73 @@ def _shook_defer_run_inner(key: str) -> None:
     # the game whose tip-off the check time was set from: place_tip must not re-pick a game by team
     # hours later (a back-to-back could resolve to another night)
     tip._presolved_event = tip.event
-    cur, note, markets = _shook_board_line(tip)
-    if cur is None:
-        _shook_defer_update(key, due_ts=time.time() + _SHOOK_DEFER_RETRY_SEC)
-        log.warning(f"Shook: {label}: board line unreadable ({note}); check {runs} of "
-                    f"{_SHOOK_DEFER_MAX_RUNS}, again in {_SHOOK_DEFER_RETRY_SEC / 60:.0f} min")
-        return
-    _mins, max_worse = _shook_defer_cfg()
-    leg = tip.legs[0]
-    tipped = shook_defer.tipped_line(leg, bool(getattr(tip, "_is_threshold", False)))
-    ok, worse = shook_defer.line_verdict(shook_defer.side_of(leg.selection), tipped, cur, max_worse)
-    if not ok:
-        _shook_defer_finish(key, "line_moved")
-        log.info(f"Shook: {label} not bet: line moved from {tipped:g} to {cur:g} "
-                 f"(more than {max_worse:g} worse)")
-        return
-    if abs(cur - tipped) > 1e-9:
-        log.info(f"Shook: {label}: line {tipped:g} -> {cur:g} ({abs(worse):g} "
-                 f"{'worse' if worse > 0 else 'better'}), betting the current line")
-        leg.line = cur
-        tip._is_threshold = False       # the board's line is a plain over/under line now
+    if capped:
+        cur, note, markets = None, "runs cap reached, Tarken known down", {}
     else:
-        log.info(f"Shook: {label}: line unchanged ({note}), betting")
-    _shook_filter_alts(tip, markets, max_worse, label)
+        cur, note, markets = _shook_board_line(tip)
+    if cur is None:
+        # v6.247 (Wilson 5 Nov: bet365 and Sportmarket still bet with Tarken down): the board is read from
+        # Sportsbet, so no board is no line to check. Only a Tarken KNOWN down (v6.238's read of the session
+        # list; a stalled session is not known down) takes the external-books route, with the tipped line as the
+        # reference; an unreadable list, Tarken up (a failed price read), or a missing external book keeps the
+        # retry above exactly.
+        if not _tk_down:
+            _tk_down, _tk_why = _shook_down_route(tip)
+        if not _tk_down:
+            _shook_defer_update(key, due_ts=time.time() + _SHOOK_DEFER_RETRY_SEC)
+            log.warning(f"Shook: {label}: board line unreadable ({note}); check {runs} of "
+                        f"{_SHOOK_DEFER_MAX_RUNS}, again in {_SHOOK_DEFER_RETRY_SEC / 60:.0f} min")
+            return
+    if _tk_down:
+        log.warning(f"Shook: {label}: Tarken is down ({_tk_why}); no board to check the line against: bet365 / "
+                    f"Sportmarket may bet the tipped line {tipped:g} (and no more than {max_worse:g} worse), "
+                    f"tipster alts dropped")
+        tip.alt_line = None
+        tip.alt_lines = None
+    else:
+        ok, worse = shook_defer.line_verdict(shook_defer.side_of(leg.selection), tipped, cur, max_worse)
+        if not ok:
+            _shook_defer_finish(key, "line_moved")
+            log.info(f"Shook: {label} not bet: line moved from {tipped:g} to {cur:g} "
+                     f"(more than {max_worse:g} worse)")
+            return
+        # v6.249 (Wilson 6 Nov): a PRICED tip whose main line moved our way. Sportsbet files every Alt rung as a plain
+        # over row of the same key, so the board read above calls the tipped line "unmoved" whenever the ladder
+        # carries it: the main row (not the Alt ladder) is read apart for that. No price: nothing here runs.
+        _better = None
+        if _tip_has_own_price(tip) and markets:
+            if worse < -1e-9:
+                _better = cur
+            else:
+                _ml, _mnote = _shook_rows_line(markets, leg.player, leg.stat, tipped_side, tipped, main_only=True)
+                if _ml is not None and shook_defer.line_verdict(tipped_side, tipped, _ml, max_worse)[1] < -1e-9:
+                    _better = _ml
+        if _better is not None:
+            log.info(f"Shook: {label}: main line {tipped:g} -> {_better:g} (better)")
+            _pick, _pnote = _shook_better_line_pick(tip, markets, tipped, _better, tipped_side)
+            log.info(f"Shook: {label}: better line {_better:g}: {_pick} ({_pnote})")
+            if _pick == "main":
+                leg.line = _better
+                tip._is_threshold = False       # the board's line is a plain over/under line now
+            else:
+                # his tipped line as a plain over/under line; the flag makes the SPORTSBET resolvers take that row
+                # exactly (no nearest-row snap back to the main line) or refuse it, and stops the auto +-1 try and the
+                # line-move retry. bet365 and Sportmarket spills keep their normal +-1 rules (the stake goes through
+                # the normal spill); v6.249 review corrected this comment, which said "every resolver"
+                leg.line = tipped
+                tip._is_threshold = False
+                tip._shook_exact_line = True
+                if _pick == "none":
+                    log.warning(f"Shook: {label}: no Tarken bet at the better line {_better:g} or his {tipped:g}: the "
+                                f"stake goes on to the other books and the alert")
+        elif abs(cur - tipped) > 1e-9:
+            log.info(f"Shook: {label}: line {tipped:g} -> {cur:g} ({abs(worse):g} "
+                     f"{'worse' if worse > 0 else 'better'}), betting the current line")
+            leg.line = cur
+            tip._is_threshold = False       # the board's line is a plain over/under line now
+        else:
+            log.info(f"Shook: {label}: line unchanged ({note}), betting")
+        _shook_filter_alts(tip, markets, max_worse, label)
     # the game may have started while the board was read
     if time.time() >= tipoff:
         _shook_defer_missed(key, tip, label, ent)
@@ -21931,9 +23242,14 @@ def _shook_defer_run_inner(key: str) -> None:
     tip.timestamp = datetime.now()
     tip._timing = {"t0": time.time(), "parse_sec": 0.0}
     t0 = time.time()
+    _outcome = "placed"
     try:
         _audit_tip(tip, ent.get("msg_time") or tip.timestamp)
         placed = place_tip(tip)
+        if _tk_down and not any(r.success or _is_ambiguous_result(r) for r in placed or []):
+            # v6.247: the Tarken-down route sent nothing that landed or may have landed (the alert for the manual
+            # bet already went out); the tombstone says so. A crash below keeps "placed": bets may be on.
+            _outcome = "down_nothing_placed"
         for r in placed or []:
             if r.success:
                 log.info(f"PLACED: {r.bet_id} on {r.bookie} @ {r.odds} [shook 1-hour check, "
@@ -21952,7 +23268,7 @@ def _shook_defer_run_inner(key: str) -> None:
         except Exception:
             pass
     finally:
-        _shook_defer_finish(key, "placed")
+        _shook_defer_finish(key, _outcome)
 
 
 def _shook_defer_claim_due() -> list:
@@ -22298,7 +23614,8 @@ async def _process_tip(text: str, tipster: str, sport: str,
                 f"Raw: {tip.raw_message[:120]}"
             )
             tip.alert_only = True
-            tip.alert_reason = "no unit/stake specified by the tipster — place manually"
+            # v6.259: add to the parser's reason (AusBets McCollum correction 5 Nov), do not replace it
+            _add_alert_reason(tip, "no unit/stake specified by the tipster — place manually")
 
         # v5.52 braces: explicit no-bet framing routes ALL tips parsed from the
         # message to manual ("nothin today", "no bets today", "none quite",
@@ -22313,10 +23630,9 @@ async def _process_tip(text: str, tipster: str, sport: str,
                 f"bets -> manual. Raw: {tip.raw_message[:120]}"
             )
             tip.alert_only = True
-            tip.alert_reason = (
-                "tipster framed this message as NO bet ('nothin today' / "
-                "'none quite' phrasing) — review manually, do not place"
-            )
+            # v6.259: add to the earlier reasons (parser, no-unit), do not replace them
+            _add_alert_reason(tip, "tipster framed this message as NO bet ('nothin today' / "
+                                   "'none quite' phrasing) — review manually, do not place")
 
         # v6.72 (units_cap.py): over MAX_UNITS places the cap, the rest is a manual alert.
         # Not for a tip already going to manual (its own alert carries it) or one a flat
@@ -22362,7 +23678,7 @@ async def _process_tip(text: str, tipster: str, sport: str,
             # before the persist below; place_tip then sends its PAUSED manual alert.
             if _sports_paused() and (tip.sport or "").lower() != "racing":
                 tip.alert_only = True
-                tip.alert_reason = _SPORTS_PAUSED_REASON
+                _add_alert_reason(tip, _SPORTS_PAUSED_REASON)   # v6.259: keep earlier reasons
             if not skip_dedup:
                 _register_tip_fingerprint(tip, fp=_dupe_fp)
                 _inflight_fps.add(_dupe_fp)  # v6.03: block re-send for the WHOLE flight
@@ -22677,6 +23993,7 @@ for _mi, _mn in enumerate(
      "september", "october", "november", "december"], 1):
     _IMG_MONTHS[_mn] = _mi
     _IMG_MONTHS[_mn[:3]] = _mi
+_IMG_MONTHS["sept"] = 9
 
 
 def _au_east_day(dt) -> "_date":
@@ -22720,7 +24037,15 @@ def _img_parse_racing_date(raw_date, msg_time) -> "str|None":
     'race not in catalog' -> manual, and worse, a same-numbered race on the
     wrong day could match and place on the WRONG race. Handles ISO, D/M[/Y]
     (AU order), 'June 6'/'6 June', weekday names ('Saturday'/'Sat' -> the next
-    such day on/after the post), and today/tomorrow. 2026-06-03."""
+    such day on/after the post), and today/tomorrow. 2026-06-03.
+
+    v6.246: an explicit date wins over a weekday in the same text ('Sat 14 Nov' read as the next Saturday, 7 Nov, and
+    was priced on the wrong day); a weekday that disagrees is logged. The weekday is the fallback when no valid date
+    is there. Beside a weekday the date must be clear: a month is a whole name, its short form or the start of one
+    ('Novem'; 'Novice' is not November) and a number right after 'race' is not a day ('Sat Race 2 June Stakes' stays
+    Saturday). With no weekday a month still reads by its first three letters ('14 Febuary'). A date with no year more
+    than half a year behind the post is next year's ('Sat 2 Jan' in late December), and one about a year ahead is last
+    year's ('31 Dec' posted on 1 Jan)."""
     s = (raw_date or "").strip().lower()
     if not s:
         return None
@@ -22738,30 +24063,55 @@ def _img_parse_racing_date(raw_date, msg_time) -> "str|None":
         return base.isoformat()
     if "tomorrow" in s:
         return (base + _timedelta(days=1)).isoformat()
-    for name, wd in _IMG_WEEKDAYS.items():
-        if re.search(rf"\b{name}\b", s):
-            return (base + _timedelta(days=(wd - base.weekday()) % 7)).isoformat()
-    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", s)
+
+    def _no_year(mo, d):
+        got = _date(base.year, mo, d)
+        gap = (base - got).days
+        step = 1 if gap > 183 else -1 if gap < -300 else 0
+        try:
+            return _date(base.year + step, mo, d)
+        except ValueError:          # 29 Feb, and the other year has none
+            return got
+
+    s = re.sub(r"\s+", " ", s)
+    named = [wd for name, wd in _IMG_WEEKDAYS.items() if re.search(rf"\b{name}\b", s)]
+    # a loose year in the text, only next to the post's own year (a 24-hour '2030' is a time)
+    near = [int(y) for y in re.findall(r"\b(20\d{2})\b", s) if abs(int(y) - base.year) <= 1]
+    yr = near[-1] if near else None
+    got = None
+    not_race = r"(?<!\brace )" if named else ""
+    m = re.search(not_race + r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", s)
     if m:
         d, mo = int(m.group(1)), int(m.group(2))
-        yr = int(m.group(3)) if m.group(3) else base.year
-        if yr < 100:
-            yr += 2000
         try:
-            return _date(yr, mo, d).isoformat()
+            if m.group(3):
+                y3 = int(m.group(3))
+                got = _date(y3 + 2000 if y3 < 100 else y3, mo, d)
+            else:
+                got = _date(yr, mo, d) if yr else _no_year(mo, d)
         except ValueError:
-            return None
-    m = (re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?([a-z]{3,9})\b", s)
-         or re.search(r"\b([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?\b", s))
-    if m:
-        g1, g2 = m.group(1), m.group(2)
-        d, mon_name = (int(g1), g2) if g1.isdigit() else (int(g2), g1)
-        mo = _IMG_MONTHS.get(mon_name) or _IMG_MONTHS.get(mon_name[:3])
-        if mo:
-            try:
-                return _date(base.year, mo, d).isoformat()
-            except ValueError:
-                return None
+            got = None
+    if got is None:
+        day_first = r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?([a-z]{3,9})\b"
+        for m in [*re.finditer(not_race + day_first, s),
+                  *re.finditer(r"\b([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?\b", s)]:
+            g1, g2 = m.group(1), m.group(2)
+            d, mon_name = (int(g1), g2) if g1.isdigit() else (int(g2), g1)
+            mo = _IMG_MONTHS.get(mon_name) or (
+                next((v for k, v in _IMG_MONTHS.items() if len(mon_name) >= 4 and k.startswith(mon_name)), None)
+                if named else _IMG_MONTHS.get(mon_name[:3]))
+            if mo:
+                try:
+                    got = _date(yr, mo, d) if yr else _no_year(mo, d)
+                    break
+                except ValueError:
+                    pass
+    if got is not None:
+        if named and got.weekday() not in named:
+            log.warning(f"image tip date {raw_date!r}: the weekday disagrees with the date, using {got.isoformat()}")
+        return got.isoformat()
+    if named:
+        return (base + _timedelta(days=(named[0] - base.weekday()) % 7)).isoformat()
     return None
 
 
@@ -24239,11 +25589,10 @@ async def _route_image_afl_tips(raw_tips: list, tipster: str, unit_size: float,
             # to manual. A lone no-units tip still auto-places at 2.5u (intended).
             if getattr(tip, "_units_fallback", False) and no_units_count > 1:
                 tip.alert_only = True
-                tip.alert_reason = (
-                    f"{no_units_count} tips in one image had NO unit sizing "
-                    f"(likely vision over-parse) — place by hand to avoid an "
-                    f"over-staked $1000 guess on each"
-                )
+                # v6.259: add to the image parser's reason (e.g. "total market (image tip)"), do not replace it
+                _add_alert_reason(tip, f"{no_units_count} tips in one image had NO unit sizing "
+                                       f"(likely vision over-parse) — place by hand to avoid an "
+                                       f"over-staked $1000 guess on each")
 
             _units_tipped = float(tip.units or 0)  # v6.72: the rest is alerted below
             if tip.units > MAX_UNITS:
@@ -24643,15 +25992,8 @@ def _american_to_decimal_odds(american):
     always follow instructions, and this function is the last line of
     defense against whatever it actually emits -- it must enforce its own
     documented contract itself, not assume the caller already did."""
-    try:
-        a = float(american)
-    except (TypeError, ValueError):
-        return None
-    if abs(a) < 100:
-        return None
-    if a > 0:
-        return round(1 + a / 100, 4)
-    return round(1 + 100 / abs(a), 4)
+    # v6.249: the body lives in groq_parser (the Shook median price needs it and cannot import main)
+    return groq_parser.american_to_decimal_odds(american)
 
 
 def _nfl_odds_guard_refuses(tipster: str, tipster_odds, live_odds) -> tuple[bool, str]:
@@ -24732,7 +26074,21 @@ def _nfl_slug_tokens(s: str) -> set:
     folded = _roster_fold_accents((s or "").lower())
     toks = re.findall(r"[a-z0-9]+", folded)
     core = [t for t in toks if t.rstrip(".") not in _ROSTER_GEN_SUFFIXES]
-    return set(core or toks)
+    # v6.267 (Wilson 7 Nov: fix the name mismatches): a run of single-letter words is ONE joined initials token, in
+    # order: "D.K. Metcalf" (d, k, metcalf) = the key "dk_metcalf" (dk, metcalf); "T.J. Watt" (tj) is not "J.T. Watt"
+    # (jt) and "J.J. Watt" (jj) is not "J Watt" (j), which the bare token sets collapsed
+    words = core or toks
+    out, run = [], []
+    for w in words + [""]:
+        if len(w) == 1:
+            run.append(w)
+            continue
+        if run:
+            out.append("".join(run))
+            run = []
+        if w:
+            out.append(w)
+    return set(out)
 
 
 def _find_nfl_market(markets: dict, player: str, suffix: str):
@@ -24762,6 +26118,35 @@ def _find_nfl_market(markets: dict, player: str, suffix: str):
     return hits[0]
 
 
+def _nfl_row_player(sel, player: str) -> str:
+    """v6.267: the player name the matched catalog row carries, when it is the same man under the shared rule
+    (player_names) but spelled another way ("Kenneth Gainwell" for the tip's "Kenny Gainwell"), else `player`:
+    the POST carries the book's own spelling, never the tip's."""
+    try:
+        row = sel or {}
+        sel_name = re.sub(r"\s+(over|under)\s*$", "", str(row.get("selection") or ""), flags=re.I).strip()
+        for rp in (str(row.get("player") or "").strip(), sel_name):
+            if (rp and rp != player and _nfl_slug_tokens(rp) != _nfl_slug_tokens(player)
+                    and _catalog_spelling_ok(rp, player, "nfl")):
+                return rp
+    except Exception:
+        pass
+    return player
+
+
+def _nfl_name_on_catalog(markets: dict, player: str, want=None) -> bool:
+    """v6.267: some key of the catalog ('<player>_-_<suffix>', any suffix) spells this player exactly (token-set equal, a
+    Jr never a Sr)."""
+    want = want if want is not None else _nfl_slug_tokens(player)
+    for key in (markets or {}):
+        if "_-_" not in key:
+            continue
+        name_part = key.split("_-_", 1)[0].replace("_", " ")
+        if _nfl_slug_tokens(name_part) == want and not player_names.suffix_clash(name_part, player):
+            return True
+    return False
+
+
 def _nfl_market_hits(markets: dict, player: str, suffix: str) -> list:
     """Every (key, market) whose key is exactly '<player>_-_{suffix}' (token-set equal).
     v6.54: split out so the rush attempts fallback can tell 'not offered' (0) from
@@ -24771,12 +26156,27 @@ def _nfl_market_hits(markets: dict, player: str, suffix: str) -> list:
         return []
     target_end = f"_-_{suffix}"
     hits = []
+    parts = {}
     for key, m in (markets or {}).items():
         if not key.endswith(target_end):
             continue
         name_part = key[: -len(target_end)].replace("_", " ")
-        if _nfl_slug_tokens(name_part) == want:
+        parts[key] = name_part
+        # v6.267: a Jr never binds to a Sr (both carry a suffix and they differ); a suffix on one side still matches
+        if _nfl_slug_tokens(name_part) == want and not player_names.suffix_clash(name_part, player):
             hits.append((key, m))
+    if not hits and parts and not _nfl_name_on_catalog(markets, player, want):
+        # v6.267: no key spells him exactly, under this suffix or any other: the shared rule (player_names: the alias
+        # table, or ONE market name with the same surname and a shortened first name, for a rostered tip name whose
+        # other spelling is not on the NFL roster). A player who has his own key under another market (Chris Jones
+        # receiving yards) is never borrowed from a namesake's (Christian Jones rush attempts).
+        # The key returned is the catalog's OWN key for that row, so the bet goes out under it (Sportmarket refuses
+        # a key built from our spelling).
+        _pm = player_names.match(list(set(parts.values())), player, roster=player_names.roster_keys("nfl"))
+        if _pm.kind in ("alias", "first_name"):
+            hits = [(k, markets[k]) for k, n in parts.items() if n == _pm.name]
+            if hits:
+                log.info(f"NFL market: {player!r} read as the catalog's {_pm.name!r} ({_pm.kind}) for '{suffix}'")
     return hits
 
 
@@ -24796,7 +26196,9 @@ def _nfl_atd_row(player: str, markets: dict, event: str):
 
     def _pick(name):
         want = _nfl_slug_tokens(name)
-        hits = [s for s in rows if _nfl_slug_tokens(s.get("selection") or "") == want]
+        # v6.267 follow-up: a Jr never binds to a Sr (as in _nfl_market_hits); a suffix on one side only still matches
+        hits = [s for s in rows if _nfl_slug_tokens(s.get("selection") or "") == want
+                and not player_names.suffix_clash(s.get("selection") or "", name)]
         return hits[0] if len(hits) == 1 else None
 
     row = _pick(player)
@@ -25316,6 +26718,9 @@ def _resolve_nfl_market(player: str, team: str, stat: str, side: str,
             "start_time_iso": pc.get("start_time_iso"),      # v6.223: the probe board's start
             "event_id": pc.get("event_id"),                  # v6.224: the bridge board's own id
             "stake_mult": stake_mult, "player": player,
+            # v6.267: the book's own spelling of him (a Sportmarket / Sportsbet POST carries it; tipbot's alerts, ledger
+            # and dedup keep "player", the tip's name)
+            "book_player": _nfl_row_player(sel, player),
             # v6.44: a 1st quarter ladder row has no line of its own; don't send one.
             "hb_omit_line": bool(sel.get("_line_from_text")),
             "period": sel.get("period") or "full_game",
@@ -25350,7 +26755,9 @@ def _nfl_most_row(player: str, market: dict, event: str):
 
     def _pick(name):
         want = _nfl_slug_tokens(name)
-        hits = [s for s in rows if _nfl_slug_tokens(s.get("selection") or "") == want]
+        # v6.267 follow-up: a Jr never binds to a Sr (as in _nfl_market_hits); a suffix on one side only still matches
+        hits = [s for s in rows if _nfl_slug_tokens(s.get("selection") or "") == want
+                and not player_names.suffix_clash(s.get("selection") or "", name)]
         return hits[0] if len(hits) == 1 else None
 
     row = _pick(player)
@@ -25566,7 +26973,7 @@ def _nfl_margin_band(side: str, line):
 
 def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: str,
                               priority_sessions: list, tipster: str = "",
-                              tipster_odds=None):
+                              tipster_odds=None, diag=None):
     """Read-only: resolve one NFL TEAM-level tip (moneyline/spread/total)
     against the LIVE Sportsbet board. Mirrors _resolve_nfl_market's shape
     and philosophy exactly (same fail-safe-to-manual behaviour, same return
@@ -25638,6 +27045,8 @@ def _resolve_nfl_team_market(team: str, market_type: str, tipster_line, side: st
             return None
 
         markets_all = pc.get("markets") or {}
+        if diag is not None:
+            diag["catalog_read"] = True          # v6.250: Sportsbet's board was read (a refusal below is "no usable row")
         market = markets_all.get(catalog_key)
         if not market:
             # v6.172: the bridge may file a moneyline / total under its own key spelling
@@ -25837,9 +27246,9 @@ def _is_price_moved_error(err) -> bool:
 #   (b) Sportsbet does not fill it: after the Sportsbet fan-out (and its spill) the UNFILLED
 #       remainder, never maybe-placed stake, goes to bet365, up to its cap.
 # Caps are TO-WIN per bet on the bet365 account (B365_MAX_TO_WIN_NFL/NBA/NBL), sized at the max_odds
-# ceiling sent, so a better fill can never win more. Player props only (the caller sets
-# tip._b365_ctx only for an exact single player prop); game lines, totals, h2h, handicaps, SGMs
-# and MMA never come here. Money rules: bet365 bets never appear in /api/pending_bets, so a
+# ceiling sent, so a better fill can never win more. Player props (the caller sets
+# tip._b365_ctx for an exact single player prop) and, v6.250, NFL game lines (_b365_game_line_ctx below);
+# NBA / NBL game lines, SGMs and MMA never come here. Money rules: bet365 bets never appear in /api/pending_bets, so a
 # maybe-placed bet365 bet is NEVER re-placed, spilled or reconciled (it stays maybe placed, the
 # fan-out's ambiguous CRITICAL names it); one bet365 bet per tip per line (a fast stake-too-high
 # that states a max is rebet ONCE at that max, else it stops); the price comes from a catalog
@@ -26300,9 +27709,13 @@ _B365_HBM_EVENTS_FAIL: dict = {}  # sport -> (failed_at, why): a failed events r
 _B365_HBM_FAIL_TTL_SEC = 60.0     # for this long
 
 
-def _b365_hbm_epk(sport: str, ev: str) -> tuple:
+_B365_GL_HORIZON_H = 6.5 * 24     # v6.250: a game line may be tipped days early (props keep 36 h); v6.254: _nfl_too_far_ahead refuses past NFL_MAX_DAYS_AHEAD first
+
+
+def _b365_hbm_epk(sport: str, ev: str, horizon_h: float = 36.0) -> tuple:
     """(epk, event name, "") for the ONE scheduled HyperBot event that is this game, or
-    ("", "", why). Fails closed on no match or more than one."""
+    ("", "", why). Fails closed on no match or more than one. v6.250: `horizon_h` is how far ahead a game may
+    start (36 h for a prop, as before; an NFL game line passes _B365_GL_HORIZON_H)."""
     now = time.time()
     with _B365_HBM_LOCK:
         hit = _B365_HBM_EVENTS.get(sport)
@@ -26345,17 +27758,20 @@ def _b365_hbm_epk(sport: str, ev: str) -> tuple:
             st = datetime.fromisoformat(str(e.get("start_time")).replace("Z", "+00:00")).timestamp()
         except (TypeError, ValueError):
             continue
-        if now - 900 <= st <= now + 36 * 3600:
+        if now - 900 <= st <= now + horizon_h * 3600:
             cands.append(e)
     if len(cands) != 1:
-        return "", "", f"{len(cands)} scheduled HyperBot events match {ev!r} in the next 36 h"
+        return "", "", f"{len(cands)} scheduled HyperBot events match {ev!r} in the next {horizon_h:g} h"
     return str(cands[0]["epk"]), str(cands[0].get("event") or ""), ""
 
 
-def _b365_hb_markets_catalog(sport: str, ev: str) -> tuple:
+def _b365_hb_markets_catalog(sport: str, ev: str, horizon_h: float = 36.0, game_line: bool = False) -> tuple:
     """(catalog, "") from HyperBot's GET /v3/markets bet365 card, or (None, why). NBA, NBL (v6.197)
     and NFL (v6.197), each behind its own switch (B365_NBA_HB_MARKETS / B365_NBL_HB_MARKETS /
-    B365_NFL_HB_MARKETS). Never raises."""
+    B365_NFL_HB_MARKETS). Never raises.
+    v6.250: an NFL card also holds the game-line rows. A caller that is not after a game line (`game_line` False,
+    every prop caller) still gets None for a card with no PLAYER row, exactly as before; a game-line caller passes
+    the longer `horizon_h`."""
     import config as _c
     import bet365_sports as _b3
     sport = (sport or "").lower()
@@ -26364,14 +27780,14 @@ def _b365_hb_markets_catalog(sport: str, ev: str) -> tuple:
     if not _switch or not getattr(_c, _switch, False):
         return None, "off"
     try:
-        epk, hb_ev, why = _b365_hbm_epk(sport, ev)
+        epk, hb_ev, why = _b365_hbm_epk(sport, ev, horizon_h)
         if not epk:
             return None, why
         now = time.time()
         with _B365_HBM_LOCK:
             hit = _B365_HBM_CARDS.get(epk)
         if hit and now - hit[0] < _B365_HBM_CARD_TTL_SEC:
-            return (hit[1], "") if hit[1] is not None else (None, hit[2])
+            return _b365_card_for(hit[1], hit[2], epk, game_line)
         resp = hb.get_markets(epk, "bet365")
         cat, why = None, ""
         if not isinstance(resp, dict):
@@ -26388,9 +27804,19 @@ def _b365_hb_markets_catalog(sport: str, ev: str) -> tuple:
             for k in [k for k, v in _B365_HBM_CARDS.items() if now - v[0] >= _B365_HBM_CARD_TTL_SEC]:
                 _B365_HBM_CARDS.pop(k, None)
             _B365_HBM_CARDS[epk] = (now, cat, why)
-        return (cat, "") if cat is not None else (None, why)
+        return _b365_card_for(cat, why, epk, game_line)
     except Exception as e:
         return None, f"/v3/markets read crashed ({e})"
+
+
+def _b365_card_for(cat, why: str, epk: str, game_line: bool) -> tuple:
+    """(catalog, "") or (None, why) from a card read or its cache. v6.250: a card holding game-line rows only is
+    not usable for a prop (nothing to bet there, as a card with no rows at all always was)."""
+    if cat is None:
+        return None, why
+    if not game_line and not cat.get("_has_players", True):
+        return None, f"bet365 card for {epk} is not bound or has no usable player rows"
+    return cat, ""
 
 
 def _b365_ceiling(tip, price: float) -> float:
@@ -26405,7 +27831,25 @@ def _b365_ceiling(tip, price: float) -> float:
         _t = 0.0
     if _mult and _mult > 1.0 and _t > 1.0:
         return float(round(_t * float(_mult), 2))
+    return _b365_price_ceiling(price)
+
+
+def _b365_price_ceiling(price: float) -> float:
+    """The bet365 no-ceiling rule: 10% over the quoted price, down to the cent."""
     return float(math.floor(price * 1.10 * 100 + 1e-6) / 100)
+
+
+def _b365_milestone_up_per_point() -> float:
+    """v6.249: B365_MILESTONE_UP_PER_POINT when the step is on and the number is usable, else 0.0 (off).
+    A missing, non-finite or non-positive number turns the step off (fail closed)."""
+    import config as _c
+    if not bool(getattr(_c, "B365_MILESTONE_UP", False)):
+        return 0.0
+    try:
+        pp = float(getattr(_c, "B365_MILESTONE_UP_PER_POINT", 0.10))
+    except (TypeError, ValueError):
+        return 0.0
+    return pp if math.isfinite(pp) and pp > 0 else 0.0
 
 
 def _b365_shortfall_pick(markets: dict, sport: str, tip, ctx: dict, ref: float):
@@ -26415,21 +27859,46 @@ def _b365_shortfall_pick(markets: dict, sport: str, tip, ctx: dict, ref: float):
     price no more than B365_SHORTFALL_ODDS_DROP_PCT under the tipster's price `ref` and under the
     tipster's ceiling (v6.127: one 10% band for all lines; was 20% O/U, 30% milestone).
     The tipped line wins when it passes, else the passing row priced closest to `ref`.
+    v6.249 (Wilson 6 Nov): a milestone rung ABOVE the tipped line (an NBA / NBL / NFL over with a price of the
+    tipster's own) is held to the milestone-up rule instead of that band: the NEXT rung only (the lowest
+    milestone line strictly above the tipped line, found on the card even when it is two or more points up,
+    tried last), at ref x (1 + B365_MILESTONE_UP_PER_POINT x points up), no top limit (the ceiling is 10% over
+    its price). Rows below the tipped line and O/U rows keep the band.
     Returns (pick, kind, minimum price, ceiling, "") or (None, "", 0, 0, why)."""
     import config as _c
     import bet365_sports as _b3
     drop = float(getattr(_c, "B365_SHORTFALL_ODDS_DROP_PCT", 0.10) or 0)
     maxd = float(getattr(_c, "B365_SHORTFALL_MAX_LINE_DIFF", 1.0) or 0)
+    band_floor = bool(getattr(_c, "B365_SHORTFALL_BAND_FLOOR", False))
     tl = float(ctx["line"])
     lines = [tl] + ([] if ctx.get("exact_only") else
                     [tl + d for d in (1.0, -1.0) if abs(d) <= maxd + 1e-9 and tl + d > 0])
-    passing, why = [], []
-    for ln in lines:
+    pp, up_line = 0.0, None
+    if (str(sport or "").lower() in ("nba", "nbl", "nfl") and (ctx.get("side") or "").lower() == "over"
+            and not ctx.get("exact_only") and _tip_has_own_price(tip)):
+        pp = _b365_milestone_up_per_point()
+        if pp > 0:
+            up_line = _b3.next_milestone_line(markets, ctx["player"], ctx["stat"], tl, sport)
+    far_up = up_line is not None and all(abs(up_line - x) > 1e-9 for x in lines)
+    # v6.249 review: the price `ref` belongs to the tipster's ORIGINAL line. A deferred Shook tip carries the line the
+    # board showed (ctx["line"], the one Tarken is sent) while his median is for tip._shook_orig_line: the points up
+    # are counted from that. Every other tip has no original line, and the tipped line is it.
+    try:
+        _orig = getattr(tip, "_shook_orig_line", None)
+        price_line = float(_orig) if _orig is not None and math.isfinite(float(_orig)) else tl
+    except (TypeError, ValueError):
+        price_line = tl
+
+    def _walk(ln: float):
+        """(row tuple or None, why or "") for one candidate line."""
         p = _b3.resolve(markets, sport, tip.event or "", "prop", player=ctx["player"],
                         stat=ctx["stat"], line=ln, side=ctx["side"])
+        is_next = up_line is not None and abs(ln - up_line) < 1e-9
         if not p.ok:
-            why.append(f"{ln}: {p.refused}")
-            continue
+            if is_next:
+                log.info(f"bet365 milestone up: {ctx['player']} {ctx['stat']} over {ln:g} (tipped {tl:g} @ {ref}) "
+                         f"has no usable row: {p.refused}")
+            return None, f"{ln}: {p.refused}"
         if p.line is None:
             p.line = ln          # v6.122 review: the ledger / alert / payload carry the line bet
         price = float(p.odds or 0)
@@ -26437,18 +27906,80 @@ def _b365_shortfall_pick(markets: dict, sport: str, tip, ctx: dict, ref: float):
             kind = "exact"
         else:
             kind = "o/u" if "o/u" in (p.market or "") else "milestone"
+        if is_next and ln > tl + 1e-9 and (kind == "milestone" or ln > tl + 1.0 + 1e-9):
+            # v6.249: the next milestone up. Linear per point (1.80 at o22.5 -> 2.16 at o24.5), to the cent
+            # up; a live price under it is refused. The ceiling is 10% over the price: no top limit.
+            # v6.249 review: counted from the line the price is for, and never under the band's own minimum (a rung
+            # that is a better number than his original line is a band row at the least)
+            need = max(ref * (1.0 + pp * (ln - price_line)), ref * (1.0 - drop))
+            need_c = _b3.cents_at_or_above(need)
+            if not (price + 1e-9 >= need_c):
+                log.info(f"bet365 milestone up: {ctx['player']} {ctx['stat']} over {ln:g} (tipped {tl:g} @ {ref}) "
+                         f"refused: {price:.3f} is under the {need_c:.2f} minimum")
+                return None, f"milestone up {ln} @ {price:.3f} under the {need_c:.2f} minimum for tipped {ref}"
+            return ("milestone up", ln, price, p, need, _b365_price_ceiling(price)), ""
+        _sw = _shook_orig_refusal(tip, p.line)
+        if _sw:
+            # v6.249 review: Shook's original-line limit is applied here, so a row it refuses drops out BEFORE the
+            # closest-priced choice (it used to win and then be refused, losing a valid row). Not for the next
+            # milestone up (above): that row is exempt, the price minimum is its protection.
+            return None, f"{kind} {ln} refused: Shook original-line limit: {_sw}"
         lo, ceiling = ref * (1.0 - drop), _b365_ceiling(tip, price)
         ok = lo - 1e-9 <= price <= ceiling + 1e-9
+        if ok and band_floor and price + 1e-9 < _b3.cents_at_or_above(lo):
+            ok = False           # v6.249: the band minimum is the target, so the price must reach it at the cent
         if not ok:
-            why.append(f"{kind} {ln} @ {price:.3f} outside [{lo:.3f}, {ceiling:.2f}] for tipped {ref}")
-            continue
-        passing.append((kind, ln, price, p, lo, ceiling))
+            return None, f"{kind} {ln} @ {price:.3f} outside [{lo:.3f}, {ceiling:.2f}] for tipped {ref}"
+        return (kind, ln, price, p, lo, ceiling), ""
+    passing, why = [], []
+    for ln in lines:
+        row, w = _walk(ln)
+        if row is None:
+            why.append(w)
+        else:
+            passing.append(row)
+    if not passing and far_up:
+        # the last resort: the next milestone up, when it sits more than the line limit from the tip
+        row, w = _walk(up_line)
+        if row is None:
+            why.append(w)
+        else:
+            passing.append(row)
     if not passing:
         return None, "", 0.0, 0.0, "; ".join(why)[:300] or "no row"
+    # v6.249 review (Wilson: "only that line ... feel free to go on the next milestone up"): the next milestone up is
+    # the last resort even when it is the +1 row, so it never beats a passing row on closest price
+    _not_up = [x for x in passing if x[0] != "milestone up"]
+    passing = _not_up or passing
     exact = [x for x in passing if x[0] == "exact"]
     kind, ln, price, p, lo, ceiling = (exact[0] if exact else
                                        min(passing, key=lambda x: abs(math.log(x[2] / ref))))
     return p, kind, lo, float(ceiling), ""
+
+
+def _b365_shook_near_pick(markets: dict, sport: str, tip, ctx: dict):
+    """v6.248 (Wilson 5 Nov: "allow one worse on b365 and sportmarket aswell"): the bet365 row for a deferred Shook
+    over with no tipster price, when the tipped line has no bet365 row at all. Walks _shook_near_lines (the line
+    one below first, then one above, each inside Shook's original-line limit) through bet365's own resolver; a
+    row priced at or under the 1.60 no-comparison floor falls through to the next line. Not _b365_shortfall_pick:
+    that one divides by the tipster's price and its band needs it. Returns (pick, "") or (None, why)."""
+    import bet365_sports as _b3
+    why = []
+    leg = tip.legs[0] if getattr(tip, "legs", None) else None
+    for ln in _shook_near_lines(tip, leg, ctx["line"]):
+        p = _b3.resolve(markets, sport, tip.event or "", "prop", player=ctx["player"],
+                        stat=ctx["stat"], line=ln, side=ctx["side"])
+        if not p.ok:
+            why.append(f"{ln:g}: {p.refused}")
+            continue
+        if p.line is None:
+            p.line = ln          # the ledger / alert / payload carry the line bet
+        bad, w = _nfl_odds_guard_refuses(tip.tipster, None, float(p.odds or 0))
+        if bad:
+            why.append(f"{ln:g}: {w}")
+            continue
+        return p, ""
+    return None, "; ".join(why)[:300] or "no candidate line inside the limits"
 
 
 def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
@@ -26473,6 +28004,9 @@ def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
     want = math.floor(float(want or 0) * 100 + 1e-6) / 100
     if want < max(1.0, AFL_FANOUT_MIN_STAKE):
         return _b365_refuse(label, f"${want:.2f} is under the minimum stake")
+    if ctx.get("game_line"):
+        # v6.250: an NFL game line has its own pick and price rules (card only, by epk + market_ref)
+        return _b365_game_line_attempt_inner(tip, ctx, want, mode, sb_price, label, sent, sid, cap)
     ev = _b3.event_name(sport, tip.event or "")
     # v6.188: steals / blocks are not in HyperBot's bet365 catalog but place by name ($1 tests
     # 2026-10-31: Maxey over 1.5 steals = the "2+ Steals" slip, LeBron over 0.5 blocks): no catalog
@@ -26482,7 +28016,7 @@ def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
     pc, _why_hbm = _b365_hb_markets_catalog(sport, ev)
     _bn = ""
     if (pc is not None
-            and not _b3.player_stat_rows_exist(pc["markets"], ctx["player"], ctx["stat"])):
+            and not _b3.player_stat_rows_exist(pc["markets"], ctx["player"], ctx["stat"], sport)):
         # review: the card has no row at all for this player and stat (v6.199: any stat, e.g. an
         # NBL card with no rebounds / assists): the route before the card (by name for steals /
         # blocks, else the /v3/price catalog), a missed bet otherwise
@@ -26562,17 +28096,37 @@ def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
         if pick is None:
             return _b365_refuse(label, f"no bet365 row within the shortfall rules: {_why_alt}")
         price = float(pick.odds or 0)
-        target = math.floor(min(price, _ref) * 100 + 1e-9) / 100
-        if target <= 1.0 or target > price + 1e-9 or target < _lo - 1e-9:
+        if alt_kind == "milestone up" or getattr(_c, "B365_SHORTFALL_BAND_FLOOR", False):
+            # v6.249 (Wilson 6 Nov, Wagner: tip 1.80, card 1.833, live 1.74, refused "live 1.74 < floor 1.80"):
+            # the spill's floor is the row's own minimum (the 10% band, or the milestone-up minimum) to the cent
+            # up, not the tip's price; the check below still wants it usable and no higher than the quote
+            target, _tol = _b3.cents_at_or_above(_lo), 2e-8
+        else:
+            target, _tol = math.floor(min(price, _ref) * 100 + 1e-9) / 100, 1e-9
+        if target <= 1.0 or target > price + 1e-9 or target < _lo - _tol:
             return _b365_refuse(label, f"no usable target_odds floor ({target}) for price {price:.3f} "
                                        f"(minimum {_lo:.3f})")
     else:
         pick = _b3.resolve(pc["markets"], sport, tip.event or "", "prop", player=ctx["player"],
                            stat=ctx["stat"], line=ctx["line"], side=ctx["side"])
+        _near_pick = False
+        if (not pick.ok and mode == "shortfall" and ctx.get("side") == "over"
+                and _shook_near_lines_ok(tip, tip.legs[0] if tip.legs else None)):
+            # v6.248: a deferred Shook over with no tipster price and NO bet365 row at the tipped rung: the line one
+            # below, then one above (inside his original-line limit), above the 1.60 floor. A rung that is there but
+            # was refused (two rows, an unverified id) is not "no row": no near line then. Shortfall only.
+            if _b3.rung_rows_exist(pc["markets"], ctx["player"], ctx["stat"], ctx["line"], sport):
+                return _b365_refuse(label, f"no exact bet365 row: {pick.refused} (the tipped rung exists, so no "
+                                           f"line one away)")
+            _np, _np_why = _b365_shook_near_pick(pc["markets"], sport, tip, ctx)
+            if _np is None:
+                return _b365_refuse(label, f"no exact bet365 row: {pick.refused}; no line one away usable: "
+                                           f"{_np_why}")
+            pick, alt_kind, _near_pick = _np, "near", True
         if not pick.ok:
             if not (mode == "better" and _b365_nba_rungs_on(sport, ctx)):
                 return _b365_refuse(label, f"no exact bet365 row: {pick.refused}")
-            if _b3.rung_rows_exist(pc["markets"], ctx["player"], ctx["stat"], ctx["line"]):
+            if _b3.rung_rows_exist(pc["markets"], ctx["player"], ctx["stat"], ctx["line"], sport):
                 # review: the tipped rung IS there but was refused (two rows, an unverified id):
                 # Wilson's rule swaps rungs only when bet365 has no row at the tipped one
                 return _b365_refuse(label, f"no exact bet365 row: {pick.refused} (the tipped rung "
@@ -26588,7 +28142,7 @@ def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
                                            f"side good enough: {_awhy}")
             pick, alt_kind = _alt, _akind
         price = float(pick.odds or 0)
-        if alt_kind != "exact":
+        if alt_kind not in ("exact", "near"):
             # v6.188: the fill must clear the rung's own bar (Sportsbet's price for the rung below,
             # Sportsbet / 0.8 for the rung above): bet365 refuses anything under target_odds
             target = _b3.cents_at_or_above(_need)
@@ -26601,17 +28155,33 @@ def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
                     return _b365_refuse(label, f"price guard ({alt_kind}): {why}")
                 ceiling = _b365_ceiling(tip, price)
             else:
+                if not _tip_has_own_price(tip):
+                    # v6.249 review (Wilson 6 Nov): a tip with NO tipster price takes the rung above only above the flat
+                    # 1.60 no-comparison floor (exactly 1.60 refused, the _nfl_odds_guard_refuses boundary), and the
+                    # target is held to it too (here `target` is the rung's bar, Sportsbet / 0.8). tipped=None: the
+                    # guard's ceiling would sit on the 1.25 this rung needs, and suggested_odds can be Sportsbet's quote
+                    bad, why = _nfl_odds_guard_refuses(tip.tipster, None, price)
+                    if bad:
+                        return _b365_refuse(label, f"price guard ({alt_kind}): {why}")
+                    target = max(target, round(float(_NFL_MIN_LIVE_ODDS_NO_COMPARISON) + 0.01, 2))
+                    if target > price + 1e-9:
+                        return _b365_refuse(label, f"no usable target_odds floor ({target}) for the {alt_kind} "
+                                                   f"at {price:.3f}")
                 # the normal ceiling (tipster x 1.25) sits on the 1.25 this rung needs
                 _base = _ref if _ref > 1.0 else float(sb_price)
                 ceiling = float(round(_base * float(getattr(
                     _c, "B365_NBA_HARDER_RUNG_MAX_ODDS_MULT", 1.5)), 2))
+                if TIPSTERS_MAX_ODDS_MULT.get(tip.tipster) == 0.0:
+                    # v6.249 (Wilson 6 Nov: no top limit for Shook): only the to-win sizing rule is left
+                    ceiling = _b365_price_ceiling(price)
         else:
             # v6.226 (Wilson 3 Nov 2026: Sportsbet accounts are mostly 1%, so a tie goes to bet365)
             if mode == "better" and not _b3.better_or_equal(price, sb_price):
                 return _b365_refuse(label, f"bet365 {price:.3f} is not equal or better than Sportsbet {sb_price}")
             # The same price rules as the Sportsbet bet: the NFL/NBL odds guard (10% under the
             # tipster's price, the ceiling, the no-comparison floor), the fan-out target floor.
-            bad, why = _nfl_odds_guard_refuses(tip.tipster, tipped, price)
+            # v6.248: a near line has no tipster price to compare with: the 1.60 floor and nothing else
+            bad, why = _nfl_odds_guard_refuses(tip.tipster, None if _near_pick else tipped, price)
             if bad:
                 return _b365_refuse(label, f"price guard: {why}")
             # v6.121 (2026-10-26 Kenneth Walker: price 1.8696, floor rounded UP to 1.87, refused):
@@ -26632,6 +28202,32 @@ def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
             # v6.121 review: flooring a fractional price to the cent can land under the 10% guard
             return _b365_refuse(label, f"target_odds floor {target} is under the price guard "
                                        f"minimum {_guard_min:.3f}")
+    # v6.266 (Wilson 7 Nov 2026: 1.50 minimum for a tip with no tipster price): bet365 not used under it, whatever rung
+    # or branch picked the row, and the target sent is never under it (bet365 refuses a fill under target_odds). A by-name
+    # bet has no quote: its price IS the floor, so the floor is raised and the ceiling check below judges it.
+    _npm = _no_price_min_odds(tip)
+    if _npm:
+        _t266 = _b3.cents_at_or_above(_npm)
+        if alt_kind == "by name":
+            if target < _t266:
+                target = _t266
+            price = max(price, target)
+        elif not (math.isfinite(price) and price >= _npm - 1e-9):
+            _no_price_min_note(tip, price, _npm)       # v6.266 review: the reason reaches the alert
+            return _b365_refuse(label, f"no tipster price and the bet365 row is {price:.3f}, under the {_npm:g} "
+                                       f"no-price minimum")
+        elif target < _t266:
+            target = _t266
+        if target > price + 1e-9:
+            return _b365_refuse(label, f"no usable target_odds floor ({target}) for price {price:.3f}")
+    # v6.249 review: the next milestone up is exempt (Wilson 6 Nov: a Shook o22.5 may take 25+, 2 worse than his line:
+    # the price minimum is the protection); the shortfall walk has already applied the limit to every other row
+    _shook_why = ("" if alt_kind == "milestone up" else
+                  _shook_orig_refusal(tip, pick.line if pick.line is not None else ctx.get("line")))
+    if _shook_why:
+        # v6.247 Rule A: the row picked (the tipped line, a rung either side, the shortfall's line within 1) is held
+        # to Shook's ORIGINAL line, not the current one the tip carries
+        return _b365_refuse(label, f"Shook original-line limit: {_shook_why}")
     if ceiling < target:
         return _b365_refuse(label, f"ceiling {ceiling} is under the target {target}")
     if price > ceiling + 1e-9:
@@ -26647,6 +28243,11 @@ def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
     if _st_send is not None and time.time() >= _st_send - 120:
         return _b365_refuse(label, "the game is within 2 minutes of its start (or has started): "
                                    "not sent")
+    _tip_why = _shook_tipoff_refusal(tip)
+    if _tip_why:
+        # v6.247: the last stop before the POST for a deferred Shook tip (the pause wait above can last ~125 s):
+        # nothing is sent, the rest goes to manual
+        return _b365_refuse(label, f"Shook tip-off stop: {_tip_why}: not sent")
     # v6.197: a card row goes out by epk + market_ref (HyperBot's exact form, $1-tested 1 Nov on
     # NBA points, an NFL ladder over and an NFL under); everything else exactly as before
     _ref_epk = (str((pc or {}).get("epk") or "") if (pc or {}).get("_source") == "hb_markets" else "")
@@ -26654,7 +28255,11 @@ def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
     _by_ref = bool(getattr(_c, "B365_PLACE_BY_MARKET_REF", False) and _ref_epk and _mref
                    and (pc or {}).get("market_ref_enabled") is not False)   # HB docs rule 3
 
-    _alt_note = "" if alt_kind == "exact" else f" ({alt_kind} line {pick.line}, tipped {ctx['line']})"
+    _alt_note = ("" if alt_kind == "exact" else
+                 f" (line {pick.line} for the tipped {ctx['line']}: no bet365 row on the tipped line)"
+                 if alt_kind == "near" else
+                 f" ({alt_kind} line {pick.line}, tipped {ctx['line']} @ {_ref}, minimum {_lo:.3f})"
+                 if alt_kind == "milestone up" else f" ({alt_kind} line {pick.line}, tipped {ctx['line']})")
     # review: where the price came from (HyperBot's /v3/markets card, the /v3/price catalog, by name)
     _src = ("by name" if _bn else ("card" if (pc or {}).get("_source") == "hb_markets" else "price"))
     log.info(f"{label}: bet365 {mode}: {ctx['player']} {ctx['side']} {pick.line} {ctx['stat']}{_alt_note} "
@@ -26674,7 +28279,8 @@ def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
                     _net_elapsed(t0))
         res = hb.place_single_sports_bet(
             sid, sport, ev, market=(getattr(pick, "hb_market", "") or pick.market), selection=pick.selection, stake=amount,
-            player=ctx["player"], line=pick.line, target_odds=target,
+            # v6.267: the card's own spelling when the tip's first name was shortened (Alex / Alexandre Sarr)
+            player=(getattr(pick, "player_alias", "") or ctx["player"]), line=pick.line, target_odds=target,
             proposition_id=pick.proposition_id, direction=ctx["side"], max_odds=ceiling)
         return (res if isinstance(res, dict) else {"success": False, "error": f"unreadable answer {res!r}"},
                 _net_elapsed(t0))
@@ -26684,6 +28290,9 @@ def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
     if (not r.success and getattr(r, "_b365_stake_reject", False)
             and r.max_stake and 1.0 <= r.max_stake < stake):
         mx = math.floor(min(float(r.max_stake), stake_cap) * 100 + 1e-6) / 100
+        if mx >= 1.0 and _shook_tipoff_refusal(tip):
+            log.info(f"{label}: bet365 rebet at ${mx:.2f} NOT sent: Shook tip-off stop: {_shook_tipoff_refusal(tip)}")
+            mx = 0.0
         if mx >= 1.0:
             log.info(f"{label}: bet365 stake too high at ${stake:.2f}, max ${r.max_stake}: rebet ONCE at ${mx:.2f}")
             res, el = _send(mx)
@@ -26702,14 +28311,331 @@ def _b365_attempt_inner(tip, ctx, want, mode, sb_price, label, sent) -> list:
     return [r]
 
 
+# ── v6.250 bet365 NFL GAME LINES (Wilson 6 Nov 2026) ──────────────────────────────────────────────
+# 4th and +EV tipped Jaguars -19.5 @ 4.05: Sportsbet took its $123 to-win-capped share, Sportmarket had no -19.5
+# row and $277 went to manual because bet365 was never asked. Wilson: ALL NFL game lines on bet365, the same rules
+# as a prop (first at equal or better than Sportsbet, a spill for the remainder, the 10% floor, B365_MAX_TO_WIN_NFL).
+# The row comes from HyperBot's /v3/markets card ONLY (never /v3/price, whose handicap rows are labelled 'Match')
+# and goes out by epk + market_ref ($1 tests 6 Nov on Uday 314653: line CIN -7.5, team total CIN over 27.5, total
+# over 49.5, head to head ATL). Half-point lines only for a spread / total / team total: a whole-number alt row's
+# settlement is unproven. Kept apart from the prop path on purpose: _b365_attempt_inner hands a game-line ctx here.
+_B365_GL_KIND = {"spread": "line", "total": "total_points", "team_total": "team_total", "h2h": "h2h"}
+_B365_GL_RESOLVE = {"line": "line", "total_points": "total", "team_total": "team_total", "h2h": "h2h"}
+_B365_GL_PLACED_MARKET = {"line": "line", "total_points": "total_points", "team_total": "team_total",
+                          "h2h": "head_to_head"}          # the ledger / auto-resulter names (the Sportmarket rows')
+_B365_GL_KICKOFF_TOL_SEC = 3600.0                         # the NBA wrong-fixture guard's tolerance
+
+
+def _b365_game_line_ctx(tipster: str, market_type: str, team: str, side: str, tipster_line, sb_line=None,
+                        event=None):
+    """v6.250: the bet365 context for an NFL game line (spread, total, team total, moneyline), or None (bet365 not
+    used, logged). Crash-safe like _b365_ctx: a crash here must never break the Sportsbet bet it rides on."""
+    try:
+        return _b365_game_line_ctx_inner(tipster, market_type, team, side, tipster_line, sb_line, event)
+    except Exception as e:
+        log.error(f"bet365: game-line context build crashed ({e}); bet365 not used for this tip")
+        return None
+
+
+def _b365_game_line_ctx_inner(tipster, market_type, team, side, tipster_line, sb_line, event):
+    if not _b365_on(tipster):
+        return None
+    import config as _c
+    import bet365_sports as _b3
+    mt = (market_type or "").strip().lower()
+    gl = _B365_GL_KIND.get(mt)
+    if gl is None:
+        return None                                       # not a game line: silently not ours
+    side = (side or "").strip().lower()
+    why = ""
+    canon = ""
+    fl = None
+    if not getattr(_c, "B365_NFL_GAME_LINES_ENABLED", False):
+        why = "off (B365_NFL_GAME_LINES_ENABLED)"
+    elif not getattr(_c, "B365_NFL_HB_MARKETS", False):
+        why = "the bet365 card is off (B365_NFL_HB_MARKETS)"
+    elif gl != "total_points":
+        canon = canonical_nfl_team(team) if (team or "").strip() else ""
+        if not canon or not _b3.team_short("nfl", canon):
+            why = f"team {team!r} is not an NFL team bet365 names"
+    if not why and gl in ("total_points", "team_total") and side not in ("over", "under"):
+        why = f"side {side!r} is not over/under"
+    if gl in ("line", "h2h"):
+        side = ""
+    if not why and gl != "h2h":
+        try:
+            fl = float(tipster_line)
+        except (TypeError, ValueError):
+            fl = None
+        if fl is None or not math.isfinite(fl):
+            why = f"tipped line {tipster_line!r} unreadable"
+        elif not _is_half_point(fl):
+            # v6.254 (Wilson 7 Nov 2026: "push is a void at -3.0"): whole-number game lines go on bet365 too
+            why = f"line {fl:g} is not on a whole or half point: bet365 has no such row"
+        elif gl != "line" and fl <= 0:
+            why = f"line {fl:g} is not positive"
+    if why:
+        log.info(f"bet365: not used for NFL {mt} {team} {side} {tipster_line} ({tipster}): {why}")
+        return None
+    differs = False
+    if gl != "h2h":
+        try:
+            differs = abs(float(sb_line) - fl) > 1e-9
+        except (TypeError, ValueError):
+            differs = True                                 # no Sportsbet line = cannot be compared either
+    return {"sport": "nfl", "game_line": gl, "player": "", "stat": "", "team": canon, "line": fl,
+            "side": side, "sb_line_differs": differs,
+            "start_epoch": _b365_clean_start(_espn_kickoff_epoch("nfl", event)) if event else None}
+
+
+def _b365_iso_epoch(v):
+    """An ISO start time ('2026-11-08T14:30:00Z') as epoch seconds, or None (missing, unreadable or no zone)."""
+    try:
+        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return d.timestamp() if d.tzinfo is not None else None
+
+
+def _b365_game_line_pick(tip, ctx: dict):
+    """v6.250: (card, pick, "") for a game-line ctx, or (None, None, why). The ONE bet365 row for the tipped line from
+    HyperBot's /v3/markets card: the kickoff must be known (ESPN), the card must be this game (names and a start
+    within an hour of ESPN's: a rematch guard) and the row must go out by epk + market_ref. Never the /v3/price
+    catalog and never by name."""
+    import config as _c
+    import bet365_sports as _b3
+    sport = ctx["sport"]
+    ev = _b3.event_name(sport, tip.event or "")
+    ko = _b365_clean_start(ctx.get("start_epoch"))
+    if ko is None:
+        return None, None, "the game's kickoff is unknown (ESPN): a game line is not sent without it"
+    pc, why = _b365_hb_markets_catalog(sport, ev, _B365_GL_HORIZON_H, game_line=True)
+    if pc is None:
+        return None, None, f"no bet365 card for {ev!r} ({why}); a game line is never read from /v3/price"
+    if not _b365_same_game(pc.get("event") or "", ev):
+        return None, None, f"bet365 card is {pc.get('event')!r}, not provably {ev!r}"
+    cs = _b365_iso_epoch(pc.get("start_time"))
+    if cs is None:
+        return None, None, f"the bet365 card has no readable start time ({pc.get('start_time')!r})"
+    if abs(cs - ko) > _B365_GL_KICKOFF_TOL_SEC:
+        return None, None, (f"the bet365 card starts {abs(cs - ko) / 3600:.1f} h from ESPN's kickoff for {ev!r}: "
+                            f"not provably this game")
+    pick = _b3.resolve(pc["markets"], sport, tip.event or "", _B365_GL_RESOLVE[ctx["game_line"]],
+                       team=ctx.get("team") or "", line=ctx.get("line"), side=ctx.get("side") or "")
+    if not pick.ok:
+        return None, None, f"no exact bet365 row: {pick.refused}"
+    if not (getattr(_c, "B365_PLACE_BY_MARKET_REF", False) and pc.get("_source") == "hb_markets"
+            and pc.get("epk") and pick.market_ref
+            and pc.get("market_ref_enabled") is True):        # v6.250 fix round: HB docs rule 3, a missing key is not a yes
+        return None, None, "the row cannot go out by epk + market_ref (a game line is sent no other way)"
+    return pc, pick, ""
+
+
+def _b365_game_line_desc(ctx: dict) -> str:
+    return " ".join(str(x) for x in (ctx.get("team") or "", ctx["game_line"], ctx.get("side") or "",
+                                     ctx.get("line") if ctx.get("line") is not None else "") if x != "")
+
+
+def _b365_game_line_quote(tip, ctx: dict):
+    """bet365's live card price for the tipped game line (for ordering the external books), or None."""
+    pc, pick, why = _b365_game_line_pick(tip, ctx)
+    if pick is None or not pick.odds:
+        log.warning(f"bet365 quote for ordering: no priced game-line row for {tip.event!r}: {why or 'no odds'}")
+        return None
+    return float(pick.odds)
+
+
+def _b365_game_line_placed(ctx: dict, pick) -> tuple:
+    """(market, selection) a placed game-line result carries into the ledger, in the shapes the Sportmarket rows use
+    (market line / head_to_head: the canonical team; total_points: 'Over'; team_total: '<team> Over'), so the Bet
+    Record and the auto-resulter grade it as they grade those."""
+    gl, team, side = ctx["game_line"], ctx.get("team") or "", (ctx.get("side") or "").title()
+    sel = {"line": team, "h2h": team, "total_points": side, "team_total": f"{team} {side}".strip()}[gl]
+    return _B365_GL_PLACED_MARKET[gl], sel
+
+
+def _b365_game_line_attempt_inner(tip, ctx, want, mode, sb_price, label, sent, sid, cap) -> list:
+    """v6.250: ONE bet365 bet on an NFL game line. The same rules as a prop (_b365_attempt_inner): mode "better" only
+    at a price equal or better than Sportsbet's on the same line; mode "shortfall" the exact tipped row, inside the
+    priced spill's 10% band (its lowest price to the cent up is the minimum sent), or with no price of the
+    tipster's own the exact row above the no-comparison floor; the B365_MAX_TO_WIN_NFL cap sized at the ceiling."""
+    import config as _c
+    import bet365_sports as _b3
+    sport = ctx["sport"]
+    ev = _b3.event_name(sport, tip.event or "")
+    if mode == "better" and ctx.get("sb_line_differs"):
+        return _b365_refuse(label, "Sportsbet is on a different line, so bet365 can only take the "
+                                   "shortfall at the tipped line")
+    pc, pick, why = _b365_game_line_pick(tip, ctx)
+    if pick is None:
+        return _b365_refuse(label, why)
+    tipped = getattr(tip, "suggested_odds", None)
+    try:
+        _ref = float(tipped) if tipped and float(tipped) > 1.0 else 0.0
+    except (TypeError, ValueError):
+        _ref = 0.0
+    _own = getattr(tip, "_tipster_odds", "unset")
+    try:
+        _no_own_price = _own != "unset" and not (_own is not None and float(_own) > 1.0)
+    except (TypeError, ValueError):
+        _no_own_price = True
+    price = float(pick.odds or 0)
+    if not (math.isfinite(price) and price > 1.0):
+        return _b365_refuse(label, f"the bet365 row has no usable price ({pick.odds})")
+    if mode == "shortfall" and _ref > 1.0 and not _no_own_price:
+        # the same band and sent minimum as the priced prop spill (_b365_shortfall_pick / _b365_attempt_inner)
+        drop = float(getattr(_c, "B365_SHORTFALL_ODDS_DROP_PCT", 0.10) or 0)
+        lo, ceiling = _ref * (1.0 - drop), _b365_ceiling(tip, price)
+        band_floor = bool(getattr(_c, "B365_SHORTFALL_BAND_FLOOR", False))
+        ok = lo - 1e-9 <= price <= ceiling + 1e-9
+        if ok and band_floor and price + 1e-9 < _b3.cents_at_or_above(lo):
+            ok = False
+        if not ok:
+            return _b365_refuse(label, f"no bet365 row within the shortfall rules: exact {pick.line} @ "
+                                       f"{price:.3f} outside [{lo:.3f}, {ceiling:.2f}] for tipped {_ref}")
+        if band_floor:
+            target, _tol = _b3.cents_at_or_above(lo), 2e-8
+        else:
+            target, _tol = math.floor(min(price, _ref) * 100 + 1e-9) / 100, 1e-9
+        if target <= 1.0 or target > price + 1e-9 or target < lo - _tol:
+            return _b365_refuse(label, f"no usable target_odds floor ({target}) for price {price:.3f} "
+                                       f"(minimum {lo:.3f})")
+    else:
+        if mode == "better" and not _b3.better_or_equal(price, sb_price):
+            return _b365_refuse(label, f"bet365 {price:.3f} is not equal or better than Sportsbet {sb_price}")
+        bad, why = _nfl_odds_guard_refuses(tip.tipster, tipped, price)
+        if bad:
+            return _b365_refuse(label, f"price guard: {why}")
+        target = float(price)
+        if _ref > 1.0:
+            target = min(target, _ref)
+        if mode == "better":
+            target = max(target, _b3.cents_at_or_above(sb_price))     # v6.226: never a fill under Sportsbet's price
+        target = math.floor(target * 100 + 1e-9) / 100                 # v6.121: down, never above the price
+        if target <= 1.0 or target > price + 1e-9:
+            return _b365_refuse(label, f"no usable target_odds floor ({target}) for price {price:.3f}")
+        ceiling = _b365_ceiling(tip, price)
+    _guard_min = _ref * _ODDS_FLOOR_PCT if _ref > 1.0 else 0.0
+    if _guard_min and target < _guard_min - 1e-9:
+        return _b365_refuse(label, f"target_odds floor {target} is under the price guard minimum {_guard_min:.3f}")
+    # v6.266: the NFL game-line send holds the same no-price minimum (NFL's 1.6 above stands where it is higher)
+    _npm = _no_price_min_odds(tip)
+    if _npm:
+        if not (math.isfinite(price) and price >= _npm - 1e-9):
+            _no_price_min_note(tip, price, _npm)       # v6.266 review: the reason reaches the alert
+            return _b365_refuse(label, f"no tipster price and the bet365 row is {price:.3f}, under the {_npm:g} "
+                                       f"no-price minimum")
+        target = max(target, _b3.cents_at_or_above(_npm))
+        if target > price + 1e-9:
+            return _b365_refuse(label, f"no usable target_odds floor ({target}) for price {price:.3f}")
+    if ceiling < target:
+        return _b365_refuse(label, f"ceiling {ceiling} is under the target {target}")
+    if price > ceiling + 1e-9:
+        return _b365_refuse(label, f"bet365 {price:.3f} is above the {ceiling} ceiling")
+    if ctx.get("cap_left") is not None:
+        # v6.250 fix round (Wilson 6 Nov): the near-line walk hands in the to-win cap this tip has left on bet365 after its
+        # earlier bet365 bets (the cap is per send here, so exact + near fills could pass B365_MAX_TO_WIN_NFL). Only the
+        # game-line path reads it; the prop path and the exact-line send keep the per-send cap.
+        try:
+            _cl = float(ctx["cap_left"])
+        except (TypeError, ValueError):
+            _cl = 0.0
+        if not (math.isfinite(_cl) and _cl > 0):
+            return _b365_refuse(label, f"this tip's earlier bet365 bets already use the ${cap:.0f} to-win cap")
+        cap = min(cap, _cl)
+    stake_cap = _b3.max_stake_for_to_win(cap, ceiling)
+    stake = math.floor(min(want, stake_cap) * 100 + 1e-6) / 100
+    if stake < max(1.0, AFL_FANOUT_MIN_STAKE):
+        return _b365_refuse(label, f"the ${cap:.2f} to-win cap at {ceiling} leaves ${stake:.2f}")
+    if _sports_paused():
+        return _b365_refuse(label, "sports placement paused")
+    _st_send = _b365_clean_start(ctx.get("start_epoch"))
+    if _st_send is None or time.time() >= _st_send - 120:
+        return _b365_refuse(label, "the game is within 2 minutes of its start (or has started): not sent")
+    _ref_epk, _mref = str(pc.get("epk") or ""), str(pick.market_ref or "")
+    _hbm = getattr(pick, "hb_market", "") or pick.market
+    _near_tag = f" (nearby line, tipped {ctx['near_of']:g})" if ctx.get("near_of") is not None else ""     # v6.250 part B
+    log.info(f"{label}: bet365 {mode}{_near_tag}: {_b365_game_line_desc(ctx)} ${stake:.2f} @ {price:.3f} on {sid} "
+             f"[{pick.market} prop={pick.proposition_id} target={target} max={ceiling} cap ${cap:.0f} to win; "
+             f"wanted ${want:.2f}; Sportsbet {sb_price}; src=card; by market_ref {_mref}]")
+
+    def _send(amount):
+        sent.update(stake=amount, sid=sid, odds=price)
+        t0 = time.time()
+        res = hb.place_single_sports_bet(
+            sid, sport, ev, market=_hbm, selection=pick.selection, stake=amount, target_odds=target,
+            max_odds=ceiling, epk=_ref_epk, market_ref=_mref)
+        return (res if isinstance(res, dict) else {"success": False, "error": f"unreadable answer {res!r}"},
+                _net_elapsed(t0))
+
+    res, el = _send(stake)
+    r = _b365_result(tip, ctx, pick, sid, stake, price, res, el)
+    if (not r.success and getattr(r, "_b365_stake_reject", False)
+            and r.max_stake and 1.0 <= r.max_stake < stake):
+        mx = math.floor(min(float(r.max_stake), stake_cap) * 100 + 1e-6) / 100
+        if mx >= 1.0:
+            log.info(f"{label}: bet365 stake too high at ${stake:.2f}, max ${r.max_stake}: rebet ONCE at ${mx:.2f}")
+            res, el = _send(mx)
+            r = _b365_result(tip, ctx, pick, sid, mx, price, res, el)
+            r._b365_stake_reject = True            # never a third bet365 bet on this line
+    _log_jsonl(_audit_log_path(), {
+        "type": "b365_attempt", "tipster": tip.tipster, "event": tip.event, "mode": mode,
+        "session_id": sid, "player": "", "stat": "", "game_line": ctx["game_line"], "team": ctx.get("team") or "",
+        "line": pick.line, "tipped_line": ctx.get("near_of", ctx.get("line")),
+        "line_kind": "near" if ctx.get("near_of") is not None else "exact", "price_source": "card",
+        "sent_market": _hbm, "market_ref": _mref, "epk": _ref_epk,
+        "side": ctx.get("side") or "", "market": pick.market, "proposition_id": pick.proposition_id,
+        "price": price, "sportsbet_price": sb_price, "target_odds": target, "max_odds": ceiling,
+        "stake": r.stake, "success": r.success, "maybe_placed": _is_ambiguous_result(r),
+        "bet_id": r.bet_id, "error": (r.error or "")[:200],
+        "echo_check": getattr(r, "_b365_echo", "")})       # v6.250 fix round: match / mismatch / absent / "" (not placed)
+    return [r]
+
+
+def _b365_game_line_echo_check(tip, ctx, pick, r, res) -> str:
+    """v6.250 fix round (Wilson 6 Nov): a game line goes out by epk + market_ref with no name, and a ref alone does not
+    name the team (CAR 'over_team_total_23.5' against DEN 'over_team_total_23.5_team_total'). On a PLACED bet,
+    HyperBot's answer carries resolved.book_selection_id, which equalled the row's proposition_id on six live bets
+    (6 Nov). 'match' / 'mismatch' (a CRITICAL alert, the bet stays recorded as placed) / 'absent' (a log line only: the
+    field or our id is missing). NEVER raises: a crash here must never lose the placed result."""
+    try:
+        _rv = res.get("resolved") if isinstance(res.get("resolved"), dict) else {}
+        echoed = _rv.get("book_selection_id")
+        asked = getattr(pick, "proposition_id", None)
+        if echoed in (None, "") or asked in (None, ""):
+            log.info(f"bet365 game line {r.bet_id}: no book_selection_id check (HyperBot echoed {echoed!r}, "
+                     f"row proposition_id {asked!r})")
+            return "absent"
+        if str(echoed).strip() == str(asked).strip():
+            return "match"
+        what = _b365_game_line_desc(ctx)
+        log.error(f"bet365 game line {r.bet_id}: HyperBot echoed book_selection_id {echoed!r} but we asked for "
+                  f"proposition_id {asked!r} ({what}); recorded as placed")
+        try:
+            notifier.notify_critical(
+                f"bet365 game line may be the WRONG SELECTION on {tip.tipster}: asked for {what} "
+                f"(proposition_id {asked}, market_ref {getattr(pick, 'market_ref', '')}), HyperBot echoed "
+                f"book_selection_id {echoed} ({_rv.get('selection')!r}, line {_rv.get('line')}). Bet id {r.bet_id}, "
+                f"stake ${float(r.stake or 0):.2f}. The bet is recorded as placed: check the bet365 account for what "
+                f"was actually bet.")
+        except Exception as e:
+            log.error(f"bet365 game line {r.bet_id}: the selection mismatch alert failed ({e})")
+        return "mismatch"
+    except Exception as e:
+        log.error(f"bet365 game line {getattr(r, 'bet_id', '?')}: selection check crashed ({e}); bet kept as placed")
+        return ""
+
+
 def _b365_result(tip, ctx, pick, sid, stake, price, res, el) -> BetResult:
     """One bet365 answer as a BetResult. Placed; CLEAN (proven not sent: a fast stake-too-high,
     a pre-placement reject, a definite 4xx); everything else MAYBE PLACED (never re-placed)."""
     err = str(res.get("error") or "")
+    _pm, _psel = ((pick.market, f"{ctx['player']} {ctx['side'].title()}") if not ctx.get("game_line")
+                  else _b365_game_line_placed(ctx, pick))          # v6.250: a game line's ledger shape
     r = BetResult(success=False, tip=tip, session_id=sid, bookie="bet365", stake=stake,
-                  odds=price, timestamp=datetime.now(), placed_market=pick.market,
+                  odds=price, timestamp=datetime.now(), placed_market=_pm,
                   placed_player=ctx["player"], placed_stat=ctx["stat"], placed_line=pick.line,
-                  placed_selection=f"{ctx['player']} {ctx['side'].title()}",
+                  placed_selection=_psel,
                   correlation_id=res.get("client_bet_id") or res.get("correlation_id"))
     r.elapsed_sec = el
     r._b365 = True
@@ -26739,6 +28665,8 @@ def _b365_result(tip, ctx, pick, sid, stake, price, res, el) -> BetResult:
             log.warning(f"bet365 placed {ctx['player']} {ctx['stat']} at line {_rl}, asked {pick.line}: "
                         f"recorded as placed ({r.bet_id})")
             r.placed_line = _rl
+        if ctx.get("game_line"):
+            r._b365_echo = _b365_game_line_echo_check(tip, ctx, pick, r, res)       # v6.250 fix round
         return r
     fast = el < STAKE_REJECT_LATENCY_THRESHOLD_SEC
     flagged = bool(res.get("ambiguous") or res.get("cid_unresolved"))
@@ -26947,6 +28875,16 @@ def _is_half_line(x) -> bool:
     except (TypeError, ValueError):
         return False
     return math.isfinite(v) and abs(v - round(v)) < 1e-9 and int(round(v)) % 2 == 1
+
+
+def _is_half_point(x) -> bool:
+    """v6.254: a finite line on a whole or half point (-3.0, -3.5), never an Asian quarter line (-3.25, which
+    splits the stake across two lines)."""
+    try:
+        v = float(x) * 2
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(v) and abs(v - round(v)) < 1e-9
 
 
 def _sm_first_half_market(tip, leg) -> "str | None":
@@ -27221,14 +29159,17 @@ def _sm_attach_board(tip, res, board) -> None:
         log.warning(f"Sportmarket board not attached: {e}")
 
 
-def _sm_resolve(tip, sess, exact_only: bool, fh_hb_price=None):
+def _sm_resolve(tip, sess, exact_only: bool, fh_hb_price=None, shook_near: bool = False):
     """The tipped row on the bridge's catalog through the shared resolver (the same ceiling and
-    exact-line rules as any session): (resolved, "") or (None, why). Never raises."""
+    exact-line rules as any session): (resolved, "") or (None, why). Never raises. v6.248: `shook_near`
+    (a deferred Shook tip with no tipster price, _shook_near_lines_ok) lets the resolver return a row one line
+    away, marked "_shook_near", when the tipped line has no row at all; that row is for the shortfall only."""
     hb_router.clear_bridge_price()
     try:
         res, manual = _resolve_single_for_placement(
             tip, sess, apply_ceiling=True, apply_floor=False, exact_only=exact_only,
-            **({"fh_hb_price": fh_hb_price} if fh_hb_price is not None else {}))
+            **({"fh_hb_price": fh_hb_price} if fh_hb_price is not None else {}),
+            **({"shook_near": True} if shook_near else {}))
     except Exception as e:
         return None, f"resolve crashed: {e}"
     if res is None:
@@ -27251,6 +29192,8 @@ def _ext_quote_b365(tip, cx) -> float | None:
         import config as _c
         import bet365_sports as _b3
         sid = str(getattr(_c, "B365_SPORTS_SESSION", "") or "").strip()
+        if cx.get("game_line"):
+            return _b365_game_line_quote(tip, cx)       # v6.250: card only
         ev = _b3.event_name(cx["sport"], tip.event or "")
         pc, _why = _b365_hb_markets_catalog(cx["sport"], ev)       # v6.194: the card first
         if pc is None:
@@ -27279,6 +29222,104 @@ def _ext_quote_b365(tip, cx) -> float | None:
 def _ext_order(quotes: dict) -> list:
     """Book names best price first; a book with no price goes last (its own attempt decides)."""
     return [n for n, _p in sorted(quotes.items(), key=lambda kv: -(kv[1] or 0.0))]
+
+
+def _line_worse_for_us(kind, line, tipped) -> bool:
+    """v6.256: `line` is a strictly worse number than `tipped` for the bettor: an over higher, an under lower, a
+    spread (kind "team", the row's line signed for our team) lower, i.e. fewer points in our favour. A moneyline
+    (kind None), an unreadable or non-finite line is not worse."""
+    try:
+        ln, tl = float(line), float(tipped)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(ln) and math.isfinite(tl)):
+        return False
+    if kind in ("team", "under"):
+        return ln < tl - 1e-9
+    if kind == "over":
+        return ln > tl + 1e-9
+    return False
+
+
+def _shortfall_kind(tip, sm_res, b365_cx) -> "str | None":
+    """v6.256: "team" for a spread, "over" / "under" for a game total, team total or player prop, None for a
+    moneyline or anything that cannot be read (the order is then plain best price)."""
+    gl = None
+    for src in (sm_res, b365_cx):
+        g = (src or {}).get("game_line")
+        if g:
+            gl = _sm_game_line_market(g)
+            break
+    if gl == "h2h":
+        return None
+    if gl == "line":
+        return "team"
+    legs = getattr(tip, "legs", None) or []
+    for c in ((b365_cx or {}).get("side"), (sm_res or {}).get("selection"),
+              getattr(legs[0], "selection", None) if legs else None):
+        for t in reversed(str(c or "").strip().lower().split()):
+            if t in ("over", "under"):
+                return t
+    if getattr(tip, "_is_threshold", False):
+        return "over"            # an 'N+' tip with no side word on the leg or the rows is the over N - 0.5
+    return None
+
+
+def _shortfall_order(quotes: dict, tip, sm_res=None, b365_cx=None, label: str = "") -> list:
+    """v6.256 (Wilson 7 Nov 2026, Parker Washington o60.5: Sportmarket had only 61.5 at 1.892 and took the whole
+    remainder ahead of bet365's 60.5 at 1.870): the book order for the SHORTFALL after Sportsbet. A book whose
+    row is on a line WORSE for us than the tip's goes after every other book; each group stays best price first
+    (_ext_order, a book with no price last). A better number, a moneyline, no readable line = not worse. Sportmarket's
+    line is its resolved row's; bet365's is its context line, but only when bet365 HAS a quote (its quote is the
+    tipped-line row): a bet365 with no quote has no tipped-line row, so it earns no place in the first group and
+    sits with the worse-line books (price order, a book with no price last), as before. Its attempt may still take a
+    rung inside its own rules (v6.188 / v6.193) after its tipped row fails the band; this only orders. The reference
+    line is Shook's ORIGINAL tipped line (tip._shook_orig_line, side _shook_orig_side) when the deferred run set it,
+    since the leg then carries the moved board line. Only the order changes: each book's own price, band, cap and
+    line rules still decide. Switch SHORTFALL_TIPPED_LINE_FIRST; off, or on any error, it is plain _ext_order.
+    Never raises."""
+    plain = _ext_order(quotes)
+    try:
+        import config as _c
+        if len(plain) < 2 or not getattr(_c, "SHORTFALL_TIPPED_LINE_FIRST", True):
+            return plain
+        kind = _shortfall_kind(tip, sm_res, b365_cx)
+        orig = getattr(tip, "_shook_orig_line", None)
+        if orig is not None:
+            # a deferred Shook tip: the leg's line is the MOVED board line, the tip is the original one
+            tl = orig
+            _os = str(getattr(tip, "_shook_orig_side", "") or "").strip().lower()
+            if _os in ("over", "under") and kind in (None, "over", "under"):
+                kind = _os
+        else:
+            tl = (sm_res or {}).get("tipped_line")
+            legs = getattr(tip, "legs", None) or []
+            if tl is None and legs:
+                tl = _sm_tipped_line(tip, legs[0])
+            if tl is None:
+                tl = (b365_cx or {}).get("line")
+        if kind is None or tl is None:
+            return plain
+        lines = {}
+        if "sportmarket" in plain and sm_res:
+            lines["sportmarket"] = sm_res.get("line")
+        if "bet365" in plain and b365_cx and quotes.get("bet365"):
+            lines["bet365"] = b365_cx.get("line")
+        worse = {n for n, ln in lines.items() if _line_worse_for_us(kind, ln, tl)}
+        if not worse:
+            return plain                          # nothing on a worse line: the old price order stands
+        behind = set(worse)
+        if "bet365" in plain and not quotes.get("bet365"):
+            behind.add("bet365")                  # no quote = no tipped-line row: no place in the first group
+        out = sorted(plain, key=lambda n: n in behind)         # stable: price order kept inside each group
+        if out != plain:
+            log.info(f"{label + ': ' if label else ''}shortfall order {out} instead of best price {plain}: "
+                     + ", ".join(f"{n} on {lines[n]}" for n in plain if n in lines)
+                     + f" against the tipped {float(tl):g} ({', '.join(sorted(worse))} on a worse line goes after the rest)")
+        return out
+    except Exception as e:
+        log.warning(f"shortfall order failed ({e}); best price order")
+        return plain
 
 
 def _sm_attempt(tip, sess, resolved, want, *, mode: str, sb_price=None,
@@ -27328,6 +29369,32 @@ def _sm_attempt(tip, sess, resolved, want, *, mode: str, sb_price=None,
         except Exception as e2:
             log.error(f"{label}: reconcile after the Sportmarket crash failed ({e2}): maybe placed")
         return [r]
+
+
+def _sm_round_up_ask(tip, stake: float, want: float, cap_stake=None) -> float:
+    """v6.251 (Wilson 6 Nov): the Sportmarket ask in whole dollars, up: 326.10 -> 327. `stake` is the ask after
+    tipbot's own caps (cents), `want` the remainder asked for, `cap_stake` tipbot's liability cap on the ask (None =
+    none). Returned unchanged (today's ask) when the switch is off, when a cap shaped the ask (stake under want),
+    when a tip-level cap shaped `want` upstream (tip._sm_stake_capped; Eddie's no-units fallback), when the ask is a
+    whole dollar already, or when the whole dollar above it would pass the liability cap. The caller has refused an
+    amount under the minimum stake before this: a remainder of cents is never rounded up into a bet."""
+    try:
+        import config as _c
+        if not bool(getattr(_c, "SPORTMARKET_ROUND_UP_STAKE", True)):
+            return stake
+        if getattr(tip, "_sm_stake_capped", False) or getattr(tip, "_units_fallback", False):
+            return stake
+        cents = int(round(float(stake) * 100))
+        if cents <= 0 or abs(float(stake) - float(want)) > 0.005:
+            return stake                  # a cap shaped it: the capped amount, as before
+        up = float(-(-cents // 100))      # the whole dollar at or above
+        if up <= float(stake) + 1e-9:
+            return stake                  # already a whole dollar
+        if cap_stake is not None and up > math.floor(float(cap_stake) * 100 + 1e-6) / 100 + 1e-9:
+            return stake                  # the whole dollar would pass tipbot's own cap
+        return up
+    except Exception:
+        return stake
 
 
 def _sm_attempt_inner(tip, sess, resolved, want, mode, sb_price, label, sent, sm_floor=None) -> list:
@@ -27402,6 +29469,11 @@ def _sm_attempt_inner(tip, sess, resolved, want, mode, sb_price, label, sent, sm
         sb_line = float(resolved["sb_line"]) if resolved.get("sb_line") is not None else None
     except (TypeError, ValueError):
         sb_line = None
+    _shook_why = _shook_orig_refusal(tip, sm_line)
+    if _shook_why:
+        # v6.247 Rule A: Sportmarket's row (the tipped line, or the resolver's line within 1) is held to Shook's
+        # ORIGINAL line, not the current one the tip carries
+        return _sm_refuse(label, f"Shook original-line limit: {_shook_why}")
     # v6.172: a game line's key ('h2h', 'line', 'total_points', 'team_total') or None for a prop
     _gl = _sm_game_line_market(resolved.get("game_line")) if resolved.get("game_line") else None
     if mode == "v4":
@@ -27420,6 +29492,12 @@ def _sm_attempt_inner(tip, sess, resolved, want, mode, sb_price, label, sent, sm
         if price < _smf - 1e-9:
             return _sm_refuse(label, f"v4: Sportmarket {price:.3f} is under the sm_floor {_smf}")
     elif mode == "better":
+        if resolved.get("_shook_near") or resolved.get("_sm_near_line"):
+            # v6.250: an NFL game-line near row is the shortfall's too, whatever the flag says in this mode
+            # v6.248: a row one line away (a Shook tip with no tipster price) is the shortfall's, never the better
+            # step's: Sportsbet's price on the tipped line is no comparison for another line
+            return _sm_refuse(label, f"Sportmarket's row is on line {resolved.get('line')}, the tip on {tl}: "
+                                     f"a near line is for the shortfall only")
         # v6.226 (Wilson 3 Nov 2026: Sportsbet accounts are mostly 1%, so a tie goes to Sportmarket)
         if sb_price is None or not _b3.better_or_equal(price, sb_price):
             return _sm_refuse(label, f"Sportmarket {price:.3f} is not equal or better than Sportsbet {sb_price}")
@@ -27457,13 +29535,17 @@ def _sm_attempt_inner(tip, sess, resolved, want, mode, sb_price, label, sent, sm
             maxd = min(maxd, float(_HC_LINE_TOLERANCE))
         elif _gl == "team_total":
             maxd = 0.0                         # the team-total matcher is exact on every book
+        if resolved.get("_sm_near_line") and _gl in _SM_BETTER_LINE_MARKETS and _nfl_near_enabled():
+            maxd = 1.0                         # v6.250: the near step's row (flagged by _sm_near_rows), one point
         # v6.161 (the v6.129 rule): a tip whose tipster gave no price takes the exact line only
         _own = getattr(tip, "_tipster_odds", "unset")
         try:
             _no_own = _own != "unset" and not (_own is not None and float(_own) > 1.0)
         except (TypeError, ValueError):
             _no_own = True
-        if _no_own:
+        if _no_own and not (resolved.get("_shook_near") and _shook_near_lines_ok(tip, tip.legs[0])):
+            # v6.248: ...except a deferred Shook tip's near row (one line away, chosen by the resolver's own
+            # candidate walk inside Shook's original-line limit): maxd is then the B365_SHORTFALL_MAX_LINE_DIFF
             maxd = 0.0
         if tl is None or sm_line is None or abs(sm_line - tl) > maxd + 1e-9:
             return _sm_refuse(label, f"Sportmarket's line {resolved.get('line')} is more than {maxd:g} from "
@@ -27492,10 +29574,31 @@ def _sm_attempt_inner(tip, sess, resolved, want, mode, sb_price, label, sent, sm
     if mode == "better":
         target = max(target, _b3.cents_at_or_above(sb_price))     # v6.226: the fill must still equal or beat Sportsbet
     target = math.floor(target * 100 + 1e-9) / 100
+    if mode == "shortfall" and ref > 1.0 and not is_model:
+        # v6.249 review: the floor to the cent can sit under the band's minimum (ref 1.84, minimum 1.656, price 1.6565:
+        # target 1.65). The target is never under the minimum at the cent: the cent up, refused when that is over the
+        # price. Every tipster (the shortfall band applies to all of them).
+        _lo_sm = ref * (1.0 - float(getattr(_c, "B365_SHORTFALL_ODDS_DROP_PCT", 0.10) or 0))
+        if target < _lo_sm - 1e-9:
+            _t_up = _b3.cents_at_or_above(_lo_sm)
+            if _t_up > price + 1e-9:
+                return _sm_refuse(label, f"no usable target_odds floor: the cent up from the {_lo_sm:.3f} minimum "
+                                         f"({_t_up}) is over the price {price:.4f}")
+            target = _t_up
     if mode == "v4":
         target = max(target, _smf)       # nba-v4: the bridge can never fill under sm_floor
     if _v5_on:
         target = max(target, _v5f)       # v6.234: nor under a v5 line's sm_floor, in any mode
+    # v6.266 (Wilson 7 Nov 2026: 1.50 minimum for a tip with no tipster price): the bridge has no pre-read here, so the
+    # live price is judged and the target sent is never under the minimum (the cent at or above it: 1.50 passes, a
+    # fill at 1.49 cannot happen). The same boundary style as Shook's 1.61 above; Shook's and NFL's 1.6 stand where higher.
+    _npm = _no_price_min_odds(tip)
+    if _npm:
+        if not (math.isfinite(price) and price >= _npm - 1e-9):
+            _no_price_min_note(tip, price, _npm)       # v6.266 review: the reason reaches the alert
+            return _sm_refuse(label, f"no tipster price and Sportmarket's row is {price:.3f}, under the {_npm:g} "
+                                     f"no-price minimum")
+        target = max(target, _no_price_min_target(_npm))
     if target <= 1.0 or target > price + 1e-9:
         return _sm_refuse(label, f"no usable target_odds floor ({target}) for price {price:.3f}")
     if ceiling < target:
@@ -27505,18 +29608,35 @@ def _sm_attempt_inner(tip, sess, resolved, want, mode, sb_price, label, sent, sm
     # tipbot's own cap, when sessions.yaml gives the Sportmarket session a number for this market
     # (unlimited = none here: the bridge's EUR per-bet cap and the live Sportmarket cap bound it)
     stake = want
+    _cap_stake = None
     try:
         cap = session_priority.lookup_liability_cap(
             sid, sport, resolved.get("cap_market") or resolved.get("market") or "")
         if isinstance(cap, (list, tuple)) and cap:
             cap = cap[0]
         if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
-            stake = min(stake, session_priority.liability_to_max_stake(float(cap), ceiling or price))
+            _cap_stake = float(session_priority.liability_to_max_stake(float(cap), ceiling or price))
+            stake = min(stake, _cap_stake)
     except Exception as e:
         return _sm_refuse(label, f"liability cap unreadable ({e})")
     stake = math.floor(float(stake) * 100 + 1e-6) / 100
     if stake < max(1.0, AFL_FANOUT_MIN_STAKE):
         return _sm_refuse(label, f"the liability cap leaves ${stake:.2f}")
+    # v6.251 (Wilson 6 Nov: a Sportmarket ask with cents goes UP to the next whole dollar, $326.10 asks $327; it may
+    # pass the target by under $1). THE one place every Sportmarket ask passes (the better step and its rungs, the
+    # shortfall, the NBA model's v4 / v5 ask, NFL, AusBets, Shook): `want` is already the remainder against the
+    # current ceiling, so the whole dollar above it is the most the ask can pass that ceiling by, and a later send
+    # works its remainder out fresh (nothing left once a fill is at or over it). The rounding never touches an
+    # amount a cap shaped: tipbot's liability cap above, a tip-level cap upstream (the no-odds to-win cap,
+    # Eddie's no-units caps) or the bridge's max_stake rebet below stay exactly as they were.
+    _stake_exact = stake
+    stake = _sm_round_up_ask(tip, stake, want, _cap_stake)
+    if stake > _stake_exact + 1e-9:
+        log.info(f"{label}: Sportmarket ask ${_stake_exact:.2f} goes up to ${stake:.2f} (next whole dollar)")
+    if is_model:
+        # the fills record's `requested` counts this ask (see the cap on `attempted` in the row handler);
+        # v6.251 review: set on EVERY ask, so a later unrounded ask of the same tip clears a stale marker
+        tip._nba_sm_round_ask = (sid, stake) if stake > _stake_exact + 1e-9 else None
     if _sports_paused():
         return _sm_refuse(label, "sports placement paused")
     rs = dict(resolved, target_odds=target, twin=None, send_target_odds=None)
@@ -27538,8 +29658,12 @@ def _sm_attempt_inner(tip, sess, resolved, want, mode, sb_price, label, sent, sm
 
     if not _note(stake):
         return _sm_refuse(label, "could not record the placement intent (NBA model): not sending")
+    _near_note = (f" (line {resolved.get('line')} for the tipped {tl:g}: no row on the tipped line)"
+                  if resolved.get("_shook_near") and tl is not None else "")     # v6.248
+    if resolved.get("_sm_near_line") and tl is not None:
+        _near_note = f" (nearby line {resolved.get('line')} for the tipped {tl:g})"          # v6.250
     log.info(f"{label}: Sportmarket {mode}: {resolved.get('player')} {resolved.get('selection')} "
-             f"{resolved.get('line')} ${stake:.2f} @ {price:.3f} on {sid} [{resolved.get('market')} "
+             f"{resolved.get('line')}{_near_note} ${stake:.2f} @ {price:.3f} on {sid} [{resolved.get('market')} "
              f"prop={resolved.get('proposition_id')} target={target} ceiling={ceiling}; wanted "
              f"${want:.2f}; Sportsbet {sb_price}]")
     # the event string _execute_bet_inner will POST (its reconcile and the crash path's must match it)
@@ -27558,7 +29682,9 @@ def _sm_attempt_inner(tip, sess, resolved, want, mode, sb_price, label, sent, sm
             mx = float(r.max_stake) if r.max_stake is not None else 0.0
         except (TypeError, ValueError):
             mx = 0.0
-        mx = math.floor(min(mx, stake) * 100 + 1e-6) / 100 if mx > 0 else 0.0
+        # v6.251 review: the rebet is also capped at the exact `want` (a rounded ask of 327 for a 326.10 want must
+        # not rebet at the bridge's 326.50: the rule is "up to the next dollar", never over the max)
+        mx = math.floor(min(mx, stake, want) * 100 + 1e-6) / 100 if mx > 0 else 0.0
         if not (max(1.0, AFL_FANOUT_MIN_STAKE) <= mx < stake):
             log.info(f"{label}: Sportmarket stake too high at ${stake:.2f} and no usable max to rebet at "
                      f"(max_stake={r.max_stake!r}): nothing more sent")
@@ -27579,6 +29705,8 @@ def _sm_attempt_inner(tip, sess, resolved, want, mode, sb_price, label, sent, sm
             sent["out"] = None
             sent["stake"] = mx
             sent["t"] = time.time()
+            if is_model:
+                tip._nba_sm_round_ask = None     # v6.251 review: the rebet is not a rounded ask (_note(mx) set it)
             r2 = _fanout_place_account(tip, sess, [mx], rs)
             r2._sm = True
             r2._sm_stake_reject = True           # never a third Sportmarket bet on this line
@@ -27596,7 +29724,9 @@ def _sm_attempt_inner(tip, sess, resolved, want, mode, sb_price, label, sent, sm
         "success": out[-1].success, "maybe_placed": _is_ambiguous_result(out[-1]),
         "bet_id": out[-1].bet_id, "error": (out[-1].error or "")[:200],
         **({"sm_floor": _smf} if mode == "v4" else {}),
-        **({"sm_floor": _v5f, "nba_version": "v5"} if _v5_on else {})})
+        **({"sm_floor": _v5f, "nba_version": "v5"} if _v5_on else {}),
+        **({"near_line": True, "tipped_line": tl}
+           if (resolved.get("_shook_near") or resolved.get("_sm_near_line")) else {})})   # v6.248 / v6.250
     return out
 
 
@@ -27676,7 +29806,7 @@ def _sm_pid_line(pid, gl) -> "float | None":
         if side == "h":
             return units / 4.0
         if side == "a":
-            return -units / 4.0
+            return -units / 4.0 + 0.0       # v6.254: + 0.0, an away pick'em is 0, not -0.0 ("-0 HC" on the record)
         return None
     return units / 4.0
 
@@ -27851,6 +29981,330 @@ def _sm_better_step(tip, sess, resolved, want, *, sb_price, label: str = "Sportm
     return out
 
 
+# ── v6.250 part B: NFL game-line NEAR lines (Wilson 6 Nov 2026) ───────────────────────────────────
+# 4th and +EV tipped Jaguars team total over 24.5 @ 1.89, $800: Sportmarket's board showed 24.5 at 1.892 but both
+# betslips refused it ([selection_not_carried] no liquidity quote arrived), Tarken took $367 and $433 went to manual.
+# A team-total shortfall was exact-line only on every book, the better-number rungs need a price at or over
+# Sportsbet's, and bet365's team-total ladder is sparse. Wilson's rule, "within 1, 10% floor", for NFL team totals,
+# spreads and game totals on Sportmarket AND bet365: the tipped line first (as ever), then the better number, then the
+# worse one, each at no more than 10% under the TIPPED price. SHORTFALL stage only, half-point tipped line with a price
+# of the tipster's own only (a no-price tip stays exact, v6.129; a whole-number line gets no near step). One helper
+# serves every shortfall site (_nfl_near_line_walk); the floor, ceiling and cap are the shortfall attempts' own
+# (_sm_attempt_inner / _b365_game_line_attempt_inner in mode "shortfall": the v6.249 band, B365_MAX_TO_WIN_NFL,
+# Sportmarket's liability cap), and the time budget is SPORTMARKET_BETTER_LINE_BUDGET_SEC.
+_NFL_NEAR_MARKETS = ("line", "total_points", "team_total")
+
+
+def _nfl_near_enabled() -> bool:
+    """NFL_GAME_LINE_NEAR_ENABLED, fail closed (a missing value is off)."""
+    import config as _c
+    return bool(getattr(_c, "NFL_GAME_LINE_NEAR_ENABLED", False))
+
+
+def _nfl_near_candidates(gl, side, tipped) -> list:
+    """[(line, "better" | "worse")] for a tipped line on a whole or half point: every whole and half point within 1
+    of it, the better numbers first (_sm_line_better: an over lower, an under higher, a spread higher for its own
+    team), then the worse ones, the nearest first on each side. v6.254 (Wilson 7 Nov 2026: "push is a void at
+    -3.0"): o24.5 -> 24, 23.5, 25, 25.5; -3 -> -2.5, -2, -3.5, -4 (v6.250 had half lines only). A total / team
+    total line must stay positive. [] when the tipped line is a quarter line or a total's side is not over / under."""
+    try:
+        tl = float(tipped)
+    except (TypeError, ValueError):
+        return []
+    if gl not in _NFL_NEAR_MARKETS or not _is_half_point(tl):
+        return []
+    side = (side or "").strip().lower()
+    if gl != "line" and side not in ("over", "under"):
+        return []
+    out = []
+    for d in (-0.5, 0.5, -1.0, 1.0):      # nearest first; the sort below keeps that order on each side
+        ln = tl + d
+        if gl != "line" and ln <= 0:
+            continue
+        better = _sm_line_better(gl, "team" if gl == "line" else side, ln, tl)
+        out.append((ln, "better" if better else "worse"))
+    out.sort(key=lambda x: 0 if x[1] == "better" else 1)
+    return out
+
+
+def _nfl_near_label(gl, side, team, ln) -> str:
+    """A line as the alert says it: 'o25.5', 'Jacksonville Jaguars o25.5', 'Jacksonville Jaguars -18.5'."""
+    side = (side or "").strip().lower()
+    if gl == "line":
+        return f"{team} {float(ln):+g}".strip()
+    pre = {"over": "o", "under": "u"}.get(side, side)
+    return f"{team} {pre}{float(ln):g}".strip() if gl == "team_total" else f"{pre}{float(ln):g}"
+
+
+def _sm_near_rows(tip, sess, base, gl, side, team, tl, lines, label) -> dict:
+    """v6.250: {line: resolved copy} for the bridge's rows on the near `lines`, from ONE board read (as
+    _sm_better_rungs reads it: one POST try, the board must provably be this game). A row is the same market and
+    side as the tip or it is not used: the same proposition family as the exact row when there is one
+    (_sm_pid_family), the tipped side (direction), the team on a spread (the selection) and on a team total (the
+    row's market name), a whole or half point (v6.254), full game, the line its id bets, not under a Tie / Draw market. Two different
+    ids on one line = ambiguous = that line is not used. Each copy carries `_sm_near_line` (the flag
+    _sm_attempt_inner needs to allow the one-point difference, shortfall mode only), the board read's event id
+    and start, and the sessions.yaml key of the tipped market. {} on any problem (logged). Never raises."""
+    try:
+        sid = str(sess.get("session_id", "") or "")
+        if not sid or _session_stalled(sid):
+            return {}
+        ev = _bookie_event(base.get("event_verified") or tip.event, _sm_bookie(), tip.sport)
+        pr = hb.price_check_sports(session_id=sid, sport=tip.sport, event=ev, max_attempts=1)
+        if not (isinstance(pr, dict) and pr.get("success")):
+            log.info(f"{label}: Sportmarket nearby lines not read "
+                     f"({(pr or {}).get('error') if isinstance(pr, dict) else pr})")
+            return {}
+        if not _b365_same_game(str(pr.get("event") or ""), ev):
+            log.info(f"{label}: Sportmarket nearby lines not used: the board is {pr.get('event')!r}, "
+                     f"not provably {ev!r}")
+            return {}
+        markets = pr.get("markets") or {}
+        fam = _sm_pid_family(base.get("proposition_id"))
+        team_lc = (team or "").strip().lower()
+        side = (side or "").strip().lower()
+        found: dict = {}        # line -> {pid: (key order, key, row, line, odds)}
+        for ki, key in enumerate(_SM_RUNG_KEYS[gl]):
+            sels = _catalog_selections(markets, key)
+            tie_ids = {s.get("market_external_id") for s in sels if isinstance(s, dict)
+                       and str(s.get("selection") or "").strip().lower() in ("tie", "draw")
+                       and s.get("market_external_id") is not None}
+            for s in sels:
+                if not isinstance(s, dict):
+                    continue
+                per = str(s.get("period") or "").strip().lower()
+                if per != "full_game":
+                    continue            # v6.250 fix round (Wilson 6 Nov: a blank period is not proof of the full game)
+                if s.get("market_external_id") is not None and s.get("market_external_id") in tie_ids:
+                    continue
+                pid = s.get("proposition_id")
+                if not pid or (fam and _sm_pid_family(pid) != fam):
+                    continue
+                try:
+                    ln, odds = float(s.get("line")), float(s.get("odds"))
+                except (TypeError, ValueError):
+                    continue
+                if not (math.isfinite(ln) and math.isfinite(odds) and odds > 1.0) or not _is_half_point(ln):
+                    continue
+                if not any(abs(ln - x) < 1e-9 for x in lines):
+                    continue
+                pl = _sm_pid_line(pid, gl)
+                if pl is None or abs(pl - ln) > 1e-9:
+                    continue            # the row's line must be the line its id bets
+                if gl == "line":
+                    if _sm_base_selection(s.get("selection")) != team_lc:
+                        continue
+                else:
+                    if str(s.get("direction") or _sm_rung_side(gl, s.get("selection")) or "").strip().lower() != side:
+                        continue
+                    if gl == "team_total" and canonical_nfl_team(_nfl_team_total_team(s) or "").strip().lower() != team_lc:
+                        continue
+                found.setdefault(round(ln, 4), {}).setdefault(str(pid), (ki, key, s, ln, odds))
+        out: dict = {}
+        for ln4, by_pid in found.items():
+            if len(by_pid) != 1:
+                log.info(f"{label}: Sportmarket line {ln4:g} has {len(by_pid)} different rows: not used")
+                continue
+            ki, key, s, ln, odds = next(iter(by_pid.values()))
+            rr = dict(base, line=ln, proposition_id=s.get("proposition_id"), live_odds=odds,
+                      game_line=gl, period="full_game", tipped_line=tl, _sm_near_line=True, _sm_side=side,
+                      _sm_event_id=_sm_clean_event_id(pr.get("event_id")),
+                      cap_market=base.get("cap_market") or base.get("market"),
+                      raw_market_name=s.get("raw_market_name") or base.get("raw_market_name"))
+            if _sm_start_epoch(pr.get("start_time_iso")) is not None:
+                rr["_sm_start"] = pr.get("start_time_iso")
+            if gl == "team_total":
+                rr["market"], rr["selection"] = "team_total", f"{team} {side.title()}"
+            else:
+                rr["market"], rr["selection"] = key, s.get("selection")
+            out[ln] = rr
+        if out:
+            log.info(f"{label}: Sportmarket nearby lines for the tipped {tl:g}: "
+                     + ", ".join(f"{k:g} @ {v['live_odds']}" for k, v in sorted(out.items())))
+        else:
+            log.info(f"{label}: Sportmarket board read: no row on a nearby line of the tipped {tl:g}")
+        return out
+    except Exception as e:
+        log.info(f"{label}: Sportmarket nearby-line read failed ({e}); not used")
+        return {}
+
+
+def _walk_book(r) -> str:
+    """v6.250 fix round: which external book a result is on, "bet365" / "sportmarket" / "" (Sportsbet or unknown)."""
+    bk = (getattr(r, "bookie", "") or "").strip().lower()
+    if getattr(r, "_b365", False) or bk == "bet365":
+        return "bet365"
+    if getattr(r, "_sm", False) or bk == _sm_bookie():
+        return "sportmarket"
+    return ""
+
+
+def _walk_result_line(r, tl):
+    """The line a result actually bet: the result's own placed_line, else the line the walk asked it on, else the
+    tipped line (the exact / better steps always set placed_line on a bet that landed). None never comes back."""
+    for v in (getattr(r, "placed_line", None), getattr(r, "_near_line_bet", None), tl):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f):
+            return f
+    return tl
+
+
+def _walk_book_blocked(results, book, ln, tl) -> str:
+    """v6.250 fix round (Wilson 6 Nov): why the near-line walk may not ask `book` on line `ln`, or "". Two rules, both
+    over every result of this tip so far (the steps before the walk and the walk's own):
+    - one bet per tip per line per book: the book already holds this line (a fill, a partial fill or a maybe-placed
+      answer on it), judged on the line the result actually bet, not the tip's;
+    - a stake-size refusal on the book at any earlier step ends the book for this tip.
+    This differs from _sm_post_allowed / _b365_post_allowed on purpose: those end the book on ANY fill or maybe, but
+    Wilson wants what is still unfilled tried on the near line after a fill or partial fill on a DIFFERENT line."""
+    for r in results:
+        if _walk_book(r) != book:
+            continue
+        if getattr(r, "_sm_stake_reject" if book == "sportmarket" else "_b365_stake_reject", False):
+            return "a stake-size refusal earlier on this book ends it for this tip"
+        if (r.success or _is_ambiguous_result(r)) and abs(_walk_result_line(r, tl) - ln) < 1e-9:
+            return f"the book already holds line {ln:g} for this tip (one bet per tip per line)"
+    return ""
+
+
+def _walk_b365_cap_left(results, cap) -> float:
+    """v6.250 fix round (Wilson 6 Nov): B365_MAX_TO_WIN_NFL less the to-win of this tip's bet365 bets so far (placed
+    or maybe placed, stake x (odds - 1)). A bet whose odds cannot be read leaves nothing (fail closed). 0.0 when spent."""
+    held = 0.0
+    for r in results:
+        if _walk_book(r) != "bet365" or not (r.success or _is_ambiguous_result(r)):
+            continue
+        try:
+            stake = float(r.stake or getattr(r, "_requested_stake", None) or 0)
+            odds = float(r.odds)
+        except (TypeError, ValueError):
+            return 0.0
+        if not (math.isfinite(stake) and math.isfinite(odds) and odds > 1.0):
+            return 0.0
+        held += stake * (odds - 1.0)
+    left = float(cap) - held
+    return round(left, 2) if left > 0 else 0.0
+
+
+def _nfl_near_line_walk(tip, want, label, *, gl, side, team, tipped, b365_cx, sm_sess, sm_base,
+                        prior=(), sm_label=None) -> list:
+    """v6.250 part B: the NEAR-LINE step of an NFL spread / game total / team total, for the stake `want` still
+    unfilled after the tipped line, on bet365 and Sportmarket. Candidates: the better numbers then the worse ones
+    (_nfl_near_candidates). On one line the book with the better quoted price goes first (_ext_order) and the
+    other takes what is left. Every send is a SHORTFALL attempt of its own book (the tipped-price 10% band floor and
+    ceiling, the per-book caps, the kickoff and card guards), on the nearby row only: bet365 by epk + market_ref
+    from the card (_b365_game_line_pick, the candidate's line), Sportmarket on a row of the same market and side
+    from one board read (_sm_near_rows). Runs only for NFL_GAME_LINE_NEAR_ENABLED, an NFL tip with a price of the
+    tipster's own and a tipped line on a whole or half point. A maybe-placed answer on either book (or in `prior`) ends the
+    walk at once; no new send starts after SPORTMARKET_BETTER_LINE_BUDGET_SEC, and each book's own kickoff refusal stops
+    a late send (bet365 120 s, Sportmarket 90 s: _inside_start_window has no start for an NFL tip).
+    Per book (fix round, _walk_book_blocked): a line the book already holds for this tip is not bet again, and a
+    stake-size refusal earlier on the book ends it; bet365 gets only the to-win cap left after the tip's bets. Returns
+    the BetResults of the walk (each marked with the line it filled on). NEVER raises: a crash is logged and the
+    results so far are kept, the rest goes to manual as before."""
+    out: list = []
+    try:
+        _nfl_near_line_walk_inner(out, tip, want, label, gl, side, team, tipped, b365_cx, sm_sess, sm_base,
+                                  list(prior or ()), sm_label or label)
+    except Exception as e:
+        log.exception(f"{label}: nearby-line step crashed ({e}): keeping what was sent, the rest goes to manual")
+    return out
+
+
+def _nfl_near_line_walk_inner(out, tip, want, label, gl, side, team, tipped, b365_cx, sm_sess, sm_base,
+                              prior, sm_label) -> None:
+    import config as _c
+    if not _nfl_near_enabled() or (getattr(tip, "sport", "") or "").lower() != "nfl" or gl not in _NFL_NEAR_MARKETS:
+        return
+    if any(_is_ambiguous_result(r) for r in prior):
+        log.info(f"{label}: nearby lines not tried: an earlier answer may have placed")
+        return
+    if not _tip_has_own_price(tip):
+        log.info(f"{label}: nearby lines not tried: the tipster gave no price of his own (exact line only)")
+        return
+    cands = _nfl_near_candidates(gl, side, tipped)
+    if not cands:
+        log.info(f"{label}: nearby lines not tried: tipped line {tipped!r} is not on a whole or half point")
+        return
+    floor = max(1.0, AFL_FANOUT_MIN_STAKE)
+    left = math.floor(float(want or 0) * 100 + 1e-6) / 100
+    if left < floor:
+        return
+    try:
+        budget = float(getattr(_c, "SPORTMARKET_BETTER_LINE_BUDGET_SEC", 90.0) or 0)
+    except (TypeError, ValueError):
+        budget = 90.0
+    t0 = time.monotonic()
+    tl = float(tipped)
+    b3 = b365_cx if (b365_cx and b365_cx.get("game_line") == gl and b365_cx.get("sport") == "nfl") else None
+    sm_rows: dict = {}
+    if sm_sess and isinstance(sm_base, dict) and _sm_on(tip.tipster, "nfl"):
+        sm_rows = _sm_near_rows(tip, sm_sess, sm_base, gl, side, team, tl, [c[0] for c in cands], sm_label)
+    if b3 is None and not sm_rows:
+        log.info(f"{label}: nearby lines of the tipped {tl:g}: no row on either book")
+        return
+    log.info(f"{label}: nearby lines of the tipped {tl:g} for ${left:.2f}: "
+             + ", ".join(f"{ln:g} ({kind})" for ln, kind in cands))
+    for ln, kind in cands:
+        if left < floor:
+            break
+        quotes: dict = {}
+        ctx2 = None
+        if b3 is not None:
+            ctx2 = dict(b3, line=ln, near_of=tl, sb_line_differs=True)
+            try:
+                _pc, _pk, _why = _b365_game_line_pick(tip, ctx2)
+            except Exception as e:
+                _pk, _why = None, f"pick crashed ({e})"
+            if _pk is not None and _pk.odds and float(_pk.odds) > 1.0:
+                quotes["bet365"] = float(_pk.odds)
+            else:
+                log.info(f"{label}: bet365 has no priced row on {ln:g}: {_why or 'no odds'}")
+        if ln in sm_rows:
+            quotes["sportmarket"] = float(sm_rows[ln]["live_odds"])
+        note = (f"nearby line {_nfl_near_label(gl, side, team, ln)} instead of tipped "
+                f"{_nfl_near_label(gl, side, team, tl)}")
+        for name in _ext_order(quotes):
+            if left < floor:
+                break
+            if time.monotonic() - t0 > budget:
+                log.info(f"{label}: nearby-line step past {budget:g}s: no further sends, ${left:.2f} goes to manual")
+                return
+            if _inside_start_window(tip, f"{label} nearby line {ln:g} {name}"):
+                return
+            _blocked = _walk_book_blocked(list(prior) + out, name, ln, tl)
+            if _blocked:
+                log.info(f"{label}: {name} not asked on nearby line {ln:g}: {_blocked}")
+                continue
+            if name == "bet365":
+                _cap = float(getattr(_c, _B365_SPORT_CAP_KEY["nfl"], 0) or 0)
+                _cl = _walk_b365_cap_left(list(prior) + out, _cap)
+                if _cl <= 0:
+                    log.info(f"{label}: bet365 not asked on nearby line {ln:g}: this tip's earlier bet365 bets already "
+                             f"use the ${_cap:.0f} to-win cap")
+                    continue
+                o = _b365_attempt(tip, dict(ctx2, cap_left=_cl), left, mode="shortfall", label=label)
+            else:
+                _held = [str(r.bet_id) for r in list(prior) + out
+                         if getattr(r, "bet_id", None) and (r.success or _is_ambiguous_result(r))]
+                rr = sm_rows[ln]
+                if _held:
+                    rr = dict(rr, _exclude_bet_ids=list(rr.get("_exclude_bet_ids") or []) + _held)
+                o = _sm_attempt(tip, sm_sess, rr, left, mode="shortfall", label=label)
+            for r in o:
+                r._near_line_note = note
+                r._near_line_bet = ln          # v6.250 fix round: the line this answer was asked on
+            out.extend(o)
+            left = round(max(0.0, left - _b365_committed(o)), 2)
+            log.info(f"{label}: {name} on {ln:g} ({kind}): took ${_b365_committed(o):.2f}, ${left:.2f} still wanted")
+            if any(_is_ambiguous_result(r) for r in o):
+                log.warning(f"{label}: {name} on nearby line {ln:g} may have placed: no further nearby-line bet")
+                return
+
+
 class _LimitedPhaseNotice:
     """v6.127 (Wilson 2026-10-28: "only fire after all the max/limited accounts are bet already and
     confirmed then move onto the 3 non limited accounts"; "no estimate, just facts"). Wraps the
@@ -27931,7 +30385,9 @@ class _LimitedPhaseNotice:
                 maybe += st
                 parts.append(f"{name} ${st:.2f} maybe placed")
             else:
-                parts.append(f"{name} $0 ({(r.error or 'not placed')[:60]})")
+                _lim_err = str(r.error or 'not placed')
+                # v6.266: the no-price minimum's sentence is longer than the usual cut and keeps its reason
+                parts.append(f"{name} $0 ({notifier._plain_error(_lim_err)[:120 if '[no_price_minimum]' in _lim_err else 60]})")
         left = round(max(0.0, self.intended - placed - maybe), 2)
         n = len({x[0] for x in self.lim})
         msg = (f"{self.what}: the {n} limited Sportsbet account{'s' if n != 1 else ''} took "
@@ -28009,10 +30465,11 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     # candidate too; a moneyline has no tipped line, every other game line needs one; margins and
     # anything _sm_game_line_market does not know stay off
     _sm_gl = _sm_game_line_market(cap_market) if (cap_market or "").strip().lower() in _GAME_LINE_CAP_MARKETS else None
-    if (sm_resolve is not None and (_sm_tl is not None or _sm_gl == "h2h")
-            and _sm_eligible(tip, tip.legs[0] if tip.legs else None, _sm_sess, game_line=_sm_gl is not None)
-            and (match.get("period") or "full_game") == "full_game"
-            and (_sm_gl is not None or (cap_market or "").strip().lower() not in _GAME_LINE_CAP_MARKETS)):
+    _sm_gate = (sm_resolve is not None and (_sm_tl is not None or _sm_gl == "h2h")
+                and _sm_eligible(tip, tip.legs[0] if tip.legs else None, _sm_sess, game_line=_sm_gl is not None)
+                and (match.get("period") or "full_game") == "full_game"
+                and (_sm_gl is not None or (cap_market or "").strip().lower() not in _GAME_LINE_CAP_MARKETS))
+    if _sm_gate:
         try:
             _smm = sm_resolve()
         except Exception as e:
@@ -28027,7 +30484,7 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
             _sm_res = {
                 "market": _smm["market"], "selection": _sm_sel,
                 "game_line": _sm_gl,                 # v6.172: None for a prop
-                "player": (None if _sm_gl else (_smm.get("player") or tip.legs[0].player)),
+                "player": (None if _sm_gl else (_smm.get("book_player") or _smm.get("player") or tip.legs[0].player)),
                 "stat": tip.legs[0].stat, "period": _smm.get("period") or "full_game",
                 "line": _smm.get("line"),
                 "target_odds": _fanout_target_odds(_smm.get("odds"), getattr(tip, "suggested_odds", None)),
@@ -28046,6 +30503,21 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
                      f"(Sportsbet {match.get('odds')} on {match.get('line')}, tipped {_sm_tl})")
         elif _smm is not None:
             log.info(f"{_sm_label}: Sportmarket row unusable ({_smm!r}); Sportmarket not used")
+    # v6.250 part B: the template of a Sportmarket row for the near-line step (_nfl_near_line_walk) when the bridge has no
+    # usable row on the TIPPED line (a missing exact row must not stop its nearby lines); the exact row is the template
+    # when there is one. Only an NFL spread / total / team total (the step re-checks everything else).
+    _sm_near_base = None
+    if (_sm_gate and (sport or "").lower() == "nfl" and _sm_gl in _NFL_NEAR_MARKETS and _nfl_near_enabled()):
+        _nb_team = (match.get("team") or "").strip()
+        _nb_side = str(match.get("direction") or "").strip().lower()
+        _sm_near_base = _sm_res if _sm_res is not None else {
+            "market": _sm_gl, "game_line": _sm_gl, "player": None, "period": "full_game",
+            "stat": tip.legs[0].stat if tip.legs else "", "line": _sm_tl, "proposition_id": None,
+            "selection": (f"{_nb_team} {_nb_side.title()}".strip() if _sm_gl == "team_total"
+                          else (_nb_side.title() if _sm_gl == "total_points" else _nb_team)),
+            "twin": None, "event_verified": None, "target_odds": None, "live_odds": None,
+            "sb_line": match.get("line"), "tipped_line": _sm_tl, "cap_market": cap_market,
+            "_sm_start": None, "_sm_event_id": None}
     active_by_sid = {str(s.get("session_id", "")): s for s in raw_sessions}
     sessions: list[dict] = []
     seen: set[str] = set()
@@ -28180,11 +30652,29 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
         _tl_cmp = _sm_res.get("tipped_line")              # v6.161: when only Sportmarket holds
     _sb_after_ok, _sb_after_why = ((True, "") if not _b365_holds else _sb_after_b365_ok(
         tip, match.get("odds"), match.get("line"), _tl_cmp,
-        lineless=((_sm_res or {}).get("game_line") == "h2h")))        # v6.172
+        lineless=((_sm_res or {}).get("game_line") == "h2h"
+                  or (_b365_cx or {}).get("game_line") == "h2h")))        # v6.172 (v6.250: bet365 alone on a moneyline)
     if _b365_holds and _sb_after_ok and sessions and intended_stake >= AFL_FANOUT_MIN_STAKE:
         log.info(f"[{channel_name}] {_S} fan-out: bet365 is equal or better and holds "
                  f"${_b365_committed(_b365_pre):.2f}; Sportsbet takes the ${intended_stake:.2f} left "
                  f"(price {match.get('odds')}, line {match.get('line')})")
+
+    def _near_step(left, prior) -> list:
+        # v6.250 part B (Wilson 6 Nov: "within 1, 10% floor"): what is still unfilled after the tipped line tries the
+        # nearby lines on bet365 and Sportmarket. ONE helper for every shortfall site; [] for anything but an NFL
+        # spread / game total / team total with a price of the tipster's own. Never raises.
+        try:
+            if ((sport or "").lower() != "nfl" or _sm_gl not in _NFL_NEAR_MARKETS
+                    or (match.get("period") or "full_game") != "full_game"):
+                return []
+            _nt = _sm_tl if _sm_tl is not None else (_b365_cx or {}).get("line")
+            return _nfl_near_line_walk(
+                tip, left, _b365_label, gl=_sm_gl, side=str(match.get("direction") or ""),
+                team=match.get("team") or "", tipped=_nt, b365_cx=_b365_cx, sm_sess=_sm_sess,
+                sm_base=_sm_near_base, prior=prior, sm_label=_sm_label)
+        except Exception as e:
+            log.error(f"[{channel_name}] {_S} fan-out: nearby-line step failed ({e}); the rest goes to manual")
+            return []
 
     def _b365_without_sportsbet() -> list:
         # No Sportsbet bet at all (no account, nothing left, or no usable share): the external
@@ -28198,7 +30688,7 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
             _pq["bet365"] = _ext_q.get("bet365") if "bet365" in _ext_q else _ext_quote_b365(tip, _b365_cx)
         if _sm_res is not None and _sm_post_allowed(_sm_pre) and not _pre_maybe:
             _pq["sportmarket"] = float(_sm_res.get("live_odds") or 0)
-        for _name in _ext_order(_pq):
+        for _name in _shortfall_order(_pq, tip, _sm_res, _b365_cx, _b365_label):
             if _left < AFL_FANOUT_MIN_STAKE:
                 break
             if _name == "bet365":
@@ -28213,6 +30703,8 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
                 log.warning(f"[{channel_name}] {_S} fan-out: {_name} answer unclear (maybe placed): no other "
                             f"book is asked, the rest goes to manual")
                 break
+        if _left >= AFL_FANOUT_MIN_STAKE and not any(_is_ambiguous_result(r) for r in _only):
+            _only += _near_step(_left, _only)         # v6.250 part B: the nearby lines for what is still unfilled
         if not _only:
             return []
         try:
@@ -28246,7 +30738,8 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
                      f"{_S}_SESSION_PRIORITY (Tarken not active): the external books alone for "
                      f"{bet_label}, shortfall rules")
         _only = _b365_without_sportsbet()
-        if match.get("b365_only") and not _only:
+        # v6.266: a row refused for the no-price minimum has its own reason, already logged for the alert
+        if match.get("b365_only") and not _only and not getattr(tip, "_no_price_min_note", ""):
             log.info(f"[{channel_name}] {_S} fan-out: bet365 has no usable row for {bet_label} "
                      f"either -> manual")
         return _only
@@ -28260,7 +30753,7 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     # stat-less retry cost a round trip (Bediako DD 8.0 -> 7.0 inside it). The
     # proposition_id pins the row, so send no stat from the start.
     _stat = leg.stat
-    _player = leg.player
+    _player = match.get("book_player") or leg.player        # v6.267: the book's own spelling of him, else the tip's
     if (_stat or "").strip().lower() in ("double_double", "triple_double") and match.get("proposition_id"):
         _stat = None
     if (_stat or "").strip().lower() in ("longest_rush", "longest_reception", "longest_pass")             and match.get("proposition_id"):
@@ -28622,7 +31115,7 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
     except Exception as e:
         log.error(f"[{channel_name}] {_S} fan-out: spill of the unfilled remainder crashed "
                   f"({e}); the remainder goes to manual")
-    if _b365_cx or _sm_res is not None:
+    if _b365_cx or _sm_res is not None or _sm_near_base is not None:
         # v6.120: Sportsbet did not fill it all: the UNFILLED remainder (placed AND maybe-placed
         # Sportsbet stake excluded) goes to bet365, up to its cap. Never after a bet365 bet on this
         # line (one per tip per line). v6.161: and to Sportmarket; the books not yet holding a bet
@@ -28641,7 +31134,7 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
                 _pq["bet365"] = _ext_q.get("bet365")
             if _sm_res is not None and _sm_post_allowed(_sm_pre) and not _pre_maybe:
                 _pq["sportmarket"] = float(_sm_res.get("live_odds") or 0)
-            for _name in _ext_order(_pq):
+            for _name in _shortfall_order(_pq, tip, _sm_res, _b365_cx, _b365_label):
                 if _left < AFL_FANOUT_MIN_STAKE:
                     break
                 # v6.125 (Wilson: no delay between Sportsbet and bet365, they are independent)
@@ -28658,6 +31151,10 @@ def _place_nfl_fanout(tip: ParsedTip, priority: list, match: dict, intended_stak
                     log.warning(f"[{channel_name}] {_S} fan-out: {_name} shortfall answer unclear (maybe "
                                 f"placed): no other book is asked, the rest goes to manual")
                     break
+            if _left >= AFL_FANOUT_MIN_STAKE:
+                # v6.250 part B: the nearby lines for what is still unfilled (a maybe on either external book,
+                # before or after Sportsbet, ends it; a Sportsbet maybe is already out of _left)
+                _b365_post.extend(_near_step(_left, list(_b365_pre) + list(_sm_pre) + _b365_post))
         except Exception as e:
             log.error(f"[{channel_name}] {_S} fan-out: external shortfall step crashed ({e})")
         results = list(_b365_pre) + list(_sm_pre) + list(results) + list(_b365_post)
@@ -28945,6 +31442,11 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
             "reason": ("fast_ambiguous" if getattr(r, "is_ambiguous", False)
                        else "slow_rejection"),
             "correlation_id": getattr(r, "correlation_id", None),
+            # v6.250 fix round (Wilson 6 Nov): the line the maybe was on and its near-line note, so the check is on the
+            # right line (a maybe on o25.5 is not looked for as o24.5)
+            "line": getattr(r, "placed_line", None),
+            "near_note": getattr(r, "_near_line_note", "") or "",
+            "b365": _walk_book(r) == "bet365",
         }
         for r in ambiguous_results
     ]
@@ -28984,7 +31486,8 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
         _pl = getattr(r, "placed_line", None)
         log.warning(f"[{channel_name}] {_S} AUTO-PLACED: {bet_label} @ {r.odds} "
                     f"${r.stake} on {r.bookie}:{r.session_id} (bet_id={r.bet_id})"
-                    + (f" placed_line={_pl}" if _pl is not None else ""))
+                    + (f" placed_line={_pl}" if _pl is not None else "")
+                    + (f" [{r._near_line_note}]" if getattr(r, "_near_line_note", "") else ""))     # v6.250
     log.info(f"[{channel_name}] {_S} fan-out: placed ${total_placed:.2f} of "
              f"${display_intended:.2f} across {len(placed_results)}/{_n_accts} "
              f"account(s) ({len(failed_results)} failed, {len(ambiguous_results)} "
@@ -29023,10 +31526,12 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
         _why = ""
         if failed_results:
             _why = "\nNot placed:\n" + "\n".join(
-                f"- {session_priority.session_label(r.session_id, r.bookie)}: {_short_err(r.error)}"
+                f"- {session_priority.session_label(r.session_id, r.bookie)}: {_short_err(notifier._plain_error(r.error))}"
+                + (f" ({r._near_line_note})" if getattr(r, "_near_line_note", "") else "")      # v6.254
                 for r in failed_results)
         _landed = ("\nPlaced:\n" + "\n".join(
             f"- {session_priority.session_label(r.session_id, r.bookie)} ${r.stake:.2f} @ {r.odds}"
+            + (f" ({r._near_line_note})" if getattr(r, "_near_line_note", "") else "")      # v6.250
             for r in placed_results)) if placed_results else ""
         # v6.54 (Opus review): when the bet placed differs from the tip (rush attempts ->
         # rushing yards, a worse line at 75%), say so, or the top-up goes on the wrong market.
@@ -29057,11 +31562,19 @@ def _nfl_fanout_rollup(tip: ParsedTip, jobs: list, results: list, intended_stake
             _accts = ", ".join(
                 f"{session_priority.session_label(o['session_id'], o['bookie'])} ${o['stake']:.2f}"
                 + (f" (cid {o.get('correlation_id')})" if o.get("correlation_id") else "")
+                + (f" on line {o['line']:g}" if isinstance(o.get("line"), (int, float))
+                   and not isinstance(o.get("line"), bool) and math.isfinite(o["line"]) else "")    # v6.250 fix round
+                + (f" [{o['near_note']}]" if o.get("near_note") else "")
                 for o in ambiguous_outcomes)
+            # v6.250 fix round (Wilson 6 Nov): bet365 bets never show in HyperBot pending_bets, so a bet365 maybe says
+            # where to look
+            _where = ("Check the bet365 account itself"
+                      if all(o.get("b365") for o in ambiguous_outcomes)
+                      else "Check HyperBot pending_bets (and the bet365 account itself for a bet365 one)")
             notifier.notify_critical(
                 f"{_S} AUTO-PLACE AMBIGUOUS on {channel_name}: {bet_label} -- "
-                f"${ambiguous_total:.2f} MAY have landed ({_accts}). Check HyperBot "
-                f"pending_bets before placing this again by hand -- do NOT re-place "
+                f"${ambiguous_total:.2f} MAY have landed ({_accts}). {_where} "
+                f"before placing this again by hand -- do NOT re-place "
                 f"blindly.{_b365_hint_for(ambiguous_results)}\n\n{raw_message}")
         except Exception as e:
             log.error(f"[{channel_name}] {_S} fan-out: ambiguous critical alert failed: {e}")
@@ -29088,10 +31601,13 @@ def _sb_down_for_priority(priority) -> bool:
     return _sb_down_state(priority) == "down"
 
 
-def _sb_down_state(priority) -> str:
+def _sb_down_state(priority, stalled_unknown: bool = False) -> str:
     """v6.238 review round 2: _sb_down_for_priority's one read as a state, so a caller can word its manual alert
     without a second read: "off" (switch off, nothing read), "unknown" (the list could not be read), "up" (a
-    session in `priority` is active) or "down" (none is)."""
+    session in `priority` is active) or "down" (none is).
+    v6.247 (stalled_unknown, Shook only): a session in `priority` that is listed active but stalled (not
+    answering) is NOT proof Tarken is down, so with none answering it reads "unknown" instead of "down" and the
+    caller keeps its old retry. Every other caller keeps the default (a stalled session counts as down)."""
     if not _sb_down_switch():
         return "off"
     try:
@@ -29110,10 +31626,18 @@ def _sb_down_state(priority) -> str:
     except Exception as e:
         log.warning(f"Sportsbet-down check failed ({e}): not treated as down")
         return "unknown"
-    return "up" if any(x in active for x in want) else "down"
+    if any(x in active for x in want):
+        return "up"
+    if stalled_unknown and any(x in stuck for x in want):
+        # listed active but stalled: not known down (v6.247, Shook)
+        listed = {str(r.get("session_id", "")) for r in rows if _is_owned_session(r.get("session_id", ""))}
+        if any(x in listed for x in want):
+            log.warning("Sportsbet-down check: a Sportsbet session is listed but stalled: not treated as down")
+            return "unknown"
+    return "down"
 
 
-def _nfl_sb_down_match(tipster, market_type_norm, player, team, stat, side, tipster_line):
+def _nfl_sb_down_match(tipster, market_type_norm, player, team, stat, side, tipster_line, tipster_odds="unset"):
     """v6.238: a match stub when no Sportsbet session in the NFL list is active (Tarken down), so bet365 (player
     props, its own catalog) and Sportmarket (its own resolver against the bridge) can take the tip alone under the
     shortfall rules. Marked b365_only (no Sportsbet account, no better step) and sb_down. None (manual as
@@ -29122,7 +31646,9 @@ def _nfl_sb_down_match(tipster, market_type_norm, player, team, stat, side, tips
         sm_ok = _sm_on(tipster, "nfl")
         if market_type_norm == "player_prop":
             m = _nfl_b365_only_match(tipster, player, team, stat, side, tipster_line, need_b365=not sm_ok)
-        elif market_type_norm in ("h2h", "spread", "total", "team_total") and sm_ok:
+        elif market_type_norm in ("h2h", "spread", "total", "team_total") and (
+                sm_ok or _nfl_b365_game_only_match(tipster, market_type_norm, team, side, tipster_line,
+                                                   tipster_odds=tipster_odds)):
             ct = canonical_nfl_team(team) if team else ""
             event = resolve_nfl_event(ct) if ct else None
             if not event:
@@ -29143,7 +31669,7 @@ def _nfl_sb_down_match(tipster, market_type_norm, player, team, stat, side, tips
             m["sb_down"] = True
             log.warning(f"NFL auto-place: no Sportsbet session active (Tarken not active): "
                         f"{'Sportmarket' if sm_ok else ''}{' and ' if sm_ok and _b365_on(tipster) else ''}"
-                        f"{'bet365' if _b365_on(tipster) and market_type_norm == 'player_prop' else ''} "
+                        f"{'bet365' if _b365_on(tipster) and (market_type_norm == 'player_prop' or market_type_norm in _B365_GL_KIND) else ''} "
                         f"may bet {market_type_norm} alone on {m['event']!r}")
         return m
     except Exception as e:
@@ -29196,6 +31722,153 @@ def _nfl_b365_only_match(tipster, player, team, stat, side, tipster_line, need_b
     except Exception as e:
         log.warning(f"NFL auto-place: bet365-only check failed for {player!r}: {e}")
         return None
+
+
+def _nfl_b365_game_only_match(tipster, market_type_norm, team, side, tipster_line, tipster_odds="unset"):
+    """v6.250: a match stub for bet365 ALONE when Sportsbet has no usable row on an NFL game line (spread, total, team
+    total, moneyline) and bet365's card has the exact row (priced). The game comes
+    from the same team -> event resolution Sportsbet uses; the price and the row are _b365_attempt's. None (manual,
+    as before) when bet365 is off, the line is not one it takes, the game cannot be pinned or the card has no priced
+    row. Reads the cached card (no bet365 session read)."""
+    try:
+        ct = canonical_nfl_team(team) if team else ""
+        event = resolve_nfl_event(ct) if ct else None
+        if not event:
+            return None
+        ctx = _b365_game_line_ctx(tipster, market_type_norm, ct, side, tipster_line, sb_line=None, event=event)
+        if ctx is None:
+            return None
+        from types import SimpleNamespace as _NS
+        pc, pick, why = _b365_game_line_pick(_NS(event=event), ctx)
+        if (pick is None or not pick.odds) and _nfl_near_enabled() and ctx.get("game_line") in _NFL_NEAR_MARKETS:
+            # v6.250 part B (Wilson 6 Nov: "within 1, 10% floor"): no exact row on the card, but a priced row one point
+            # away is a candidate for the near step (a tip with a price of its own only; the attempt judges the price)
+            try:
+                _own_ok = tipster_odds == "unset" or float(tipster_odds) > 1.0
+            except (TypeError, ValueError):
+                _own_ok = False
+            if _own_ok:
+                for _nl, _nk in _nfl_near_candidates(ctx["game_line"], side, ctx["line"]):
+                    _npc, _npk, _nw = _b365_game_line_pick(_NS(event=event), dict(ctx, line=_nl))
+                    if _npk is not None and _npk.odds:
+                        log.info(f"NFL auto-place: {ct!r} {market_type_norm} {tipster_line}: no exact bet365 row, "
+                                 f"but one on {_nl:g} ({_nk}): bet365 alone, nearby lines")
+                        pick = _npk
+                        break
+        if pick is None or not pick.odds:
+            log.info(f"NFL auto-place: {ct!r} {market_type_norm} {tipster_line}: no usable Sportsbet row and bet365 "
+                     f"has none either ({why or 'no price'})")
+            return None
+        tl = ctx["line"]
+        sel = ((side or "").strip().title() if market_type_norm in ("total", "team_total") else ct)
+        log.info(f"NFL auto-place: {ct!r} {market_type_norm} {tipster_line}: no usable Sportsbet row, trying "
+                 f"bet365 alone on {event!r}")
+        return {"event": event, "market": None, "selection": sel, "line": tl,
+                "odds": None, "proposition_id": None,
+                "direction": (side or "").strip().lower() or None, "team": ct, "probe_session_id": None,
+                "bookie": "bet365", "b365_only": True}
+    except Exception as e:
+        log.warning(f"NFL auto-place: bet365-only game-line check failed for {team!r}: {e}")
+        return None
+
+
+def _nfl_too_far_ahead(event) -> str:
+    """v6.254 (Wilson 7 Nov 2026: "we will only bet up to 4 days ahead of match starting"): why an NFL bet on `event`
+    is not placed, or "". The kickoff is ESPN's, from the schedule the resolver just read. A kickoff that cannot be
+    read cannot be shown to be inside the limit, so it refuses too. A tip arriving over 5 h after its game kicked off
+    is read as the team's next game, so this also stops it while that game is past the limit; once that game is
+    inside 4 days (a Sunday game then a Thursday one) it does not, and v6.255 _nfl_late_tip stops it instead.
+    NFL_MAX_DAYS_AHEAD 0 turns the check off."""
+    import config as _c
+    days = float(getattr(_c, "NFL_MAX_DAYS_AHEAD", 0) or 0)
+    if days <= 0:
+        return ""
+    ko = _b365_clean_start(_espn_kickoff_epoch("nfl", event))
+    if ko is None:
+        return f"the kickoff of {event!r} is unknown, so the {days:g}-day limit cannot be checked"
+    ahead = ko - time.time()
+    if not ahead <= days * 86400:          # written so a NaN limit refuses
+        return f"{event!r} kicks off in {ahead / 86400:.1f} days, past the {days:g}-day limit"
+    return ""
+
+
+def _nfl_late_tip(event) -> str:
+    """v6.255 (Wilson 7 Nov 2026: "thats fine it can go manual", 24 hours): why an NFL bet on `event` ("Home v Away",
+    the game the resolver chose) is not placed because the tip came too soon after a game, or "". A tip over 5 h
+    after a team's Sunday kickoff resolves to that team's NEXT game (Thursday), which can sit inside the 4-day limit,
+    and a real Thursday tip looks the same, so a tip arriving within NFL_LATE_TIP_HOURS after the last kickoff of
+    EITHER team goes to manual (a false manual is the safe direction). ESPN schedule pages that failed, or an event
+    that does not split into two teams, also refuse: a recent game cannot be ruled out. A game with no readable
+    kickoff is skipped, as the resolver skips it when timed games exist. NFL_LATE_TIP_HOURS 0 turns the check off."""
+    import config as _c
+    hours = float(getattr(_c, "NFL_LATE_TIP_HOURS", 0) or 0)
+    if hours <= 0:
+        return ""
+    if not hours <= 24 * 14:               # a NaN or absurd limit refuses (written so NaN fails the test)
+        return f"NFL_LATE_TIP_HOURS is {hours:g}, which is not usable, so the late-tip check cannot be done"
+    teams = [t.strip() for t in str(event or "").split(" v ")]
+    if len(teams) != 2 or not all(teams):
+        return f"{event!r} does not split into two teams, so the {hours:g}-hour late-tip check cannot be done"
+    import nba_resolver as _nr
+    now = datetime.fromtimestamp(time.time(), tz=_dt_timezone.utc)
+    last, failed, untimed = _nr.nfl_recent_kickoffs(teams, hours, now)
+    for t in teams:
+        ko = last.get(t)
+        if ko is not None and 0 <= (now - ko).total_seconds() < hours * 3600:
+            return (f"{t} kicked off {(now - ko).total_seconds() / 3600:.1f} h ago, inside the {hours:g}-hour late-tip "
+                    f"limit, so the tip may mean that game and not {event!r}")
+    if failed:
+        return (f"ESPN schedule page(s) {failed} failed, so a game of {event!r} that kicked off in the last "
+                f"{hours:g} h cannot be ruled out")
+    if untimed:
+        # v6.255 fix round: a just-finished game with no start time on ESPN's page would pass as "no recent game"
+        return (f"ESPN lists a game of {event!r} with no kickoff time ({'; '.join(untimed)}), so one that kicked off "
+                f"in the last {hours:g} h cannot be ruled out")
+    return ""
+
+
+def _nfl_limits_on() -> bool:
+    """v6.255: True when either NFL limit (NFL_MAX_DAYS_AHEAD, NFL_LATE_TIP_HOURS) is on, so a refusal can happen and
+    the refused-tip memory is read and written. A NaN limit counts as on (the checks refuse on it). Both off is v6.254."""
+    import config as _c
+    for name in ("NFL_MAX_DAYS_AHEAD", "NFL_LATE_TIP_HOURS"):
+        if not float(getattr(_c, name, 0) or 0) <= 0:
+            return True
+    return False
+
+
+def _nfl_refused_key(tipster: str, market_type: str, player, team, stat, side, line, event) -> str:
+    """v6.255: the key of the marker that remembers a tip the NFL limits sent to manual, or "" (no key: the tip has
+    no usable identity). It is the resend-guard key (_nfl_seen_key, built from the same parsed fields, with the
+    resolver-corrected player and team so a corrected spelling keys the same) plus the resolved game, so a later
+    game of the same bet is not blocked. A game total is keyed here without the resolver: _nfl_seen_key looks the
+    game up from the team over the network and answers "" while that game is live, and the event is known already."""
+    if not str(event or "").strip():
+        return ""
+    mt = (market_type or "").strip().lower()
+    if mt == "total":
+        base = f"NFL|{tipster}|total|{(side or '').strip().lower()}|{_seen_num(line)}"
+    else:
+        base = _nfl_seen_key(tipster, {"market_type": mt, "player": player, "team": team, "stat": stat,
+                                       "side": side, "line": line})
+    return f"NFLREFUSED|{base}|{str(event).lower()}" if base else ""
+
+
+def _nfl_noevent_key(tipster: str, market_type: str, player, team, stat, side, line) -> str:
+    """v6.255 fix round: the marker key for a tip that found NO usable game or market (no row, or its game live: a tip
+    0 to 5 h after kickoff makes the resolver answer None) and so went to manual with no event to key on, or "" when
+    the tip has no usable identity. It is _nfl_refused_key's base with "|noevent" in place of the game. A game total
+    is keyed on its canonical team here (there is no game yet to carry the identity). Costs one false manual: the
+    same tipster's same bet on the same line next week, inside the 8-day retention, goes to manual once."""
+    mt = (market_type or "").strip().lower()
+    if mt == "total":
+        canon = canonical_nfl_team(team or "").lower()
+        num = _seen_num(line)
+        base = f"NFL|{tipster}|total|{canon}|{(side or '').strip().lower()}|{num}" if (canon and num) else ""
+    else:
+        base = _nfl_seen_key(tipster, {"market_type": mt, "player": player, "team": team, "stat": stat,
+                                       "side": side, "line": line})
+    return f"NFLREFUSED|{base}|noevent" if base else ""
 
 
 def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: str,
@@ -29391,8 +32064,9 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
             # (one row per player, no line/direction), not an Over/Under line match.
             match = _resolve_nfl_most_market(player, team, stat, priority, tipster, tipster_odds)
         elif market_type_norm in _NFL_TEAM_MARKET_KEY:
+            _diag: dict = {}
             match = _resolve_nfl_team_market(team, market_type_norm, tipster_line, side,
-                                              priority, tipster, tipster_odds)
+                                              priority, tipster, tipster_odds, diag=_diag)
         else:
             log.info(f"NFL auto-place: unrecognised market_type {market_type!r} -> manual")
             return False
@@ -29402,10 +32076,68 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
             # prop"): Sportsbet has no usable row (no such prop, line, or price) -> bet365 alone
             # under the shortfall rules, for the whole stake
             match = _nfl_b365_only_match(tipster, player, team, stat, side, tipster_line)
+        if not match and market_type_norm in _B365_GL_KIND and _diag.get("catalog_read"):
+            # v6.250 (Wilson 6 Nov 2026, Jaguars -19.5): Sportsbet has no usable row on the tipped game line: bet365
+            # alone under the shortfall rules when its card has the exact row (Sportmarket's step still runs when
+            # it has a row); else manual as before
+            match = _nfl_b365_game_only_match(tipster, market_type_norm, team, side, tipster_line,
+                                              tipster_odds=tipster_odds)
         if not match and _sb_down_for_priority(priority):
             # v6.238 (Wilson 4 Nov 2026): Tarken down: bet365 / Sportmarket may still bet it alone
-            match = _nfl_sb_down_match(tipster, market_type_norm, player, team, stat, side, tipster_line)
+            match = _nfl_sb_down_match(tipster, market_type_norm, player, team, stat, side, tipster_line,
+                                       tipster_odds=tipster_odds)
+        _limits_on = _nfl_limits_on()
         if not match:
+            # v6.255 fix round (Wilson 7 Nov 2026, "yes reposts go manual"): a tip with no usable game or market (its game
+            # live, no row) goes to manual with no event to key a marker on, so it leaves a "|noevent" marker: the same
+            # tip re-posted after the 3-day resend guard, when it resolves to the next game, goes to manual too. Accepted
+            # side effect: the same tipster's same bet on the same line within the 8-day retention goes to manual once.
+            if _limits_on:
+                _nk = _nfl_noevent_key(tipster, market_type_norm, player, team, stat, side, tipster_line)
+                if _nk:
+                    try:
+                        seen_bets.check_and_mark_strict(_nk, seen_bets._MAX_AGE_SEC, "no usable game or market, went to manual")
+                    except Exception as e:
+                        log.error(f"NFL auto-place: could not record the no-match refusal of {_nk!r}: {e}")
+                else:
+                    log.info(f"NFL auto-place: no refused-tip key for {market_type_norm} {player or team} {side} "
+                             f"{tipster_line} with no game, so a re-post cannot be recognised")
+            return False
+        # v6.254: before the dedup fingerprint. A re-post within NFL_DEDUP_TTL_SEC stays dropped by the caller's resend
+        # guard (seen_bets): the first post's manual alert may already have been bet by hand.
+        # v6.255 (Wilson 7 Nov 2026, "yes reposts go manual"): a tip these NFL limits refused is remembered under
+        # NFLREFUSED|... for seen_bets' whole retention (8 days, longer than the resolver looks ahead), because the
+        # resend guard forgets it after 3 days, and a re-post after that goes to manual too: the first manual alert may
+        # have been bet by hand. The marker is read FIRST, on the dry run and the real pass alike, and fails closed.
+        _ev = match.get("event")
+        _rk = _nfl_refused_key(tipster, market_type_norm, match.get("player") or player, match.get("team") or team,
+                               stat, side, tipster_line, _ev) if _limits_on else ""
+        # the event marker (this game) and the "|noevent" marker (a first post that found no game), both before any limit
+        _nk = _nfl_noevent_key(tipster, market_type_norm, player, team, stat, side, tipster_line) if _limits_on else ""
+        for _mk in (_rk, _nk):
+            if not _mk:
+                continue
+            try:
+                _prev = seen_bets.peek_strict(_mk, seen_bets._MAX_AGE_SEC)
+            except seen_bets.Unavailable as e:
+                log.warning(f"NFL auto-place: the refused-tip memory is unavailable ({e}), so a re-post of a tip these "
+                            f"limits refused cannot be ruled out -> manual")
+                return False
+            if _prev:
+                log.warning(f"NFL auto-place: this tip went to manual {seen_bets.age_text(_prev)} ago under the NFL "
+                            f"limits ({_prev.get('label') or 'no reason kept'}) and may have been bet by hand -> manual")
+                return False
+        if _limits_on and not _rk:
+            log.info(f"NFL auto-place: no refused-tip key for {market_type_norm} {player or team} {side} {tipster_line} "
+                     f"on {_ev!r}, so a re-post of a refusal cannot be recognised")
+        _why_not = (_nfl_too_far_ahead(_ev) or _nfl_late_tip(_ev)) if _limits_on else ""
+        if _why_not:
+            if _rk:
+                try:
+                    seen_bets.check_and_mark_strict(_rk, seen_bets._MAX_AGE_SEC, _why_not)
+                except Exception as e:
+                    log.error(f"NFL auto-place: could not record the refusal of {_rk!r}: {e}")
+            log.warning(f"NFL auto-place: {_why_not} -> manual")
             return False
         if dry_run:
             return "b365" if match.get("b365_only") else True
@@ -29586,6 +32318,14 @@ def _attempt_nfl_auto_place(tipster: str, channel_name: str, player: str, team: 
                 if match.get("b365_only"):
                     _mark_b365_only_ctx(tip._b365_ctx, _espn_kickoff_epoch("nfl", match.get("event")),
                                         channel_name)
+        elif market_type_norm in _B365_GL_KIND and _mult >= 1.0:
+            # v6.250: bet365 for an NFL game line (spread, total, team total, moneyline), the tipped line as tipped
+            # (a spread keeps its sign; v6.254: a whole-number line too, a push is a void), full game only
+            tip._b365_ctx = _b365_game_line_ctx(tipster, market_type_norm, match.get("team") or team, side,
+                                                tipster_line, sb_line=match.get("line"), event=match.get("event"))
+            if tip._b365_ctx is not None and match.get("b365_only"):
+                _mark_b365_only_ctx(tip._b365_ctx, tip._b365_ctx.get("start_epoch"), channel_name)
+                tip._b365_ctx["sb_line_differs"] = True        # no Sportsbet row: only ever the shortfall
         # [] means no account was eligible, so nothing was attempted and the caller
         # sends its manual alert. Anything else means a placement was attempted and
         # _place_nfl_fanout has already alerted.
@@ -32014,6 +34754,7 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
             headline = f"(headline render failed: {e})"
 
         _a1_mt = (raw.get("market_type") or "").strip().lower()
+        _a1_why = ""
         if _a1_mt in ("player_prop", "most_stat"):
             # v6.28 (Wilson: "Sportsbet copies FD prices, so we can just
             # compare off of that"). raw.get("odds") was always None here --
@@ -32027,8 +34768,8 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
             _tipster_odds = _american_to_decimal_odds(raw.get("fd_odds"))
             # v6.22 code review: run off the event loop, same as the 4th&EV
             # image path -- see that call site's comment for why.
-            handled = await _run_in_placement_executor(
-                _attempt_nfl_auto_place,
+            handled, _a1_why = await _run_in_placement_executor(
+                _with_manual_reason, _attempt_nfl_auto_place,
                 tipster, channel_name, raw.get("player"), raw.get("team"),
                 raw.get("stat"), raw.get("side"), raw.get("line"),
                 raw.get("units"), unit_size,
@@ -32041,7 +34782,7 @@ async def _route_a1_nfl_text(text: str, tipster: str, channel_name: str,
         try:
             notifier.notify_text_manual_alert(
                 channel_name,
-                f"{headline}\n{_ctx}",
+                (f"WHY: {_a1_why}\n" if _a1_why else "") + f"{headline}\n{_ctx}",     # v6.254
                 header="A1 NFL, MANUAL",
             )
         except Exception as e:
@@ -32158,17 +34899,23 @@ def _with_manual_reason(fn, *args, **kwargs):
             except Exception:
                 return
             if ("-> manual" in msg or "-> MANUAL" in msg or "REFUSED" in msg
-                    or "falling back to manual" in msg):
+                    or "falling back to manual" in msg or "-> not resolving" in msg):
                 captured.append(msg)
 
     h = _Grab(level=logging.INFO)
+    # v6.255 fix round: nba_resolver logs under its own name, not under "tipbot", so its "-> not resolving" refusals
+    # (a game live, an ESPN page failed) never reached the manual alert's WHY
+    _res_log = logging.getLogger("nba_resolver")
     log.addHandler(h)
+    _res_log.addHandler(h)
     try:
         res = fn(*args, **kwargs)
     finally:
         log.removeHandler(h)
+        _res_log.removeHandler(h)
     why = captured[-1] if captured else ""
     why = re.sub(r"^NFL auto-place:\s*", "", why)
+    why = re.sub(r"\s*->\s*not resolving", ", not resolving", why)
     why = re.sub(r"\s*->\s*(manual|MANUAL).*$", "", why)
     return res, why[:300]
 
@@ -34281,12 +37028,16 @@ async def _place_one_nba_row(row: dict, msg_time, channel_name: str, arrival_epo
     except BaseException:
         # Crash or cancellation mid-placement: the bet MAY have landed. Book the amount
         # actually ATTEMPTED as ambiguous so nothing ever re-offers against it.
-        ambiguous = round(float(requested), 2)
+        # v6.251 review: a Sportmarket ask rounded up to the whole dollar is what may have landed, so the
+        # crash books that (the message stake is the larger only when no rounded ask was sent)
+        _crash_ra = getattr(tip, "_nba_sm_round_ask", None)
+        _crash_req = max(float(requested), float(_crash_ra[1])) if _crash_ra else float(requested)
+        ambiguous = round(_crash_req, 2)
         amb_acc = [{"session_id": "unknown", "stake": ambiguous,
                     "max_odds": _nba_max_odds(tip)}]
         c, nums = await _run_in_ledger_executor(
-            _commit_blocking, 0.0, ambiguous, False, [], amb_acc, "none", requested)
-        nba_core.write_fill(row, requested=requested, placed=0.0, ambiguous=ambiguous,
+            _commit_blocking, 0.0, ambiguous, False, [], amb_acc, "none", _crash_req)
+        nba_core.write_fill(row, requested=_crash_req, placed=0.0, ambiguous=ambiguous,
                             manual=False, accounts=[], outcome="none", event=event_name,
                             selection=nums if c is not None else None,
                             add_selection=None if c is not None else (0.0, ambiguous))
@@ -34347,7 +37098,14 @@ async def _place_one_nba_row(row: dict, msg_time, channel_name: str, arrival_epo
             attempted = round(attempted + spill_sent, 2)
         # v6.154: the same cap for the base asks: a Sportmarket partial fill's remainder is re-asked
         # at the Sportsbet accounts, so the asks together can pass the message stake too
-        attempted = round(min(float(requested), attempted), 2)
+        _cap_req = float(requested)
+        _sm_ra = getattr(tip, "_nba_sm_round_ask", None)
+        if _sm_ra and not spill_sent and set(asks) == {_sm_ra[0]}:
+            # v6.251: Sportmarket's ask was rounded up to the whole dollar and is the ONLY ask of this key, so
+            # `requested` is that ask (placed + ambiguous can never pass it); with another account asked, the
+            # message stake still caps the asks together as before (the rounded ask overlaps what it left)
+            _cap_req = max(_cap_req, float(asks[_sm_ra[0]]))
+        attempted = round(min(_cap_req, attempted), 2)
     else:
         attempted = float(getattr(tip, "_attempted_stake", 0.0) or 0.0)
     asked = 0.0 if capped else round(max(attempted, placed + ambiguous), 2)
@@ -34631,7 +37389,10 @@ def _mma_startup_notice() -> str:
         return "refused"
     if _cmma.MMA_ENABLED and mma_sports is not None:
         log.warning(f"[mma] Just Bleed MMA is ENABLED: ${_cmma.MMA_UNIT_SIZE:g}/unit, max "
-                    f"{_cmma.MMA_MAX_UNITS:g}u, accounts {_mma_accounts() or 'NONE (set MMA_SESSION_PRIORITY)'}")
+                    f"{_cmma.MMA_MAX_UNITS:g}u, accounts {_mma_accounts() or 'NONE (set MMA_SESSION_PRIORITY)'}, "
+                    + (f"no bet inside {_cmma.MMA_MIN_LEAD_SEC:g}s of the start (MMA_START_CUTOFF_ENABLED)"
+                       if _cmma.MMA_START_CUTOFF_ENABLED
+                       else "NO start-time cut-off (bets until ESPN shows the fight started or the book refuses)"))
         return "on"
     log.info("[mma] MMA_ENABLED=false: the Just Bleed MMA channel is not monitored")
     return "off"
@@ -34859,7 +37620,10 @@ async def _mma_handle_tip_inner(tip, post, post_text, fights, catalogs, channel_
             accounts["sportmarket"] = _sm_mma
     if not accounts:
         return refuse("no MMA account: MMA_SESSION_PRIORITY is empty or lists no Sportsbet/bet365 session")
-    min_lead, tol = float(_c.MMA_MIN_LEAD_SEC), float(_c.MMA_START_TOLERANCE_SEC)
+    # v6.252 (Wilson 6 Nov 2026): no start-time cut-off unless MMA_START_CUTOFF_ENABLED (min_lead None); the
+    # book-start-vs-ESPN check and ESPN's "pre" state still apply
+    min_lead = float(_c.MMA_MIN_LEAD_SEC) if bool(_c.MMA_START_CUTOFF_ENABLED) else None
+    tol = float(_c.MMA_START_TOLERANCE_SEC)
     late = mma_sports.timing_problem(_mma_now(), fight.start, None, min_lead, tol)
     if late:
         return refuse(late)
@@ -35272,9 +38036,18 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
                 continue
         prev_e = legup_ledger.lookup(ledger, t["runner"], race_date, t["track"], t["race_num"])
         prev = prev_e["units"] if prev_e else None
-        d = legup_ledger.decide(t["units"], prev, cap)
+        # v6.264 (Wilson 7 Nov 2026, "only the additional"): a card first seen as "7 units (4 locked
+        # in + 3 more at the current price)" with nothing in the ledger for the horse counts the 4
+        # locked-in units as already held, so only the 3 more are placed. The ledger is still
+        # recorded at 7. A horse WITH a ledger entry is decided by the ledger alone, as before.
+        locked = t.get("locked_units") if prev_e is None else None
+        if locked is not None and not (0 < locked < t["units"]):
+            locked = None
+        held = prev if prev_e else locked
+        d = legup_ledger.decide(t["units"], held, cap)
         was = (f"already tipped {prev:g}u ({prev_e.get('source')}, first {prev_e.get('first_seen')})"
-               if prev_e else "")
+               if prev_e else
+               f"{locked:g}u locked in when first seen, NOT bet by the bot" if locked is not None else "")
         if d["action"] == "resend":
             resent.append(f"{_desc(t)} ({was}, same units: nothing more placed)")
             continue
@@ -35297,17 +38070,25 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
         ledger = upd
         add, place, rest = d["new_units"], d["place_units"], d["manual_units"]
         if d["action"] == "manual_all":
-            over.append(f"{_desc(t)}" + (f" ({was})" if prev_e else "")
+            over.append(f"{_desc(t)}" + (f" ({was})" if was else "")
                         + f": {t['units']:g}u is more than twice the {cap:g}u max, place the "
                           f"{add:g}u yourself (${add * unit_size:,.0f})")
             continue
         if not t.get("fixed_price"):
-            tote.append(f"{_desc(t)}" + (f" (top-up: {was}, place {add:g}u more)" if prev_e else ""))
+            tote.append(f"{_desc(t)}" + (f" (top-up: {was}, place {add:g}u more)" if was else "")
+                        + (" (the card's locked-in / added units wording was not understood, so "
+                           "no price was taken: check the card for what is already on. The units "
+                           f"ledger now counts {t['units']:g}u, so a later post of these units "
+                           "will NOT add any: place what you want yourself)"
+                           if t.get("locked_unreadable") else ""))
             continue
         if rest > 0:
-            over.append(f"{_desc(t)}" + (f" ({was})" if prev_e else "")
+            over.append(f"{_desc(t)}" + (f" ({was})" if was else "")
                         + (f"\n   1. Auto-placing: {place:g}u (${place * unit_size:,.0f})" if place > 0
-                           else f"\n   1. Auto-placing: nothing more ({prev:g}u already tipped)")
+                           else f"\n   1. Auto-placing: nothing more ({held:g}u already tipped)"
+                           if prev_e else
+                           f"\n   1. Auto-placing: nothing more ({held:g}u were locked in when "
+                           f"first seen, not bet by the bot)")
                         + f"\n   2. Left for you to place manually: {rest:g}u (${rest * unit_size:,.0f})"
                           f"\n   3. Why: the max for The Leg Up is {cap:g}u per horse")
         if place <= 0:
@@ -35317,11 +38098,19 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
                  if prev_e else "")
         if topup:
             topups.append(f"{_desc(t)}: {topup}")
+        elif locked is not None:
+            topups.append(f"{_desc(t)}: the additional {place:g}u are auto-placing; the {locked:g}u "
+                          f"locked in were NOT bet by the bot")
         raw_tips.append({"track": t["track"], "date": race_date, "race": t["race_num"],
                          "saddle": t["saddle"], "runner": t["runner"], "odds": t["odds"],
                          "units": place, "market": t["market"], "race_type": "(R)",
-                         "_legup_topup": bool(prev_e), "_legup_skip_resend": True,
-                         "_legup_note": f"(top-up of {prev:g}u)" if prev_e else ""})
+                         # v6.264 review fix: the guards stand aside for a locked-in card too,
+                         # the ledger decided it (another tipster's bet on the horse is no dup)
+                         "_legup_topup": bool(prev_e) or locked is not None,
+                         "_legup_skip_resend": True,
+                         "_legup_note": (f"(top-up of {prev:g}u)" if prev_e else
+                                         f"(additional {place:g}u, {locked:g}u locked in)"
+                                         if locked is not None else "")})
     cant += post["unparsed"]
 
     # Future Tips are Wilson's to place, but they go in the ledger under their race date and
@@ -35356,7 +38145,7 @@ async def _process_legup_post(text, cfg, msg_time, channel_name):
 
     sections = []
     if tote:
-        sections.append("TO+ (best tote) tips, place these yourself:\n" + "\n".join(f"- {x}" for x in tote))
+        sections.append("No fixed price read (TO+ or unreadable wording), place these yourself:\n" + "\n".join(f"- {x}" for x in tote))
     if over:
         sections.append(f"Over the {cap:g}u max per horse, the rest is yours to place:\n"
                         + "\n".join(f"- {x}" for x in over))
@@ -36601,6 +39390,13 @@ async def main():
                    f"{os.getenv('SPORTMARKET_KICKOFF_CHECK_ENABLED', '<unset>')[:40]!r})")
     except Exception as _e:
         log.warning(f"Sportmarket kickoff check state unreadable: {_e}")
+    # v6.247: can Shook NBA reach Sportmarket? On/off words only (no .env value, no bridge URL). Sportmarket needs
+    # SHOOK_SPORTMARKET_ENABLED, shook on the Sportmarket tipster list + the sport + the bridge URL (_sm_on), and
+    # the 1-hour deferral (only a tip that went through the check gets the new books)
+    try:
+        log.info(_shook_sm_state_line())
+    except Exception as _e:
+        log.warning(f"Shook NBA Sportmarket state unreadable: {_e}")
 
     if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
         log.error("TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in .env")
@@ -37035,6 +39831,7 @@ async def main():
             # where a concurrent Shook task mutates _shook_buffer between
             # the buffer-add and the context read.
             context = _shook_get_context()
+            _shook_prev = _shook_buffer[-1][1] if _shook_buffer else ""   # v6.259: his message before this one
             _shook_buffer_add(text)
 
             if _shook_should_process(text):
@@ -37043,6 +39840,12 @@ async def main():
                 asyncio.create_task(
                     _process_tip(combined, tipster, sport, unit_size, default_units, msg_time, channel_name)
                 )
+            elif _shook_alt_post(text):
+                # v6.259: an alt post is a manual alert only (off the loop), never a parse or a bet
+                log.info(f"[{channel_name}] Shook alt post -> manual alert only: {text[:60]}...")
+                _mid = getattr(getattr(event, "message", None), "id", None)
+                asyncio.get_running_loop().run_in_executor(
+                    None, _shook_alt_alert, text, _shook_prev, f"{chat_id}:{_mid}" if _mid else "")
             else:
                 log.debug(f"[{channel_name}] Buffered (no trigger): {text[:60]}...")
             return

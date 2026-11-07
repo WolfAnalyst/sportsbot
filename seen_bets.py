@@ -137,6 +137,34 @@ def check_and_mark_strict(key: str, ttl_sec: float, label: str = "", path: Path 
         raise Unavailable(str(e)) from e
 
 
+def peek_strict(key: str, ttl_sec: float, path: Path | None = None):
+    """v6.255: read-only and FAIL CLOSED, for a money path that must not guess (the NFL refused-tip marker): the
+    entry if `key` was seen within `ttl_sec`, else None; nothing is registered. When the registry cannot tell (an
+    empty key, the file unreadable, any error) it raises `Unavailable` instead of answering "not seen". With
+    SEEN_BETS_ENABLED=false the guard is deliberately off, nothing was ever recorded and nothing is expected, so it
+    answers None (v6.255 fix round: raising there sent every keyed NFL tip to manual). Under the test suite an
+    un-opted-in registry answers None, like check_and_mark_strict."""
+    if not key:
+        raise Unavailable("empty key")
+    if not _active():
+        return None
+    path = path or SEEN_PATH
+    try:
+        with _lock:
+            data = _load(path)
+            if data is None:
+                raise Unavailable(f"{path.name} could not be read")
+            prev = data.get(key)
+            if prev and time.time() - float(prev.get("ts", 0)) <= ttl_sec:
+                return dict(prev)
+            return None
+    except Unavailable:
+        raise
+    except Exception as e:
+        log.error(f"seen_bets: peek_strict failed for {key!r} ({e})")
+        raise Unavailable(str(e)) from e
+
+
 def check(key: str, ttl_sec: float, path: Path | None = None):
     """The entry if `key` was seen within `ttl_sec`, else None. Does not register."""
     if not key or not _active():

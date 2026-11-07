@@ -110,20 +110,39 @@ _DEFAULT_FOLLOW_SEC = 14 * 3600     # a record with no deadline of its own
 _PROCESS_START = 0.0 if os.getenv("TIPBOT_TESTING") else time.time()
 
 
-def read_balance(hb, session_id):
+def _other_read_failed(purpose, session_id, why: str) -> None:
+    """v6.257: a balance read for another caller (the racing balance retry) failed. It has its own wording and one
+    INFO line per failure, and touches neither _READ_WARNED nor _SHAPE_WARNED, so it never silences the trader
+    watch's own warning for the same session."""
+    log.info(f"{purpose}: balance read for s{session_id} {why}")
+
+
+def read_balance(hb, session_id, purpose=None):
     """The session's cash balance from /v3/balance, or None when it cannot be read. One attempt
-    with a short timeout: it runs on a follow's thread, often several at once."""
+    with a short timeout (READ_TIMEOUT_SEC is per socket operation, so a slow read can last about twice that): it
+    runs on a follow's thread, often several at once. `purpose` (v6.257): None for the trader watch; a caller
+    that is not the watch (the racing balance retry) names itself, and a failure is then logged in its own words
+    without touching the watch's once-per-10-minutes warning state."""
     try:
         r = hb.get_balance(str(session_id), timeout=READ_TIMEOUT_SEC, max_attempts=1)
     except Exception as e:
-        _read_failed(session_id, f"failed: {e}")
+        if purpose:
+            _other_read_failed(purpose, session_id, f"failed: {e}")
+        else:
+            _read_failed(session_id, f"failed: {e}")
         return None
     if not isinstance(r, dict) or r.get("success") is False:
-        _read_failed(session_id, "gave no balance")
+        if purpose:
+            _other_read_failed(purpose, session_id, "gave no balance")
+        else:
+            _read_failed(session_id, "gave no balance")
         return None
     try:
         b = float(r.get("balance"))
     except (TypeError, ValueError):
+        if purpose:
+            _other_read_failed(purpose, session_id, f"has no usable 'balance' (keys {sorted(r)[:12]})")
+            return None
         global _SHAPE_WARNED
         if not _SHAPE_WARNED:
             _SHAPE_WARNED = True
@@ -155,6 +174,12 @@ def _cents(x) -> int:
 
 def _money(x) -> str:
     return f"${float(x):.2f}"
+
+
+def _step_text(step_d) -> str:
+    """v6.260 fix round: step_d is the previous look minus this one, so a NEGATIVE one is a RISE. Said in words,
+    never as a signed number."""
+    return f"balance rose {_money(-step_d)}" if step_d < 0 else f"balance fell {_money(step_d)}"
 
 
 def _send_id(e):
@@ -308,7 +333,7 @@ def check(rec: dict, hb, *, label: str, sends=(), other_open_stakes=(), reading=
             # an earlier look withheld this step for a send in doubt, and that send is no longer in the register
             # (pruned while still in doubt): the step can never be judged. Say nothing for it, and re-baseline.
             log.warning(f"{label}: a step withheld for a send in doubt can no longer be judged (the send left the "
-                        f"register): nothing said, re-baselined at ${b:.2f} (step {step_d:+.2f}, stake "
+                        f"register): nothing said, re-baselined at ${b:.2f} ({_step_text(step_d)}, stake "
                         f"{_money(stake_d)}, withheld send ids {sorted(map(str, withheld))})")
             rec.pop("balance_withheld_ids", None)
             rec["balance_last"], rec["balance_last_ts"], rec["balance_look_ts"] = b, t_read, t_read
@@ -372,11 +397,20 @@ def check(rec: dict, hb, *, label: str, sends=(), other_open_stakes=(), reading=
                 log.info(f"{label}: balance rose by the stake {_money(stake_d)} since the previous look "
                          f"(a decline if {bookie} held the stake, or a refund); not alerted")
             elif certain > 0 and abs(step_d - certain) < _EPS:
-                log.info(f"{label}: balance step {step_d:+.2f} explained by own sends (the bot's own placed sends "
-                         f"in the window total {_money(certain)})")
+                log.info(f"{label}: balance fell {_money(step_d)}, explained by own sends (the bot's own placed "
+                         f"sends in the window total {_money(certain)})")
+            elif step_d < 0:
+                # v6.260 (Wilson 7 Nov 2026): step_d is previous look minus this look, so a NEGATIVE one is a RISE
+                # (a settlement credit, a refund, a deposit). It never counts against the referral: log only.
+                # A net rise can still hide this bet's debit (a credit bigger than the stake in the same interval),
+                # so the line names the open referred stake rather than calling the bet clear.
+                log.info(f"{label}: balance rose {_money(-step_d)} since the previous look, likely a settled bet "
+                         f"or a credit; a {_money(stake_d)} {'refused' if rec.get('refusal_watch') else 'referred'} stake is still "
+                         f"being watched, so a debit could be hidden "
+                         f"inside the rise; not alerted")
             else:
-                log.warning(f"{label}: unexplained balance step {step_d:+.2f} (stake {_money(stake_d)}, the bot's own "
-                            f"placed sends in the window {_money(certain)}, in doubt {uncertain}, other open "
+                log.warning(f"{label}: unexplained balance fall {_money(step_d)} (stake {_money(stake_d)}, the bot's "
+                            f"own placed sends in the window {_money(certain)}, in doubt {uncertain}, other open "
                             f"referrals {others})")
             rec.pop("balance_withheld_ids", None)
             advance()

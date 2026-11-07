@@ -634,6 +634,42 @@ def resolve_nfl_event(team: str = "") -> Optional[str]:
     return event
 
 
+def nfl_recent_kickoffs(teams, within_hours: float, now_utc=None):
+    """v6.255: each NFL team's most recent kickoff that has ALREADY happened, read from ESPN's schedule pages, for the
+    late-tip check. Returns ({team as given: aware UTC kickoff, or None when no timed game of that team in the window},
+    [dates of pages that FAILED], [a listed team's games on the pages read that have NO readable kickoff, as
+    "team on date"]). A failed page is reported apart from "no game": the caller cannot tell that no game
+    kicked off on it. An untimed game is reported too (v6.255 fix round): it may have kicked off in the window. ESPN files a game under its US date, which is the UTC date of the kickoff or the day before it
+    (Sunday 1pm ET is Monday 05:00 in Sydney, and Sunday night games are Monday in UTC), so the pages read run from the
+    UTC date of the window start minus one day to today's UTC date, whatever the local clock says: the Sunday page is
+    read at Tuesday 04:59 Sydney for a 24 h window. `now_utc` is for tests."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    first = (now_utc - timedelta(hours=max(float(within_hours), 0.0))).astimezone(timezone.utc).date() - timedelta(days=1)
+    last = now_utc.astimezone(timezone.utc).date()
+    dates, d = [], first
+    while d <= last:
+        dates.append(d.isoformat())
+        d += timedelta(days=1)
+    t_start = datetime.now()
+    out = {t: None for t in teams}
+    failed, untimed = [], []
+    for check_date in dates:
+        games = _fetch_schedule("nfl", check_date)
+        if _schedule_fetch_failed.get(f"nfl_{check_date}", datetime.min) >= t_start:
+            failed.append(check_date)
+            continue
+        for team in teams:
+            game = _match_team(canonical_nfl_team(team), games, NFL_TEAM_ALIASES)
+            if not game:
+                continue
+            ko = _parse_kickoff(game.get("start"))
+            if ko is None:
+                untimed.append(f"{team} on {check_date}")
+            elif ko <= now_utc and (out[team] is None or ko > out[team]):
+                out[team] = ko
+    return out, failed, untimed
+
+
 def _parse_kickoff(v):
     """ESPN event date ('2026-09-29T00:15Z') -> aware UTC datetime, or None."""
     if not v:

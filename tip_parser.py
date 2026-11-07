@@ -536,5 +536,6 @@ def build_tips_from_parsed(parsed, text, tipster, sport, unit_size, default_unit
     tips = _merge_slash_line_into_sgm(tips, text)
     tips = groq_parser._check_team_legs_against_text(tips, text)   # v6.58
     tips = groq_parser._check_shook_side_against_text(tips, text)   # v6.138
+    tips = groq_parser._apply_shook_median_price(tips, text)   # v6.249
     tips = groq_parser._check_ausbets_stat_against_text(tips, text)   # v6.144
     return tips

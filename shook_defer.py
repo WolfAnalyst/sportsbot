@@ -363,6 +363,32 @@ def norm_name(name) -> str:
     return " ".join(toks)
 
 
+def name_suffix(name) -> str:
+    """v6.249 review: the generational suffix of a name (jr / sr / ii / iii / iv, punctuation and case dropped), or ''."""
+    s = unicodedata.normalize("NFD", str(name or ""))
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn").lower()
+    for t in re.sub(r"[^a-z0-9 ]+", " ", s).split():
+        if t in _SUFFIX:
+            return t
+    return ""
+
+
+def name_key(name) -> str:
+    """v6.249 review: norm_name with the spaces dropped too, so spacing and punctuation inside a name do not cause a
+    miss ("PJ Washington" and "P.J. Washington", "DeAndre Hunter" and "De'Andre Hunter" read the same)."""
+    return norm_name(name).replace(" ", "")
+
+
+def names_match(a, b) -> bool:
+    """v6.249 review: two spellings of one player under the 1-hour check's rule: the same name_key, and no DIFFERENT
+    generational suffixes (a Jr never binds to a Sr). A suffix on one side only still matches (plain vs "Jr.")."""
+    ka, kb = name_key(a), name_key(b)
+    if not ka or ka != kb:
+        return False
+    sa, sb = name_suffix(a), name_suffix(b)
+    return not (sa and sb and sa != sb)
+
+
 def pick_board_line(ou_lines, threshold_lines, tipped: float, side: str = "over"):
     """The current line for the tipped player / stat / side from the board.
       ou_lines: the lines of the player's plain full-game over/under rows on the tipped side;
